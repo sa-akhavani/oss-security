@@ -1,16 +1,18 @@
 import os
 import csv
 import datetime
+import shutil
 from git import Repo
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import time
 
 
 REPO_BASE_PATH = "./repos"
 RESULT_CSV_PATH = "./contributor_history_results.csv"
-REPO_LIST_PATH = "../datasets/processed_git_details.csv"
-BATH_SIZE = 20
-PROCESS_COUNT = 10
+REPO_LIST_PATH = "./processed_git_details.csv"
+BATH_SIZE = 2
+PROCESS_COUNT = 2
 
 
 # Period definition. Two datapoints per year from 2017 to 2025, January 1st to June 30th and July 1st to December 31st
@@ -67,6 +69,16 @@ def fetch_unique_contributors(commits):
     for commit in commits:
         contributors.add(commit.author.email)
     return contributors
+
+def cleanup_repos():
+    """
+    Clean up all cloned repositories after a batch is processed.
+    """
+    if os.path.exists(REPO_BASE_PATH):
+        print("Cleaning up repositories...")
+        shutil.rmtree(REPO_BASE_PATH)
+        os.makedirs(REPO_BASE_PATH)  # Recreate the base directory for future repos
+        print("Repository cleanup complete.")
 
 def process_repo(row):
     """
@@ -143,8 +155,12 @@ def process_repos(input_csv_path):
                     batch_results = []  # Reset the batch
                     futures = []  # Reset futures list
                     print(f"Processed {repo_count} repositories, results saved.")
+
+                    # Clean up repositories after each batch
+                    cleanup_repos()
+
                     # sleep for 30 secs
-                    time.sleep(30)
+                    time.sleep(15)
 
             # Collect and save remaining results
             for future in futures:
