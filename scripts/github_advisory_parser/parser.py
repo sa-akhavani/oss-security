@@ -18,18 +18,32 @@ severity = data['database_specific'].get('severity')
 ecosystem = data['affected'][0]['package'].get('ecosystem')
 package_name = data['affected'][0]['package'].get('name')
 
-# Collect version ranges
+# Collect version ranges and versions
 version_ranges = []
 for affected in data['affected']:
-    for version_range in affected['ranges']:
-        introduced = ""
-        fixed = ""
-        for event in version_range['events']:
-            if 'introduced' in event:
-                introduced = event['introduced']
-            if 'fixed' in event:
-                fixed = event['fixed']
-        version_ranges.append(f"[{introduced},{fixed})")
+    if 'ranges' in affected:
+        for version_range in affected['ranges']:
+            start_bracket = ""
+            end_bracket = ""
+            start_version = ""
+            end_version = ""
+            
+            for event in version_range['events']:
+                if 'introduced' in event:
+                    start_bracket = "["
+                    start_version = event['introduced']
+                if 'fixed' in event:
+                    end_bracket = ")"
+                    end_version = event['fixed']
+                if 'last_affected' in event:
+                    end_bracket = "]"
+                    end_version = event['last_affected']
+            
+            version_ranges.append(f"{start_bracket}{start_version},{end_version}{end_bracket}")
+    
+    if 'versions' in affected:
+        versions = affected['versions']
+        version_ranges.append(f"[{', '.join(versions)}]")
 
 version_range = ''.join(version_ranges)
 
@@ -54,6 +68,5 @@ row = {
 
 # Output to CSV format
 csv_writer = csv.DictWriter(sys.stdout, fieldnames=row.keys(), quoting=csv.QUOTE_ALL)
-csv_writer.writeheader()
+# csv_writer.writeheader()
 csv_writer.writerow(row)
-
