@@ -14,10 +14,10 @@ paper which is currently in submission to a security conference.
 <!-- ``` -->
 
 
-### Dataset
+## Dataset
 Here, we explain what each dataset folder contains and the CSV format we used to represent that data.
 
-#### Github Advisory Parsed Data
+### Github Advisory Parsed Data
 Parsed data from the Github advisory database from 2017 to 2025 in a csv format.
 `github_advisory_parsed_data`
 
@@ -25,15 +25,15 @@ Parsed data from the Github advisory database from 2017 to 2025 in a csv format.
 ID,SOURCE,REVIEWED,PUBLISH_DATE,CWE_IDS,ALIASES,SUMMARY,SEVERITY,ECOSYSTEM,PACKAGE_NAME,VERSION_RANGE,REFERENCES
 ```
 
-#### Libraries.io
+### Libraries.io
 This includes the status of total packages in each ecosystem from 2017 to 2025.
 `libraries.io`
 
-#### npm data
+### npm data
 Some of the top downloaded npm packages and their metadata.
 `npm-data`
 
-#### Vulnerable Package Metadata
+### Vulnerable Package Metadata
 This is a detailed dataset that contains our extracted vulnrability and metadata information for each studied package.
 `vulnerable_package_repository_info`
 
@@ -41,7 +41,7 @@ This is a detailed dataset that contains our extracted vulnrability and metadata
 ID,Package,CWE,Date,Platform,GitHub URL,Stars,Contributors,Dependencies,Dependents
 ```
 
-#### Contributor History
+### Contributor History
 Includes the studied Github package contributor history.
 `contributor_history`
 
@@ -49,7 +49,7 @@ Includes the studied Github package contributor history.
 REPO_NAME,GITHUB_URL,PERIOD_START,PERIOD_END,CONTRIBUTORS,CUMULATIVE_CONTRIBUTORS
 ```
 
-### Scripts
+## Scripts
 Scripts folder contains the scripts we used to crawl
 `github advisory` and `snyk.io` data,
 and also the code we used to extract the contributor history from github packages.
