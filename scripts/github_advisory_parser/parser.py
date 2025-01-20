@@ -48,7 +48,8 @@ for affected in data['affected']:
 version_range = ''.join(version_ranges)
 
 # Collect references
-references = ', '.join(ref['url'] for ref in data.get('references', []))
+references = str(data.get('references'))
+# references = ', '.join(ref['url'] for ref in data.get('references', []))
 
 # CSV rows
 row = {
