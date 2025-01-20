@@ -17,6 +17,14 @@ paper which is currently in submission to a security conference.
 ## Dataset
 Here, we explain what each dataset folder contains and the CSV format we used to represent that data.
 
+### Vulnerable Package Metadata
+This is a detailed dataset that contains our extracted vulnrability and metadata information for each studied package.
+`vulnerable_package_repository_info`
+
+```csv
+ID,Package,CWE,Date,Platform,GitHub URL,Stars,Contributors,Dependencies,Dependents
+```
+
 ### Github Advisory Parsed Data
 Parsed data from the Github advisory database from 2017 to 2025 in a csv format.
 `github_advisory_parsed_data`
@@ -32,14 +40,6 @@ This includes the status of total packages in each ecosystem from 2017 to 2025.
 ### npm data
 Some of the top downloaded npm packages and their metadata.
 `npm-data`
-
-### Vulnerable Package Metadata
-This is a detailed dataset that contains our extracted vulnrability and metadata information for each studied package.
-`vulnerable_package_repository_info`
-
-```csv
-ID,Package,CWE,Date,Platform,GitHub URL,Stars,Contributors,Dependencies,Dependents
-```
 
 ### Contributor History
 Includes the studied Github package contributor history.
