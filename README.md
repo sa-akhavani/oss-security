@@ -52,4 +52,8 @@ REPO_NAME,GITHUB_URL,PERIOD_START,PERIOD_END,CONTRIBUTORS,CUMULATIVE_CONTRIBUTOR
 ## Scripts
 Scripts folder contains the scripts we used to crawl
 `github advisory` and `snyk.io` data,
-and also the code we used to extract the contributor history from github packages.
+and also the code we used to extract the contributor history from github packages. It includes the code to merge the data from the two sources with a unified structure and stores it in `csv` format to be used in the analysis.
+
+
+## Analysis
+Analysis folder contains the code utilized for analysis of the data and plots related to differnect sections of the manuscript.
