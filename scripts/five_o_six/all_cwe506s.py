@@ -98,6 +98,7 @@ print(f"Scoped packages (@org/package): {scoped} ({scoped/total_cwe506_analyzed*
 print(f"Names with dashes: {with_dashes} ({with_dashes/total_cwe506_analyzed*100:.1f}%)")
 print()
 
+
 # =============================================================================
 # VERSION TARGETING PATTERNS  
 # =============================================================================
@@ -106,18 +107,33 @@ print("CWE-506 VERSION TARGETING PATTERNS")
 print("="*80)
 
 version_ranges = cwe506_df['Version Range'].dropna().astype(str)
-all_versions = version_ranges.str.contains('\*', regex=False).sum()
-has_range = (version_ranges.str.contains('<') | 
-             version_ranges.str.contains('>') | 
-             version_ranges.str.contains('~') | 
-             version_ranges.str.contains('\^')).sum()
+
+# Fixed detection - check for patterns like ['*'] or "*" or * 
+all_versions = version_ranges.str.contains(r"\*", regex=True).sum()
+
+# Has range operators - but exclude those that also have * (they're already counted)
+has_range = (
+    (~version_ranges.str.contains(r"\*", regex=True)) &  # NOT wildcard
+    (version_ranges.str.contains('<') | 
+     version_ranges.str.contains('>') | 
+     version_ranges.str.contains('~') | 
+     version_ranges.str.contains('\^') |
+     version_ranges.str.contains(','))  # Comma often indicates ranges like [1.0.0, 2.0.0)
+).sum()
+
+# Specific versions are everything else
 specific = len(version_ranges) - all_versions - has_range
 
 print(f"\nTotal CWE-506 with version info: {len(version_ranges)}")
-print(f"All versions ('*'): {all_versions} ({all_versions/len(version_ranges)*100:.1f}%)")
+print(f"All versions (contains '*'): {all_versions} ({all_versions/len(version_ranges)*100:.1f}%)")
+print(f"Version ranges (with <, >, ~, ^, comma): {has_range} ({has_range/len(version_ranges)*100:.1f}%)")
 print(f"Specific versions: {specific} ({specific/len(version_ranges)*100:.1f}%)")
-print(f"Version ranges: {has_range} ({has_range/len(version_ranges)*100:.1f}%)")
 print()
+
+print("Sample version range formats:")
+print(version_ranges.head(10).tolist())
+print()
+
 
 # =============================================================================
 # YEARLY DISTRIBUTION OF CWE-506
