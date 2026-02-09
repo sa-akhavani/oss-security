@@ -1,0 +1,1969 @@
+# ====================================================================
+# FILE: panel/command/serve.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 266-339 ---
+   266|             action  = 'store',
+   267|             type    = str,
+   268|             help    = "Path to a setup script to run before server starts. If --num-procs is enabled it will be run in each process after the server has started.",
+   269|             default = None
+   270|         )),
+   271|         ('--liveness', Argument(
+   272|             action  = 'store_true',
+   273|             help    = "Whether to add a liveness endpoint."
+   274|         )),
+   275|         ('--liveness-endpoint', Argument(
+   276|             action  = 'store',
+   277|             type    = str,
+   278|             help    = "The endpoint for the liveness API.",
+   279|             default = "liveness"
+   280|         )),
+   281|         ('--plugins', dict(
+   282|             action  = 'append',
+   283|             type    = str
+   284|         )),
+   285|         ('--reuse-sessions', Argument(
+   286|             action  = 'store_true',
+   287|             help    = "Whether to reuse sessions when serving the initial request.",
+   288|         )),
+   289|         ('--global-loading-spinner', Argument(
+   290|             action  = 'store_true',
+   291|             help    = "Whether to add a global loading spinner to the application(s).",
+   292|         )),
+   293|     )) # type: ignore[assignment]
+   294|     _extensions = ['.py', '.ipynb', '.md']
+   295|     def customize_applications(self, args, applications):
+   296|         if args.index and not args.index.endswith('.html'):
+   297|             index = args.index.split(os.path.sep)[-1]
+   298|             for ext in self._extensions:
+   299|                 if index.endswith(ext):
+   300|                     index = index[:-len(ext)]
+   301|             if f'/{index}' in applications:
+   302|                 applications['/'] = applications[f'/{index}']
+   303|         return super().customize_applications(args, applications)
+   304|     def warm_applications(self, applications, reuse_sessions, error=True, initialize_session=True):
+   305|         from ..io.session import generate_session
+   306|         for path, app in applications.items():
+   307|             try:
+   308|                 session = generate_session(app, initialize=initialize_session)
+   309|             except Exception as e:
+   310|                 if error:
+   311|                     raise e
+   312|                 else:
+   313|                     continue
+   314|             with set_curdoc(session.document):
+   315|                 if config.session_key_func:
+   316|                     reuse_sessions = False
+   317|                 else:
+   318|                     state._session_key_funcs[path] = lambda r: r.path
+   319|                     state._sessions[path] = session
+   320|                     session.block_expiration()
+   321|                 state._on_load(None)
+   322|             _cleanup_doc(session.document, destroy=not reuse_sessions)
+   323|     def customize_kwargs(self, args, server_kwargs):
+   324|         '''Allows subclasses to customize ``server_kwargs``.
+   325|         Should modify and return a copy of the ``server_kwargs`` dictionary.
+   326|         '''
+   327|         kwargs = dict(server_kwargs)
+   328|         if 'index' not in kwargs:
+   329|             kwargs['index'] = INDEX_HTML
+   330|         elif kwargs['index'].endswith('.html'):
+   331|             kwargs['index'] = os.path.abspath(kwargs['index'])
+   332|         kwargs['extra_patterns'] = patterns = kwargs.get('extra_patterns', [])
+   333|         if args.ico_path:
+   334|             settings.ico_path.set_value(args.ico_path)
+   335|         else:
+   336|             kwargs["ico_path"] = DIST_DIR / "images" / "favicon.ico"
+   337|         static_dirs = parse_vars(args.static_dirs) if args.static_dirs else {}
+   338|         patterns += get_static_routes(static_dirs)
+   339|         files = []
+
+# --- HUNK 2: Lines 392-435 ---
+   392|             state._setup_module = module
+   393|             def setup_file():
+   394|                 setup_path = state._setup_module.__dict__['__file__']
+   395|                 with open(setup_path) as f:
+   396|                     setup_source = f.read()
+   397|                 nodes = ast.parse(setup_source, os.fspath(setup_path))
+   398|                 code = compile(nodes, filename=setup_path, mode='exec', dont_inherit=True)
+   399|                 exec(code, state._setup_module.__dict__)
+   400|             if args.num_procs > 1:
+   401|                 state._setup_file_callback = setup_file
+   402|             else:
+   403|                 state._setup_file_callback = None
+   404|                 setup_file()
+   405|         if args.warm or config.autoreload:
+   406|             argvs = {f: args.args for f in files}
+   407|             applications = build_single_handler_applications(files, argvs)
+   408|             initialize_session = not (args.num_procs != 1 and sys.version_info < (3, 12))
+   409|             if config.autoreload:
+   410|                 with record_modules(list(applications.values())):
+   411|                     self.warm_applications(
+   412|                         applications, args.reuse_sessions, error=False, initialize_session=initialize_session
+   413|                     )
+   414|             else:
+   415|                 self.warm_applications(applications, args.reuse_sessions, initialize_session=initialize_session)
+   416|         if args.dev:
+   417|             del server_kwargs['autoreload']
+   418|         if args.liveness:
+   419|             argvs = {f: args.args for f in files}
+   420|             applications = build_single_handler_applications(files, argvs)
+   421|             patterns += [(rf"/{args.liveness_endpoint}", LivenessHandler, dict(applications=applications))]
+   422|         config.profiler = args.profiler
+   423|         if args.admin:
+   424|             from ..io.admin import admin_panel
+   425|             from ..io.server import per_app_patterns
+   426|             admin_path = "/admin"
+   427|             if args.admin_endpoint:
+   428|                 admin_path = args.admin_endpoint
+   429|                 admin_path = admin_path if admin_path.startswith('/') else f'/{admin_path}'
+   430|             config._admin = True
+   431|             app = Application(FunctionHandler(admin_panel))
+   432|             unused_timeout = args.check_unused_sessions or 15000
+   433|             state._admin_context = app_ctx = AdminApplicationContext(
+   434|                 app, unused_timeout=unused_timeout, url=admin_path
+   435|             )
+
+
+# ====================================================================
+# FILE: panel/config.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 119-165 ---
+   119|         Compatibility to be set to error by default in Panel 1.1.""")
+   120|     load_entry_points = param.Boolean(default=True, doc="""
+   121|         Load entry points from external packages.""")
+   122|     loading_indicator = param.Boolean(default=False, doc="""
+   123|         Whether a loading indicator is shown by default while panes are updating.""")
+   124|     loading_spinner = param.Selector(default='arc', objects=[
+   125|         'arc', 'arcs', 'bar', 'dots', 'petal'], doc="""
+   126|         Loading indicator to use when component loading parameter is set.""")
+   127|     loading_color = param.Color(default='#c3c3c3', doc="""
+   128|         Color of the loading indicator.""")
+   129|     loading_max_height = param.Integer(default=400, doc="""
+   130|         Maximum height of the loading indicator.""")
+   131|     notifications = param.Boolean(default=False, doc="""
+   132|         Whether to enable notifications functionality.""")
+   133|     profiler = param.Selector(default=None, allow_None=True, objects=[
+   134|         'pyinstrument', 'snakeviz', 'memray'], doc="""
+   135|         The profiler engine to enable.""")
+   136|     ready_notification = param.String(doc="""
+   137|         The notification to display when the application is ready and
+   138|         fully loaded.""")
+   139|     reuse_sessions = param.Boolean(default=False, doc="""
+   140|         Whether to reuse a session for the initial request to speed up
+   141|         the initial page render. Note that if the initial page differs
+   142|         between sessions, e.g. because it uses query parameters to modify
+   143|         the rendered content, then this option will result in the wrong
+   144|         content being rendered. Define a session_key_func to ensure that
+   145|         reused sessions are only reused when appropriate.""")
+   146|     session_key_func = param.Callable(default=None, doc="""
+   147|         Used in conjunction with the reuse_sessions option, the
+   148|         session_key_func is given a tornado.httputil.HTTPServerRequest
+   149|         and should return a key that uniquely captures a session.""")
+   150|     safe_embed = param.Boolean(default=False, doc="""
+   151|         Ensure all bokeh property changes trigger events which are
+   152|         embedded. Useful when only partial updates are made in an
+   153|         app, e.g. when working with HoloViews.""")
+   154|     session_history = param.Integer(default=0, bounds=(-1, None), doc="""
+   155|         If set to a non-negative value this determines the maximum length
+   156|         of the pn.state.session_info dictionary, which tracks
+   157|         information about user sessions. A value of -1 indicates an
+   158|         unlimited history.""")
+   159|     sizing_mode = param.Selector(default=None, objects=[
+   160|         'fixed', 'stretch_width', 'stretch_height', 'stretch_both',
+   161|         'scale_width', 'scale_height', 'scale_both', None], doc="""
+   162|         Specify the default sizing mode behavior of panels.""")
+   163|     template = param.Selector(default=None, doc="""
+   164|         The default template to render served applications into.""")
+   165|     throttled = param.Boolean(default=False, doc="""
+
+
+# ====================================================================
+# FILE: panel/custom.py
+# Total hunks: 5
+# ====================================================================
+# --- HUNK 1: Lines 1-40 ---
+     1| from __future__ import annotations
+     2| import asyncio
+     3| import hashlib
+     4| import importlib
+     5| import inspect
+     6| import os
+     7| import pathlib
+     8| import sys
+     9| import textwrap
+    10| from collections import defaultdict
+    11| from collections.abc import Callable, Mapping
+    12| from functools import partial
+    13| from typing import (
+    14|     TYPE_CHECKING, Any, ClassVar, Literal,
+    15| )
+    16| import param
+    17| from param.parameterized import ParameterizedMetaclass
+    18| from .config import config
+    19| from .io.datamodel import construct_data_model
+    20| from .io.document import freeze_doc, hold
+    21| from .io.resources import component_resource_path
+    22| from .io.state import state
+    23| from .layout.base import Panel
+    24| from .models import (
+    25|     AnyWidgetComponent as _BkAnyWidgetComponent,
+    26|     ReactComponent as _BkReactComponent, ReactiveESM as _BkReactiveESM,
+    27| )
+    28| from .models.esm import DataEvent, ESMEvent
+    29| from .models.reactive_html import DOMEvent
+    30| from .pane.base import PaneBase  # noqa
+    31| from .reactive import (  # noqa
+    32|     Reactive, ReactiveCustomBase, ReactiveHTML, ReactiveMetaBase,
+    33| )
+    34| from .util import classproperty
+    35| from .util.checks import import_available
+    36| from .viewable import (  # noqa
+    37|     Child, Children, Layoutable, Viewable, Viewer, is_viewable_param,
+    38| )
+    39| from .widgets.base import WidgetBase  # noqa
+    40| if TYPE_CHECKING:
+
+# --- HUNK 2: Lines 353-426 ---
+   353|                 continue
+   354|             doc = state._views[ref][2]
+   355|             is_session = doc.session_context and doc.session_context.server_context
+   356|             esm = self._render_esm(not config.autoreload, server=is_session)
+   357|             if esm == model.esm:
+   358|                 continue
+   359|             self._apply_update({}, {'esm': esm}, model, ref)
+   360|     @property
+   361|     def _linked_properties(self) -> tuple[str, ...]:
+   362|         return tuple(p for p in self._data_model.properties() if p != 'js_property_callbacks')
+   363|     def _get_properties(self, doc: Document | None) -> dict[str, Any]:
+   364|         props = super()._get_properties(doc)
+   365|         cls = type(self)
+   366|         data_params = {}
+   367|         ignored = [
+   368|             p for p in Reactive.param
+   369|             if not issubclass(cls.param[p].owner, ReactiveESM) or
+   370|             (p in Viewable.param and p not in ('name', 'use_shadow_dom')
+   371|              and type(Reactive.param[p]) is type(cls.param[p]))
+   372|         ]
+   373|         for k, v in self.param.values().items():
+   374|             p = self.param[k]
+   375|             if is_viewable_param(p) or type(self)._property_mapping.get(k, "") is None:
+   376|                 props.pop(k, None)
+   377|                 continue
+   378|             elif (k in ignored and k != 'name') or ((p.precedence or 0) < 0):
+   379|                 continue
+   380|             if k in props:
+   381|                 props.pop(k)
+   382|             data_params[k] = v
+   383|         bundle_path = self._bundle_path
+   384|         importmap = self._process_importmap()
+   385|         is_session = False
+   386|         css_bundle = None
+   387|         if bundle_path:
+   388|             is_session = bool(doc and doc.session_context and doc.session_context.server_context)
+   389|             if bundle_path == self._esm_path(not config.autoreload) and cls.__module__ in sys.modules and is_session:
+   390|                 bundle_hash = 'url'
+   391|                 if self._bundle_css:
+   392|                     esm_bundle = self._component_resource_path(bundle_path, compiled=True)
+   393|                     css_bundle = esm_bundle.replace('_bundle_path', '_bundle_css').replace('.js', '.css')
+   394|             else:
+   395|                 bundle_hash = hashlib.sha256(str(bundle_path).encode('utf-8')).hexdigest()
+   396|         else:
+   397|             bundle_hash = None
+   398|         data_props = self._process_param_change(data_params)
+   399|         data_props['esm_constants'] = self._constants
+   400|         props.update({
+   401|             'bundle': bundle_hash,
+   402|             'css_bundle': css_bundle,
+   403|             'class_name': cls.__name__,
+   404|             'data': self._data_model(**{p: v for p, v in data_props.items() if p not in ignored}),
+   405|             'dev': config.autoreload or getattr(self, '_debug', False),
+   406|             'esm': self._render_esm(not config.autoreload, server=is_session),
+   407|             'importmap': importmap,
+   408|             'name': cls.__name__
+   409|         })
+   410|         return props
+   411|     @classmethod
+   412|     def _process_importmap(cls):
+   413|         return cls._importmap
+   414|     def _get_child_model(
+   415|         self, child: Viewable, doc: Document, root: Model, parent: Model, comm: Comm | None
+   416|     ) -> tuple[list[UIElement] | UIElement | None, list[UIElement]]:
+   417|         if child is None:
+   418|             return None, []
+   419|         ref = root.ref['id']
+   420|         old = []
+   421|         if isinstance(child, list):
+   422|             models = []
+   423|             for sv in child:
+   424|                 if ref in sv._models:
+   425|                     model = sv._models[ref][0]
+   426|                     old.append(model)
+
+# --- HUNK 3: Lines 469-549 ---
+   469|         self._link_props(props['data'], self._linked_properties, doc, root, comm)
+   470|         self._register_events('dom_event', 'data_event', model=model, doc=doc, comm=comm)
+   471|         self._setup_autoreload()
+   472|         return model
+   473|     def _process_event(self, event: Event) -> None:
+   474|         if isinstance(event, DataEvent):
+   475|             for cb in self._msg__callbacks:
+   476|                 state.execute(partial(cb, event), schedule=False)
+   477|             state.execute(partial(self._handle_msg, event.data), schedule=False)
+   478|             return
+   479|         elif not isinstance(event, DOMEvent):
+   480|             return
+   481|         if hasattr(self, f'_handle_{event.node}'):
+   482|             getattr(self, f'_handle_{event.node}')(event)
+   483|         for cb in self._event__callbacks.get(event.node, []):
+   484|             state.execute(partial(cb, event), schedule=False)
+   485|     def _update_model(
+   486|         self, events: dict[str, param.parameterized.Event], msg: dict[str, Any],
+   487|         root: Model, model: Model, doc: Document, comm: Comm | None
+   488|     ) -> None:
+   489|         model_msg, data_msg  = {}, {}
+   490|         for prop, v in list(msg.items()):
+   491|             if prop in list(Reactive.param)+['esm', 'importmap']:
+   492|                 model_msg[prop] = v
+   493|             elif prop in model.children:
+   494|                 continue
+   495|             else:
+   496|                 data_msg[prop] = v
+   497|         for name, event in events.items():
+   498|             if name not in model.children:
+   499|                 continue
+   500|             new = event.new
+   501|             old_objects = event.old if isinstance(event.old, list) else [event.old]
+   502|             for old in old_objects:
+   503|                 if old is None or old is new or (isinstance(new, list) and old in new):
+   504|                     continue
+   505|                 old._cleanup(root)
+   506|         update_children = any(e in model.children for e in events)
+   507|         if update_children:
+   508|             children, old_children = self._get_children(model.data, doc, root, model, comm)
+   509|             data_msg.update(children)
+   510|             model_msg['children'] = list(children)
+   511|         ref = root.ref['id']
+   512|         prev_changing = self._changing.get(ref, [])
+   513|         try:
+   514|             update = Panel._batch_update
+   515|             Panel._batch_update = True
+   516|             with hold(doc):
+   517|                 changing = []
+   518|                 with freeze_doc(doc, model, msg, force=update_children):
+   519|                     changing += self._set_on_model(model_msg, root, model)
+   520|                     changing += self._set_on_model(data_msg, root, model.data)
+   521|                     if update and update_children and ref in state._views:
+   522|                         state._views[ref][0]._preprocess(root, self, old_children)
+   523|                 self._changing[ref] = changing
+   524|         finally:
+   525|             Panel._batch_update = update
+   526|             if prev_changing:
+   527|                 self._changing[ref] = prev_changing
+   528|             elif ref in self._changing:
+   529|                 del self._changing[ref]
+   530|     def _handle_msg(self, data: Any) -> None:
+   531|         """
+   532|         Message handler for messages sent from the frontend using the
+   533|         `model.send_msg` API.
+   534|         Parameters
+   535|         ----------
+   536|         data: any
+   537|             Data received from the frontend.
+   538|         """
+   539|     def _send_msg(self, data: Any) -> None:
+   540|         """
+   541|         Sends data to the frontend which can be observed on the frontend
+   542|         with the `model.on("msg:custom", callback)` API.
+   543|         Parameters
+   544|         ----------
+   545|         data: any
+   546|             Data to send to the frontend.
+   547|         """
+   548|         self._send_event(ESMEvent, data=data)
+   549|     def on_msg(self, callback: Callable) -> None:
+
+
+# ====================================================================
+# FILE: panel/io/document.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 59-100 ---
+    59|         return False
+    60|     @property
+    61|     def request(self):
+    62|         return Request(headers={}, cookies={}, arguments={})
+    63| def _cleanup_task(task):
+    64|     if task in _write_tasks:
+    65|         _write_tasks.remove(task)
+    66| def _dispatch_events(doc: Document, events: list[DocumentChangedEvent]) -> None:
+    67|     """
+    68|     Handles dispatch of events which could not be processed in
+    69|     unlocked decorator.
+    70|     """
+    71|     for event in events:
+    72|         doc.callbacks.trigger_on_change(event)
+    73| def _cleanup_doc(doc, destroy=True):
+    74|     for callback in doc.session_destroyed_callbacks:
+    75|         try:
+    76|             callback(None)
+    77|         except Exception:
+    78|             pass
+    79|     if hasattr(doc.callbacks, '_change_callbacks'):
+    80|         doc.callbacks._change_callbacks[None] = {}
+    81|     from ..viewable import Viewable
+    82|     views = {}
+    83|     for ref, (pane, root, vdoc, comm) in list(state._views.items()):
+    84|         if vdoc is doc:
+    85|             pane._cleanup(root)
+    86|             if isinstance(pane, Viewable):
+    87|                 pane._hooks = []
+    88|                 for p in pane.select():
+    89|                     p._hooks = []
+    90|                     p.param.watchers = {}
+    91|                     p._documents = {}
+    92|                     p._internal_callbacks = {}
+    93|             pane.param.watchers = {}
+    94|             pane._documents = {}
+    95|             pane._internal_callbacks = {}
+    96|         else:
+    97|             views[ref] = (pane, root, vdoc, comm)
+    98|     state._views = views
+    99|     if not destroy:
+   100|         return
+
+
+# ====================================================================
+# FILE: panel/io/model.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 125-164 ---
+   125|     props = []
+   126|     for k, v in properties:
+   127|         if k in ignored:
+   128|             continue
+   129|         if isinstance(v, Model):
+   130|             v = f'{type(v).__name__}()'
+   131|         else:
+   132|             v = repr(v)
+   133|         if len(v) > 30:
+   134|             v = v[:30] + '...'
+   135|         props.append(f'{k}={v}')
+   136|     props_repr = ', '.join(props)
+   137|     if isinstance(obj, FlexBox):
+   138|         r += f'{cls}(children=[\n'
+   139|         for child_obj in obj.children: # type: ignore
+   140|             r += textwrap.indent(bokeh_repr(child_obj, depth=depth+1) + ',\n', '  ')
+   141|         r += f'], {props_repr})'
+   142|     else:
+   143|         r += f'{cls}({props_repr})'
+   144|     return r
+   145| @contextmanager
+   146| def hold(doc: Document | None = None, policy: HoldPolicyType = 'combine', comm: Comm | None = None):
+   147|     """
+   148|     Context manager that holds events on a particular Document
+   149|     allowing them all to be collected and dispatched when the context
+   150|     manager exits. This allows multiple events on the same object to
+   151|     be combined if the policy is set to 'combine'.
+   152|     Parameters
+   153|     ----------
+   154|     doc: Document
+   155|         The Bokeh Document to hold events on.
+   156|     policy: HoldPolicyType
+   157|         One of 'combine', 'collect' or None determining whether events
+   158|         setting the same property are combined or accumulated to be
+   159|         dispatched when the context manager exits.
+   160|     comm: Comm
+   161|         The Comm to dispatch events on when the context manager exits.
+   162|     """
+   163|     deprecated(
+   164|         '1.7.0', 'panel.io.model.hold', 'panel.io.document.hold',
+
+
+# ====================================================================
+# FILE: panel/io/pyodide.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-27 ---
+     1| from __future__ import annotations
+     2| import asyncio
+     3| import functools
+     4| import io
+     5| import json
+     6| import os
+     7| import sys
+     8| import uuid
+     9| from collections.abc import Callable
+    10| from typing import TYPE_CHECKING, Any
+    11| import bokeh
+    12| import js
+    13| import param
+    14| import pyodide # isort: split
+    15| from bokeh import __version__
+    16| from bokeh.core.serialization import Buffer, Serialized, Serializer
+    17| from bokeh.document import Document
+    18| from bokeh.document.json import PatchJson
+    19| from bokeh.embed.elements import script_for_render_items
+    20| from bokeh.embed.util import standalone_docs_json_and_render_items
+    21| from bokeh.embed.wrappers import wrap_in_script_tag
+    22| from bokeh.events import DocumentReady
+    23| from bokeh.io.doc import set_curdoc
+    24| from bokeh.model import Model
+    25| from bokeh.settings import settings as bk_settings
+    26| from js import JSON, XMLHttpRequest
+    27| from ..config import config
+
+# --- HUNK 2: Lines 52-91 ---
+    52|         from pyscript import RUNNING_IN_WORKER as _IN_PYSCRIPT_WORKER
+    53|         if _IN_PYSCRIPT_WORKER:
+    54|             from pyscript import document, window
+    55|             js.document = document
+    56|             js.window = window
+    57|         _IN_WORKER = False
+    58|     except Exception:
+    59|         _IN_PYSCRIPT_WORKER = False
+    60|         _IN_WORKER = True
+    61| if _IN_WORKER:
+    62|     os.environ['MPLBACKEND'] = 'agg'
+    63| try:
+    64|     import pyodide_http
+    65|     pyodide_http.patch_all()
+    66| except Exception:
+    67|     pyodide_http = None
+    68| try:
+    69|     import fsspec.implementations.http_sync  # noqa
+    70| except Exception:
+    71|     pass
+    72| if 'pyolite' in sys.modules and os.path.exists('/drive/assets/sampledata'):
+    73|     def _sampledata_dir(create=None):
+    74|         return '/drive/assets/sampledata'
+    75|     bokeh.util.sampledata.external_data_dir = _sampledata_dir
+    76| if pyodide_http is None:
+    77|     import pandas
+    78|     def _read_file(*args, **kwargs):
+    79|         if args and isurl(args[0]):
+    80|             args = (pyodide.http.open_url(args[0]),)+args[1:]
+    81|         elif isurl(kwargs.get('filepath_or_buffer')):
+    82|             kwargs['filepath_or_buffer'] = pyodide.http.open_url(kwargs['filepath_or_buffer'])
+    83|         return args, kwargs
+    84|     _read_csv_original = pandas.read_csv
+    85|     @functools.wraps(pandas.read_csv)
+    86|     def _read_csv(*args, **kwargs):
+    87|         args, kwargs = _read_file(*args, **kwargs)
+    88|         return _read_csv_original(*args, **kwargs)
+    89|     pandas.read_csv = _read_csv  # type: ignore
+    90|     _read_json_original = pandas.read_json
+    91|     @functools.wraps(pandas.read_json)
+
+# --- HUNK 3: Lines 218-276 ---
+   218| })
+   219| """)
+   220| _current_buffers = []
+   221| _patching = False
+   222| def _bytes_converter(value, converter, other):
+   223|     if not hasattr(value, 'buffer'):
+   224|         return value
+   225|     value = dict(value.object_entries())
+   226|     uid = uuid.uuid4().hex
+   227|     _current_buffers.append(
+   228|         Buffer(id=uid, data=value['buffer'].to_bytes())
+   229|     )
+   230|     return {'id': uid}
+   231| def _convert_json_patch(json_patch):
+   232|     try:
+   233|         patch = json_patch.to_py(default_converter=_bytes_converter)
+   234|         serialized = Serialized(content=patch, buffers=list(_current_buffers))
+   235|     finally:
+   236|         _current_buffers.clear()
+   237|     return serialized
+   238| def _link_docs(pydoc: Document, jsdoc: Any) -> None:
+   239|     """
+   240|     Links Python and JS documents in Pyodide ensuring that messages
+   241|     are passed between them.
+   242|     Parameters
+   243|     ----------
+   244|     pydoc: bokeh.document.Document
+   245|         The Python Bokeh Document instance to sync.
+   246|     jsdoc: Javascript Document
+   247|         The Javascript Bokeh Document instance to sync.
+   248|     """
+   249|     def jssync(event):
+   250|         setter_id = getattr(event, 'setter_id', None)
+   251|         if (setter_id is not None and setter_id == 'python') or _patching:
+   252|             return
+   253|         json_patch = jsdoc.create_json_patch(pyodide.ffi.to_js([event]))
+   254|         patch = _convert_json_patch(json_patch)
+   255|         pydoc.apply_json_patch(patch, setter='js')
+   256|     jsdoc.on_change(pyodide.ffi.create_proxy(jssync), pyodide.ffi.to_js(False))
+   257|     def pysync(event):
+   258|         global _patching
+   259|         setter = getattr(event, 'setter', None)
+   260|         if setter is not None and setter == 'js':
+   261|             return
+   262|         json_patch, buffer_map = _process_document_events(pydoc, [event])
+   263|         json_patch = pyodide.ffi.to_js(json_patch, dict_converter=_dict_converter)
+   264|         buffer_map = pyodide.ffi.to_js(buffer_map)
+   265|         _patching = True
+   266|         try:
+   267|             jsdoc.apply_json_patch(json_patch, buffer_map)
+   268|         finally:
+   269|             _patching = False
+   270|     pydoc.on_change(pysync)
+   271|     try:
+   272|         pydoc.unhold()
+   273|         pydoc.callbacks.trigger_event(DocumentReady())
+   274|     except Exception as e:
+   275|         print(f'Error raised while processing Document events: {e}')  # noqa: T201
+   276| def _link_docs_worker(doc: Document, dispatch_fn: Any, msg_id: str | None = None, setter: str | None = None):
+
+
+# ====================================================================
+# FILE: panel/io/resources.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 228-268 ---
+   228|         return abs_path
+   229|     return pathlib.Path(os.path.relpath(abs_path, module_path))
+   230| def component_resource_path(component, attr, path):
+   231|     """
+   232|     Generates a canonical URL for a component resource.
+   233|     To be used in conjunction with the `panel.io.server.ComponentResourceHandler`
+   234|     which allows dynamically resolving resources defined on components.
+   235|     """
+   236|     if not isinstance(component, type):
+   237|         component = type(component)
+   238|     component_path = COMPONENT_PATH
+   239|     if state.rel_path:
+   240|         component_path = f"{state.rel_path}/{component_path}"
+   241|     custom_path = resolve_custom_path(component, path, relative=True)
+   242|     if custom_path:
+   243|         rel_path = os.fspath(custom_path).replace(os.path.sep, '/')
+   244|     else:
+   245|         rel_path = path
+   246|     return f'{component_path}{component.__module__}/{component.__name__}/{attr}/{rel_path}'
+   247| def patch_stylesheet(stylesheet, dist_url):
+   248|     url = stylesheet.url
+   249|     if url.startswith(CDN_DIST+dist_url) and dist_url != CDN_DIST:
+   250|         patched_url = url.replace(CDN_DIST+dist_url, dist_url)
+   251|     elif url.startswith(CDN_DIST) and dist_url != CDN_DIST:
+   252|         patched_url = url.replace(CDN_DIST, dist_url)
+   253|     elif url.startswith(LOCAL_DIST) and dist_url.lstrip('./').startswith(LOCAL_DIST):
+   254|         patched_url = url.replace(LOCAL_DIST, dist_url)
+   255|     else:
+   256|         return
+   257|     version_suffix = f'?v={JS_VERSION}'
+   258|     if not patched_url.endswith(version_suffix):
+   259|         patched_url += version_suffix
+   260|     try:
+   261|         stylesheet.url = patched_url
+   262|     except Exception:
+   263|         pass
+   264| def _is_file_path(stylesheet: str)->bool:
+   265|     return stylesheet.lower().endswith(".css")
+   266| def resolve_stylesheet(cls, stylesheet: str, attribute: str | None = None):
+   267|     """
+   268|     Resolves a stylesheet definition, e.g. originating on a component
+
+
+# ====================================================================
+# FILE: panel/io/server.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 407-456 ---
+   407|             )
+   408|             with set_curdoc(temp_session.document):
+   409|                 authorized, auth_error = self._authorize()
+   410|             if authorized is None:
+   411|                 return
+   412|             elif not authorized:
+   413|                 self.set_status(403)
+   414|                 page = self._render_auth_error(auth_error)
+   415|                 self.set_header("Content-Type", 'text/html')
+   416|                 self.write(page)
+   417|                 return
+   418|         app = self.application
+   419|         key_func = state._session_key_funcs.get(self.request.path, lambda r: r.path)
+   420|         old_request = key_func(self.request) in state._sessions
+   421|         session = await self.get_session()
+   422|         if old_request and state._sessions.get(key_func(self.request)) is session:
+   423|             session_id = generate_session_id(
+   424|                 secret_key=self.application.secret_key,
+   425|                 signed=self.application.sign_sessions
+   426|             )
+   427|             payload = get_token_payload(session.token)
+   428|             payload.update(payload)
+   429|             del payload['session_expiry']
+   430|             token = generate_jwt_token(
+   431|                 session_id,
+   432|                 secret_key=app.secret_key,
+   433|                 signed=app.sign_sessions,
+   434|                 expiration=app.session_token_expiration,
+   435|                 extra_payload=payload
+   436|             )
+   437|         else:
+   438|             token = session.token
+   439|         logger.info(LOG_SESSION_CREATED, id(session.document))
+   440|         with set_curdoc(session.document):
+   441|             resources = Resources.from_bokeh(self.application.resources())
+   442|             authorized, auth_error = self._authorize(session=True)
+   443|             if authorized:
+   444|                 page = server_html_page_for_session(
+   445|                     session, resources=resources, title=session.document.title,
+   446|                     token=token, template=session.document.template,
+   447|                     template_variables=session.document.template_variables,
+   448|                 )
+   449|             elif authorized is None:
+   450|                 return
+   451|             else:
+   452|                 page = self._render_auth_error(auth_error)
+   453|         self.set_header("Content-Type", 'text/html')
+   454|         self.write(page)
+   455| per_app_patterns[0] = (r'/?', DocHandler)
+   456| class AutoloadJsHandler(BkAutoloadJsHandler):
+
+
+# ====================================================================
+# FILE: panel/models/esm.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 7-43 ---
+     7| from ..io.resources import bundled_files
+     8| from ..util import classproperty
+     9| from .layout import HTMLBox
+    10| class DataEvent(ModelEvent):
+    11|     event_name = 'data_event'
+    12|     def __init__(self, model, data=None):
+    13|         self.data = data
+    14|         super().__init__(model=model)
+    15|     def event_values(self) -> dict[str, Any]:
+    16|         return dict(super().event_values(), data=self.data)
+    17| class ESMEvent(DataEvent):
+    18|     event_name = 'esm_event'
+    19| class ReactiveESM(HTMLBox):
+    20|     css_bundle = bp.Nullable(bp.String)
+    21|     bundle = bp.Nullable(bp.String)
+    22|     class_name = bp.String()
+    23|     children = bp.List(bp.String)
+    24|     data = bp.Instance(DataModel)
+    25|     dev = bp.Bool(False)
+    26|     esm = bp.String()
+    27|     importmap = bp.Dict(bp.String, bp.Dict(bp.String, bp.String))
+    28|     __javascript_raw__ = [
+    29|         f"{config.npm_cdn}/es-module-shims@^1.10.0/dist/es-module-shims.min.js"
+    30|     ]
+    31|     @classproperty
+    32|     def __javascript__(cls):
+    33|         return bundled_files(cls)
+    34| class ReactComponent(ReactiveESM):
+    35|     """
+    36|     Renders jsx/tsx based ESM bundles using React.
+    37|     """
+    38|     root_node = bp.Nullable(bp.String)
+    39|     use_shadow_dom = bp.Bool(True)
+    40| class AnyWidgetComponent(ReactComponent):
+    41|     """
+    42|     Renders AnyWidget esm definitions by adding a compatibility layer.
+    43|     """
+
+
+# ====================================================================
+# FILE: panel/models/jsoneditor.ts
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 10-85 ---
+    10|   }
+    11|   protected override get event_values(): Attrs {
+    12|     return {model: this.origin, data: this.data}
+    13|   }
+    14|   static {
+    15|     this.prototype.event_name = "json_edit"
+    16|   }
+    17| }
+    18| export class JSONEditorView extends HTMLBoxView {
+    19|   declare model: JSONEditor
+    20|   editor: any
+    21|   _menu_context: any
+    22|   override connect_signals(): void {
+    23|     super.connect_signals()
+    24|     const {data, disabled, templates, menu, mode, search, schema} = this.model.properties
+    25|     this.on_change([data], () => this.editor.update(this.model.data))
+    26|     this.on_change([templates], () => {
+    27|       this.editor.options.templates = this.model.templates
+    28|     })
+    29|     this.on_change([menu], () => {
+    30|       this.editor.options.menu = this.model.menu
+    31|     })
+    32|     this.on_change([search], () => {
+    33|       this.editor.options.search = this.model.search
+    34|     })
+    35|     this.on_change([schema], () => {
+    36|       this.editor.options.schema = this.model.schema
+    37|     })
+    38|     this.on_change([disabled, mode], () => {
+    39|       const mode = this.model.disabled ? "view": this.model.mode
+    40|       this.editor.setMode(mode)
+    41|     })
+    42|   }
+    43|   override stylesheets(): StyleSheetLike[] {
+    44|     const styles = super.stylesheets()
+    45|     for (const css of this.model.css) {
+    46|       styles.push(new ImportedStyleSheet(css))
+    47|     }
+    48|     return styles
+    49|   }
+    50|   override remove(): void {
+    51|     super.remove()
+    52|     this.editor.destroy()
+    53|   }
+    54|   override render(): void {
+    55|     super.render()
+    56|     const mode = this.model.disabled ? "view": this.model.mode
+    57|     this.editor = new (window as any).JSONEditor(this.shadow_el, {
+    58|       menu: this.model.menu,
+    59|       mode,
+    60|       onChangeJSON: (json: any) => {
+    61|         this.model.data = json
+    62|       },
+    63|       onChangeText: (text: any) => {
+    64|         try {
+    65|           this.model.data = JSON.parse(text)
+    66|         } catch (e) {
+    67|           console.warn(e)
+    68|         }
+    69|       },
+    70|       onSelectionChange: (start: any, end: any) => {
+    71|         this.model.selection = [start, end]
+    72|       },
+    73|       search: this.model.search,
+    74|       schema: this.model.schema,
+    75|       templates: this.model.templates,
+    76|     })
+    77|     this.editor.set(this.model.data)
+    78|   }
+    79| }
+    80| export namespace JSONEditor {
+    81|   export type Attrs = p.AttrsOf<Props>
+    82|   export type Props = HTMLBox.Props & {
+    83|     css: p.Property<string[]>
+    84|     data: p.Property<any>
+    85|     menu: p.Property<boolean>
+
+
+# ====================================================================
+# FILE: panel/models/modal.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 83-123 ---
+    83|       child_view.render_to(target)
+    84|     }
+    85|     this.close_button = button({
+    86|       id: "pnx_dialog_close",
+    87|       "data-a11y-dialog-hide": "",
+    88|       class: "pnx-dialog-close",
+    89|       ariaLabel: "Close this dialog window",
+    90|     } as any)
+    91|     this.close_button.innerHTML = "&#x2715"
+    92|     dialog.append(dialog_overlay)
+    93|     dialog.append(content)
+    94|     content.append(this.close_button)
+    95|     this.shadow_el.append(dialog)
+    96|     let first_open = false
+    97|     this.modal = new A11yDialog(dialog)
+    98|     this.update_close_button()
+    99|     this.modal.on("show", () => {
+   100|       this.model.open = true
+   101|       dialog.style.display = ""
+   102|       if (!first_open) {
+   103|         requestAnimationFrame(() => { this.invalidate_layout() })
+   104|         first_open = true
+   105|       }
+   106|     })
+   107|     this.modal.on("hide", () => {
+   108|       this.model.open = false
+   109|       dialog.style.display = "none"
+   110|     })
+   111|     if (this.model.open) { this.modal.show() }
+   112|   }
+   113|   update_close_button(): void {
+   114|     if (this.model.show_close_button) {
+   115|       this.close_button.style.display = "block"
+   116|     } else {
+   117|       this.close_button.style.display = "none"
+   118|     }
+   119|   }
+   120| }
+   121| export namespace Modal {
+   122|   export type Attrs = p.AttrsOf<Props>
+   123|   export type Props = BkColumn.Props & {
+
+
+# ====================================================================
+# FILE: panel/models/player.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 247-286 ---
+   247|     } else if (this.model.loop_policy == "loop") {
+   248|       loop.checked = true
+   249|     } else {
+   250|       reflect.checked = true
+   251|     }
+   252|     this.loop_state.appendChild(once)
+   253|     this.loop_state.appendChild(once_label)
+   254|     this.loop_state.appendChild(loop)
+   255|     this.loop_state.appendChild(loop_label)
+   256|     this.loop_state.appendChild(reflect)
+   257|     this.loop_state.appendChild(reflect_label)
+   258|     this.groupEl.appendChild(this.titleEl)
+   259|     this.groupEl.appendChild(this.sliderEl)
+   260|     this.groupEl.appendChild(button_div)
+   261|     if (this.model.show_loop_controls) {
+   262|       this.groupEl.appendChild(this.loop_state)
+   263|     }
+   264|     this.toggle_disable()
+   265|     this.update_css()
+   266|     this.shadow_el.appendChild(this.groupEl)
+   267|   }
+   268|   set_frame(frame: number, throttled: boolean = true): void {
+   269|     this.model.value = frame
+   270|     this.update_title_and_value()
+   271|     if (throttled) {
+   272|       this.model.value_throttled = frame
+   273|     }
+   274|     if (this.sliderEl.value != String(frame)) {
+   275|       this.sliderEl.value = String(frame)
+   276|     }
+   277|   }
+   278|   get_loop_state(): string {
+   279|     const button_group = this.loop_state.state
+   280|     for (let i = 0; i < button_group.length; i++) {
+   281|       const button = button_group[i]
+   282|       if (button.checked) {
+   283|         return button.value
+   284|       }
+   285|     }
+   286|     return "once"
+
+
+# ====================================================================
+# FILE: panel/models/react_component.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 350-395 ---
+   350|     } if (name == "useState") {
+   351|       return (prop) => {
+   352|         const data_model = target.model.data
+   353|         const propPath = prop.split(".")
+   354|         let targetModel = data_model
+   355|         let resolvedProp = null
+   356|         for (let i = 0; i < propPath.length - 1; i++) {
+   357|           if (targetModel && targetModel.properties && propPath[i] in targetModel.properties) {
+   358|             targetModel = targetModel[propPath[i]]
+   359|           } else {
+   360|             targetModel = null
+   361|             break
+   362|           }
+   363|         }
+   364|         if (targetModel && targetModel.attributes && propPath[propPath.length - 1] in targetModel.attributes) {
+   365|           resolvedProp = propPath[propPath.length - 1]
+   366|         }
+   367|         if (resolvedProp && targetModel) {
+   368|           const [value, setValue] = React.useState(targetModel.attributes[resolvedProp])
+   369|           React.useEffect(() => {
+   370|             const cb = () => setValue(targetModel.attributes[resolvedProp])
+   371|             react_proxy.on(prop, cb)
+   372|             return () => react_proxy.off(prop, cb)
+   373|           }, [])
+   374|           React.useEffect(() => {
+   375|             targetModel.setv({ [resolvedProp]: value })
+   376|           }, [value])
+   377|           return [value, setValue]
+   378|         }
+   379|         throw ReferenceError("Could not resolve " + prop + " on " + target.model.class_name)
+   380|       }
+   381|     } else if (name === "get_child") {
+   382|       return (child) => {
+   383|         const data_model = target.model.data
+   384|         const value = data_model.attributes[child]
+   385|         if (Array.isArray(value)) {
+   386|           const [children_state, set_children] = React.useState(value.map((model) =>
+   387|             React.createElement(Child, { parent: target, name: child, key: model.id, id: model.id })
+   388|           ))
+   389|           React.useEffect(() => {
+   390|             target.on_child_render(child, () => {
+   391|               const current_models = data_model.attributes[child]
+   392|               const previous_models = children_state.map(child => child.props.index)
+   393|               if (current_models.some((model, i) => model.id !== previous_models[i])) {
+   394|                 set_children(current_models.map((model, i) => (
+   395|                   React.createElement(Child, { parent: target, name: child, key: model.id, id: model.id })
+
+
+# ====================================================================
+# FILE: panel/models/reactive_esm.ts
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 75-122 ---
+    75|           model.unwatch(target, p, callback)
+    76|           continue
+    77|         } else if (p === "msg:custom") {
+    78|           target.remove_on_event(callback)
+    79|           continue
+    80|         }
+    81|         if (p.startsWith("lifecycle:")) {
+    82|           p = p.slice("lifecycle:".length)
+    83|         }
+    84|         if (target._lifecycle_handlers.has(p)) {
+    85|           const handlers = target._lifecycle_handlers.get(p)
+    86|           if (handlers && handlers.includes(callback)) {
+    87|             target._lifecycle_handlers.set(p, handlers.filter(v => v !== callback))
+    88|           }
+    89|           continue
+    90|         }
+    91|         console.warn(`Could not unregister callback for event type '${p}'`)
+    92|       }
+    93|     }
+    94|   } else if (name === "on") {
+    95|     return (prop: string | string[], callback: any) => {
+    96|       const props = isArray(prop) ? prop : [prop]
+    97|       for (let p of props) {
+    98|         if (p.startsWith("change:")) {
+    99|           p = p.slice("change:".length)
+   100|         }
+   101|         if (p in model.attributes || p.split(".")[0] in model.data.attributes) {
+   102|           model.watch(target, p, callback)
+   103|           continue
+   104|         } else if (p === "msg:custom") {
+   105|           target.on_event(callback)
+   106|           continue
+   107|         }
+   108|         if (p.startsWith("lifecycle:")) {
+   109|           p = p.slice("lifecycle:".length)
+   110|         }
+   111|         if (target._lifecycle_handlers.has(p)) {
+   112|           (target._lifecycle_handlers.get(p) || []).push(callback)
+   113|           continue
+   114|         }
+   115|         console.warn(`Could not register callback for event type '${p}'`)
+   116|       }
+   117|     }
+   118|   } else if (Reflect.has(model.data, name)) {
+   119|     if (name in model.data.attributes && !target.accessed_properties.includes(name)) {
+   120|       target.accessed_properties.push(name)
+   121|     }
+   122|     return Reflect.get(model.data, name)
+
+# --- HUNK 2: Lines 478-601 ---
+   478|     }
+   479|     if (callback === undefined) {
+   480|       this._child_callbacks.delete(child)
+   481|     } else {
+   482|       let callbacks = this._child_callbacks.get(child) || []
+   483|       callbacks = callbacks.filter((cb) => cb !== callback)
+   484|       this._child_callbacks.set(child, callbacks)
+   485|     }
+   486|   }
+   487| }
+   488| export namespace ReactiveESM {
+   489|   export type Attrs = p.AttrsOf<Props>
+   490|   export type Props = HTMLBox.Props & {
+   491|     css_bundle: p.Property<string | null>
+   492|     bundle: p.Property<string | null>
+   493|     children: p.Property<any>
+   494|     class_name: p.Property<string>
+   495|     data: p.Property<any>
+   496|     dev: p.Property<boolean>
+   497|     esm: p.Property<string>
+   498|     importmap: p.Property<any>
+   499|   }
+   500| }
+   501| export interface ReactiveESM extends ReactiveESM.Attrs {}
+   502| export class ReactiveESM extends HTMLBox {
+   503|   declare properties: ReactiveESM.Props
+   504|   compiled: string | null = null
+   505|   compiled_module: Promise<any> | null = null
+   506|   compile_error: Error | null = null
+   507|   model_proxy: any
+   508|   render_module: Promise<any> | null = null
+   509|   sucrase_transforms: Transform[] = ["typescript"]
+   510|   _destroyer: any | null = null
+   511|   _esm_watchers: any = {}
+   512|   constructor(attrs?: Partial<ReactiveESM.Attrs>) {
+   513|     super(attrs)
+   514|   }
+   515|   override initialize(): void {
+   516|     super.initialize()
+   517|     this.model_proxy = new Proxy(this, {
+   518|       get: init_model_getter,
+   519|       set: init_model_setter,
+   520|     })
+   521|     this.recompile()
+   522|   }
+   523|   override connect_signals(): void {
+   524|     super.connect_signals()
+   525|     this.connect(this.properties.esm.change, () => this.recompile())
+   526|     this.connect(this.properties.importmap.change, () => this.recompile())
+   527|   }
+   528|   watch(view: ReactiveESMView | null, prop: string, cb: any): void {
+   529|     if (prop in this._esm_watchers) {
+   530|       this._esm_watchers[prop].push([view, cb])
+   531|     } else {
+   532|       this._esm_watchers[prop] = [[view, cb]]
+   533|     }
+   534|     const propPath = prop.split(".")
+   535|     let target: any = this.data
+   536|     let resolvedProp: string | null = null
+   537|     for (let i = 0; i < propPath.length - 1; i++) {
+   538|       if (target && target.properties && propPath[i] in target.properties) {
+   539|         target = target[propPath[i]]
+   540|       } else {
+   541|         target = null
+   542|         break
+   543|       }
+   544|     }
+   545|     if (target && target.properties && propPath[propPath.length - 1] in target.properties) {
+   546|       resolvedProp = propPath[propPath.length - 1]
+   547|     }
+   548|     if (resolvedProp && target) {
+   549|       target.property(resolvedProp).change.connect(cb)
+   550|     } else if (prop in this.properties) {
+   551|       this.property(prop).change.connect(cb)
+   552|     }
+   553|   }
+   554|   unwatch(view: ReactiveESMView | null, prop: string, cb: any): boolean {
+   555|     if (!(prop in this._esm_watchers)) {
+   556|       return false
+   557|     }
+   558|     const remaining = []
+   559|     for (const [wview, wcb] of this._esm_watchers[prop]) {
+   560|       if (wview !== view || wcb !== cb) {
+   561|         remaining.push([wview, wcb])
+   562|       }
+   563|     }
+   564|     if (remaining.length > 0) {
+   565|       this._esm_watchers[prop] = remaining
+   566|     } else {
+   567|       delete this._esm_watchers[prop]
+   568|     }
+   569|     const propPath = prop.split(".")
+   570|     let target: any = this.data
+   571|     let resolvedProp: string | null = null
+   572|     for (let i = 0; i < propPath.length - 1; i++) {
+   573|       if (target && target.properties && propPath[i] in target.properties) {
+   574|         target = target[propPath[i]]
+   575|       } else {
+   576|         target = null
+   577|         break
+   578|       }
+   579|     }
+   580|     if (target && target.properties && propPath[propPath.length - 1] in target.properties) {
+   581|       resolvedProp = propPath[propPath.length - 1]
+   582|     }
+   583|     if (resolvedProp && target) {
+   584|       return target.property(resolvedProp).change.disconnect(cb)
+   585|     } else if (prop in this.properties) {
+   586|       return this.property(prop).change.disconnect(cb)
+   587|     }
+   588|     return false
+   589|   }
+   590|   disconnect_watchers(view: ReactiveESMView): void {
+   591|     for (const p in this._esm_watchers) {
+   592|       const prop = this.data.properties[p]
+   593|       const remaining = []
+   594|       for (const [wview, cb] of this._esm_watchers[p]) {
+   595|         if (wview === view) {
+   596|           prop?.change.disconnect(cb)
+   597|         } else {
+   598|           remaining.push([wview, cb])
+   599|         }
+   600|       }
+   601|       if (remaining.length > 0) {
+
+# --- HUNK 3: Lines 741-764 ---
+   741|       } catch (e: any) {
+   742|         if (this.dev) {
+   743|           this.compile_error = e
+   744|         }
+   745|         console.error(`Could not initialize module due to error: ${e}`)
+   746|         return null
+   747|       }
+   748|     })
+   749|   }
+   750|   static override __module__ = "panel.models.esm"
+   751|   static {
+   752|     this.prototype.default_view = ReactiveESMView
+   753|     this.define<ReactiveESM.Props>(({Any, Array, Bool, Nullable, Str}) => ({
+   754|       css_bundle:  [ Nullable(Str),     null ],
+   755|       bundle:      [ Nullable(Str),     null ],
+   756|       children:    [ Array(Str),          [] ],
+   757|       class_name:  [ Str,                 "" ],
+   758|       data:        [ Any                     ],
+   759|       dev:         [ Bool,             false ],
+   760|       esm:         [ Str,                 "" ],
+   761|       importmap:   [ Any,                 {} ],
+   762|     }))
+   763|   }
+   764| }
+
+
+# ====================================================================
+# FILE: panel/pane/base.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 454-494 ---
+   454|         self._models[root.ref['id']] = (model, parent)
+   455|         self._link_props(model, self._linked_properties, doc, root, comm)
+   456|         return model
+   457|     def _update(self, ref: str, model: Model) -> None:
+   458|         model.update(**self._get_properties(model.document))
+   459|     def _init_params(self):
+   460|         params = {
+   461|             p: v for p, v in self.param.values().items()
+   462|             if v is not None and p not in ('name', 'default_layout')
+   463|         }
+   464|         params['object'] = self.object
+   465|         return params
+   466|     def _transform_object(self, obj: Any) -> dict[str, Any]:
+   467|         return dict(object=obj)
+   468|     def _process_param_change(self, params):
+   469|         if 'object' in params:
+   470|             params.update(self._transform_object(params.pop('object')))
+   471|         if self._bokeh_model is not None and 'stylesheets' in params:
+   472|             css = getattr(self._bokeh_model, '__css__', [])
+   473|             params['stylesheets'] = [
+   474|                 ImportedStyleSheet(url=ss) for ss in css
+   475|             ] + params['stylesheets']
+   476|         return super()._process_param_change(params)
+   477| class ReplacementPane(Pane):
+   478|     """
+   479|     ReplacementPane provides a baseclass for dynamic components that
+   480|     may have to dynamically update or switch out their contents, e.g.
+   481|     a dynamic callback that may return different objects to be rendered.
+   482|     When the pane updates it either entirely replaces the underlying
+   483|     `bokeh.model.Model`, by creating an internal layout to replace the
+   484|     children on, or updates the existing model in place.
+   485|     """
+   486|     inplace = param.Boolean(default=False, doc="""
+   487|         Whether to update the object inplace.""")
+   488|     object = param.Parameter(default=None, allow_refs=False, doc="""
+   489|         The object being wrapped, which will be converted to a
+   490|         Bokeh model.""")
+   491|     _pane = param.ClassSelector(class_=Viewable, allow_refs=False)
+   492|     _ignored_refs: ClassVar[tuple[str,...]] = ('object',)
+   493|     _linked_properties: tuple[str,...] = ()
+   494|     _rename: ClassVar[Mapping[str, str | None]] = {'_pane': None, 'inplace': None}
+
+
+# ====================================================================
+# FILE: panel/pane/holoviews.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 99-143 ---
+    99|     }
+   100|     _rerender_params = ['object', 'backend', 'format']
+   101|     _skip_layoutable = (
+   102|         'css_classes', 'margin', 'name', 'sizing_mode',
+   103|         'width', 'height', 'max_width', 'max_height'
+   104|     )
+   105|     def __init__(self, object=None, **params):
+   106|         self._initialized = False
+   107|         self._height_responsive = None
+   108|         self._width_responsive = None
+   109|         self._restore_plot = None
+   110|         super().__init__(object, **params)
+   111|         self.widget_box = self.widget_layout()
+   112|         self._widget_container = []
+   113|         self._plots = {}
+   114|         self._syncing_props = False
+   115|         self._overrides = [
+   116|             p for p, v in params.items()
+   117|             if p in Layoutable.param and v != self.param[p].default
+   118|         ]
+   119|         watcher = self.param.watch(self._update_widgets, self._rerender_params)
+   120|         self._internal_callbacks.append(watcher)
+   121|         self._update_responsive()
+   122|         self._update_widgets()
+   123|         self._initialized = True
+   124|     def _param_change(self, *events: param.parameterized.Event) -> None:
+   125|         if self._object_changing:
+   126|             return
+   127|         self._track_overrides(*(e for e in events if e.name in Layoutable.param))
+   128|         super()._param_change(*(e for e in events if e.name in self._overrides+['css_classes']))
+   129|     @param.depends('backend', watch=True, on_init=True)
+   130|     def _load_backend(self):
+   131|         from holoviews import Store, extension
+   132|         if self.backend and self.backend not in Store.renderers:
+   133|             ext = extension._backends[self.backend]
+   134|             __import__(f'holoviews.plotting.{ext}')
+   135|     @property
+   136|     def _layout_sizing_mode(self):
+   137|         if self._width_responsive and self._height_responsive:
+   138|             smode = 'stretch_both'
+   139|         elif self._width_responsive:
+   140|             smode = 'stretch_width'
+   141|         elif self._height_responsive:
+   142|             smode = 'stretch_height'
+   143|         else:
+
+
+# ====================================================================
+# FILE: panel/pane/plot.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 57-97 ---
+    57|     >>> Bokeh(some_bokeh_figure)
+    58|     """
+    59|     autodispatch = param.Boolean(default=True, doc="""
+    60|         Whether to automatically dispatch events inside bokeh on_change
+    61|         and on_event callbacks in the notebook.""")
+    62|     theme = param.ClassSelector(default=None, class_=(Theme, str), doc="""
+    63|         Bokeh theme to apply to the plot.""")
+    64|     priority: ClassVar[float | bool | None] = 0.8
+    65|     _rename: ClassVar[Mapping[str, str | None]] = {
+    66|         'autodispatch': None, 'theme': None
+    67|     }
+    68|     def __init__(self, object=None, **params):
+    69|         super().__init__(object, **params)
+    70|         self._syncing_props = False
+    71|         self._overrides = [
+    72|             p for p, v in params.items()
+    73|             if p in Layoutable.param and v != self.param[p].default
+    74|         ]
+    75|     def _param_change(self, *events: param.parameterized.Event) -> None:
+    76|         self._track_overrides(*(e for e in events if e.name in Layoutable.param))
+    77|         super()._param_change(*(e for e in events if e.name in self._overrides+['css_classes']))
+    78|     @classmethod
+    79|     def applies(cls, obj: Any) -> float | bool | None:
+    80|         return isinstance(obj, LayoutDOM)
+    81|     @classmethod
+    82|     def _property_callback_wrapper(cls, cb, doc, comm, callbacks):
+    83|         def wrapped_callback(attr, old, new):
+    84|             with _wrap_callback(cb, wrapped_callback, doc, comm, callbacks):
+    85|                 cb(attr, old, new)
+    86|         return wrapped_callback
+    87|     @classmethod
+    88|     def _event_callback_wrapper(cls, cb, doc, comm, callbacks):
+    89|         def wrapped_callback(event):
+    90|             with _wrap_callback(cb, wrapped_callback, doc, comm, callbacks):
+    91|                 cb(event)
+    92|         return wrapped_callback
+    93|     @classmethod
+    94|     def _wrap_bokeh_callbacks(cls, root, bokeh_model, doc, comm):
+    95|         for model in bokeh_model.select({'type': Model}):
+    96|             for key, cbs in model._callbacks.items():
+    97|                 callbacks = model._callbacks[key]
+
+
+# ====================================================================
+# FILE: panel/param.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 10-51 ---
+    10| import os
+    11| import sys
+    12| import textwrap
+    13| import threading
+    14| import types
+    15| from collections import defaultdict, namedtuple
+    16| from collections.abc import Callable, Generator
+    17| from contextlib import contextmanager
+    18| from functools import partial
+    19| from types import FunctionType
+    20| from typing import TYPE_CHECKING, Any, ClassVar
+    21| import param
+    22| try:
+    23|     from param import Skip
+    24| except Exception:
+    25|     class Skip(Exception):  # type: ignore
+    26|         """
+    27|         Exception that allows skipping an update for function-level updates.
+    28|         """
+    29| from param.parameterized import (
+    30|     Undefined, bothmethod, classlist, discard_events, eval_function_with_deps,
+    31|     get_method_owner, iscoroutinefunction, resolve_ref, resolve_value,
+    32| )
+    33| from param.reactive import rx
+    34| from .config import config
+    35| from .io import state
+    36| from .layout import (
+    37|     Column, HSpacer, ListLike, Panel, Row, Spacer, Tabs, WidgetBox,
+    38| )
+    39| from .pane import DataFrame as DataFramePane
+    40| from .pane.base import Pane, ReplacementPane
+    41| from .reactive import Reactive
+    42| from .util import (
+    43|     abbreviated_repr, flatten, full_groupby, fullpath, is_parameterized,
+    44|     param_name, recursive_parameterized, to_async_gen,
+    45| )
+    46| from .util.checks import is_dataframe, is_mpl_axes, is_series
+    47| from .viewable import Layoutable, Viewable
+    48| from .widgets import (
+    49|     ArrayInput, Button, Checkbox, ColorPicker, DataFrame, DatePicker,
+    50|     DateRangeSlider, DatetimeInput, DatetimeRangeSlider, DiscreteSlider,
+    51|     FileInput, FileSelector, FloatInput, FloatSlider, IntInput, IntSlider,
+
+# --- HUNK 2: Lines 503-569 ---
+   503|                     isinstance(widget.param['options'], param.List)):
+   504|                     options = list(options)
+   505|                 updates['options'] = options
+   506|             elif change.what == 'bounds':
+   507|                 start, end = p_obj.get_soft_bounds()
+   508|                 supports_bounds = hasattr(widget, 'start')
+   509|                 if start is None or end is None:
+   510|                     rerender = supports_bounds
+   511|                 else:
+   512|                     rerender = not supports_bounds
+   513|                 if supports_bounds:
+   514|                     updates['start'] = start
+   515|                     updates['end'] = end
+   516|                 if rerender and is_instance:
+   517|                     self_or_cls._rerender_widget(p_name)
+   518|                     return
+   519|             elif change.what == 'step':
+   520|                 updates['step'] = p_obj.step
+   521|             elif change.what == 'label':
+   522|                 updates['name'] = p_obj.label
+   523|             elif p_key in updating:
+   524|                 return
+   525|             elif hasattr(param, 'Event') and isinstance(p_obj, param.Event):
+   526|                 return
+   527|             elif isinstance(p_obj, param.Action):
+   528|                 prev_watcher = watchers[0]
+   529|                 widget.param.unwatch(prev_watcher)
+   530|                 def action(event):
+   531|                     change.new(parameterized)
+   532|                 watchers[0] = widget.param.watch(action, 'clicks')
+   533|                 idx = self_or_cls._internal_callbacks.index(prev_watcher)
+   534|                 self_or_cls._internal_callbacks[idx] = watchers[0]
+   535|                 return
+   536|             elif throttled and hasattr(widget, 'value_throttled'):
+   537|                 updates['value_throttled'] = change.new
+   538|                 updates['value'] = change.new
+   539|             elif isinstance(widget, Row) and len(widget) == 2:
+   540|                 updates['value'] = change.new
+   541|                 widget = widget[0]
+   542|             else:
+   543|                 updates['value'] = change.new
+   544|             try:
+   545|                 updating.append(p_key)
+   546|                 if change.type == 'triggered':
+   547|                     with discard_events(widget):
+   548|                         widget.param.update(**updates)
+   549|                     widget.param.trigger(*updates)
+   550|                 else:
+   551|                     widget.param.update(**updates)
+   552|             finally:
+   553|                 updating.remove(p_key)
+   554|         watchers.append(parameterized.param.watch(link, p_name, 'constant'))
+   555|         watchers.append(parameterized.param.watch(link, p_name, 'precedence'))
+   556|         watchers.append(parameterized.param.watch(link, p_name, 'label'))
+   557|         if hasattr(p_obj, 'get_range'):
+   558|             watchers.append(parameterized.param.watch(link, p_name, 'objects'))
+   559|         if hasattr(p_obj, 'get_soft_bounds'):
+   560|             watchers.append(parameterized.param.watch(link, p_name, 'bounds'))
+   561|         if 'step' in kw:
+   562|             watchers.append(parameterized.param.watch(link, p_name, 'step'))
+   563|         watchers.append(parameterized.param.watch(link, p_name))
+   564|         options = resolve_value(kwargs.get('options', []), recursive=False)
+   565|         if isinstance(options, dict):
+   566|             options = options.values()
+   567|         if ((is_parameterized(value) or any(is_parameterized(o) for o in options))
+   568|             and (self_or_cls.expand_button or (self_or_cls.expand_button is None and not self_or_cls.expand))):
+   569|             toggle = Toggle(
+
+
+# ====================================================================
+# FILE: panel/reactive.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 151-190 ---
+   151|         if 'height' in properties and self.sizing_mode is None:
+   152|             properties['min_height'] = properties['height']
+   153|         if 'stylesheets' in properties:
+   154|             from .config import config
+   155|             stylesheets = [loading_css(
+   156|                 config.loading_spinner, config.loading_color, config.loading_max_height
+   157|             ), f'{CDN_DIST}css/loading.css']
+   158|             stylesheets += process_raw_css(config.raw_css)
+   159|             stylesheets += config.css_files
+   160|             stylesheets += [
+   161|                 resolve_stylesheet(self, css_file, '_stylesheets')
+   162|                 for css_file in self._stylesheets
+   163|             ]
+   164|             stylesheets += properties['stylesheets']
+   165|             wrapped = []
+   166|             if state.curdoc:
+   167|                 css_cache = state._stylesheets.get(state.curdoc, {})
+   168|             else:
+   169|                 css_cache = {}
+   170|             for stylesheet in stylesheets:
+   171|                 if isinstance(stylesheet, str) and (stylesheet.split('?')[0].endswith('.css') or stylesheet.startswith('http')):
+   172|                     if stylesheet in css_cache:
+   173|                         conv_stylesheet = css_cache[stylesheet]
+   174|                     else:
+   175|                         css_cache[stylesheet] = conv_stylesheet = ImportedStyleSheet(url=stylesheet)
+   176|                     stylesheet = conv_stylesheet
+   177|                 wrapped.append(stylesheet)
+   178|             properties['stylesheets'] = wrapped
+   179|         return properties
+   180|     @property
+   181|     def _linkable_params(self) -> list[str]:
+   182|         """
+   183|         Parameters that can be linked in JavaScript via source transforms.
+   184|         """
+   185|         return [
+   186|             p for p in self._synced_params if self._rename.get(p, False) is not None
+   187|             and self._source_transforms.get(p, False) is not None and
+   188|             p not in ('design', 'stylesheets')
+   189|         ]
+   190|     @property
+
+# --- HUNK 2: Lines 1349-1389 ---
+  1349|     @classmethod
+  1350|     def _loaded(cls) -> bool:
+  1351|         """
+  1352|         Whether the component has been loaded.
+  1353|         """
+  1354|         return (
+  1355|             cls._extension_name is None or
+  1356|             (cls._extension_name in ReactiveMetaBase._loaded_extensions and
+  1357|              (state._extensions is None or (cls._extension_name in state._extensions)))
+  1358|         )
+  1359|     def _process_param_change(self, params):
+  1360|         props = super()._process_param_change(params)
+  1361|         if 'stylesheets' in params:
+  1362|             css = getattr(self, '__css__', []) or []
+  1363|             if state.rel_path:
+  1364|                 css = [
+  1365|                     ss if ss.startswith('http') else f'{state.rel_path}/{ss}'
+  1366|                     for ss in css
+  1367|                 ]
+  1368|             props['stylesheets'] = [
+  1369|                 ImportedStyleSheet(url=ss) for ss in css
+  1370|             ] + props['stylesheets']
+  1371|         return props
+  1372|     @classmethod
+  1373|     def _patch_datamodel_ref(cls, props, ref):
+  1374|         """
+  1375|         Ensure all DataModels have reference to the root model to ensure
+  1376|         that they can be cleaned up correctly.
+  1377|         """
+  1378|         ref_str = f"__ref:{ref}"
+  1379|         for m in props.select({'type': DataModel}):
+  1380|             if ref_str not in m.tags:
+  1381|                 m.tags.append(ref_str)
+  1382|     def _set_on_model(self, msg: Mapping[str, Any], root: Model, model: Model) -> list[str]:
+  1383|         if not msg:
+  1384|             return []
+  1385|         prev_changing = self._changing.get(root.ref['id'], [])
+  1386|         changing = []
+  1387|         transformed = {}
+  1388|         for attr, value in msg.items():
+  1389|             prop = model.lookup(attr).property
+
+# --- HUNK 3: Lines 1581-1621 ---
+  1581|             p for p in super()._linkable_params if p not in self._parser.children.values() and
+  1582|             p not in ('loading')]
+  1583|     @property
+  1584|     def _child_names(self):
+  1585|         return {}
+  1586|     def _process_children(
+  1587|         self, doc: Document, root: Model, model: Model, comm: Comm | None,
+  1588|         children: dict[str, list[Model]]
+  1589|     ) -> dict[str, list[Model]]:
+  1590|         return children
+  1591|     def _process_param_change(self, params):
+  1592|         props = super()._process_param_change(params)
+  1593|         if 'stylesheets' in params:
+  1594|             css = getattr(self, '__css__', []) or []
+  1595|             if state.rel_path:
+  1596|                 css = [
+  1597|                     ss if ss.startswith('http') else f'{state.rel_path}/{ss}'
+  1598|                     for ss in css
+  1599|                 ]
+  1600|             props['stylesheets'] = [
+  1601|                 ImportedStyleSheet(url=ss) for ss in css
+  1602|             ] + props['stylesheets']
+  1603|         return props
+  1604|     def _init_params(self) -> dict[str, Any]:
+  1605|         ignored = list(Reactive.param)
+  1606|         for child in self._parser.children.values():
+  1607|             if self._child_config.get(child) != 'literal':
+  1608|                 ignored.append(child)
+  1609|         params = {
+  1610|             p : getattr(self, p) for p in list(Layoutable.param)
+  1611|             if getattr(self, p) is not None and p != 'name'
+  1612|         }
+  1613|         data_params, event_params = {}, []
+  1614|         for k, v in self.param.values().items():
+  1615|             pobj = self.param[k]
+  1616|             if (
+  1617|                 (k in ignored and k != 'name') or
+  1618|                 ((pobj.precedence or 0) < 0) or
+  1619|                 (isinstance(v, Viewable) and not isinstance(pobj, param.ClassSelector))
+  1620|             ):
+  1621|                 continue
+
+
+# ====================================================================
+# FILE: panel/widgets/base.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 33-72 ---
+    33|     e.g. it may be used as a mix-in to a PyComponent or JSComponent.
+    34|     """
+    35|     value = param.Parameter(allow_None=True, doc="""
+    36|         The widget value which the widget type resolves to when used
+    37|         as a reactive param reference.""")
+    38|     __abstract = True
+    39|     @classmethod
+    40|     def from_param(cls: type[T], parameter: param.Parameter, **params) -> T:
+    41|         """
+    42|         Construct a widget from a Parameter and link the two
+    43|         bi-directionally.
+    44|         Parameters
+    45|         ----------
+    46|         parameter: param.Parameter
+    47|           A parameter to create the widget from.
+    48|         Returns
+    49|         -------
+    50|         Widget instance linked to the supplied parameter
+    51|         """
+    52|         from ..param import Param
+    53|         return Param.widget(parameter.name, parameter.owner, dict(type=cls, **params))
+    54|     @classmethod
+    55|     def _infer_params(cls, values, **params):
+    56|         if 'name' not in params and getattr(values, 'name', None):
+    57|             params['name'] = values.name
+    58|         if 'start' in cls.param and 'start' not in params:
+    59|             params['start'] = np.nanmin(values)
+    60|         if 'end' in cls.param and 'end' not in params:
+    61|             params['end'] = np.nanmax(values)
+    62|         if 'options' in cls.param and 'options' not in params:
+    63|             if isinstance(values, dict):
+    64|                 params['options'] = values
+    65|             else:
+    66|                 params['options'] = list(unique_iterator(values))
+    67|         if 'value' not in params:
+    68|             p = cls.param['value']
+    69|             if isinstance(p, param.Tuple):
+    70|                 params['value'] = (params['start'], params['end'])
+    71|             elif 'start' in params:
+    72|                 params['value'] = params['start']
+
+
+# ====================================================================
+# FILE: panel/widgets/misc.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 253-273 ---
+   253|         Current selection.""")
+   254|     schema = param.Dict(default=None, doc="""
+   255|         Validate the JSON object against a JSON schema. A JSON schema
+   256|         describes the structure that a JSON object must have, like
+   257|         required properties or the type that a value must have.
+   258|         See http://json-schema.org/ for more information.""")
+   259|     templates = param.List(doc="""
+   260|         Array of templates that will appear in the context menu, Each
+   261|         template is a json object precreated that can be added as a
+   262|         object value to any node in your document.""")
+   263|     value = param.Parameter(default={}, doc="""
+   264|         JSON data to be edited.""")
+   265|     _rename: ClassVar[Mapping[str, str | None]] = {
+   266|         'name': None, 'value': 'data'
+   267|     }
+   268|     def _get_model(self, doc, root=None, parent=None, comm=None):
+   269|         JSONEditor._widget_type = lazy_load(
+   270|             "panel.models.jsoneditor", "JSONEditor", isinstance(comm, JupyterComm)
+   271|         )
+   272|         model = super()._get_model(doc, root, parent, comm)
+   273|         return model
+
+
+# ====================================================================
+# FILE: panel/widgets/select.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 47-123 ---
+    47|         for o in self.options:
+    48|             if isinstance(o, param.Parameterized) and not PARAM_NAME_PATTERN.match(o.name):
+    49|                 labels.append(o.name)
+    50|             else:
+    51|                 labels.append(str(o))
+    52|         return labels
+    53|     @property
+    54|     def values(self):
+    55|         if isinstance(self.options, dict):
+    56|             return list(self.options.values())
+    57|         else:
+    58|             return self.options
+    59|     @property
+    60|     def _items(self):
+    61|         return dict(zip(self.labels, self.values))
+    62| class SingleSelectBase(SelectBase):
+    63|     value = param.Parameter(default=None)
+    64|     _allows_values: ClassVar[bool] = True
+    65|     _allows_none: ClassVar[bool] = False
+    66|     _supports_embed: bool = True
+    67|     __abstract = True
+    68|     def __init__(self, **params):
+    69|         super().__init__(**params)
+    70|         values = self.values
+    71|         if self.value is None and None not in values and values and not self._allows_none:
+    72|             self.value = values[0]
+    73|     def _process_param_change(self, msg):
+    74|         msg = super()._process_param_change(msg)
+    75|         labels, values = self.labels, self.values
+    76|         unique = len(set(self.unicode_values)) == len(labels) and self._allows_values
+    77|         if 'value' in msg:
+    78|             val = msg['value']
+    79|             if isIn(val, values):
+    80|                 unicode_values = self.unicode_values if unique else labels
+    81|                 msg['value'] = unicode_values[indexOf(val, values)]
+    82|             elif values:
+    83|                 self.value = self.param['value'].default if self._allows_none else self.values[0]
+    84|                 if not self._allows_none:
+    85|                     del msg['value']
+    86|             else:
+    87|                 self.value = self.param['value'].default
+    88|                 if self._allows_none:
+    89|                     msg['value'] = self.value
+    90|         option_prop = self._property_mapping.get('options', 'options')
+    91|         is_list = isinstance(self.param['value'], param.List)
+    92|         if option_prop in msg and not is_list:
+    93|             if isinstance(self.options, dict):
+    94|                 if unique and self._allows_values:
+    95|                     options = [(v, l) for l,v in zip(labels, self.unicode_values)]
+    96|                 else:
+    97|                     options = labels
+    98|                 msg[option_prop] = options
+    99|             else:
+   100|                 msg[option_prop] = self.unicode_values
+   101|             val = self.value
+   102|             if values:
+   103|                 if not isIn(val, values):
+   104|                     self.value = self.param['value'].default if self._allows_none else values[0]
+   105|             else:
+   106|                 self.value = self.param['value'].default
+   107|         return msg
+   108|     @property
+   109|     def unicode_values(self):
+   110|         return [str(v) for v in self.values]
+   111|     def _process_property_change(self, msg):
+   112|         msg = super()._process_property_change(msg)
+   113|         if 'value' in msg:
+   114|             if not self.values:
+   115|                 pass
+   116|             elif msg['value'] == '':
+   117|                 msg['value'] = self.values[0] if self.values else None
+   118|             else:
+   119|                 if isIn(msg['value'], self.unicode_values):
+   120|                     idx = indexOf(msg['value'], self.unicode_values)
+   121|                 else:
+   122|                     idx = indexOf(msg['value'], self.labels)
+   123|                 msg['value'] = self._items[self.labels[idx]]
+
+# --- HUNK 2: Lines 780-819 ---
+   780|         present in the list of completion strings.""")
+   781|     search_strategy = param.Selector(default='starts_with',
+   782|         objects=['starts_with', 'includes'], doc="""
+   783|         Define how to search the list of completion strings. The default option
+   784|         `"starts_with"` means that the user's text must match the start of a
+   785|         completion string. Using `"includes"` means that the user's text can
+   786|         match any substring of a completion string.""")
+   787|     value = param.Parameter(default='', allow_None=True, doc="""
+   788|       Initial or entered text value updated when <enter> key is pressed.""")
+   789|     value_input = param.String(default='', allow_None=True, doc="""
+   790|       Initial or entered text value updated on every key press.""")
+   791|     width = param.Integer(default=300, allow_None=True, doc="""
+   792|       Width of this component. If sizing_mode is set to stretch
+   793|       or scale mode this will merely be used as a suggestion.""")
+   794|     description = param.String(default=None, doc="""
+   795|         An HTML string describing the function of this component.""")
+   796|     _allows_values: ClassVar[bool] = False
+   797|     _allows_none: ClassVar[bool] = True
+   798|     _rename: ClassVar[Mapping[str, str | None]] = {'name': 'title', 'options': 'completions'}
+   799|     _widget_type: ClassVar[type[Model]] = _BkAutocompleteInput
+   800|     def _process_property_change(self, msg):
+   801|         if not self.restrict and 'value' in msg:
+   802|             try:
+   803|                 return super()._process_property_change(msg)
+   804|             except Exception:
+   805|                 return Widget._process_property_change(self, msg)
+   806|         return super()._process_property_change(msg)
+   807|     def _process_param_change(self, msg):
+   808|         if 'value' in msg and not self.restrict and not isIn(msg['value'], self.values):
+   809|             with param.parameterized.discard_events(self):
+   810|                 props = super()._process_param_change(msg)
+   811|                 self.value = props['value'] = msg['value']
+   812|         else:
+   813|             props = super()._process_param_change(msg)
+   814|         return props
+   815| class _RadioGroupBase(SingleSelectBase):
+   816|     _supports_embed = False
+   817|     _rename: ClassVar[Mapping[str, str | None]] = {
+   818|         'name': None, 'options': 'labels', 'value': 'active'
+   819|     }
+
+
+# ====================================================================
+# FILE: panel/widgets/tables.py
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 545-612 ---
+   545|             if not isinstance(filter, param.Parameter):
+   546|                 raise ValueError(f'{type(self).__name__} filter must be '
+   547|                                  'a constant value, parameter, widget '
+   548|                                  'or function.')
+   549|             elif column is None:
+   550|                 raise ValueError('When filtering with a parameter or '
+   551|                                  'widget, a column to filter on must be '
+   552|                                  'declared.')
+   553|             deps = [filter]
+   554|         for dep in deps:
+   555|             dep.owner.param.watch(self._update_cds, dep.name)
+   556|         self._filters.append((column, filter))
+   557|         self._update_cds()
+   558|     def remove_filter(self, filter):
+   559|         """
+   560|         Removes a filter which was previously added.
+   561|         """
+   562|         self._filters = [(column, filt) for (column, filt) in self._filters
+   563|                          if filt is not filter]
+   564|         self._update_cds()
+   565|     def _process_column(self, values: TDataColumn):
+   566|         if not isinstance(values, (list, np.ndarray)):
+   567|             return [str(v) for v in values]
+   568|         if isinstance(values, np.ndarray) and values.dtype.kind == "b":
+   569|             return values.tolist()
+   570|         return values
+   571|     def _get_data(self) -> tuple[pd.DataFrame, DataDict]:
+   572|         return self._process_df_and_convert_to_cds(self.value)
+   573|     def _process_df_and_convert_to_cds(self, df: pd.DataFrame) -> tuple[pd.DataFrame, DataDict]:
+   574|         import pandas as pd
+   575|         df = self._filter_dataframe(df, header_filters=False)
+   576|         if df is None:
+   577|             return [], {}
+   578|         indexes: list[Any]
+   579|         if isinstance(self.value.index, pd.MultiIndex):
+   580|             indexes = [
+   581|                 f'level_{i}' if n is None else n
+   582|                 for i, n in enumerate(df.index.names)
+   583|             ]
+   584|         else:
+   585|             default_index = ('level_0' if 'index' in df.columns else 'index')
+   586|             indexes = [df.index.name or default_index]
+   587|         if df.columns.nlevels > 1 and len(indexes) > 1:
+   588|             indexes = [i + "_" * (df.columns.nlevels - 1) for i in indexes]
+   589|         data = ColumnDataSource.from_df(df.reset_index() if len(indexes) > 1 else df)
+   590|         if not self.show_index and len(indexes) > 1:
+   591|             data = {k: v for k, v in data.items() if k not in indexes}
+   592|         return df, {k if isinstance(k, str) else str(k): self._process_column(v) for k, v in data.items()}
+   593|     def _update_column(self, column: str, array: TDataColumn):
+   594|         import pandas as pd
+   595|         self.value[column] = array
+   596|         if self._processed is not None and self.value is not self._processed:
+   597|             with pd.option_context('mode.chained_assignment', None):
+   598|                 self._processed[column] = array
+   599|     @property
+   600|     def indexes(self):
+   601|         import pandas as pd
+   602|         if self.value is None or not self.show_index:
+   603|             return []
+   604|         elif isinstance(self.value.index, pd.MultiIndex):
+   605|             indexes = [
+   606|                 f'level_{i}' if n is None else n
+   607|                 for i, n in enumerate(self.value.index.names)
+   608|             ]
+   609|             if self.value.columns.nlevels > 1:
+   610|                 indexes = [i + "_" * (self.value.columns.nlevels - 1) for i in indexes]
+   611|             return indexes
+   612|         default_index = ('level_0' if 'index' in self.value.columns else 'index')
+
+# --- HUNK 2: Lines 1228-1268 ---
+  1228|     def _get_data(self):
+  1229|         if self.pagination != 'remote' or self.value is None:
+  1230|             return super()._get_data()
+  1231|         import pandas as pd
+  1232|         df = self._filter_dataframe(self.value)
+  1233|         df = self._sort_df(df)
+  1234|         nrows = self.page_size or self.initial_page_size
+  1235|         start = (self.page-1)*nrows
+  1236|         page_df = df.iloc[start: start+nrows]
+  1237|         if isinstance(self.value.index, pd.MultiIndex):
+  1238|             indexes = [
+  1239|                 f'level_{i}' if n is None else n
+  1240|                 for i, n in enumerate(df.index.names)
+  1241|             ]
+  1242|         else:
+  1243|             default_index = ('level_0' if 'index' in df.columns else 'index')
+  1244|             indexes = [df.index.name or default_index]
+  1245|         if len(indexes) > 1:
+  1246|             page_df = page_df.reset_index()
+  1247|         data = ColumnDataSource.from_df(page_df).items()
+  1248|         return df, {k if isinstance(k, str) else str(k): v for k, v in data}
+  1249|     def _get_style_data(self, recompute=True):
+  1250|         if self.value is None or self.style is None or self.value.empty:
+  1251|             return {}
+  1252|         df = self._processed
+  1253|         if len(self.indexes) > 1:
+  1254|             df = df.reset_index()
+  1255|         if recompute:
+  1256|             try:
+  1257|                 self._computed_styler = styler = df.style
+  1258|             except Exception:
+  1259|                 self._computed_styler = None
+  1260|                 return {}
+  1261|             if styler is None:
+  1262|                 return {}
+  1263|             styler._todo = styler_update(self.style, df)
+  1264|             try:
+  1265|                 styler._compute()
+  1266|             except Exception:
+  1267|                 styler._todo = []
+  1268|         else:
+
+# --- HUNK 3: Lines 1555-1597 ---
+  1555|         if isinstance(self.selectable, int) and not isinstance(self.selectable, bool):
+  1556|             ilocs = ilocs[len(ilocs) - self.selectable:]
+  1557|         self.selection = ilocs  # type: ignore
+  1558|     def _get_properties(self, doc: Document | None = None) -> dict[str, Any]:
+  1559|         properties = super()._get_properties(doc)
+  1560|         properties['configuration'] = self._get_configuration(properties['columns'])
+  1561|         properties['cell_styles'] = self._get_style_data()
+  1562|         properties['indexes'] = self.indexes
+  1563|         if self.pagination:
+  1564|             length = self._length
+  1565|             page_size = self.page_size or self.initial_page_size
+  1566|             properties['max_page'] = max(length//page_size + bool(length % page_size), 1)
+  1567|         if isinstance(self.selectable, str) and self.selectable.startswith('checkbox'):
+  1568|             properties['select_mode'] = 'checkbox'
+  1569|         else:
+  1570|             properties['select_mode'] = self.selectable
+  1571|         return properties
+  1572|     def _process_param_change(self, params):
+  1573|         if 'theme' in params or 'stylesheets' in params:
+  1574|             theme_url = self._get_theme(params.pop('theme', self.theme))
+  1575|             params['stylesheets'] = params.get('stylesheets', self.stylesheets) + [
+  1576|                 ImportedStyleSheet(url=theme_url)
+  1577|             ]
+  1578|         params = Reactive._process_param_change(self, params)
+  1579|         if 'disabled' in params:
+  1580|             params['editable'] = not params.pop('disabled') and len(self.indexes) <= 1
+  1581|         if 'frozen_rows' in params:
+  1582|             length = self._length
+  1583|             params['frozen_rows'] = [
+  1584|                 length+r if r < 0 else r for r in params['frozen_rows']
+  1585|             ]
+  1586|         if 'hidden_columns' in params:
+  1587|             import pandas as pd
+  1588|             if not self.show_index and self.value is not None and not isinstance(self.value.index, pd.MultiIndex):
+  1589|                 params['hidden_columns'] = params['hidden_columns'] + [self.value.index.name or 'index']
+  1590|         if 'selectable_rows' in params:
+  1591|             params['selectable_rows'] = self._get_selectable()
+  1592|         return params
+  1593|     def _get_model(
+  1594|         self, doc: Document, root: Model | None = None,
+  1595|         parent: Model | None = None, comm: Comm | None = None
+  1596|     ) -> Model:
+  1597|         Tabulator._widget_type = lazy_load(
+

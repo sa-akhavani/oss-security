@@ -1,0 +1,1449 @@
+--- a/tgmix/main.py
++++ b/tgmix/main.py
+@@ -1,17 +1,17 @@
+ import argparse
+ import re
+ import shutil
+ from pathlib import Path
+ from ujson import JSONDecodeError, dump, loads
+ from tgmix import __version__
+-from tgmix.message_processor import MessageProcessor
++from tgmix.message_processor import fix_reply_ids, handle_init, stitch_messages
+ from tgmix.stats_processor import compute_chat_stats, print_stats
+ PACKAGE_DIR = Path(__file__).parent.resolve()
+ def load_config(target_dir: Path) -> dict:
+     """
+     Loads the configuration.
+     Priority:
+     1. tgmix_config.json in the target directory.
+     2. Built-in config.json from the package (default).
+     """
+     local_config_path = target_dir / "tgmix_config.json"
+@@ -42,23 +42,22 @@
+             " the original audio is kept"
+         )
+     summary_block = {
+         "tgmix_summary": {
+             "purpose":
+                 "This file contains a structured representation of a "
+                 "Telegram chat export, prepared for AI analysis by TGMix",
+             "format_description":
+                 "JSON object containing chat metadata and a list of messages. "
+                 "Each message uses an `author_id` to "
+-                "reference an author in the map, timestamp, "
+-                "and media data. Text is formated in Markdown. "
+-                "special cases: __underline__, ||spoiler||,",
++                "reference an author in the map, timestamp, Markdown text, "
++                "and media data",
+             "usage_guidelines": {
+                 "main_principle":
+                     "Process this JSON together with any attached media "
+                     "when such media exists.",
+                 "author_references":
+                     "Authors are listed in the top-level `author_map`. Each "
+                     "message refers to an author using a compact `author_id` "
+                     "(e.g. 'U1'). Use this map to resolve the author's full "
+                     "name. In your responses, always use the full name",
+                 "special_media_handling": special_media_handling,
+@@ -80,83 +79,61 @@
+     parsed = {}
+     for item in rules_list:
+         if ':' not in item:
+             print(f"[!] Warning: Skipping invalid rule '{item}'. "
+                   f"Format must be 'key:value'.")
+             continue
+         key, value = item.split(':', 1)
+         parsed[key] = value
+     return parsed
+ def run_processing(target_dir: Path, config: dict,
+-                   masking_rules: dict | None, do_anonymise: bool,
+-                   do_confirm_deletion: bool) -> tuple[dict, dict]:
++                   masking_rules: dict | None,
++                   do_anonymise: bool) -> tuple[dict, dict]:
+     """Main processing logic for the export."""
+     export_json_path = target_dir / config['export_json_file']
+     if not export_json_path.exists():
+         print(f"[!] Error: '{config['export_json_file']}' not found"
+               f" in {target_dir}")
+         return {}, {}
+     media_dir = target_dir / config['media_output_dir']
+     if media_dir.exists():
+-        if do_confirm_deletion and input(
+-                f"\nMedia directory '{media_dir}' already exists.\n"
+-                "Delete and continue? [Y/N]: ").lower() != "y":
+-            return {}, {}
+         print(f"[*] Cleaning up '{config['media_output_dir']}'...")
+         shutil.rmtree(media_dir)
+     media_dir.mkdir(exist_ok=True)
+     raw_chat = loads(open(export_json_path, encoding="utf-8").read())
+-    if not raw_chat.get("messages"):
+-        print("[!] Error: No messages found in the export.")
+-        return {}, raw_chat
+-    message_processor = MessageProcessor(
+-        target_dir, media_dir, config["mark_media"], masking_rules,
+-        do_anonymise)
+-    stitched_messages, author_map, is_anonymised = (
+-        message_processor.stitch_messages(raw_chat["messages"]))
+-    message_processor.fix_reply_ids(stitched_messages)
++    stitched_messages, id_alias_map, author_map = stitch_messages(
++        raw_chat["messages"], target_dir, media_dir, config, masking_rules,
++        do_anonymise
++    )
++    fix_reply_ids(stitched_messages, id_alias_map)
+     chat_name = raw_chat.get("name")
+-    if is_anonymised and ("authors" in masking_rules.get("presets", {})):
++    if masking_rules and ("authors" in masking_rules.get("presets", {})):
+         template = masking_rules["presets"]["authors"]
+         print("[*] Anonymizing author names...")
+         for compact_id in author_map.keys():
+             numeric_id_match = re.search(r'\d+', compact_id)
+             if not numeric_id_match:
+                 continue
+             unique_placeholder = template.replace(
+                 ']', f'_{numeric_id_match.group(0)}]'
+             )
+             author_map[compact_id] = unique_placeholder
+         chat_name = "[ANONYMIZED CHAT]"
+     processed_chat = create_summary_block(
+         False,
+         "(File not included. "
+         "Change data exporting settings to download.)" in str(raw_chat)
+     )
+     processed_chat["chat_name"] = chat_name
+     processed_chat["author_map"] = author_map
+     processed_chat["messages"] = stitched_messages
+     return processed_chat, raw_chat
+-def handle_init(package_dir: Path) -> None:
+-    """Creates tgmix_config.json in the current directory from a template."""
+-    config_template_path = package_dir / "config.json"
+-    target_config_path = Path.cwd() / "tgmix_config.json"
+-    if not config_template_path.exists():
+-        print(
+-            "[!] Critical Error: config.json template not found in package.")
+-        return
+-    if target_config_path.exists():
+-        print(f"[!] File 'tgmix_config.json' already exists here.")
+-        return
+-    shutil.copy(config_template_path, target_config_path)
+-    print(
+-        f"[+] Configuration file 'tgmix_config.json' created successfully.")
+ def main():
+     """Main entry point for the CLI application."""
+     parser = argparse.ArgumentParser(
+         description="Process a Telegram chat export for AI analysis.",
+         formatter_class=argparse.RawTextHelpFormatter
+     )
+     parser.add_argument(
+         "path",
+         nargs="?",
+         default=None,
+@@ -182,65 +159,52 @@
+         action="store_true",
+         help="Enable anonymization of message content. "
+              "Rules are taken from config or overridden by CLI flags."
+     )
+     parser.add_argument(
+         "--no-stats",
+         action="store_true",
+         help="Disable statistics computation and printing."
+     )
+     parser.add_argument(
+-        "--no-mark-media",
+-        action="store_true",
+-        help="Do not mark media files in the output."
+-    )
+-    parser.add_argument(
+         '--mask-preset',
+         nargs='+',
+         metavar='PRESET',
+         help='A list of built-in presets to use (e.g., phone email authors). '
+              'Overrides presets in config.'
+     )
+     parser.add_argument(
+         '--mask-literal',
+         nargs='+',
+         metavar='"LITERAL:REPLACEMENT"',
+         help="A list of exact phrases to mask, with their replacements. "
+              "Overrides literals in config."
+     )
+     parser.add_argument(
+         '--mask-regex',
+         nargs='+',
+         metavar='"REGEX:REPLACEMENT"',
+         help="A list of regex patterns to mask, with their replacements. "
+              "Overrides regex rules in config."
+-    )
+-    parser.add_argument(
+-        "--no-confirm-deletion",
+-        action="store_false",
+-        dest="do_confirm_deletion",
+-        help=argparse.SUPPRESS
+     )
+     args = parser.parse_args()
+     if args.init:
+         handle_init(PACKAGE_DIR)
+         return
+     target_directory = Path(args.path).resolve() if args.path else Path.cwd()
+     if target_directory.is_file():
+         if target_directory.suffix != ".json":
+             print("[!] Error: Path must be a directory, not a file.")
+             return
+         target_directory = target_directory.parent
+     config = load_config(target_directory)
+     masking_rules: dict | None = dict()
+-    if args.no_mark_media:
+-        config["mark_media"] = False
+     if args.anonymize or config.get("anonymize", False):
+         print("[*] Anonymization enabled.")
+         masking_rules = {
+             "default_phone_region": config.get("default_phone_region", "RU")
+         }
+         default_presets = config.get("mask_presets", {})
+         active_presets = (
+             args.mask_preset if args.mask_preset else
+             default_presets.keys()
+         )
+@@ -251,22 +215,21 @@
+         masking_rules["literals"] = (
+             parse_cli_dict(args.mask_literal) if args.mask_literal else
+             config.get("mask_literals", {})
+         )
+         masking_rules["regex"] = (
+             parse_cli_dict(args.mask_regex) if args.mask_regex else
+             config.get("mask_regex", {})
+         )
+     print(f"--- Starting TGMix on directory: {target_directory} ---")
+     processed_chat, raw_chat = run_processing(
+-        target_directory, config, masking_rules, args.anonymize,
+-        args.do_confirm_deletion)
++        target_directory, config, masking_rules, args.anonymize)
+     if not processed_chat:
+         return
+     output_path = target_directory / config['final_output_json']
+     with open(output_path, "w", encoding="utf-8") as file:
+         dump(processed_chat, file, ensure_ascii=False, indent=2)
+     if args.no_stats:
+         return
+     if not config.get("enable_stats", True):
+         return
+     if not (stats := compute_chat_stats(processed_chat, raw_chat)):
+
+--- a/tgmix/media_processor.py
++++ b/tgmix/media_processor.py
+@@ -1,96 +1,63 @@
++import shutil
++import subprocess
+ from pathlib import Path
+-from shutil import copyfile
+-from markmymedia import mark_audio, mark_image, mark_video
+-from markmymedia.errors import (
+-    AudioMarkingError, FFmpegProcessError, ImageMarkingError,
+-    InvalidMediaError, VideoMarkingError)
+ from tgmix.consts import MEDIA_KEYS
+-class Media:
+-    def __init__(self, base_dir: Path, media_dir: Path, mark_media: bool):
+-        self.base_dir = base_dir
+-        self.media_dir = media_dir
+-        self.do_mark_media = mark_media
+-    @staticmethod
+-    def detect(message: dict) -> str:
+-        for key in MEDIA_KEYS:
+-            if key in message:
+-                return key
+-        return ""
+-    def check_path(self, filename: str):
+-        try:
+-            source_path = self.base_dir / filename
+-            resolved_source = source_path.resolve(strict=True)
+-            resolved_base = self.base_dir.resolve()
+-        except FileNotFoundError:
+-            print(f"[!] Skipped: File not found: {filename}")
+-            return "NF", ""  # Not found
+-        except Exception as e:
+-            print(f"[!] Skipped (error resolving path for '{filename}'):\n"
+-                  f"{e}")
+-            return "NF", ""
+-        if not resolved_source.is_relative_to(resolved_base):
+-            print("[!] Security Warning: Blocked attempt to access a file "
+-                  f"outside the base directory: {filename}")
+-            return "OOB", resolved_source  # Out Of Bounds
+-        if resolved_source.is_dir():
+-            print(f"[!] Skipped: Path points to a directory: {filename}")
+-            return "isdir", resolved_source
+-        return "", resolved_source
+-    def process(self, message: dict) -> str | None:
+-        """
+-        Detects media in a message, processes it, and returns
+-        structured information.
+-        """
+-        if not (media_type := self.detect(message)):
+-            return
+-        filename = message.get(media_type)
+-        if not isinstance(filename, str) or not filename:
+-            return
+-        if filename in ("(File not included. "
+-                        "Change data exporting settings to download.)",
+-                        "(File exceeds maximum size. "
+-                        "Change data exporting settings to download.)",
+-                        "(File unavailable, please try again later)"):
+-            return "B"
+-        output_code, resolved_source = self.check_path(filename)
+-        if output_code:
+-            return output_code
+-        prepared_path = self.media_dir / resolved_source.name
+-        if not self.do_mark_media:
+-            self.copy_media_file(resolved_source, prepared_path)
+-            return filename
+-        self.mark_media(resolved_source, prepared_path)
+-        return filename
+-    def _mark_media(self, func, source_path: Path,
+-                    prepared_path: Path) -> None:
+-        try:
+-            func(source_path, prepared_path)
+-        except (AudioMarkingError, VideoMarkingError, ImageMarkingError):
+-            print(f"[!] Failed to mark media: {source_path.name}")
+-            self.copy_media_file(source_path, prepared_path)
+-        except InvalidMediaError:
+-            print(f"[!] Invalid media: {source_path.name}")
+-            self.copy_media_file(source_path, prepared_path)
+-        except FFmpegProcessError:
+-            print("[!] Ffmpeg not found, disabling media marking.")
+-            self.do_mark_media = False
+-            self.copy_media_file(source_path, prepared_path)
+-    def mark_media(self, source_path: Path,
+-                   prepared_path: Path) -> None:
+-        file_type = source_path.parent.name
+-        if file_type == "voice_messages":
+-            self._mark_media(mark_audio, source_path,
+-                             prepared_path.with_suffix(".mp4"))
+-        elif file_type in ("round_video_messages", "video_files"):
+-            self._mark_media(mark_video, source_path, prepared_path)
+-        elif file_type == "photos":
+-            self._mark_media(mark_image, source_path, prepared_path)
+-        else:
+-            self.copy_media_file(source_path, prepared_path)
+-    @staticmethod
+-    def copy_media_file(source_path: Path, output_path: Path) -> None:
+-        """Simply copies a file if it exists."""
+-        if not source_path.exists():
+-            print(f"[!] Skipped (not found): {source_path}")
+-            return
+-        copyfile(source_path, output_path)
++def process_media(msg: dict, base_dir: Path, media_dir: Path,
++                  config: dict) -> dict | None:
++    """
++    Detects media in a message, processes it, and returns
++    structured information. (beta)
++    """
++    media_type = next((key for key in MEDIA_KEYS if key in msg), None)
++    if not media_type:
++        return None
++    source_path = base_dir / msg[media_type]
++    output_filename = source_path.with_suffix(
++        ".mp4").name if media_type == "voice_message" else source_path.name
++    prepared_path = media_dir / output_filename
++    filename = msg[media_type]
++    if filename in ("(File not included. "
++                    "Change data exporting settings to download.)",
++                    "(File exceeds maximum size. "
++                    "Change data exporting settings to download.)",
++                    "(File unavailable, please try again later)"):
++        filename = "B"
++    else:
++        copy_media_file(source_path, prepared_path)
++    return {"type": media_type, "source_file": filename}
++def convert_to_video_with_filename(
++    input_path: Path, output_path: Path, drawtext_settings: str
++):
++    """
++    Converts a media file to MP4 with the filename overlaid on the frame.
++    The drawtext settings are passed as an argument.
++    """
++    if not input_path.exists():
++        print(f"[!] Skipped (not found): {input_path}")
++        return False
++    filename_text = input_path.name.replace("'", "\\'")
++    drawtext_filter = drawtext_settings.format(filename=filename_text)
++    command = [
++        "ffmpeg", "-y", "-i", str(input_path), "-f", "lavfi",
++        "-i", "color=c=black:s=640x360:d=1", "-vf", drawtext_filter,
++        "-c:a", "copy", "-shortest", str(output_path),
++    ]
++    try:
++        subprocess.run(
++            command, check=True,
++            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
++        )
++        return True
++    except FileNotFoundError:
++        raise RuntimeError(
++            "FFmpeg not found. Make sure it is installed and in your PATH."
++        )
++    except subprocess.CalledProcessError:
++        print(f"\n[!] FFmpeg error while processing file {input_path.name}")
++        return False
++def copy_media_file(source_path: Path, output_path: Path):
++    """Simply copies a file if it exists."""
++    if not source_path.exists():
++        print(f"[!] Skipped (not found): {source_path}")
++        return
++    shutil.copy(source_path, output_path)
+
+--- a/tgmix/message_processor.py
++++ b/tgmix/message_processor.py
+@@ -1,34 +1,25 @@
+ import re
++import shutil
+ from pathlib import Path
+ import phonenumbers
+ from tqdm import tqdm
+-from tgmix.media_processor import Media
+-from tgmix.utils import b64decode_forgiving
++from tgmix.media_processor import process_media
++from tgmix.consts import MEDIA_KEYS
+ class Masking:
+     def __init__(self, rules: dict | None, enabled: bool):
+         self.rules = rules
+         self.email_re = re.compile(
+             r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}'
+             r'[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}'
+             r'[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}\b')
+-        self.name_to_authors_map: dict[str, list] = {}
+         self.enabled = enabled
+-        if not rules.get("regex"):
+-            return
+-        rules_regex = {}
+-        for rule, placeholder in rules["regex"].items():
+-            try:
+-                rules_regex.update({re.compile(rule): placeholder})
+-            except re.error as e:
+-                print(f"[!] Warning: Invalid regex '{rule}'. {e}")
+-        self.rules["regex"] = rules_regex
+     @staticmethod
+     def _replace_phone_numbers(text: str, placeholder: str,
+                                region: str | None) -> str:
+         """
+         Finds, filters, and replaces phone numbers for a single pass.
+         :param text: The text to process.
+         :param placeholder: The string to replace numbers with.
+         :param region: The region to search for. If None, searches for
+                        international numbers only.
+         :return: Text with numbers replaced.
+@@ -58,578 +49,415 @@
+             key=lambda m: m.start,
+             reverse=True
+         )
+         for match in sorted_matches:
+             text = f"{text[:match.start]}{placeholder}{text[match.end:]}"
+         return text
+     def apply(self, text: str) -> str:
+         """Applies a set of masking rules to the given text."""
+         if (not self.enabled) or (not self.rules) or (not text):
+             return text
+-        if not isinstance(text, str):
+-            return text
+         for literal, placeholder in self.rules.get("literals", {}).items():
+             text = re.sub(
+                 re.escape(literal), placeholder, text, flags=re.IGNORECASE
+             )
+         preset_rules = self.rules.get("presets", {})
+         if "email" in preset_rules:
+             text = self.email_re.sub(preset_rules["email"], text)
+         if "phone" in preset_rules:
+             placeholder = preset_rules["phone"]
+-            region = self.rules.get("default_phone_region", "RU")
++            region = self.rules.get("default_phone_region", "US")
+             text = self._replace_phone_numbers(text, placeholder, region)
+             text = self._replace_phone_numbers(text, placeholder, None)
+-        for pattern_re, placeholder in self.rules.get("regex", {}).items():
++        for pattern, placeholder in self.rules.get("regex", {}).items():
+             try:
+-                text = pattern_re.sub(placeholder, text)
++                text = re.sub(pattern, placeholder, text)
+             except re.error as e:
+-                print(f"[!] Warning: Invalid regex '{pattern_re.pattern}'. "
+-                      f"{e}")
++                print(f"[!] Warning: Invalid regex '{pattern}'. {e}")
+         return text
+-    def author(self, text: str):
+-        if not self.enabled:
+-            return text
+-        author = self.name_to_authors_map.get(text, text)
+-        if not author:
+-            return text
+-        if len(author) == 1:
+-            return author[0]
+-        return author
+-class MessageProcessor:
+-    def __init__(self, target_dir: Path, media_dir: Path, mark_media: bool,
+-                 masking_rules: dict, do_anonymise: bool) -> None:
+-        self.media = Media(target_dir, media_dir, mark_media)
+-        self.pbar = None
+-        self.id_to_author_map = {}
+-        self.masking = Masking(masking_rules, do_anonymise)
+-        self.id_alias_map = {}
+-    def format_text_entities_to_markdown(self, entities: list) -> str:
+-        """
+-        Converts text_entities to Markdown.
+-        """
+-        if not entities:
+-            return ""
+-        if isinstance(entities, str):
+-            return entities
+-        masking_presets = self.masking.rules.get("presets")
+-        markdown_parts = []
+-        for entity in entities:
+-            if isinstance(entity, str):
+-                markdown_parts.append(entity)
+-                continue
+-            text = entity.get("text", "")
+-            entity_type = entity.get("type", "plain")
+-            if not text:
+-                continue
+-            match entity_type:
+-                case "bold":
+-                    markdown_parts.append(f"**{text}**")
+-                case "italic":
+-                    markdown_parts.append(f"*{text}*")
+-                case "strikethrough":
+-                    markdown_parts.append(f"~~{text}~~")
+-                case "code":
+-                    markdown_parts.append(f"`{text}`")
+-                case "pre":
+-                    markdown_parts.append(f"```{entity.get('language', '')}\n"
+-                                          f"{text}\n```")
+-                case "email":
+-                    if self.masking.enabled and (
+-                            mask := masking_presets.get("email")):
+-                        markdown_parts.append(mask)
+-                        continue
+-                    markdown_parts.append(text)
+-                case "phone":
+-                    if self.masking.enabled and (
+-                            mask := masking_presets.get("phone")):
+-                        markdown_parts.append(mask)
+-                        continue
+-                    markdown_parts.append(text)
+-                case "mention" | "mention_name":
+-                    if self.masking.enabled and (
+-                            mask := masking_presets.get("authors")):
+-                        if author_id := self.id_to_author_map.get(
+-                                f"user{text}"):
+-                            markdown_parts.append(f"[{author_id}]")
+-                            continue
+-                        markdown_parts.append(mask)
+-                        continue
+-                    markdown_parts.append(text)
+-                case "underline":
+-                    markdown_parts.append(f"<u>{text}</u>")
+-                case "spoiler":
+-                    markdown_parts.append(f"||{text}||")
+-                case "custom_emoji":
+-                    markdown_parts.append(f"[emoji_{entity['document_id']}]")
+-                case "bank_card":
+-                    if self.masking.enabled and (
+-                            mask := masking_presets.get("bank_card")):
+-                        markdown_parts.append(mask)
+-                        continue
+-                    markdown_parts.append(text)
+-                case "blockquote":
+-                    markdown_parts.append(f"> {text}")
+-                case "link":
+-                    if self.masking.enabled and (
+-                            mask := masking_presets.get("link")):
+-                        markdown_parts.append(mask)
+-                        continue
+-                    markdown_parts.append(text)
+-                case "text_link":
+-                    if self.masking.enabled and (
+-                            mask := masking_presets.get("link")):
+-                        markdown_parts.append(f"[{entity.get('text')}]"
+-                                              f"({mask})")
+-                        continue
+-                    markdown_parts.append(f"[{entity.get('text')}]"
+-                                          f"({entity.get('href', '#')})")
+-                case "bot_command" | "hashtag" | "cashtag":
+-                    markdown_parts.append(text)
+-                case _:  # plain and others
+-                    print(f"[!] Warning: Unknown entity type '{entity_type}'")
+-                    markdown_parts.append(text)
+-        return "".join(markdown_parts)
+-    def stitch_messages(
+-            self, source_messages: list) -> tuple[list, dict, bool]:
+-        """
+-        Step 1: Iterates through messages, gathers "raw" parts,
+-        and then parses them at once. Returns processed messages and maps.
+-        """
+-        author_map = {}
+-        author_counter = 1
+-        for next_message in source_messages:
+-            author_id = next_message.get("from_id")
+-            if not author_id or author_id in self.id_to_author_map:
+-                continue
+-            compact_id = f"U{author_counter}"
+-            self.id_to_author_map[author_id] = compact_id
+-            author_map[compact_id] = {
+-                "name": next_message.get("from"),
+-                "id": author_id
+-            }
+-            self.masking.name_to_authors_map.setdefault(
+-                next_message.get("from"), []).append(compact_id)
+-            author_counter += 1
+-        stitched_messages = []
+-        next_id = 0
+-        self.pbar = tqdm(total=len(source_messages),
+-                    desc="Step 1/2: Stitching messages")
+-        while next_id < len(source_messages):
+-            next_message = source_messages[next_id]
+-            self.pbar.update()
+-            if next_message.get("type") != "message":
+-                if next_message.get("type") != "service":
+-                    next_id += 1
+-                    continue
+-                stitched_messages.append(
+-                    self.parse_service_message(next_message))
++def detect_media(message: dict) -> str:
++    for key in MEDIA_KEYS:
++        if key in message:
++            return key
++    return ""
++def format_text_entities_to_markdown(entities: list) -> str:
++    """
++    Converts text_entities to Markdown.
++    """
++    if not entities:
++        return ""
++    if isinstance(entities, str):
++        return entities
++    markdown_parts = []
++    for entity in entities:
++        if isinstance(entity, str):
++            markdown_parts.append(entity)
++            continue
++        text = entity.get("text", "")
++        entity_type = entity.get("type", "plain")
++        if not text:
++            continue
++        match entity_type:
++            case "bold":
++                markdown_parts.append(f"**{text}**")
++            case "italic":
++                markdown_parts.append(f"*{text}*")
++            case "strikethrough":
++                markdown_parts.append(f"~~{text}~~")
++            case "code":
++                markdown_parts.append(f"`{text}`")
++            case "pre":
++                markdown_parts.append(f"```{entity.get('language', '')}\n"
++                                      f"{text}\n```")
++            case "link":
++                markdown_parts.append(text)
++            case "text_link":
++                url = entity.get("href", "#")
++                markdown_parts.append(f"[{text}]({url})")
++            case "mention":
++                markdown_parts.append(text)
++            case _:  # plain and others
++                markdown_parts.append(text)
++    return "".join(markdown_parts)
++def handle_init(package_dir: Path) -> None:
++    """Creates tgmix_config.json in the current directory from a template."""
++    config_template_path = package_dir / "config.json"
++    target_config_path = Path.cwd() / "tgmix_config.json"
++    if not config_template_path.exists():
++        print("[!] Critical Error: config.json template not found in package.")
++        return
++    if target_config_path.exists():
++        print(f"[!] File 'tgmix_config.json' already exists here.")
++        return
++    shutil.copy(config_template_path, target_config_path)
++    print(f"[+] Configuration file 'tgmix_config.json' created successfully.")
++def stitch_messages(source_messages: list, target_dir: Path, media_dir: Path,
++                    config: dict, masking_rules: dict,
++                    do_anonymise: bool) -> tuple[list, dict, dict]:
++    """
++    Step 1: Iterates through messages, gathers "raw" parts,
++    and then parses them at once. Returns processed messages and maps.
++    """
++    author_map = {}
++    id_to_author_map = {}
++    author_counter = 1
++    masking = Masking(masking_rules, do_anonymise)
++    for next_message in source_messages:
++        author_id = next_message.get("from_id")
++        if not author_id or author_id in id_to_author_map:
++            continue
++        compact_id = f"U{author_counter}"
++        id_to_author_map[author_id] = compact_id
++        author_map[compact_id] = {
++            "name": next_message.get("from"),
++            "id": author_id
++        }
++        author_counter += 1
++    stitched_messages = []
++    id_alias_map = {}
++    next_id = 0
++    pbar = tqdm(total=len(source_messages),
++                desc="Step 1/2: Stitching messages")
++    while next_id < len(source_messages):
++        next_message = source_messages[next_id]
++        pbar.update()
++        if next_message.get("type") != "message":
++            if next_message.get("type") != "service":
+                 next_id += 1
+                 continue
+-            parsed_msg = self.parse_message_data(next_message)
+-            next_id = self.combine_messages(
+-                next_message, next_id, parsed_msg,
+-                source_messages
+-            )
+-            stitched_messages.append(parsed_msg)
+-        self.pbar.close()
+-        return stitched_messages, author_map, self.masking.enabled
+-    @staticmethod
+-    def check_attributes(message1: dict, message2: dict,
+-                         same: tuple = None, has: tuple = None) -> bool:
+-        if not same:
+-            same = ()
+-        if not has:
+-            has = ()
+-        for attribute in same:
+-            if message1.get(attribute) != message2.get(attribute):
+-                return False
+-        for attribute in has:
+-            if (attribute not in message1) or (attribute not in message2):
+-                return False
+-        return True
+-    def combine_messages(self, message: dict,
+-                         message_id: int, parsed_message: dict,
+-                         source_messages: list) -> int:
+-        next_id = message_id + 1
++            stitched_messages.append(
++                parse_service_message(id_to_author_map, next_message, masking))
++            next_id += 1
++            continue
++        parsed_msg = parse_message_data(config, media_dir, next_message,
++                                        target_dir, id_to_author_map, masking)
++        next_id = combine_messages(
++            config, id_alias_map, media_dir, next_message, next_id,
++            parsed_msg, pbar, source_messages, target_dir, id_to_author_map,
++            masking
++        )
++        stitched_messages.append(parsed_msg)
++    pbar.close()
++    return stitched_messages, id_alias_map, author_map
++def check_attributes(message1: dict, message2: dict,
++                     same: tuple = None, has: tuple = None) -> bool:
++    if not same:
++        same = ()
++    if not has:
++        has = ()
++    for attribute in same:
++        if message1.get(attribute) != message2.get(attribute):
++            return False
++    for attribute in has:
++        if (attribute not in message1) or (attribute not in message2):
++            return False
++    return True
++def combine_messages(config: dict, id_alias_map: dict, media_dir: Path,
++                     message: dict, message_id: int, parsed_message: dict,
++                     pbar: tqdm, source_messages: list, target_dir: Path,
++                     id_to_author_map: dict, masking: Masking) -> int:
++    next_id = message_id + 1
++    if not len(source_messages) > next_id:
++        return next_id
++    next_message = source_messages[next_id]
++    while (check_attributes(message, next_message,
++                            ("from_id", "forwarded_from", "date_unixtime"))
++           and (check_attributes(message, next_message, ("type",))
++                and message.get("type") == "message")
++           and ((check_attributes(message, next_message, has=("text",))
++                 or (parsed_message["content"].get("media")
++               and detect_media(next_message))))):
++        pbar.update()
++        next_text = masking.apply(
++            format_text_entities_to_markdown(next_message.get("text")))
++        if next_text:
++            if not parsed_message["content"].get("text"):
++                parsed_message["content"]["text"] = next_text
++            else:
++                parsed_message["content"]["text"] += f"\n\n{next_text}"
++        if media := process_media(next_message, target_dir, media_dir, config):
++            if isinstance(parsed_message["content"].get("media"), str):
++                parsed_message["content"]["media"] = [
++                    parsed_message["content"]["media"]]
++            elif not parsed_message["content"].get("media"):
++                parsed_message["content"]["media"] = []
++            parsed_message["content"]["media"].append(media["source_file"])
++        combine_reactions(next_message, parsed_message, id_to_author_map)
++        id_alias_map[next_message["id"]] = message["id"]
++        next_id += 1
+         if not len(source_messages) > next_id:
+             return next_id
+         next_message = source_messages[next_id]
+-        while self.check_attributes(
+-                message, next_message,
+-                ("from_id", "forwarded_from", "date_unixtime")):
+-            self.pbar.update()
+-            next_text = self.masking.apply(
+-                self.format_text_entities_to_markdown(
+-                    next_message.get("text")))
+-            if next_text:
+-                if not parsed_message.get("text"):
+-                    parsed_message["text"] = next_text
+-                else:
+-                    parsed_message["text"] += f"\n\n{next_text}"
+-            if file_name := self.media.process(next_message):
+-                if isinstance(parsed_message.get("media"), str):
+-                    parsed_message["media"] = [
+-                        parsed_message["media"]]
+-                elif not parsed_message.get("media"):
+-                    parsed_message["media"] = []
+-                parsed_message["media"].append(file_name)
+-            self.combine_reactions(next_message, parsed_message)
+-            self.id_alias_map[next_message["id"]] = message["id"]
+-            next_id += 1
+-            if not len(source_messages) > next_id:
+-                return next_id
+-            next_message = source_messages[next_id]
+-        return next_id
+-    def combine_reactions(self, next_message: dict,
+-                          parsed_message: dict) -> None:
+-        """
+-        Merges raw reactions from next_msg_data with already processed
+-        reactions in parsed_message, applying minimization.
+-        """
+-        if "reactions" not in next_message:
+-            return
+-        if "reactions" not in parsed_message:
+-            parsed_message["reactions"] = []
+-        for next_reaction in next_message["reactions"]:
+-            next_shape, next_count = (
+-                next_reaction.get("emoji") or next_reaction.get("document_id")
+-                or "⭐️", next_reaction["count"])
+-            if next_reaction["type"] == "paid":
+-                next_shape = "⭐️"
+-            found = False
+-            for reaction_id in range(len(parsed_message["reactions"])):
+-                reaction = parsed_message["reactions"][reaction_id]
+-                if reaction.get(next_shape) is not None:
+-                    parsed_message["reactions"][reaction_id][
+-                        next_shape] += next_count
+-                    found = True
+-                    break
+-            if not found:
+-                parsed_message["reactions"].append({
+-                    next_shape: next_count
+-                })
+-            if not next_reaction.get("recent"):
++    return next_id
++def combine_reactions(next_message: dict, parsed_message: dict,
++                      id_to_author_map: dict) -> None:
++    """
++    Merges raw reactions from next_msg_data with already processed
++    reactions in parsed_message, applying minimization.
++    """
++    if "reactions" not in next_message:
++        return
++    if "reactions" not in parsed_message:
++        parsed_message["reactions"] = []
++    for next_reaction in next_message["reactions"]:
++        next_shape, next_count = (
++            next_reaction.get("emoji") or next_reaction.get("document_id")
++            or "⭐️", next_reaction["count"])
++        if next_reaction["type"] == "paid":
++            next_shape = "⭐️"
++        found = False
++        for reaction_id in range(len(parsed_message["reactions"])):
++            reaction = parsed_message["reactions"][reaction_id]
++            if reaction.get(next_shape) is not None:
++                parsed_message["reactions"][reaction_id][
++                    next_shape] += next_count
++                found = True
++                break
++        if not found:
++            parsed_message["reactions"].append({
++                next_shape: next_count
++            })
++        if not next_reaction.get("recent"):
++            continue
++        for reaction_id in range(len(parsed_message["reactions"])):
++            if not parsed_message["reactions"][reaction_id].get(next_shape):
+                 continue
+-            for reaction_id in range(len(parsed_message["reactions"])):
+-                if not parsed_message["reactions"][reaction_id].get(
+-                        next_shape):
+-                    continue
+-                parsed_message["reactions"][reaction_id].setdefault(
+-                    "recent", []).extend(self.minimise_recent_reactions(
+-                    next_reaction))
+-    def minimise_recent_reactions(self, reactions: dict) -> list[dict]:
+-        recent = []
+-        for reaction in reactions["recent"]:
+-            if author_id := self.id_to_author_map.get(reaction["from_id"]):
+-                recent.append({
+-                    "author_id": author_id,
+-                    "date": reaction["date"]
+-                })
+-                continue
++            parsed_message["reactions"][reaction_id].setdefault(
++                "recent", []).extend(minimise_recent_reactions(
++                next_reaction, id_to_author_map))
++def minimise_recent_reactions(reactions: dict,
++                              id_to_author_map: dict) -> list[dict]:
++    recent = []
++    for reaction in reactions["recent"]:
++        if author_id := id_to_author_map.get(reaction["from_id"]):
+             recent.append({
+-                "from": reaction["from"],
+-                "from_id": reaction["from_id"],
++                "author_id": author_id,
+                 "date": reaction["date"]
+             })
+-        return recent
+-    def parse_message_data(self, message: dict) -> dict:
+-        """Parses a single message using the author map."""
+-        parsed_message = {
++            continue
++        recent.append({
++            "from": reaction["from"],
++            "from_id": reaction["from_id"],
++            "date": reaction["date"]
++        })
++    return recent
++def parse_message_data(config: dict, media_dir: Path,
++                       message: dict, target_dir: Path,
++                       id_to_author_map: dict,
++                       masking: Masking) -> dict:
++    """Parses a single message using the author map."""
++    parsed_message = {
++        "id": message["id"],
++        "time": message["date"],
++        "author_id": id_to_author_map.get(message.get("from_id")),
++        "content": {}
++    }
++    if message.get("text"):
++        parsed_message["content"]["text"] = masking.apply(
++            format_text_entities_to_markdown(message["text"]))
++    if "reply_to_message_id" in message:
++        parsed_message["reply_to_message_id"] = message["reply_to_message_id"]
++    if media := process_media(message, target_dir, media_dir, config):
++        parsed_message["content"]["media"] = media["source_file"]
++    if "forwarded_from" in message:
++        parsed_message["forwarded_from"] = masking.apply(
++            message["forwarded_from"])
++    if "edited" in message:
++        parsed_message["edited_time"] = message["edited"]
++    if "author" in message:
++        parsed_message["post_author"] = masking.apply(
++            message["author"])
++    if "paid_stars_amount" in message:
++        parsed_message["media_unlock_stars"] = message["paid_stars_amount"]
++    if "poll" in message:
++        answers = [
++            masking.apply(answer) for answer in message["poll"]["answers"]
++        ]
++        parsed_message["poll"] = {
++            "question": masking.apply(
++                message["poll"]["question"]),
++            "closed": message["poll"]["closed"],
++            "answers": answers,
++        }
++    if "inline_bot_buttons" in message:
++        parsed_message["inline_buttons"] = []
++        for button_group in message["inline_bot_buttons"]:
++            for button in button_group:
++                if button["type"] == "callback":
++                    parsed_message["inline_buttons"].append(button)
++                elif button["type"] == "auth":
++                    parsed_message["inline_buttons"].append(
++                        {
++                            "type": "auth",
++                            "text": masking.apply(button["text"]),
++                            "data": button["data"],
++                        }
++                    )
++    if "reactions" in message:
++        parsed_message["reactions"] = []
++        for reaction in message["reactions"]:
++            shape_value = reaction.get("emoji") or reaction.get(
++                "document_id") or "⭐️"
++            parsed_message["reactions"].append({
++                shape_value: reaction["count"]
++            })
++            if reaction.get("recent"):
++                parsed_message["reactions"][-1][
++                    "recent"] = minimise_recent_reactions(
++                    reaction, id_to_author_map)
++    return parsed_message
++def parse_service_message(id_to_author_map: dict, message: dict,
++                          masking: Masking) -> dict:
++    action_from = id_to_author_map.get(message.get("actor_id"))
++    match message.get("action"):
++        case "phone_call":
++            data = {
++                "id": message["id"],
++                "type": "phone_call",
++                "time": message["date"],
++                "from": action_from,
++                "discard_reason": message["discard_reason"],
++            }
++            if "duration_seconds" in message:
++                data["duration"] = message["duration_seconds"]
++            return data
++        case "invite_to_group_call":
++            members = [
++                masking.apply(member) for member in message["members"]]
++            return {
++                "id": message["id"],
++                "type": "invite_to_group_call",
++                "time": message["date"],
++                "from": action_from,
++                "members": members,
++            }
++        case "pin_message":
++            return {
++                "id": message["id"],
++                "type": "pin_message",
++                "time": message["date"],
++                "from": action_from,
++                "message_id": message["message_id"],
++            }
++        case "send_star_gift":
++            data = {
++                "id": message["id"],
++                "type": "send_star_gift",
++                "time": message["date"],
++                "from": action_from,
++                "gift_id": message["gift_id"],
++                "stars": message["stars"],
++                "is_limited": message["is_limited"],
++                "is_anonymous": message["is_anonymous"],
++            }
++            if message.get("gift_text"):
++                data["text"] = message["gift_text"]
++            return data
++        case "paid_messages_price_change":
++            return {
++                "id": message["id"],
++                "type": "paid_pm_price_change",
++                "time": message["date"],
++                "from": action_from,
++                "price_stars": message["price_stars"],
++                "is_broadcast_messages_allowed":
++                    message["is_broadcast_messages_allowed"],
++            }
++        case "join_group_by_request":
++            return {
++                "id": message["id"],
++                "type": "join_group_by_request",
++                "time": message["date"],
++                "from": action_from
++            }
++        case "join_group_by_link":
++            return {
++                "id": message["id"],
++                "type": "join_group_by_link",
++                "time": message["date"],
++                "from": action_from,
++                "inviter": message["inviter"]
++            }
++        case "invite_members":
++            members = [
++                masking.apply(member) for member in message["members"]]
++            return {
++                "id": message["id"],
++                "type": "invite_members",
++                "time": message["date"],
++                "from": action_from,
++                "members": members,
++            }
++        case "remove_members":
++            members = [
++                masking.apply(member) for member in message["members"]]
++            return {
++                "id": message["id"],
++                "type": "remove_members",
++                "time": message["date"],
++                "from": action_from,
++                "members": members,
++            }
++    print(f"[!] Unhandled service message({message['id']}): "
++          f"{message['action']}")
++    if masking.enabled:
++        return {
+             "id": message["id"],
++            "type": message.get("action"),
+             "time": message["date"],
+-            "author_id": self.id_to_author_map.get(message.get("from_id"))
++            "from": action_from,
++            "notice":
++                "Not included due to unknown action and anonymization enabled."
+         }
+-        if message.get("text"):
+-            parsed_message["text"] = self.masking.apply(
+-                self.format_text_entities_to_markdown(message["text"]))
+-        if "reply_to_message_id" in message:
+-            parsed_message["reply_to_message_id"] = message[
+-                "reply_to_message_id"]
+-        if file_name := self.media.process(message):
+-            parsed_message["media"] = file_name
+-        if "forwarded_from" in message:
+-            parsed_message["forwarded_from"] = self.masking.author(
+-                message["forwarded_from"])
+-        if "edited" in message:
+-            parsed_message["edited_time"] = message["edited"]
+-        if "author" in message:
+-            parsed_message["post_author"] = self.masking.author(
+-                message["author"])
+-        if "paid_stars_amount" in message:
+-            parsed_message["media_unlock_stars"] = message[
+-                "paid_stars_amount"]
+-        if "poll" in message:
+-            parsed_message["poll"] = {
+-                "question": self.masking.apply(
+-                    self.format_text_entities_to_markdown(
+-                        message["poll"]["question"])),
+-                "closed": message["poll"]["closed"],
+-                "answers": [
+-                    self.masking.apply(
+-                        self.format_text_entities_to_markdown(answer["text"]))
+-                    for answer in message["poll"]["answers"]],
+-            }
+-        if "contact_information" in message:
+-            if self.masking.enabled and (
+-                    self.masking.rules["presets"].get("phone")):
+-                parsed_message["contact_information"] = "[CONTACT]"
+-            else:
+-                parsed_message["contact_information"] = message[
+-                    "contact_information"]
+-        if "via_bot" in message:
+-            parsed_message["via_bot"] = message["via_bot"]
+-        if "inline_bot_buttons" in message:
+-            parsed_message["inline_buttons"] = []
+-            for button_group in message["inline_bot_buttons"]:
+-                for button in button_group:
+-                    parsed_message["inline_buttons"].append(
+-                        self.parse_inline_button(button))
+-        if "reactions" in message:
+-            parsed_message["reactions"] = []
+-            for reaction in message["reactions"]:
+-                shape_value = reaction.get("emoji") or reaction.get(
+-                    "document_id") or "⭐️"
+-                parsed_message["reactions"].append({
+-                    shape_value: reaction["count"]
+-                })
+-                if reaction.get("recent"):
+-                    parsed_message["reactions"][-1][
+-                        "recent"] = self.minimise_recent_reactions(reaction)
+-        return parsed_message
+-    def parse_inline_button(self, button) -> dict:
+-        text = self.masking.apply(button["text"] or "")
+-        has_encoded_data = "dataBase64" in button
+-        has_data = "data" in button
+-        if has_data or has_encoded_data:
+-            if has_encoded_data and not has_data:
+-                button_data = b64decode_forgiving(button["dataBase64"])
+-            elif has_encoded_data and has_data:
+-                button_data = [
+-                    b64decode_forgiving(button["dataBase64"]),
+-                    button["data"]]
+-            else:
+-                button_data = button["data"]
+-        else:
+-            button_data = ""
+-        if button["type"] == "callback":
+-            return {
+-                "type": button["type"],
+-                "text": text,
+-                "callback": button_data,
+-            }
+-        elif button["type"] == "auth":
+-            return {
+-                    "text": text,
+-                    "data": button_data,
+-                }
+-        elif button["type"] == "url":
+-                return {
+-                    "text": text,
+-                    "url": button_data,
+-                }
+-        elif button["type"] == "switch_inline_same":
+-            return {
+-                "type": button["type"],
+-                "text": text,
+-            }
+-        elif button["type"] == "switch_inline":
+-            data = {
+-                "type": button["type"],
+-                "text": text,
+-            }
+-            if button_data:
+-                data["data"] = button_data
+-            return data
+-        elif button["type"] == "game":
+-            return {
+-                "type": button["type"],
+-                "text": text,
+-            }
+-        else:
+-            button["text"] = text
+-            print("[!] Warning: Unknown inline button type "
+-                  f"'{button['type']}'")
+-            return button
+-    def parse_service_message(self, message: dict) -> dict:
+-        action_from = self.id_to_author_map.get(message.get("actor_id"))
+-        if members := message.get("members", []):
+-            members = [
+-                self.masking.author(member) for member in message["members"]]
+-        match message.get("action"):
+-            case "phone_call":
+-                data = {
+-                    "id": message["id"],
+-                    "type": "phone_call",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "discard_reason": message["discard_reason"],
+-                }
+-                if "duration_seconds" in message:
+-                    data["duration"] = message["duration_seconds"]
+-                return data
+-            case "group_call":
+-                data = {
+-                    "id": message["id"],
+-                    "type": "group_call",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                }
+-                if "duration" in message:
+-                    data["duration"] = message["duration"]
+-                return data
+-            case "invite_to_group_call":
+-                return {
+-                    "id": message["id"],
+-                    "type": "invite_to_group_call",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "members": members,
+-                }
+-            case "pin_message":
+-                return {
+-                    "id": message["id"],
+-                    "type": "pin_message",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "message_id": message["message_id"],
+-                }
+-            case "send_star_gift":
+-                data = {
+-                    "id": message["id"],
+-                    "type": "send_star_gift",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "gift_id": message["gift_id"],
+-                    "stars": message["stars"],
+-                    "is_limited": message["is_limited"],
+-                    "is_anonymous": message["is_anonymous"],
+-                }
+-                if message.get("gift_text"):
+-                    data["text"] = message["gift_text"]
+-                return data
+-            case "paid_messages_price_change":
+-                return {
+-                    "id": message["id"],
+-                    "type": "paid_pm_price_change",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "price_stars": message["price_stars"],
+-                    "is_broadcast_messages_allowed":
+-                        message["is_broadcast_messages_allowed"],
+-                }
+-            case "join_group_by_request":
+-                return {
+-                    "id": message["id"],
+-                    "type": "join_group_by_request",
+-                    "time": message["date"],
+-                    "from": action_from
+-                }
+-            case "join_group_by_link":
+-                return {
+-                    "id": message["id"],
+-                    "type": "join_group_by_link",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "inviter": self.masking.author(message["inviter"])
+-                }
+-            case "invite_members":
+-                return {
+-                    "id": message["id"],
+-                    "type": "invite_members",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "members": members,
+-                }
+-            case "remove_members":
+-                return {
+-                    "id": message["id"],
+-                    "type": "remove_members",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "members": members,
+-                }
+-            case "create_channel":
+-                return {
+-                    "id": message["id"],
+-                    "type": "create_channel",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "title": message["title"],
+-                }
+-            case "edit_group_title":
+-                return {
+-                    "id": message["id"],
+-                    "type": "edit_group_title",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "title": message["title"],
+-                }
+-            case "edit_group_photo":
+-                return {
+-                    "id": message["id"],
+-                    "type": "edit_group_photo",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "photo": message["photo"],
+-                }
+-            case "score_in_game":
+-                return {
+-                    "id": message["id"],
+-                    "type": "score_in_game",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "score": message["score"],
+-                }
+-            case "topic_created":
+-                return {
+-                    "id": message["id"],
+-                    "type": "topic_created",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "title": message["title"]
+-                }
+-            case "topic_edit":
+-                return {
+-                    "id": message["id"],
+-                    "type": "topic_edit",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "title": message["new_title"],
+-                    "icon_emoji_id": message["new_icon_emoji_id"],
+-                }
+-            case "boost_apply":
+-                return {
+-                    "id": message["id"],
+-                    "type": "boost_apply",
+-                    "time": message["date"],
+-                    "from": action_from,
+-                    "boosts": message["boosts"],
+-                }
+-        print(f"[!] Unhandled service message({message['id']}): "
+-              f"{message['action']}")
+-        if self.masking.enabled:
+-            data = {
+-                "id": message["id"],
+-                "type": message.get("action"),
+-                "time": message["date"],
+-                "from": action_from,
+-                "notice":
+-                    "Not included due to unknown action "
+-                    "and anonymization enabled."
+-            }
+-            if "members" in message:
+-                data["members"] = members
+-            return data
+-        return message
+-    def fix_reply_ids(self, messages: list) -> None:
+-        """
+-        Goes through the stitched messages and fixes reply IDs
+-        using the alias map.
+-        """
+-        for message in tqdm(messages, desc="Step 2/2: Fixing replies"):
+-            if "reply_to_message_id" not in message:
+-                continue
+-            reply_id = message["reply_to_message_id"]
+-            if reply_id not in self.id_alias_map:
+-                continue
+-            message["reply_to_message_id"] = self.id_alias_map[reply_id]
++    return message
++def fix_reply_ids(messages: list, alias_map: dict) -> None:
++    """
++    Goes through the stitched messages and fixes reply IDs
++    using the alias map.
++    """
++    for message in tqdm(messages, desc="Step 2/2: Fixing replies"):
++        if "reply_to_message_id" not in message:
++            continue
++        reply_id = message["reply_to_message_id"]
++        if reply_id not in alias_map:
++            continue
++        message["reply_to_message_id"] = alias_map[reply_id]
+
+--- a/tgmix/stats_processor.py
++++ b/tgmix/stats_processor.py
+@@ -8,45 +8,44 @@
+         "raw_total_messages": len(raw_chat.get("messages", [])),
+         "total_messages": len(messages),
+         "raw_total_tokens": 0,
+         "total_tokens": 0,
+         "raw_total_chars": 0,
+         "total_chars": 0,
+         "media_count": 0,
+     }
+     encoding = openai.o200k_base()
+     for message in tqdm(messages, desc="Counting media in messages"):
+-        if "media" not in message:
++        if "media" not in message.get("content", {}):
+             continue
+-        if isinstance(message["media"], str):
++        if isinstance(message["content"]["media"], str):
+             stats["media_count"] += 1
+         else:
+-            stats["media_count"] += len(message["media"])
++            stats["media_count"] += len(message["content"]["media"])
+     pbar = tqdm(total=2, desc="Dumping chats for stats")
+     chat_json = dumps(chat)
+     raw_chat_json = dumps(raw_chat)
+     pbar.update()
+-    pbar.set_description("Counting tokens for files")
++    pbar.set_description("Counting media files")
+     stats["raw_total_tokens"] = encoding.count(raw_chat_json)
+     stats["total_tokens"] = encoding.count(chat_json)
+     pbar.update()
+     pbar.set_description("Counting chars for files")
+     stats["raw_total_chars"] = len(raw_chat_json)
+     stats["total_chars"] = len(chat_json)
+     pbar.close()
+     return stats
+ def print_stats(stats: dict, config: dict, anonymised: bool) -> None:
+     """Prints a formatted summary of the processing stats."""
+     print("\n📊 Process Summary:\n"
+           "─────────────────────\n"
+           f"Total messages: {stats['raw_total_messages']:,} "
+           f"-> {stats['total_messages']:,}\n"
+           f"Output file tokens: {stats['raw_total_tokens']:,} "
+           f"-> {stats['total_tokens']:,}\n"
+           f"Total chars: {stats['raw_total_chars']:,} "
+           f"-> {stats['total_chars']:,}\n"
+-          f"Media tokens: unaccounted\n"
+           f"Output file: {config['final_output_json']}\n"
+           f"Anonymization: {'ON' if anonymised else 'OFF'}\n"
+           "\n"
+           "🎉 All Done!\n"
+           "Your chat has been successfully packed.")
+
+--- a/tgmix/utils.py
++++ b//dev/null
+@@ -1,3 +0,0 @@
+-from base64 import b64decode
+-def b64decode_forgiving(data_str: str) -> str:
+-    return b64decode(f"{data_str}{'=' * (4 - len(data_str) % 4)}").decode()

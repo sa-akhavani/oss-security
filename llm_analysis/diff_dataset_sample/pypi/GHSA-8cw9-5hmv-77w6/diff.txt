@@ -1,0 +1,87 @@
+--- a/sanic/__version__.py
++++ b/sanic/__version__.py
+@@ -1 +1 @@
+-__version__ = "20.12.7"
++__version__ = "20.12.6"
+
+--- a/sanic/static.py
++++ b/sanic/static.py
+@@ -1,14 +1,14 @@
+ from functools import partial, wraps
+ from mimetypes import guess_type
+-from os import path, sep
+-from pathlib import Path
++from os import path
++from re import sub
+ from time import gmtime, strftime
+ from urllib.parse import unquote
+ from sanic.compat import stat_async
+ from sanic.exceptions import (
+     ContentRangeError,
+     FileNotFound,
+     HeaderNotFound,
+     InvalidUsage,
+ )
+ from sanic.handlers import ContentRangeHandler
+@@ -16,48 +16,34 @@
+ from sanic.response import HTTPResponse, file, file_stream
+ async def _static_request_handler(
+     file_or_directory,
+     use_modified_since,
+     use_content_range,
+     stream_large_files,
+     request,
+     content_type=None,
+     file_uri=None,
+ ):
+-    file_path_raw = Path(unquote(file_or_directory))
+-    root_path = file_path = file_path_raw.resolve()
+-    not_found = FileNotFound(
+-        "File not found",
+-        path=file_or_directory,
+-        relative_url=file_uri,
+-    )
++    if file_uri and "../" in file_uri:
++        raise InvalidUsage("Invalid URL")
++    root_path = file_path = file_or_directory
+     if file_uri:
+-        unquoted_file_uri = unquote(file_uri).lstrip("/")
+-        file_path_raw = Path(file_or_directory, unquoted_file_uri)
+-        file_path = file_path_raw.resolve()
+-        if (
+-            file_path < root_path and not file_path_raw.is_symlink()
+-        ) or ".." in file_path_raw.parts:
+-            error_logger.exception(
+-                f"File not found: path={file_or_directory}, "
+-                f"relative_url={file_uri}"
+-            )
+-            raise not_found
+-    try:
+-        file_path.relative_to(root_path)
+-    except ValueError:
+-        if not file_path_raw.is_symlink():
+-            error_logger.exception(
+-                f"File not found: path={file_or_directory}, "
+-                f"relative_url={file_uri}"
+-            )
+-            raise not_found
++        file_path = path.join(file_or_directory, sub("^[/]*", "", file_uri))
++    file_path = path.abspath(unquote(file_path))
++    if not file_path.startswith(path.abspath(unquote(root_path))):
++        error_logger.exception(
++            f"File not found: path={file_or_directory}, "
++            f"relative_url={file_uri}"
++        )
++        raise FileNotFound(
++            "File not found", path=file_or_directory, relative_url=file_uri
++        )
+     try:
+         headers = {}
+         stats = None
+         if use_modified_since:
+             stats = await stat_async(file_path)
+             modified_since = strftime(
+                 "%a, %d %b %Y %H:%M:%S GMT", gmtime(stats.st_mtime)
+             )
+             if request.headers.get("If-Modified-Since") == modified_since:
+                 return HTTPResponse(status=304)

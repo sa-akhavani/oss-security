@@ -1,0 +1,1165 @@
+# ====================================================================
+# FILE: benches/output.rs
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 43-76 ---
+    43|         .collect::<Vec<_>>()
+    44| }
+    45| #[bench]
+    46| fn bench_output_activedata_etl(b: &mut Bencher) {
+    47|     let dir = tempdir().unwrap();
+    48|     b.iter(|| {
+    49|         black_box(output_activedata_etl(
+    50|             &generate_cov_result_iter(),
+    51|             Some(&dir.path().join("temp")),
+    52|             false,
+    53|         ))
+    54|     });
+    55| }
+    56| #[bench]
+    57| fn bench_output_covdir(b: &mut Bencher) {
+    58|     let dir = tempdir().unwrap();
+    59|     b.iter(|| {
+    60|         black_box(output_covdir(
+    61|             &generate_cov_result_iter(),
+    62|             Some(&dir.path().join("temp")),
+    63|         ));
+    64|     });
+    65| }
+    66| #[bench]
+    67| fn bench_output_lcov(b: &mut Bencher) {
+    68|     let dir = tempdir().unwrap();
+    69|     b.iter(|| {
+    70|         black_box(output_lcov(
+    71|             &generate_cov_result_iter(),
+    72|             Some(&dir.path().join("temp")),
+    73|             false,
+    74|         ));
+    75|     });
+    76| }
+
+
+# ====================================================================
+# FILE: benches/parser.rs
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 4-27 ---
+     4| use std::fs::File;
+     5| use std::io::BufReader;
+     6| use std::path::Path;
+     7| use test::{black_box, Bencher};
+     8| #[bench]
+     9| fn bench_parser_lcov(b: &mut Bencher) {
+    10|     b.iter(|| {
+    11|         let file = std::fs::read("./test/prova.info").expect("Failed to open lcov file");
+    12|         black_box(grcov::parse_lcov(file, true).unwrap());
+    13|     });
+    14| }
+    15| #[bench]
+    16| fn bench_parser_gcov(b: &mut Bencher) {
+    17|     let path = Path::new("./test/negative_counts.gcov");
+    18|     b.iter(|| black_box(grcov::parse_gcov(path)));
+    19| }
+    20| #[bench]
+    21| fn bench_parser_jacoco(b: &mut Bencher) {
+    22|     let path = Path::new("./test/jacoco/full-junit4-report-multiple-top-level-classes.xml");
+    23|     b.iter(|| {
+    24|         let file = BufReader::new(File::open(&path).unwrap());
+    25|         black_box(grcov::parse_jacoco_xml_report(file))
+    26|     });
+    27| }
+
+
+# ====================================================================
+# FILE: src/cobertura.rs
+# Total hunks: 8
+# ====================================================================
+# --- HUNK 1: Lines 1-29 ---
+     1| use crate::defs::*;
+     2| use quick_xml::{
+     3|     events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event},
+     4|     Writer,
+     5| };
+     6| use rustc_hash::FxHashMap;
+     7| use std::io::{BufWriter, Cursor, Write};
+     8| use std::path::Path;
+     9| use std::time::{SystemTime, UNIX_EPOCH};
+    10| use symbolic_common::Name;
+    11| use symbolic_demangle::{Demangle, DemangleOptions};
+    12| use crate::output::get_target_output_writable;
+    13| macro_rules! demangle {
+    14|     ($name: expr, $demangle: expr, $options: expr) => {{
+    15|         if $demangle {
+    16|             Name::from($name)
+    17|                 .demangle($options)
+    18|                 .unwrap_or_else(|| $name.clone())
+    19|         } else {
+    20|             $name.clone()
+    21|         }
+    22|     }};
+    23| }
+    24| struct Coverage {
+    25|     sources: Vec<String>,
+    26|     packages: Vec<Package>,
+    27| }
+    28| #[derive(Default)]
+    29| struct CoverageStats {
+
+# --- HUNK 2: Lines 170-213 ---
+   170|         matches!(self, Line::Plain { hits, .. } | Line::Branch { hits, .. } if *hits > 0)
+   171|     }
+   172| }
+   173| impl Stats for Line {
+   174|     fn get_lines(&self) -> FxHashMap<u32, Line> {
+   175|         let mut lines = FxHashMap::default();
+   176|         lines.insert(self.number(), self.clone());
+   177|         lines
+   178|     }
+   179| }
+   180| #[derive(Debug, Clone)]
+   181| struct Condition {
+   182|     number: usize,
+   183|     cond_type: ConditionType,
+   184|     coverage: f64,
+   185| }
+   186| #[derive(Debug, Clone)]
+   187| enum ConditionType {
+   188|     Jump,
+   189| }
+   190| impl ToString for ConditionType {
+   191|     fn to_string(&self) -> String {
+   192|         match *self {
+   193|             Self::Jump => String::from("jump"),
+   194|         }
+   195|     }
+   196| }
+   197| fn get_coverage(
+   198|     results: &[ResultTuple],
+   199|     sources: Vec<String>,
+   200|     demangle: bool,
+   201|     demangle_options: DemangleOptions,
+   202| ) -> Coverage {
+   203|     let packages: Vec<Package> = results
+   204|         .iter()
+   205|         .map(|(_, rel_path, result)| {
+   206|             let all_lines: Vec<u32> = result.lines.keys().cloned().collect();
+   207|             let end: u32 = result.lines.keys().last().unwrap_or(&0) + 1;
+   208|             let mut start_indexes: Vec<u32> = Vec::new();
+   209|             for function in result.functions.values() {
+   210|                 start_indexes.push(function.start);
+   211|             }
+   212|             start_indexes.sort_unstable();
+   213|             let line_from_number = |number| {
+
+# --- HUNK 3: Lines 267-314 ---
+   267|                     .map(|x| x.to_str().unwrap())
+   268|                     .unwrap_or_default()
+   269|                     .to_string(),
+   270|                 file_name: rel_path.to_str().unwrap_or_default().to_string(),
+   271|                 lines,
+   272|                 methods,
+   273|             };
+   274|             Package {
+   275|                 name: rel_path.to_str().unwrap_or_default().to_string(),
+   276|                 classes: vec![class],
+   277|             }
+   278|         })
+   279|         .collect();
+   280|     Coverage { sources, packages }
+   281| }
+   282| pub fn output_cobertura(
+   283|     source_dir: Option<&Path>,
+   284|     results: &[ResultTuple],
+   285|     output_file: Option<&Path>,
+   286|     demangle: bool,
+   287| ) {
+   288|     let demangle_options = DemangleOptions::name_only();
+   289|     let sources = vec![source_dir
+   290|         .unwrap_or_else(|| Path::new("."))
+   291|         .display()
+   292|         .to_string()];
+   293|     let coverage = get_coverage(results, sources, demangle, demangle_options);
+   294|     let mut writer = Writer::new_with_indent(Cursor::new(vec![]), b' ', 4);
+   295|     writer
+   296|         .write_event(Event::Decl(BytesDecl::new("1.0", None, None)))
+   297|         .unwrap();
+   298|     writer
+   299|         .write_event(Event::DocType(BytesText::from_escaped(
+   300|             " coverage SYSTEM 'http://cobertura.sourceforge.net/xml/coverage-04.dtd'",
+   301|         )))
+   302|         .unwrap();
+   303|     let cov_tag = "coverage";
+   304|     let mut cov = BytesStart::from_content(cov_tag, cov_tag.len());
+   305|     let stats = coverage.get_stats();
+   306|     cov.push_attribute(("lines-covered", stats.lines_covered.to_string().as_ref()));
+   307|     cov.push_attribute(("lines-valid", stats.lines_valid.to_string().as_ref()));
+   308|     cov.push_attribute(("line-rate", stats.line_rate().to_string().as_ref()));
+   309|     cov.push_attribute((
+   310|         "branches-covered",
+   311|         stats.branches_covered.to_string().as_ref(),
+   312|     ));
+   313|     cov.push_attribute(("branches-valid", stats.branches_valid.to_string().as_ref()));
+   314|     cov.push_attribute(("branch-rate", stats.branch_rate().to_string().as_ref()));
+
+# --- HUNK 4: Lines 426-499 ---
+   426|     file.write_all(&result).unwrap();
+   427| }
+   428| fn write_lines(writer: &mut Writer<Cursor<Vec<u8>>>, lines: &[Line]) {
+   429|     let lines_tag = "lines";
+   430|     let line_tag = "line";
+   431|     writer
+   432|         .write_event(Event::Start(BytesStart::from_content(
+   433|             lines_tag,
+   434|             lines_tag.len(),
+   435|         )))
+   436|         .unwrap();
+   437|     for line in lines {
+   438|         let mut l = BytesStart::from_content(line_tag, line_tag.len());
+   439|         match line {
+   440|             Line::Plain {
+   441|                 ref number,
+   442|                 ref hits,
+   443|             } => {
+   444|                 l.push_attribute(("number", number.to_string().as_ref()));
+   445|                 l.push_attribute(("hits", hits.to_string().as_ref()));
+   446|                 writer.write_event(Event::Start(l)).unwrap();
+   447|             }
+   448|             Line::Branch {
+   449|                 ref number,
+   450|                 ref hits,
+   451|                 conditions,
+   452|             } => {
+   453|                 l.push_attribute(("number", number.to_string().as_ref()));
+   454|                 l.push_attribute(("hits", hits.to_string().as_ref()));
+   455|                 l.push_attribute(("branch", "true"));
+   456|                 writer.write_event(Event::Start(l)).unwrap();
+   457|                 let conditions_tag = "conditions";
+   458|                 let condition_tag = "condition";
+   459|                 writer
+   460|                     .write_event(Event::Start(BytesStart::from_content(
+   461|                         conditions_tag,
+   462|                         conditions_tag.len(),
+   463|                     )))
+   464|                     .unwrap();
+   465|                 for condition in conditions {
+   466|                     let mut c = BytesStart::from_content(condition_tag, condition_tag.len());
+   467|                     c.push_attribute(("number", condition.number.to_string().as_ref()));
+   468|                     c.push_attribute(("type", condition.cond_type.to_string().as_ref()));
+   469|                     c.push_attribute(("coverage", condition.coverage.to_string().as_ref()));
+   470|                     writer.write_event(Event::Empty(c)).unwrap();
+   471|                 }
+   472|                 writer
+   473|                     .write_event(Event::End(BytesEnd::new(conditions_tag)))
+   474|                     .unwrap();
+   475|             }
+   476|         }
+   477|         writer
+   478|             .write_event(Event::End(BytesEnd::new(line_tag)))
+   479|             .unwrap();
+   480|     }
+   481|     writer
+   482|         .write_event(Event::End(BytesEnd::new(lines_tag)))
+   483|         .unwrap();
+   484| }
+   485| #[cfg(test)]
+   486| mod tests {
+   487|     use super::*;
+   488|     use crate::{CovResult, Function};
+   489|     use std::io::Read;
+   490|     use std::{collections::BTreeMap, path::PathBuf};
+   491|     use std::{fs::File, path::Path};
+   492|     enum Result {
+   493|         Main,
+   494|         Test,
+   495|     }
+   496|     fn coverage_result(which: Result) -> CovResult {
+   497|         match which {
+   498|             Result::Main => CovResult {
+   499|                 /* main.rs
+
+# --- HUNK 5: Lines 612-733 ---
+   612|             },
+   613|         }
+   614|     }
+   615|     fn read_file(path: &Path) -> String {
+   616|         let mut f =
+   617|             File::open(path).unwrap_or_else(|_| panic!("{:?} file not found", path.file_name()));
+   618|         let mut s = String::new();
+   619|         f.read_to_string(&mut s).unwrap();
+   620|         s
+   621|     }
+   622|     #[test]
+   623|     fn test_cobertura() {
+   624|         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+   625|         let file_name = "test_cobertura.xml";
+   626|         let file_path = tmp_dir.path().join(file_name);
+   627|         let results = vec![(
+   628|             PathBuf::from("src/main.rs"),
+   629|             PathBuf::from("src/main.rs"),
+   630|             coverage_result(Result::Main),
+   631|         )];
+   632|         output_cobertura(None, &results, Some(&file_path), true);
+   633|         let results = read_file(&file_path);
+   634|         assert!(results.contains(r#"<source>.</source>"#));
+   635|         assert!(results.contains(r#"package name="src/main.rs""#));
+   636|         assert!(results.contains(r#"class name="main" filename="src/main.rs""#));
+   637|         assert!(results.contains(r#"method name="cov_test::main""#));
+   638|         assert!(results.contains(r#"line number="1" hits="1">"#));
+   639|         assert!(results.contains(r#"line number="3" hits="2" branch="true""#));
+   640|         assert!(results.contains(r#"<condition number="0" type="jump" coverage="1"/>"#));
+   641|         assert!(results.contains(r#"lines-covered="6""#));
+   642|         assert!(results.contains(r#"lines-valid="8""#));
+   643|         assert!(results.contains(r#"line-rate="0.75""#));
+   644|         assert!(results.contains(r#"branches-covered="1""#));
+   645|         assert!(results.contains(r#"branches-valid="4""#));
+   646|         assert!(results.contains(r#"branch-rate="0.25""#));
+   647|     }
+   648|     #[test]
+   649|     fn test_cobertura_double_lines() {
+   650|         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+   651|         let file_name = "test_cobertura.xml";
+   652|         let file_path = tmp_dir.path().join(file_name);
+   653|         let results = vec![(
+   654|             PathBuf::from("src/main.rs"),
+   655|             PathBuf::from("src/main.rs"),
+   656|             coverage_result(Result::Test),
+   657|         )];
+   658|         output_cobertura(None, &results, Some(file_path.as_ref()), true);
+   659|         let results = read_file(&file_path);
+   660|         assert!(results.contains(r#"<source>.</source>"#));
+   661|         assert!(results.contains(r#"package name="src/main.rs""#));
+   662|         assert!(results.contains(r#"class name="main" filename="src/main.rs""#));
+   663|         assert!(results.contains(r#"method name="cov_test::main""#));
+   664|         assert!(results.contains(r#"method name="cov_test::test_fn""#));
+   665|         assert!(results.contains(r#"lines-covered="7""#));
+   666|         assert!(results.contains(r#"lines-valid="8""#));
+   667|         assert!(results.contains(r#"line-rate="0.875""#));
+   668|         assert!(results.contains(r#"branches-covered="1""#));
+   669|         assert!(results.contains(r#"branches-valid="2""#));
+   670|         assert!(results.contains(r#"branch-rate="0.5""#));
+   671|     }
+   672|     #[test]
+   673|     fn test_cobertura_multiple_files() {
+   674|         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+   675|         let file_name = "test_cobertura.xml";
+   676|         let file_path = tmp_dir.path().join(file_name);
+   677|         let results = vec![
+   678|             (
+   679|                 PathBuf::from("src/main.rs"),
+   680|                 PathBuf::from("src/main.rs"),
+   681|                 coverage_result(Result::Main),
+   682|             ),
+   683|             (
+   684|                 PathBuf::from("src/test.rs"),
+   685|                 PathBuf::from("src/test.rs"),
+   686|                 coverage_result(Result::Test),
+   687|             ),
+   688|         ];
+   689|         output_cobertura(None, &results, Some(file_path.as_ref()), true);
+   690|         let results = read_file(&file_path);
+   691|         assert!(results.contains(r#"<source>.</source>"#));
+   692|         assert!(results.contains(r#"package name="src/main.rs""#));
+   693|         assert!(results.contains(r#"class name="main" filename="src/main.rs""#));
+   694|         assert!(results.contains(r#"package name="src/test.rs""#));
+   695|         assert!(results.contains(r#"class name="test" filename="src/test.rs""#));
+   696|         assert!(results.contains(r#"lines-covered="13""#));
+   697|         assert!(results.contains(r#"lines-valid="16""#));
+   698|         assert!(results.contains(r#"line-rate="0.8125""#));
+   699|         assert!(results.contains(r#"branches-covered="2""#));
+   700|         assert!(results.contains(r#"branches-valid="6""#));
+   701|         assert!(results.contains(r#"branch-rate="0.3333333333333333""#));
+   702|     }
+   703|     #[test]
+   704|     fn test_cobertura_source_root_none() {
+   705|         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+   706|         let file_name = "test_cobertura.xml";
+   707|         let file_path = tmp_dir.path().join(file_name);
+   708|         let results = vec![(
+   709|             PathBuf::from("src/main.rs"),
+   710|             PathBuf::from("src/main.rs"),
+   711|             CovResult::default(),
+   712|         )];
+   713|         output_cobertura(None, &results, Some(&file_path), true);
+   714|         let results = read_file(&file_path);
+   715|         assert!(results.contains(r#"<source>.</source>"#));
+   716|         assert!(results.contains(r#"package name="src/main.rs""#));
+   717|     }
+   718|     #[test]
+   719|     fn test_cobertura_source_root_some() {
+   720|         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+   721|         let file_name = "test_cobertura.xml";
+   722|         let file_path = tmp_dir.path().join(file_name);
+   723|         let results = vec![(
+   724|             PathBuf::from("main.rs"),
+   725|             PathBuf::from("main.rs"),
+   726|             CovResult::default(),
+   727|         )];
+   728|         output_cobertura(Some(Path::new("src")), &results, Some(&file_path), true);
+   729|         let results = read_file(&file_path);
+   730|         assert!(results.contains(r#"<source>src</source>"#));
+   731|         assert!(results.contains(r#"package name="main.rs""#));
+   732|     }
+   733| }
+
+
+# ====================================================================
+# FILE: src/covdir.rs
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 26-70 ---
+    26|         } else {
+    27|             0.0
+    28|         }
+    29|     }
+    30| }
+    31| impl CDFileStats {
+    32|     pub fn new(name: String, coverage: BTreeMap<u32, u64>, precision: usize) -> Self {
+    33|         let (total, covered, lines) = Self::get_coverage(coverage);
+    34|         Self {
+    35|             name,
+    36|             stats: CDStats::new(total, covered, precision),
+    37|             coverage: lines,
+    38|         }
+    39|     }
+    40|     fn get_coverage(coverage: BTreeMap<u32, u64>) -> (usize, usize, Vec<i64>) {
+    41|         let mut covered = 0;
+    42|         let last_line = *coverage.keys().last().unwrap_or(&0) as usize;
+    43|         let total = coverage.len();
+    44|         let mut lines: Vec<i64> = vec![-1; last_line];
+    45|         for (line_num, line_count) in coverage.iter() {
+    46|             let line_count = *line_count;
+    47|             unsafe {
+    48|                 *lines.get_unchecked_mut((*line_num - 1) as usize) = line_count as i64;
+    49|             }
+    50|             covered += (line_count > 0) as usize;
+    51|         }
+    52|         (total, covered, lines)
+    53|     }
+    54|     pub fn to_json(&self) -> serde_json::Value {
+    55|         json!({
+    56|             "name": self.name,
+    57|             "linesTotal": self.stats.total,
+    58|             "linesCovered": self.stats.covered,
+    59|             "linesMissed": self.stats.missed,
+    60|             "coveragePercent": self.stats.percent,
+    61|             "coverage": self.coverage,
+    62|         })
+    63|     }
+    64| }
+    65| impl CDDirStats {
+    66|     pub fn new(name: String) -> Self {
+    67|         Self {
+    68|             name,
+    69|             files: Vec::new(),
+    70|             dirs: Vec::new(),
+
+
+# ====================================================================
+# FILE: src/gcov.rs
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 68-114 ---
+    68|             let output = String::from_utf8(output.stdout).unwrap();
+    69|             parse_version(&output)
+    70|         };
+    71|     }
+    72|     &V
+    73| }
+    74| pub fn get_gcov_output_ext() -> &'static str {
+    75|     lazy_static! {
+    76|         static ref E: &'static str = {
+    77|             let min_ver = Version::new(9, 1, 0);
+    78|             if get_gcov_version() >= &min_ver {
+    79|                 ".gcov.json.gz"
+    80|             } else {
+    81|                 ".gcov"
+    82|             }
+    83|         };
+    84|     }
+    85|     &E
+    86| }
+    87| fn parse_version(gcov_output: &str) -> Version {
+    88|     let mut versions: Vec<_> = gcov_output
+    89|         .split(|c| c == ' ' || c == '\n')
+    90|         .filter_map(|value| Version::parse(value).ok())
+    91|         .collect();
+    92|     assert!(!versions.is_empty(), "no version found for `gcov`.");
+    93|     versions.pop().unwrap()
+    94| }
+    95| #[cfg(test)]
+    96| mod tests {
+    97|     use super::*;
+    98|     #[test]
+    99|     fn test_parse_version() {
+   100|         assert_eq!(
+   101|             parse_version("gcov (Ubuntu 4.3.0-12ubuntu2) 4.3.0 20170406"),
+   102|             Version::new(4, 3, 0)
+   103|         );
+   104|         assert_eq!(
+   105|             parse_version("gcov (Ubuntu 4.9.0-12ubuntu2) 4.9.0 20170406"),
+   106|             Version::new(4, 9, 0)
+   107|         );
+   108|         assert_eq!(
+   109|             parse_version("gcov (Ubuntu 6.3.0-12ubuntu2) 6.3.0 20170406"),
+   110|             Version::new(6, 3, 0)
+   111|         );
+   112|         assert_eq!(parse_version("gcov (GCC) 12.2.0"), Version::new(12, 2, 0));
+   113|     }
+   114| }
+
+
+# ====================================================================
+# FILE: src/lib.rs
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 5-64 ---
+     5| mod producer;
+     6| pub use crate::producer::*;
+     7| mod gcov;
+     8| pub use crate::gcov::*;
+     9| mod llvm_tools;
+    10| pub use crate::llvm_tools::*;
+    11| mod parser;
+    12| pub use crate::parser::*;
+    13| mod filter;
+    14| pub use crate::filter::*;
+    15| mod symlink;
+    16| mod path_rewriting;
+    17| pub use crate::path_rewriting::*;
+    18| mod output;
+    19| pub use crate::output::*;
+    20| mod cobertura;
+    21| pub use crate::cobertura::*;
+    22| mod reader;
+    23| pub use crate::reader::*;
+    24| mod covdir;
+    25| pub use crate::covdir::*;
+    26| pub mod html;
+    27| mod file_filter;
+    28| pub use crate::file_filter::*;
+    29| use log::{error, warn};
+    30| use std::fs;
+    31| use std::io::{BufReader, Cursor};
+    32| use std::{
+    33|     collections::{btree_map, hash_map},
+    34|     path::Path,
+    35| };
+    36| use walkdir::WalkDir;
+    37| pub fn merge_results(result: &mut CovResult, result2: CovResult) -> bool {
+    38|     let mut warn_overflow = false;
+    39|     for (&line_no, &execution_count) in &result2.lines {
+    40|         match result.lines.entry(line_no) {
+    41|             btree_map::Entry::Occupied(c) => {
+    42|                 let v = c.get().checked_add(execution_count).unwrap_or_else(|| {
+    43|                     warn_overflow = true;
+    44|                     std::u64::MAX
+    45|                 });
+    46|                 *c.into_mut() = v;
+    47|             }
+    48|             btree_map::Entry::Vacant(v) => {
+    49|                 v.insert(execution_count);
+    50|             }
+    51|         };
+    52|     }
+    53|     for (line_no, taken) in result2.branches {
+    54|         match result.branches.entry(line_no) {
+    55|             btree_map::Entry::Occupied(c) => {
+    56|                 let v = c.into_mut();
+    57|                 for (x, y) in taken.iter().zip(v.iter_mut()) {
+    58|                     *y |= x;
+    59|                 }
+    60|                 let l = v.len();
+    61|                 if taken.len() > l {
+    62|                     v.extend(&taken[l..]);
+    63|                 }
+    64|             }
+
+# --- HUNK 2: Lines 96-136 ---
+    96|             None => result.0,
+    97|         };
+    98|         let entry = map.entry(path);
+    99|         match entry {
+   100|             hash_map::Entry::Occupied(obj) => {
+   101|                 warn_overflow |= merge_results(obj.into_mut(), result.1);
+   102|             }
+   103|             hash_map::Entry::Vacant(v) => {
+   104|                 v.insert(result.1);
+   105|             }
+   106|         };
+   107|     }
+   108|     if warn_overflow {
+   109|         warn!("Execution count overflow detected.");
+   110|     }
+   111| }
+   112| fn rename_single_files(results: &mut [(String, CovResult)], stem: &str) {
+   113|     if let Some(parent) = Path::new(stem).parent() {
+   114|         for (file, _) in results.iter_mut() {
+   115|             if has_no_parent(file) {
+   116|                 *file = parent.join(&file).to_str().unwrap().to_string();
+   117|             }
+   118|         }
+   119|     }
+   120| }
+   121| #[derive(PartialEq, Eq)]
+   122| enum GcovType {
+   123|     Unknown,
+   124|     SingleFile,
+   125|     MultipleFiles,
+   126| }
+   127| macro_rules! try_parse {
+   128|     ($v:expr, $f:expr) => {
+   129|         match $v {
+   130|             Ok(val) => val,
+   131|             Err(err) => {
+   132|                 error!("Error parsing file {}: {}", $f, err);
+   133|                 continue;
+   134|             }
+   135|         }
+   136|     };
+
+
+# ====================================================================
+# FILE: src/llvm_tools.rs
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-24 ---
+     1| use cargo_binutils::Tool;
+     2| use once_cell::sync::OnceCell;
+     3| use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+     4| use std::env::consts::EXE_SUFFIX;
+     5| use std::ffi::OsStr;
+     6| use std::fs;
+     7| use std::io::Write;
+     8| use std::path::{Path, PathBuf};
+     9| use std::process::{Command, Stdio};
+    10| use log::warn;
+    11| use walkdir::WalkDir;
+    12| pub static LLVM_PATH: OnceCell<PathBuf> = OnceCell::new();
+    13| pub fn is_binary(path: impl AsRef<Path>) -> bool {
+    14|     if let Ok(oty) = infer::get_from_path(path) {
+    15|         if let Some("dll" | "exe" | "elf" | "mach") = oty.map(|x| x.extension()) {
+    16|             return true;
+    17|         }
+    18|     }
+    19|     false
+    20| }
+    21| pub fn run_with_stdin(
+    22|     cmd: impl AsRef<OsStr>,
+    23|     stdin: impl AsRef<str>,
+    24|     args: &[&OsStr],
+
+# --- HUNK 2: Lines 105-163 ---
+   105|                 binary.as_ref(),
+   106|                 "--instr-profile".as_ref(),
+   107|                 profdata_path.as_ref(),
+   108|                 "--format".as_ref(),
+   109|                 "lcov".as_ref(),
+   110|             ];
+   111|             match run(&cov_tool_path, &args) {
+   112|                 Ok(result) => Some(result),
+   113|                 Err(err_str) => {
+   114|                     warn!(
+   115|                         "Suppressing error returned by llvm-cov tool for binary {:?}\n{}",
+   116|                         binary, err_str
+   117|                     );
+   118|                     None
+   119|                 }
+   120|             }
+   121|         })
+   122|         .collect::<Vec<_>>();
+   123|     Ok(results)
+   124| }
+   125| fn get_profdata_path() -> Result<PathBuf, String> {
+   126|     let path = if let Some(mut path) = LLVM_PATH.get().cloned() {
+   127|         path.push(format!("llvm-profdata{}", EXE_SUFFIX));
+   128|         path
+   129|     } else {
+   130|         Tool::Profdata.path().map_err(|x| x.to_string())?
+   131|     };
+   132|     if !path.exists() {
+   133|         Err(String::from("We couldn't find llvm-profdata. Try installing the llvm-tools component with `rustup component add llvm-tools-preview` or specifying the --llvm-path option."))
+   134|     } else {
+   135|         Ok(path)
+   136|     }
+   137| }
+   138| fn get_cov_path() -> Result<PathBuf, String> {
+   139|     let path = if let Some(mut path) = LLVM_PATH.get().cloned() {
+   140|         path.push(format!("llvm-cov{}", EXE_SUFFIX));
+   141|         path
+   142|     } else {
+   143|         Tool::Cov.path().map_err(|x| x.to_string())?
+   144|     };
+   145|     if !path.exists() {
+   146|         Err(String::from("We couldn't find llvm-cov. Try installing the llvm-tools component with `rustup component add llvm-tools-preview` or specifying the --llvm-path option."))
+   147|     } else {
+   148|         Ok(path)
+   149|     }
+   150| }
+   151| #[cfg(test)]
+   152| mod tests {
+   153|     use super::*;
+   154|     use std::fs;
+   155|     #[test]
+   156|     fn test_profraws_to_lcov() {
+   157|         let output = Command::new("rustc").arg("--version").output().unwrap();
+   158|         if !String::from_utf8_lossy(&output.stdout).contains("nightly") {
+   159|             return;
+   160|         }
+   161|         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+   162|         let tmp_path = tmp_dir.path().to_owned();
+   163|         fs::copy(
+
+# --- HUNK 3: Lines 193-239 ---
+   193|             std::env::var("CARGO_TARGET_DIR").unwrap_or("target".to_string())
+   194|         );
+   195|         #[cfg(windows)]
+   196|         let binary_path = format!(
+   197|             "{}/debug/rust-code-coverage-sample.exe",
+   198|             std::env::var("CARGO_TARGET_DIR").unwrap_or("target".to_string())
+   199|         );
+   200|         let lcovs = profraws_to_lcov(
+   201|             &[tmp_path.join("default.profraw")],
+   202|             &tmp_path.join(binary_path),
+   203|             &tmp_path,
+   204|         );
+   205|         assert!(lcovs.is_ok());
+   206|         let lcovs = lcovs.unwrap();
+   207|         assert_eq!(lcovs.len(), 1);
+   208|         let output_lcov = String::from_utf8_lossy(&lcovs[0]);
+   209|         println!("{}", output_lcov);
+   210|         assert!(output_lcov
+   211|             .lines()
+   212|             .any(|line| line.contains("SF") && line.contains("src") && line.contains("main.rs")));
+   213|         assert!(output_lcov.lines().any(|line| line.contains("FN:3")
+   214|             && line.contains("rust_code_coverage_sample")
+   215|             && line.contains("Ciao")));
+   216|         assert!(output_lcov.lines().any(|line| line.contains("FN:8")
+   217|             && line.contains("rust_code_coverage_sample")
+   218|             && line.contains("main")));
+   219|         assert!(output_lcov.lines().any(|line| line.contains("FNDA:0")
+   220|             && line.contains("rust_code_coverage_sample")
+   221|             && line.contains("Ciao")));
+   222|         assert!(output_lcov.lines().any(|line| line.contains("FNDA:1")
+   223|             && line.contains("rust_code_coverage_sample")
+   224|             && line.contains("main")));
+   225|         assert!(output_lcov.lines().any(|line| line == "FNF:2"));
+   226|         assert!(output_lcov.lines().any(|line| line == "FNH:1"));
+   227|         assert!(output_lcov.lines().any(|line| line == "DA:3,0"));
+   228|         assert!(output_lcov.lines().any(|line| line == "DA:8,1"));
+   229|         assert!(output_lcov.lines().any(|line| line == "DA:9,1"));
+   230|         assert!(output_lcov.lines().any(|line| line == "DA:10,1"));
+   231|         assert!(output_lcov.lines().any(|line| line == "DA:11,1"));
+   232|         assert!(output_lcov.lines().any(|line| line == "DA:12,1"));
+   233|         assert!(output_lcov.lines().any(|line| line == "BRF:0"));
+   234|         assert!(output_lcov.lines().any(|line| line == "BRH:0"));
+   235|         assert!(output_lcov.lines().any(|line| line == "LF:6"));
+   236|         assert!(output_lcov.lines().any(|line| line == "LH:5"));
+   237|         assert!(output_lcov.lines().any(|line| line == "end_of_record"));
+   238|     }
+   239| }
+
+
+# ====================================================================
+# FILE: src/main.rs
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-80 ---
+     1| #[cfg(all(unix, feature = "tc"))]
+     2| #[global_allocator]
+     3| static GLOBAL: tcmalloc::TCMalloc = tcmalloc::TCMalloc;
+     4| use clap::{builder::PossibleValue, ArgGroup, Parser, ValueEnum};
+     5| use crossbeam_channel::bounded;
+     6| use log::error;
+     7| use regex::Regex;
+     8| use rustc_hash::FxHashMap;
+     9| use serde_json::Value;
+    10| use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode, WriteLogger};
+    11| use std::fs::{self, File};
+    12| use std::ops::Deref;
+    13| use std::panic;
+    14| use std::path::{Path, PathBuf};
+    15| use std::str::FromStr;
+    16| use std::sync::{Arc, Mutex};
+    17| use std::{process, thread};
+    18| use grcov::*;
+    19| #[derive(Clone)]
+    20| enum OutputType {
+    21|     Ade,
+    22|     Lcov,
+    23|     Coveralls,
+    24|     CoverallsPlus,
+    25|     Files,
+    26|     Covdir,
+    27|     Html,
+    28|     Cobertura,
+    29|     Markdown,
+    30| }
+    31| impl FromStr for OutputType {
+    32|     type Err = String;
+    33|     fn from_str(s: &str) -> Result<Self, Self::Err> {
+    34|         Ok(match s {
+    35|             "ade" => Self::Ade,
+    36|             "lcov" => Self::Lcov,
+    37|             "coveralls" => Self::Coveralls,
+    38|             "coveralls+" => Self::CoverallsPlus,
+    39|             "files" => Self::Files,
+    40|             "covdir" => Self::Covdir,
+    41|             "html" => Self::Html,
+    42|             "cobertura" => Self::Cobertura,
+    43|             "markdown" => Self::Markdown,
+    44|             _ => return Err(format!("{} is not a supported output type", s)),
+    45|         })
+    46|     }
+    47| }
+    48| impl OutputType {
+    49|     fn to_file_name(&self, output_path: Option<&Path>) -> Option<PathBuf> {
+    50|         output_path.map(|path| {
+    51|             if path.is_dir() {
+    52|                 match self {
+    53|                     OutputType::Ade => path.join("activedata"),
+    54|                     OutputType::Lcov => path.join("lcov"),
+    55|                     OutputType::Coveralls => path.join("coveralls"),
+    56|                     OutputType::CoverallsPlus => path.join("coveralls+"),
+    57|                     OutputType::Files => path.join("files"),
+    58|                     OutputType::Covdir => path.join("covdir"),
+    59|                     OutputType::Html => path.join("html"),
+    60|                     OutputType::Cobertura => path.join("cobertura.xml"),
+    61|                     OutputType::Markdown => path.join("markdown.md"),
+    62|                 }
+    63|             } else {
+    64|                 path.to_path_buf()
+    65|             }
+    66|         })
+    67|     }
+    68| }
+    69| #[derive(clap::ValueEnum, Clone)]
+    70| enum Filter {
+    71|     Covered,
+    72|     Uncovered,
+    73| }
+    74| impl FromStr for Filter {
+    75|     type Err = String;
+    76|     fn from_str(s: &str) -> Result<Self, Self::Err> {
+    77|         Ok(match s {
+    78|             "covered" => Self::Covered,
+    79|             "uncovered" => Self::Uncovered,
+    80|             _ => return Err(format!("{} is not a supported filter", s)),
+
+# --- HUNK 2: Lines 125-195 ---
+   125|     #[arg(required = true)]
+   126|     paths: Vec<String>,
+   127|     #[arg(short, long, value_name = "PATH")]
+   128|     binary_path: Option<PathBuf>,
+   129|     #[arg(long, value_name = "PATH")]
+   130|     llvm_path: Option<PathBuf>,
+   131|     #[arg(
+   132|         short = 't',
+   133|         long,
+   134|         long_help = "\
+   135|             Comma separated list of custom output types:\n\
+   136|             - *html* for a HTML coverage report;\n\
+   137|             - *coveralls* for the Coveralls specific format;\n\
+   138|             - *lcov* for the lcov INFO format;\n\
+   139|             - *covdir* for the covdir recursive JSON format;\n\
+   140|             - *coveralls+* for the Coveralls specific format with function information;\n\
+   141|             - *ade* for the ActiveData-ETL specific format;\n\
+   142|             - *files* to only return a list of files.\n\
+   143|             - *markdown* for human easy read.\n\
+   144|             - *cobertura* for output in cobertura format.\n\
+   145|         ",
+   146|         value_name = "OUTPUT TYPE",
+   147|         requires_ifs = [
+   148|             ("coveralls", "coveralls-auth"),
+   149|             ("coveralls+", "coveralls-auth"),
+   150|         ],
+   151|         value_delimiter = ',',
+   152|         alias = "output-type",
+   153|         default_value = "lcov",
+   154|     )]
+   155|     output_types: Vec<OutputType>,
+   156|     #[arg(short, long, value_name = "PATH", alias = "output-file")]
+   157|     output_path: Option<PathBuf>,
+   158|     #[arg(long, value_name = "PATH", alias = "output-config-file")]
+   159|     output_config_file: Option<PathBuf>,
+   160|     #[arg(short, long, value_name = "DIRECTORY")]
+   161|     source_dir: Option<PathBuf>,
+   162|     #[arg(short, long, value_name = "PATH")]
+   163|     prefix_dir: Option<PathBuf>,
+   164|     #[arg(long)]
+   165|     ignore_not_existing: bool,
+   166|     #[arg(long = "ignore", value_name = "PATH", num_args = 1)]
+   167|     ignore_dir: Vec<String>,
+   168|     #[arg(long = "keep-only", value_name = "PATH", num_args = 1)]
+   169|     keep_dir: Vec<String>,
+   170|     #[arg(long, value_name = "PATH")]
+   171|     path_mapping: Option<PathBuf>,
+   172|     #[arg(long)]
+   173|     branch: bool,
+   174|     #[arg(long, value_enum)]
+   175|     filter: Option<Filter>,
+   176|     #[arg(long)]
+   177|     llvm: bool,
+   178|     #[arg(long, value_name = "TOKEN")]
+   179|     token: Option<String>,
+   180|     #[arg(long, value_name = "COMMIT HASH")]
+   181|     commit_sha: Option<String>,
+   182|     #[arg(long, value_name = "SERVICE NAME")]
+   183|     service_name: Option<String>,
+   184|     #[arg(long, value_name = "SERVICE NUMBER")]
+   185|     service_number: Option<String>,
+   186|     #[arg(
+   187|         long,
+   188|         value_name = "SERVICE JOB ID",
+   189|         visible_alias = "service-job-number",
+   190|         requires = "service_name"
+   191|     )]
+   192|     service_job_id: Option<String>,
+   193|     #[arg(long, value_name = "SERVICE PULL REQUEST")]
+   194|     service_pull_request: Option<String>,
+   195|     #[arg(long, value_name = "SERVICE FLAG NAME")]
+
+# --- HUNK 3: Lines 367-470 ---
+   367|     for parser in parsers {
+   368|         if parser.join().is_err() {
+   369|             process::exit(1);
+   370|         }
+   371|     }
+   372|     let result_map_mutex = Arc::try_unwrap(result_map).unwrap();
+   373|     let result_map = result_map_mutex.into_inner().unwrap();
+   374|     let path_mapping_mutex = Arc::try_unwrap(path_mapping).unwrap();
+   375|     let path_mapping = path_mapping_mutex.into_inner().unwrap();
+   376|     let iterator = rewrite_paths(
+   377|         result_map,
+   378|         path_mapping,
+   379|         source_root.as_deref(),
+   380|         prefix_dir.as_deref(),
+   381|         opt.ignore_not_existing,
+   382|         &opt.ignore_dir,
+   383|         &opt.keep_dir,
+   384|         filter_option,
+   385|         file_filter,
+   386|     );
+   387|     let service_number = opt.service_number.unwrap_or_default();
+   388|     let service_pull_request = opt.service_pull_request.unwrap_or_default();
+   389|     let commit_sha = opt.commit_sha.unwrap_or_default();
+   390|     let output_types = opt.output_types;
+   391|     let output_path = match output_types.len() {
+   392|         0 => unreachable!("Output types has a default value"),
+   393|         1 => opt.output_path.as_deref(),
+   394|         _ => match opt.output_path.as_deref() {
+   395|             Some(output_path) => {
+   396|                 if output_path.is_dir() {
+   397|                     Some(output_path)
+   398|                 } else {
+   399|                     panic!("output_path must be a directory when using multiple outputs");
+   400|                 }
+   401|             }
+   402|             _ => None,
+   403|         },
+   404|     };
+   405|     for output_type in &output_types {
+   406|         let output_path = output_type.to_file_name(output_path);
+   407|         match output_type {
+   408|             OutputType::Ade => output_activedata_etl(&iterator, output_path.as_deref(), demangle),
+   409|             OutputType::Lcov => output_lcov(&iterator, output_path.as_deref(), demangle),
+   410|             OutputType::Coveralls => output_coveralls(
+   411|                 &iterator,
+   412|                 opt.token.as_deref(),
+   413|                 opt.service_name.as_deref(),
+   414|                 &service_number,
+   415|                 opt.service_job_id.as_deref(),
+   416|                 &service_pull_request,
+   417|                 opt.service_flag_name.as_deref(),
+   418|                 &commit_sha,
+   419|                 false,
+   420|                 output_path.as_deref(),
+   421|                 &opt.vcs_branch,
+   422|                 opt.parallel,
+   423|                 demangle,
+   424|             ),
+   425|             OutputType::CoverallsPlus => output_coveralls(
+   426|                 &iterator,
+   427|                 opt.token.as_deref(),
+   428|                 opt.service_name.as_deref(),
+   429|                 &service_number,
+   430|                 opt.service_job_id.as_deref(),
+   431|                 &service_pull_request,
+   432|                 opt.service_flag_name.as_deref(),
+   433|                 &commit_sha,
+   434|                 true,
+   435|                 output_path.as_deref(),
+   436|                 &opt.vcs_branch,
+   437|                 opt.parallel,
+   438|                 demangle,
+   439|             ),
+   440|             OutputType::Files => output_files(&iterator, output_path.as_deref()),
+   441|             OutputType::Covdir => output_covdir(&iterator, output_path.as_deref(), opt.precision),
+   442|             OutputType::Html => output_html(
+   443|                 &iterator,
+   444|                 output_path.as_deref(),
+   445|                 num_threads,
+   446|                 opt.branch,
+   447|                 opt.output_config_file.as_deref(),
+   448|                 opt.precision,
+   449|             ),
+   450|             OutputType::Cobertura => output_cobertura(
+   451|                 source_root.as_deref(),
+   452|                 &iterator,
+   453|                 output_path.as_deref(),
+   454|                 demangle,
+   455|             ),
+   456|             OutputType::Markdown => {
+   457|                 output_markdown(&iterator, output_path.as_deref(), opt.precision)
+   458|             }
+   459|         };
+   460|     }
+   461| }
+   462| #[cfg(test)]
+   463| mod tests {
+   464|     use super::*;
+   465|     use clap::CommandFactory;
+   466|     #[test]
+   467|     fn clap_debug_assert() {
+   468|         Opt::command().debug_assert();
+   469|     }
+   470| }
+
+
+# ====================================================================
+# FILE: src/parser.rs
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 481-521 ---
+   481|     if !cur_lines.is_empty() {
+   482|         results.push((
+   483|             cur_file.unwrap(),
+   484|             CovResult {
+   485|                 lines: cur_lines,
+   486|                 branches: cur_branches,
+   487|                 functions: cur_functions,
+   488|             },
+   489|         ));
+   490|     }
+   491|     Ok(results)
+   492| }
+   493| fn get_xml_attribute<R: BufRead>(
+   494|     reader: &Reader<R>,
+   495|     event: &BytesStart<'_>,
+   496|     name: &str,
+   497| ) -> Result<String, ParserError> {
+   498|     for a in event.attributes() {
+   499|         let a = a?;
+   500|         if a.key.into_inner() == name.as_bytes() {
+   501|             return Ok(a.decode_and_unescape_value(reader)?.into_owned());
+   502|         }
+   503|     }
+   504|     Err(ParserError::InvalidRecord(format!(
+   505|         "Attribute {} not found",
+   506|         name
+   507|     )))
+   508| }
+   509| fn parse_jacoco_report_sourcefile<T: BufRead>(
+   510|     parser: &mut Reader<T>,
+   511|     buf: &mut Vec<u8>,
+   512| ) -> Result<JacocoReport, ParserError> {
+   513|     let mut lines: BTreeMap<u32, u64> = BTreeMap::new();
+   514|     let mut branches: BTreeMap<u32, Vec<bool>> = BTreeMap::new();
+   515|     loop {
+   516|         match parser.read_event_into(buf) {
+   517|             Ok(Event::Start(ref e)) if e.local_name().into_inner() == b"line" => {
+   518|                 let (mut ci, mut cb, mut mb, mut nr) = (None, None, None, None);
+   519|                 for a in e.attributes() {
+   520|                     let a = a?;
+   521|                     match a.key.into_inner() {
+
+# --- HUNK 2: Lines 667-707 ---
+   667|                 package, class
+   668|             )));
+   669|         }
+   670|     }
+   671|     Ok(results_map
+   672|         .into_iter()
+   673|         .map(|(class, result)| {
+   674|             (
+   675|                 format!("{}/{}.java", package, class)
+   676|                     .trim_start_matches('/')
+   677|                     .to_string(),
+   678|                 result,
+   679|             )
+   680|         })
+   681|         .collect())
+   682| }
+   683| pub fn parse_jacoco_xml_report<T: Read>(
+   684|     xml_reader: BufReader<T>,
+   685| ) -> Result<Vec<(String, CovResult)>, ParserError> {
+   686|     let mut parser = Reader::from_reader(xml_reader);
+   687|     parser.expand_empty_elements(true).trim_text(false);
+   688|     let mut results = Vec::new();
+   689|     let mut buf = Vec::new();
+   690|     loop {
+   691|         match parser.read_event_into(&mut buf) {
+   692|             Ok(Event::Start(ref e)) if e.local_name().into_inner() == b"package" => {
+   693|                 let package = get_xml_attribute(&parser, e, "name")?;
+   694|                 let mut package_results =
+   695|                     parse_jacoco_report_package(&mut parser, &mut buf, &package)?;
+   696|                 results.append(&mut package_results);
+   697|             }
+   698|             Ok(Event::Eof) => break,
+   699|             Err(e) => return Err(ParserError::Parse(e.to_string())),
+   700|             _ => {}
+   701|         }
+   702|         buf.clear();
+   703|     }
+   704|     Ok(results)
+   705| }
+   706| #[cfg(test)]
+   707| mod tests {
+
+
+# ====================================================================
+# FILE: src/reader.rs
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 852-892 ---
+   852|                         btree_map::Entry::Occupied(c) => {
+   853|                             let v = c.into_mut();
+   854|                             v.extend_from_slice(&taken);
+   855|                         }
+   856|                         btree_map::Entry::Vacant(p) => {
+   857|                             p.insert(taken);
+   858|                         }
+   859|                     }
+   860|                 }
+   861|             }
+   862|         }
+   863|         let mut r = Vec::with_capacity(results.len());
+   864|         for (k, v) in results.drain() {
+   865|             r.push((k.to_string(), v));
+   866|         }
+   867|         r
+   868|     }
+   869| }
+   870| impl GcovFunction {
+   871|     fn get_cycle_count(edges: &mut [GcovEdge], path: &[usize]) -> u64 {
+   872|         let mut count = std::u64::MAX;
+   873|         for e in path.iter() {
+   874|             count = cmp::min(count, edges[*e].cycles);
+   875|         }
+   876|         for e in path {
+   877|             edges[*e].cycles -= count;
+   878|         }
+   879|         count
+   880|     }
+   881|     fn unblock(
+   882|         block: usize,
+   883|         blocked: &mut SmallVec<[usize; 4]>,
+   884|         block_lists: &mut SmallVec<[SmallVec<[usize; 2]>; 2]>,
+   885|     ) {
+   886|         if let Some(i) = blocked.iter().position(|x| *x == block) {
+   887|             blocked.remove(i);
+   888|             for b in block_lists.remove(i) {
+   889|                 GcovFunction::unblock(b, blocked, block_lists);
+   890|             }
+   891|         }
+   892|     }
+

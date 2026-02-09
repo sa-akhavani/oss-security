@@ -1,0 +1,3105 @@
+--- a//dev/null
++++ b/build/args.js
+@@ -0,0 +1,10 @@
++var yargs = require('yargs');
++var argv = yargs.argv,
++    validBumpTypes = "major|minor|patch|prerelease".split("|"),
++    bump = (argv.bump || 'patch').toLowerCase();
++if(validBumpTypes.indexOf(bump) === -1) {
++  throw new Error('Unrecognized bump "' + bump + '".');
++}
++module.exports = {
++  bump: bump
++};
+
+--- a//dev/null
++++ b/build/babel-options.js
+@@ -0,0 +1,59 @@
++var path = require('path');
++var paths = require('./paths');
++exports.base = function() {
++  var config = {
++    filename: '',
++    filenameRelative: '',
++    sourceMap: true,
++    sourceRoot: '',
++    moduleRoot: path.resolve('src').replace(/\\/g, '/'),
++    moduleIds: false,
++    comments: false,
++    compact: false,
++    code: true,
++    presets: [ 'es2015-loose', 'stage-1' ],
++    plugins: [
++      'syntax-flow',
++      'transform-decorators-legacy',
++    ]
++  };
++  if (!paths.useTypeScriptForDTS) {
++    config.plugins.push(
++      ['babel-dts-generator', {
++          packageName: paths.packageName,
++          typings: '',
++          suppressModulePath: true,
++          suppressComments: false,
++          memberOutputFilter: /^_.*/,
++          suppressAmbientDeclaration: true
++      }]
++    );
++  };
++  config.plugins.push('transform-flow-strip-types');
++  return config;
++}
++exports.commonjs = function() {
++  var options = exports.base();
++  options.plugins.push('transform-es2015-modules-commonjs');
++  return options;
++};
++exports.amd = function() {
++  var options = exports.base();
++  options.plugins.push('transform-es2015-modules-amd');
++  return options;
++};
++exports.system = function() {
++  var options = exports.base();
++  options.plugins.push('transform-es2015-modules-systemjs');
++  return options;
++};
++exports.es2015 = function() {
++  var options = exports.base();
++  options.presets = ['stage-1']
++  return options;
++};
++exports['native-modules'] = function() {
++  var options = exports.base();
++  options.presets[0] = 'es2015-loose-native-modules';
++  return options;
++}
+
+--- a//dev/null
++++ b/build/paths.js
+@@ -0,0 +1,27 @@
++var path = require('path');
++var fs = require('fs');
++var emitter = require('events');
++emitter.defaultMaxListeners = 20;
++var appRoot = 'src/';
++var pkg = JSON.parse(fs.readFileSync('./package.json', 'utf-8'));
++var paths = {
++  root: appRoot,
++  source: appRoot + '**/*.js',
++  html: appRoot + '**/*.html',
++  style: 'styles/**/*.css',
++  output: 'dist/',
++  doc:'./doc',
++  e2eSpecsSrc: 'test/e2e/src/*.js',
++  e2eSpecsDist: 'test/e2e/dist/',
++  packageName: pkg.name,
++  ignore: [],
++  useTypeScriptForDTS: false,
++  importsToAdd: [],
++  sort: false
++};
++paths.files = [
++  'index.js'
++].map(function(file){
++  return paths.root + file;
++});
++module.exports = paths;
+
+--- a//dev/null
++++ b/build/tasks/build.js
+@@ -0,0 +1,115 @@
++var gulp = require('gulp');
++var runSequence = require('run-sequence');
++var to5 = require('gulp-babel');
++var paths = require('../paths');
++var compilerOptions = require('../babel-options');
++var compilerTsOptions = require('../typescript-options');
++var assign = Object.assign || require('object.assign');
++var through2 = require('through2');
++var concat = require('gulp-concat');
++var insert = require('gulp-insert');
++var rename = require('gulp-rename');
++var tools = require('aurelia-tools');
++var ts = require('gulp-typescript');
++var gutil = require('gulp-util');
++var gulpIgnore = require('gulp-ignore');
++var merge = require('merge2');
++var jsName = paths.packageName + '.js';
++var compileToModules = ['es2015', 'commonjs', 'amd', 'system', 'native-modules'];
++function cleanGeneratedCode() {
++  return through2.obj(function(file, enc, callback) {
++    file.contents = new Buffer(tools.cleanGeneratedCode(file.contents.toString('utf8')));
++    this.push(file);
++    return callback();
++  });
++}
++gulp.task('build-index', function() {
++  var importsToAdd = paths.importsToAdd.slice();
++  var src = gulp.src(paths.files);
++  if (paths.sort) {
++    src = src.pipe(tools.sortFiles());
++  }
++  if (paths.ignore) {
++    paths.ignore.forEach(function(filename){
++      src = src.pipe(gulpIgnore.exclude(filename));
++    });
++  }
++  return src.pipe(through2.obj(function(file, enc, callback) {
++      file.contents = new Buffer(tools.extractImports(file.contents.toString('utf8'), importsToAdd));
++      this.push(file);
++      return callback();
++    }))
++    .pipe(concat(jsName))
++    .pipe(insert.transform(function(contents) {
++      return tools.createImportBlock(importsToAdd) + contents;
++    }))
++    .pipe(gulp.dest(paths.output));
++});
++function gulpFileFromString(filename, string) {
++  var src = require('stream').Readable({ objectMode: true });
++  src._read = function() {
++    this.push(new gutil.File({ cwd: paths.appRoot, base: paths.output, path: filename, contents: new Buffer(string) }))
++    this.push(null)
++  }
++  return src;
++}
++function srcForBabel() {
++  return merge(
++    gulp.src(paths.output + jsName),
++    gulpFileFromString(paths.output + 'index.js', "export * from './" + paths.packageName + "';")
++  );
++}
++function srcForTypeScript() {
++  return gulp
++    .src(paths.output + paths.packageName + '.js')
++    .pipe(rename(function (path) {
++      if (path.extname == '.js') {
++        path.extname = '.ts';
++      }
++    }));
++}
++compileToModules.forEach(function(moduleType){
++  gulp.task('build-babel-' + moduleType, function () {
++    return srcForBabel()
++      .pipe(to5(assign({}, compilerOptions[moduleType]())))
++      .pipe(cleanGeneratedCode())
++      .pipe(gulp.dest(paths.output + moduleType));
++  });
++  if (moduleType === 'native-modules') return; // typescript doesn't support the combination of: es5 + native modules
++  gulp.task('build-ts-' + moduleType, function () {
++    var tsProject = ts.createProject(
++      compilerTsOptions({ module: moduleType, target: moduleType == 'es2015' ? 'es2015' : 'es5' }), ts.reporter.defaultReporter());
++    var tsResult = srcForTypeScript().pipe(ts(tsProject));
++    return tsResult.js
++      .pipe(gulp.dest(paths.output + moduleType));
++  });
++});
++gulp.task('build-dts', function() {
++  var tsProject = ts.createProject(
++    compilerTsOptions({ removeComments: false, target: "es2015", module: "es2015" }), ts.reporter.defaultReporter());
++  var tsResult = srcForTypeScript().pipe(ts(tsProject));
++  return tsResult.dts
++    .pipe(gulp.dest(paths.output));
++});
++gulp.task('build', function(callback) {
++  return runSequence(
++    'clean',
++    'build-index',
++    compileToModules
++      .map(function(moduleType) { return 'build-babel-' + moduleType })
++      .concat(paths.useTypeScriptForDTS ? ['build-dts'] : []),
++    callback
++  );
++});
++gulp.task('build-ts', function(callback) {
++  return runSequence(
++    'clean',
++    'build-index',
++    'build-babel-native-modules',
++    compileToModules
++      .filter(function(moduleType) { return moduleType !== 'native-modules' })
++      .map(function(moduleType) { return 'build-ts-' + moduleType })
++      .concat(paths.useTypeScriptForDTS ? ['build-dts'] : []),
++    callback
++  );
++});
+
+--- a//dev/null
++++ b/build/tasks/clean.js
+@@ -0,0 +1,8 @@
++var gulp = require('gulp');
++var paths = require('../paths');
++var del = require('del');
++var vinylPaths = require('vinyl-paths');
++gulp.task('clean', function() {
++  return gulp.src([paths.output])
++    .pipe(vinylPaths(del));
++});
+
+--- a//dev/null
++++ b/build/tasks/dev.js
+@@ -0,0 +1,8 @@
++var gulp = require('gulp');
++var tools = require('aurelia-tools');
++gulp.task('update-own-deps', function(){
++  tools.updateOwnDependenciesFromLocalRepositories();
++});
++gulp.task('build-dev-env', function () {
++  tools.buildDevEnv();
++});
+
+--- a//dev/null
++++ b/build/tasks/doc.js
+@@ -0,0 +1,41 @@
++var gulp = require('gulp');
++var paths = require('../paths');
++var typedoc = require('gulp-typedoc');
++var runSequence = require('run-sequence');
++var through2 = require('through2');
++gulp.task('doc-generate', function(){
++  return gulp.src([paths.output + paths.packageName + '.d.ts'])
++    .pipe(typedoc({
++      target: 'es6',
++      includeDeclarations: true,
++      moduleResolution: 'node',
++      json: paths.doc + '/api.json',
++      name: paths.packageName + '-docs', 
++      mode: 'modules',
++      excludeExternals: true,
++      ignoreCompilerErrors: false,
++      version: true
++    }));
++});
++gulp.task('doc-shape', function(){
++  return gulp.src([paths.doc + '/api.json'])
++    .pipe(through2.obj(function(file, enc, callback) {
++      var json = JSON.parse(file.contents.toString('utf8')).children[0];
++      json = {
++        name: paths.packageName,
++        children: json.children,
++        groups: json.groups
++      };
++      file.contents = new Buffer(JSON.stringify(json));
++      this.push(file);
++      return callback();
++    }))
++    .pipe(gulp.dest(paths.doc));
++});
++gulp.task('doc', function(callback){
++  return runSequence(
++    'doc-generate',
++    'doc-shape',
++    callback
++  );
++});
+
+--- a//dev/null
++++ b/build/tasks/lint.js
+@@ -0,0 +1,9 @@
++var gulp = require('gulp');
++var paths = require('../paths');
++var eslint = require('gulp-eslint');
++gulp.task('lint', function() {
++  return gulp.src(paths.source)
++    .pipe(eslint())
++    .pipe(eslint.format())
++    .pipe(eslint.failOnError());
++});
+
+--- a//dev/null
++++ b/build/tasks/prepare-release.js
+@@ -0,0 +1,30 @@
++var gulp = require('gulp');
++var runSequence = require('run-sequence');
++var paths = require('../paths');
++var fs = require('fs');
++var bump = require('gulp-bump');
++var args = require('../args');
++var conventionalChangelog = require('gulp-conventional-changelog');
++gulp.task('changelog', function () {
++  return gulp.src(paths.doc + '/CHANGELOG.md', {
++    buffer: false
++  }).pipe(conventionalChangelog({
++    preset: 'angular'
++  }))
++  .pipe(gulp.dest(paths.doc));
++});
++gulp.task('bump-version', function(){
++  return gulp.src(['./package.json', './bower.json'])
++    .pipe(bump({type:args.bump })) //major|minor|patch|prerelease
++    .pipe(gulp.dest('./'));
++});
++gulp.task('prepare-release', function(callback){
++  return runSequence(
++    'build',
++    'lint',
++    'bump-version',
++    'doc',
++    'changelog',
++    callback
++  );
++});
+
+--- a//dev/null
++++ b/build/typescript-options.js
+@@ -0,0 +1,8 @@
++var tsconfig = require('../tsconfig.json');
++var assign = Object.assign || require('object.assign');
++module.exports = function(override) {
++  return assign(tsconfig.compilerOptions, {
++    "target": override && override.target || "es5",
++    "typescript": require('typescript')
++  }, override || {});
++}
+
+--- a//dev/null
++++ b/config.js
+@@ -0,0 +1,80 @@
++System.config({
++  defaultJSExtensions: true,
++  transpiler: "babel",
++  babelOptions: {
++    "optional": [
++      "runtime",
++      "optimisation.modules.system"
++    ]
++  },
++  paths: {
++    "github:*": "jspm_packages/github/*",
++    "npm:*": "jspm_packages/npm/*"
++  },
++  map: {
++    "babel": "npm:babel-core@5.8.38",
++    "babel-runtime": "npm:babel-runtime@5.8.38",
++    "core-js": "npm:core-js@2.4.0",
++    "traceur": "github:jmcriffey/bower-traceur@0.0.91",
++    "traceur-runtime": "github:jmcriffey/bower-traceur-runtime@0.0.91",
++    "github:jspm/nodelibs-assert@0.1.0": {
++      "assert": "npm:assert@1.4.1"
++    },
++    "github:jspm/nodelibs-buffer@0.1.0": {
++      "buffer": "npm:buffer@3.6.0"
++    },
++    "github:jspm/nodelibs-path@0.1.0": {
++      "path-browserify": "npm:path-browserify@0.0.0"
++    },
++    "github:jspm/nodelibs-process@0.1.2": {
++      "process": "npm:process@0.11.5"
++    },
++    "github:jspm/nodelibs-util@0.1.0": {
++      "util": "npm:util@0.10.3"
++    },
++    "github:jspm/nodelibs-vm@0.1.0": {
++      "vm-browserify": "npm:vm-browserify@0.0.4"
++    },
++    "npm:assert@1.4.1": {
++      "assert": "github:jspm/nodelibs-assert@0.1.0",
++      "buffer": "github:jspm/nodelibs-buffer@0.1.0",
++      "process": "github:jspm/nodelibs-process@0.1.2",
++      "util": "npm:util@0.10.3"
++    },
++    "npm:babel-runtime@5.8.38": {
++      "process": "github:jspm/nodelibs-process@0.1.2"
++    },
++    "npm:buffer@3.6.0": {
++      "base64-js": "npm:base64-js@0.0.8",
++      "child_process": "github:jspm/nodelibs-child_process@0.1.0",
++      "fs": "github:jspm/nodelibs-fs@0.1.2",
++      "ieee754": "npm:ieee754@1.1.6",
++      "isarray": "npm:isarray@1.0.0",
++      "process": "github:jspm/nodelibs-process@0.1.2"
++    },
++    "npm:core-js@2.4.0": {
++      "fs": "github:jspm/nodelibs-fs@0.1.2",
++      "path": "github:jspm/nodelibs-path@0.1.0",
++      "process": "github:jspm/nodelibs-process@0.1.2",
++      "systemjs-json": "github:systemjs/plugin-json@0.1.2"
++    },
++    "npm:inherits@2.0.1": {
++      "util": "github:jspm/nodelibs-util@0.1.0"
++    },
++    "npm:path-browserify@0.0.0": {
++      "process": "github:jspm/nodelibs-process@0.1.2"
++    },
++    "npm:process@0.11.5": {
++      "assert": "github:jspm/nodelibs-assert@0.1.0",
++      "fs": "github:jspm/nodelibs-fs@0.1.2",
++      "vm": "github:jspm/nodelibs-vm@0.1.0"
++    },
++    "npm:util@0.10.3": {
++      "inherits": "npm:inherits@2.0.1",
++      "process": "github:jspm/nodelibs-process@0.1.2"
++    },
++    "npm:vm-browserify@0.0.4": {
++      "indexof": "npm:indexof@0.0.1"
++    }
++  }
++});
+
+--- a/dist/amd/aurelia-path.js
++++ b/dist/amd/aurelia-path.js
+@@ -1,208 +1,193 @@
+-define(['exports'], function (exports) { 'use strict';
+-    function trimDots(ary) {
+-        for (var i = 0; i < ary.length; ++i) {
+-            var part = ary[i];
+-            if (part === '.') {
+-                ary.splice(i, 1);
+-                i -= 1;
+-            }
+-            else if (part === '..') {
+-                if (i === 0 || (i === 1 && ary[2] === '..') || ary[i - 1] === '..') {
+-                    continue;
+-                }
+-                else if (i > 0) {
+-                    ary.splice(i - 1, 2);
+-                    i -= 2;
+-                }
+-            }
++define(['exports'], function (exports) {
++  'use strict';
++  Object.defineProperty(exports, "__esModule", {
++    value: true
++  });
++  exports.relativeToFile = relativeToFile;
++  exports.join = join;
++  exports.buildQueryString = buildQueryString;
++  exports.parseQueryString = parseQueryString;
++  var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) {
++    return typeof obj;
++  } : function (obj) {
++    return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj;
++  };
++  function trimDots(ary) {
++    for (var i = 0; i < ary.length; ++i) {
++      var part = ary[i];
++      if (part === '.') {
++        ary.splice(i, 1);
++        i -= 1;
++      } else if (part === '..') {
++        if (i === 0 || i === 1 && ary[2] === '..' || ary[i - 1] === '..') {
++          continue;
++        } else if (i > 0) {
++          ary.splice(i - 1, 2);
++          i -= 2;
+         }
++      }
+     }
+-    function relativeToFile(name, file) {
+-        var fileParts = file && file.split('/');
+-        var nameParts = name.trim().split('/');
+-        if (nameParts[0].charAt(0) === '.' && fileParts) {
+-            var normalizedBaseParts = fileParts.slice(0, fileParts.length - 1);
+-            nameParts.unshift.apply(nameParts, normalizedBaseParts);
++  }
++  function relativeToFile(name, file) {
++    var fileParts = file && file.split('/');
++    var nameParts = name.trim().split('/');
++    if (nameParts[0].charAt(0) === '.' && fileParts) {
++      var normalizedBaseParts = fileParts.slice(0, fileParts.length - 1);
++      nameParts.unshift.apply(nameParts, normalizedBaseParts);
++    }
++    trimDots(nameParts);
++    return nameParts.join('/');
++  }
++  function join(path1, path2) {
++    if (!path1) {
++      return path2;
++    }
++    if (!path2) {
++      return path1;
++    }
++    var schemeMatch = path1.match(/^([^/]*?:)\//);
++    var scheme = schemeMatch && schemeMatch.length > 0 ? schemeMatch[1] : '';
++    path1 = path1.substr(scheme.length);
++    var urlPrefix = void 0;
++    if (path1.indexOf('///') === 0 && scheme === 'file:') {
++      urlPrefix = '///';
++    } else if (path1.indexOf('//') === 0) {
++      urlPrefix = '//';
++    } else if (path1.indexOf('/') === 0) {
++      urlPrefix = '/';
++    } else {
++      urlPrefix = '';
++    }
++    var trailingSlash = path2.slice(-1) === '/' ? '/' : '';
++    var url1 = path1.split('/');
++    var url2 = path2.split('/');
++    var url3 = [];
++    for (var i = 0, ii = url1.length; i < ii; ++i) {
++      if (url1[i] === '..') {
++        if (url3.length && url3[url3.length - 1] !== '..') {
++          url3.pop();
++        } else {
++          url3.push(url1[i]);
+         }
+-        trimDots(nameParts);
+-        return nameParts.join('/');
++      } else if (url1[i] === '.' || url1[i] === '') {
++        continue;
++      } else {
++        url3.push(url1[i]);
++      }
+     }
+-    function join(path1, path2) {
+-        if (!path1) {
+-            return path2;
++    for (var _i = 0, _ii = url2.length; _i < _ii; ++_i) {
++      if (url2[_i] === '..') {
++        if (url3.length && url3[url3.length - 1] !== '..') {
++          url3.pop();
++        } else {
++          url3.push(url2[_i]);
+         }
+-        if (!path2) {
+-            return path1;
++      } else if (url2[_i] === '.' || url2[_i] === '') {
++        continue;
++      } else {
++        url3.push(url2[_i]);
++      }
++    }
++    return scheme + urlPrefix + url3.join('/') + trailingSlash;
++  }
++  var encode = encodeURIComponent;
++  var encodeKey = function encodeKey(k) {
++    return encode(k).replace('%24', '$');
++  };
++  function buildParam(key, value, traditional) {
++    var result = [];
++    if (value === null || value === undefined) {
++      return result;
++    }
++    if (Array.isArray(value)) {
++      for (var i = 0, l = value.length; i < l; i++) {
++        if (traditional) {
++          result.push(encodeKey(key) + '=' + encode(value[i]));
++        } else {
++          var arrayKey = key + '[' + (_typeof(value[i]) === 'object' && value[i] !== null ? i : '') + ']';
++          result = result.concat(buildParam(arrayKey, value[i]));
+         }
+-        var schemeMatch = path1.match(/^([^/]*?:)\//);
+-        var scheme = (schemeMatch && schemeMatch.length > 0) ? schemeMatch[1] : '';
+-        path1 = path1.substr(scheme.length);
+-        var urlPrefix;
+-        if (path1.indexOf('///') === 0 && scheme === 'file:') {
+-            urlPrefix = '///';
++      }
++    } else if ((typeof value === 'undefined' ? 'undefined' : _typeof(value)) === 'object' && !traditional) {
++      for (var propertyName in value) {
++        result = result.concat(buildParam(key + '[' + propertyName + ']', value[propertyName]));
++      }
++    } else {
++      result.push(encodeKey(key) + '=' + encode(value));
++    }
++    return result;
++  }
++  function buildQueryString(params, traditional) {
++    var pairs = [];
++    var keys = Object.keys(params || {}).sort();
++    for (var i = 0, len = keys.length; i < len; i++) {
++      var key = keys[i];
++      pairs = pairs.concat(buildParam(key, params[key], traditional));
++    }
++    if (pairs.length === 0) {
++      return '';
++    }
++    return pairs.join('&');
++  }
++  function processScalarParam(existedParam, value) {
++    if (Array.isArray(existedParam)) {
++      existedParam.push(value);
++      return existedParam;
++    }
++    if (existedParam !== undefined) {
++      return [existedParam, value];
++    }
++    return value;
++  }
++  function parseComplexParam(queryParams, keys, value) {
++    var currentParams = queryParams;
++    var keysLastIndex = keys.length - 1;
++    for (var j = 0; j <= keysLastIndex; j++) {
++      var key = keys[j] === '' ? currentParams.length : keys[j];
++      if (j < keysLastIndex) {
++        var prevValue = !currentParams[key] || _typeof(currentParams[key]) === 'object' ? currentParams[key] : [currentParams[key]];
++        currentParams = currentParams[key] = prevValue || (isNaN(keys[j + 1]) ? {} : []);
++      } else {
++        currentParams = currentParams[key] = value;
++      }
++    }
++  }
++  function parseQueryString(queryString) {
++    var queryParams = {};
++    if (!queryString || typeof queryString !== 'string') {
++      return queryParams;
++    }
++    var query = queryString;
++    if (query.charAt(0) === '?') {
++      query = query.substr(1);
++    }
++    var pairs = query.replace(/\+/g, ' ').split('&');
++    for (var i = 0; i < pairs.length; i++) {
++      var pair = pairs[i].split('=');
++      var key = decodeURIComponent(pair[0]);
++      if (!key) {
++        continue;
++      }
++      var keys = key.split('][');
++      var keysLastIndex = keys.length - 1;
++      if (/\[/.test(keys[0]) && /\]$/.test(keys[keysLastIndex])) {
++        keys[keysLastIndex] = keys[keysLastIndex].replace(/\]$/, '');
++        keys = keys.shift().split('[').concat(keys);
++        keysLastIndex = keys.length - 1;
++      } else {
++        keysLastIndex = 0;
++      }
++      if (pair.length >= 2) {
++        var value = pair[1] ? decodeURIComponent(pair[1]) : '';
++        if (keysLastIndex) {
++          parseComplexParam(queryParams, keys, value);
++        } else {
++          queryParams[key] = processScalarParam(queryParams[key], value);
+         }
+-        else if (path1.indexOf('//') === 0) {
+-            urlPrefix = '//';
+-        }
+-        else if (path1.indexOf('/') === 0) {
+-            urlPrefix = '/';
+-        }
+-        else {
+-            urlPrefix = '';
+-        }
+-        var trailingSlash = path2.slice(-1) === '/' ? '/' : '';
+-        var url1 = path1.split('/');
+-        var url2 = path2.split('/');
+-        var url3 = [];
+-        for (var i = 0, ii = url1.length; i < ii; ++i) {
+-            if (url1[i] === '..') {
+-                if (url3.length && url3[url3.length - 1] !== '..') {
+-                    url3.pop();
+-                }
+-                else {
+-                    url3.push(url1[i]);
+-                }
+-            }
+-            else if (url1[i] === '.' || url1[i] === '') {
+-                continue;
+-            }
+-            else {
+-                url3.push(url1[i]);
+-            }
+-        }
+-        for (var i = 0, ii = url2.length; i < ii; ++i) {
+-            if (url2[i] === '..') {
+-                if (url3.length && url3[url3.length - 1] !== '..') {
+-                    url3.pop();
+-                }
+-                else {
+-                    url3.push(url2[i]);
+-                }
+-            }
+-            else if (url2[i] === '.' || url2[i] === '') {
+-                continue;
+-            }
+-            else {
+-                url3.push(url2[i]);
+-            }
+-        }
+-        return scheme + urlPrefix + url3.join('/') + trailingSlash;
++      } else {
++        queryParams[key] = true;
++      }
+     }
+-    var encode = encodeURIComponent;
+-    var encodeKey = function (k) { return encode(k).replace('%24', '$'); };
+-    function buildParam(key, value, traditional) {
+-        var result = [];
+-        if (value === null || value === undefined) {
+-            return result;
+-        }
+-        if (Array.isArray(value)) {
+-            for (var i = 0, l = value.length; i < l; i++) {
+-                if (traditional) {
+-                    result.push(encodeKey(key) + "=" + encode(value[i]));
+-                }
+-                else {
+-                    var arrayKey = key + '[' + (typeof value[i] === 'object' && value[i] !== null ? i : '') + ']';
+-                    result = result.concat(buildParam(arrayKey, value[i]));
+-                }
+-            }
+-        }
+-        else if (typeof (value) === 'object' && !traditional) {
+-            for (var propertyName in value) {
+-                result = result.concat(buildParam(key + '[' + propertyName + ']', value[propertyName]));
+-            }
+-        }
+-        else {
+-            result.push(encodeKey(key) + "=" + encode(value));
+-        }
+-        return result;
+-    }
+-    function buildQueryString(params, traditional) {
+-        var pairs = [];
+-        var keys = Object.keys(params || {}).sort();
+-        for (var i = 0, len = keys.length; i < len; i++) {
+-            var key = keys[i];
+-            pairs = pairs.concat(buildParam(key, params[key], traditional));
+-        }
+-        if (pairs.length === 0) {
+-            return '';
+-        }
+-        return pairs.join('&');
+-    }
+-    function processScalarParam(existedParam, value) {
+-        if (Array.isArray(existedParam)) {
+-            existedParam.push(value);
+-            return existedParam;
+-        }
+-        if (existedParam !== undefined) {
+-            return [existedParam, value];
+-        }
+-        return value;
+-    }
+-    function parseComplexParam(queryParams, keys, value) {
+-        var currentParams = queryParams;
+-        var keysLastIndex = keys.length - 1;
+-        for (var j = 0; j <= keysLastIndex; j++) {
+-            var key = keys[j] === '' ? currentParams.length : keys[j];
+-            preventPollution(key);
+-            if (j < keysLastIndex) {
+-                var prevValue = !currentParams[key] || typeof currentParams[key] === 'object' ? currentParams[key] : [currentParams[key]];
+-                currentParams = currentParams[key] = prevValue || (isNaN(keys[j + 1]) ? {} : []);
+-            }
+-            else {
+-                currentParams = currentParams[key] = value;
+-            }
+-        }
+-    }
+-    function parseQueryString(queryString) {
+-        var queryParams = {};
+-        if (!queryString || typeof queryString !== 'string') {
+-            return queryParams;
+-        }
+-        var query = queryString;
+-        if (query.charAt(0) === '?') {
+-            query = query.substr(1);
+-        }
+-        var pairs = query.replace(/\+/g, ' ').split('&');
+-        for (var i = 0; i < pairs.length; i++) {
+-            var pair = pairs[i].split('=');
+-            var key = decodeURIComponent(pair[0]);
+-            if (!key) {
+-                continue;
+-            }
+-            var keys = key.split('][');
+-            var keysLastIndex = keys.length - 1;
+-            if (/\[/.test(keys[0]) && /\]$/.test(keys[keysLastIndex])) {
+-                keys[keysLastIndex] = keys[keysLastIndex].replace(/\]$/, '');
+-                keys = keys.shift().split('[').concat(keys);
+-                keysLastIndex = keys.length - 1;
+-            }
+-            else {
+-                keysLastIndex = 0;
+-            }
+-            if (pair.length >= 2) {
+-                var value = pair[1] ? decodeURIComponent(pair[1]) : '';
+-                if (keysLastIndex) {
+-                    parseComplexParam(queryParams, keys, value);
+-                }
+-                else {
+-                    preventPollution(key);
+-                    queryParams[key] = processScalarParam(queryParams[key], value);
+-                }
+-            }
+-            else {
+-                queryParams[key] = true;
+-            }
+-        }
+-        return queryParams;
+-    }
+-    function preventPollution(key) {
+-        if (key === '__proto__') {
+-            throw new Error('Prototype pollution detected.');
+-        }
+-    }
+-    exports.buildQueryString = buildQueryString;
+-    exports.join = join;
+-    exports.parseQueryString = parseQueryString;
+-    exports.relativeToFile = relativeToFile;
+-    Object.defineProperty(exports, '__esModule', { value: true });
++    return queryParams;
++  }
+ });
+
+--- a//dev/null
++++ b/dist/amd/index.js
+@@ -0,0 +1,15 @@
++define(['exports', './aurelia-path'], function (exports, _aureliaPath) {
++  'use strict';
++  Object.defineProperty(exports, "__esModule", {
++    value: true
++  });
++  Object.keys(_aureliaPath).forEach(function (key) {
++    if (key === "default" || key === "__esModule") return;
++    Object.defineProperty(exports, key, {
++      enumerable: true,
++      get: function () {
++        return _aureliaPath[key];
++      }
++    });
++  });
++});
+
+--- a//dev/null
++++ b/dist/aurelia-path.d.ts
+@@ -0,0 +1,31 @@
++/**
++* Calculates a path relative to a file.
++*
++* @param name The relative path.
++* @param file The file path.
++* @return The calculated path.
++*/
++export declare function relativeToFile(name: string, file: string): string;
++/**
++* Joins two paths.
++*
++* @param path1 The first path.
++* @param path2 The second path.
++* @return The joined path.
++*/
++export declare function join(path1: string, path2: string): string;
++/**
++* Generate a query string from an object.
++*
++* @param params Object containing the keys and values to be used.
++* @param traditional Boolean Use the old URI template standard (RFC6570)
++* @returns The generated query string, excluding leading '?'.
++*/
++export declare function buildQueryString(params: Object, traditional?: Boolean): string;
++/**
++* Parse a query string.
++*
++* @param queryString The query string to parse.
++* @returns Object with keys and values mapped from the query string.
++*/
++export declare function parseQueryString(queryString: string): Object;
+
+--- a/dist/commonjs/aurelia-path.js
++++ b/dist/commonjs/aurelia-path.js
+@@ -1,207 +1,187 @@
+ 'use strict';
+-Object.defineProperty(exports, '__esModule', { value: true });
++Object.defineProperty(exports, "__esModule", {
++  value: true
++});
++var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) { return typeof obj; } : function (obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; };
++exports.relativeToFile = relativeToFile;
++exports.join = join;
++exports.buildQueryString = buildQueryString;
++exports.parseQueryString = parseQueryString;
+ function trimDots(ary) {
+-    for (var i = 0; i < ary.length; ++i) {
+-        var part = ary[i];
+-        if (part === '.') {
+-            ary.splice(i, 1);
+-            i -= 1;
+-        }
+-        else if (part === '..') {
+-            if (i === 0 || (i === 1 && ary[2] === '..') || ary[i - 1] === '..') {
+-                continue;
+-            }
+-            else if (i > 0) {
+-                ary.splice(i - 1, 2);
+-                i -= 2;
+-            }
+-        }
++  for (var i = 0; i < ary.length; ++i) {
++    var part = ary[i];
++    if (part === '.') {
++      ary.splice(i, 1);
++      i -= 1;
++    } else if (part === '..') {
++      if (i === 0 || i === 1 && ary[2] === '..' || ary[i - 1] === '..') {
++        continue;
++      } else if (i > 0) {
++        ary.splice(i - 1, 2);
++        i -= 2;
++      }
+     }
++  }
+ }
+ function relativeToFile(name, file) {
+-    var fileParts = file && file.split('/');
+-    var nameParts = name.trim().split('/');
+-    if (nameParts[0].charAt(0) === '.' && fileParts) {
+-        var normalizedBaseParts = fileParts.slice(0, fileParts.length - 1);
+-        nameParts.unshift.apply(nameParts, normalizedBaseParts);
+-    }
+-    trimDots(nameParts);
+-    return nameParts.join('/');
++  var fileParts = file && file.split('/');
++  var nameParts = name.trim().split('/');
++  if (nameParts[0].charAt(0) === '.' && fileParts) {
++    var normalizedBaseParts = fileParts.slice(0, fileParts.length - 1);
++    nameParts.unshift.apply(nameParts, normalizedBaseParts);
++  }
++  trimDots(nameParts);
++  return nameParts.join('/');
+ }
+ function join(path1, path2) {
+-    if (!path1) {
+-        return path2;
++  if (!path1) {
++    return path2;
++  }
++  if (!path2) {
++    return path1;
++  }
++  var schemeMatch = path1.match(/^([^/]*?:)\//);
++  var scheme = schemeMatch && schemeMatch.length > 0 ? schemeMatch[1] : '';
++  path1 = path1.substr(scheme.length);
++  var urlPrefix = void 0;
++  if (path1.indexOf('///') === 0 && scheme === 'file:') {
++    urlPrefix = '///';
++  } else if (path1.indexOf('//') === 0) {
++    urlPrefix = '//';
++  } else if (path1.indexOf('/') === 0) {
++    urlPrefix = '/';
++  } else {
++    urlPrefix = '';
++  }
++  var trailingSlash = path2.slice(-1) === '/' ? '/' : '';
++  var url1 = path1.split('/');
++  var url2 = path2.split('/');
++  var url3 = [];
++  for (var i = 0, ii = url1.length; i < ii; ++i) {
++    if (url1[i] === '..') {
++      if (url3.length && url3[url3.length - 1] !== '..') {
++        url3.pop();
++      } else {
++        url3.push(url1[i]);
++      }
++    } else if (url1[i] === '.' || url1[i] === '') {
++      continue;
++    } else {
++      url3.push(url1[i]);
+     }
+-    if (!path2) {
+-        return path1;
++  }
++  for (var _i = 0, _ii = url2.length; _i < _ii; ++_i) {
++    if (url2[_i] === '..') {
++      if (url3.length && url3[url3.length - 1] !== '..') {
++        url3.pop();
++      } else {
++        url3.push(url2[_i]);
++      }
++    } else if (url2[_i] === '.' || url2[_i] === '') {
++      continue;
++    } else {
++      url3.push(url2[_i]);
+     }
+-    var schemeMatch = path1.match(/^([^/]*?:)\//);
+-    var scheme = (schemeMatch && schemeMatch.length > 0) ? schemeMatch[1] : '';
+-    path1 = path1.substr(scheme.length);
+-    var urlPrefix;
+-    if (path1.indexOf('///') === 0 && scheme === 'file:') {
+-        urlPrefix = '///';
+-    }
+-    else if (path1.indexOf('//') === 0) {
+-        urlPrefix = '//';
+-    }
+-    else if (path1.indexOf('/') === 0) {
+-        urlPrefix = '/';
+-    }
+-    else {
+-        urlPrefix = '';
+-    }
+-    var trailingSlash = path2.slice(-1) === '/' ? '/' : '';
+-    var url1 = path1.split('/');
+-    var url2 = path2.split('/');
+-    var url3 = [];
+-    for (var i = 0, ii = url1.length; i < ii; ++i) {
+-        if (url1[i] === '..') {
+-            if (url3.length && url3[url3.length - 1] !== '..') {
+-                url3.pop();
+-            }
+-            else {
+-                url3.push(url1[i]);
+-            }
+-        }
+-        else if (url1[i] === '.' || url1[i] === '') {
+-            continue;
+-        }
+-        else {
+-            url3.push(url1[i]);
+-        }
+-    }
+-    for (var i = 0, ii = url2.length; i < ii; ++i) {
+-        if (url2[i] === '..') {
+-            if (url3.length && url3[url3.length - 1] !== '..') {
+-                url3.pop();
+-            }
+-            else {
+-                url3.push(url2[i]);
+-            }
+-        }
+-        else if (url2[i] === '.' || url2[i] === '') {
+-            continue;
+-        }
+-        else {
+-            url3.push(url2[i]);
+-        }
+-    }
+-    return scheme + urlPrefix + url3.join('/') + trailingSlash;
++  }
++  return scheme + urlPrefix + url3.join('/') + trailingSlash;
+ }
+ var encode = encodeURIComponent;
+-var encodeKey = function (k) { return encode(k).replace('%24', '$'); };
++var encodeKey = function encodeKey(k) {
++  return encode(k).replace('%24', '$');
++};
+ function buildParam(key, value, traditional) {
+-    var result = [];
+-    if (value === null || value === undefined) {
+-        return result;
++  var result = [];
++  if (value === null || value === undefined) {
++    return result;
++  }
++  if (Array.isArray(value)) {
++    for (var i = 0, l = value.length; i < l; i++) {
++      if (traditional) {
++        result.push(encodeKey(key) + '=' + encode(value[i]));
++      } else {
++        var arrayKey = key + '[' + (_typeof(value[i]) === 'object' && value[i] !== null ? i : '') + ']';
++        result = result.concat(buildParam(arrayKey, value[i]));
++      }
+     }
+-    if (Array.isArray(value)) {
+-        for (var i = 0, l = value.length; i < l; i++) {
+-            if (traditional) {
+-                result.push(encodeKey(key) + "=" + encode(value[i]));
+-            }
+-            else {
+-                var arrayKey = key + '[' + (typeof value[i] === 'object' && value[i] !== null ? i : '') + ']';
+-                result = result.concat(buildParam(arrayKey, value[i]));
+-            }
+-        }
++  } else if ((typeof value === 'undefined' ? 'undefined' : _typeof(value)) === 'object' && !traditional) {
++    for (var propertyName in value) {
++      result = result.concat(buildParam(key + '[' + propertyName + ']', value[propertyName]));
+     }
+-    else if (typeof (value) === 'object' && !traditional) {
+-        for (var propertyName in value) {
+-            result = result.concat(buildParam(key + '[' + propertyName + ']', value[propertyName]));
+-        }
+-    }
+-    else {
+-        result.push(encodeKey(key) + "=" + encode(value));
+-    }
+-    return result;
++  } else {
++    result.push(encodeKey(key) + '=' + encode(value));
++  }
++  return result;
+ }
+ function buildQueryString(params, traditional) {
+-    var pairs = [];
+-    var keys = Object.keys(params || {}).sort();
+-    for (var i = 0, len = keys.length; i < len; i++) {
+-        var key = keys[i];
+-        pairs = pairs.concat(buildParam(key, params[key], traditional));
+-    }
+-    if (pairs.length === 0) {
+-        return '';
+-    }
+-    return pairs.join('&');
++  var pairs = [];
++  var keys = Object.keys(params || {}).sort();
++  for (var i = 0, len = keys.length; i < len; i++) {
++    var key = keys[i];
++    pairs = pairs.concat(buildParam(key, params[key], traditional));
++  }
++  if (pairs.length === 0) {
++    return '';
++  }
++  return pairs.join('&');
+ }
+ function processScalarParam(existedParam, value) {
+-    if (Array.isArray(existedParam)) {
+-        existedParam.push(value);
+-        return existedParam;
+-    }
+-    if (existedParam !== undefined) {
+-        return [existedParam, value];
+-    }
+-    return value;
++  if (Array.isArray(existedParam)) {
++    existedParam.push(value);
++    return existedParam;
++  }
++  if (existedParam !== undefined) {
++    return [existedParam, value];
++  }
++  return value;
+ }
+ function parseComplexParam(queryParams, keys, value) {
+-    var currentParams = queryParams;
+-    var keysLastIndex = keys.length - 1;
+-    for (var j = 0; j <= keysLastIndex; j++) {
+-        var key = keys[j] === '' ? currentParams.length : keys[j];
+-        preventPollution(key);
+-        if (j < keysLastIndex) {
+-            var prevValue = !currentParams[key] || typeof currentParams[key] === 'object' ? currentParams[key] : [currentParams[key]];
+-            currentParams = currentParams[key] = prevValue || (isNaN(keys[j + 1]) ? {} : []);
+-        }
+-        else {
+-            currentParams = currentParams[key] = value;
+-        }
++  var currentParams = queryParams;
++  var keysLastIndex = keys.length - 1;
++  for (var j = 0; j <= keysLastIndex; j++) {
++    var key = keys[j] === '' ? currentParams.length : keys[j];
++    if (j < keysLastIndex) {
++      var prevValue = !currentParams[key] || _typeof(currentParams[key]) === 'object' ? currentParams[key] : [currentParams[key]];
++      currentParams = currentParams[key] = prevValue || (isNaN(keys[j + 1]) ? {} : []);
++    } else {
++      currentParams = currentParams[key] = value;
+     }
++  }
+ }
+ function parseQueryString(queryString) {
+-    var queryParams = {};
+-    if (!queryString || typeof queryString !== 'string') {
+-        return queryParams;
++  var queryParams = {};
++  if (!queryString || typeof queryString !== 'string') {
++    return queryParams;
++  }
++  var query = queryString;
++  if (query.charAt(0) === '?') {
++    query = query.substr(1);
++  }
++  var pairs = query.replace(/\+/g, ' ').split('&');
++  for (var i = 0; i < pairs.length; i++) {
++    var pair = pairs[i].split('=');
++    var key = decodeURIComponent(pair[0]);
++    if (!key) {
++      continue;
+     }
+-    var query = queryString;
+-    if (query.charAt(0) === '?') {
+-        query = query.substr(1);
++    var keys = key.split('][');
++    var keysLastIndex = keys.length - 1;
++    if (/\[/.test(keys[0]) && /\]$/.test(keys[keysLastIndex])) {
++      keys[keysLastIndex] = keys[keysLastIndex].replace(/\]$/, '');
++      keys = keys.shift().split('[').concat(keys);
++      keysLastIndex = keys.length - 1;
++    } else {
++      keysLastIndex = 0;
+     }
+-    var pairs = query.replace(/\+/g, ' ').split('&');
+-    for (var i = 0; i < pairs.length; i++) {
+-        var pair = pairs[i].split('=');
+-        var key = decodeURIComponent(pair[0]);
+-        if (!key) {
+-            continue;
+-        }
+-        var keys = key.split('][');
+-        var keysLastIndex = keys.length - 1;
+-        if (/\[/.test(keys[0]) && /\]$/.test(keys[keysLastIndex])) {
+-            keys[keysLastIndex] = keys[keysLastIndex].replace(/\]$/, '');
+-            keys = keys.shift().split('[').concat(keys);
+-            keysLastIndex = keys.length - 1;
+-        }
+-        else {
+-            keysLastIndex = 0;
+-        }
+-        if (pair.length >= 2) {
+-            var value = pair[1] ? decodeURIComponent(pair[1]) : '';
+-            if (keysLastIndex) {
+-                parseComplexParam(queryParams, keys, value);
+-            }
+-            else {
+-                preventPollution(key);
+-                queryParams[key] = processScalarParam(queryParams[key], value);
+-            }
+-        }
+-        else {
+-            queryParams[key] = true;
+-        }
++    if (pair.length >= 2) {
++      var value = pair[1] ? decodeURIComponent(pair[1]) : '';
++      if (keysLastIndex) {
++        parseComplexParam(queryParams, keys, value);
++      } else {
++        queryParams[key] = processScalarParam(queryParams[key], value);
++      }
++    } else {
++      queryParams[key] = true;
+     }
+-    return queryParams;
++  }
++  return queryParams;
+ }
+-function preventPollution(key) {
+-    if (key === '__proto__') {
+-        throw new Error('Prototype pollution detected.');
+-    }
+-}
+-exports.buildQueryString = buildQueryString;
+-exports.join = join;
+-exports.parseQueryString = parseQueryString;
+-exports.relativeToFile = relativeToFile;
+
+--- a//dev/null
++++ b/dist/commonjs/index.js
+@@ -0,0 +1,14 @@
++'use strict';
++Object.defineProperty(exports, "__esModule", {
++  value: true
++});
++var _aureliaPath = require('./aurelia-path');
++Object.keys(_aureliaPath).forEach(function (key) {
++  if (key === "default" || key === "__esModule") return;
++  Object.defineProperty(exports, key, {
++    enumerable: true,
++    get: function get() {
++      return _aureliaPath[key];
++    }
++  });
++});
+
+--- a/dist/es2015/aurelia-path.js
++++ b/dist/es2015/aurelia-path.js
+@@ -1,202 +1,176 @@
+ function trimDots(ary) {
+-    for (let i = 0; i < ary.length; ++i) {
+-        let part = ary[i];
+-        if (part === '.') {
+-            ary.splice(i, 1);
+-            i -= 1;
+-        }
+-        else if (part === '..') {
+-            if (i === 0 || (i === 1 && ary[2] === '..') || ary[i - 1] === '..') {
+-                continue;
+-            }
+-            else if (i > 0) {
+-                ary.splice(i - 1, 2);
+-                i -= 2;
+-            }
+-        }
++  for (let i = 0; i < ary.length; ++i) {
++    let part = ary[i];
++    if (part === '.') {
++      ary.splice(i, 1);
++      i -= 1;
++    } else if (part === '..') {
++      if (i === 0 || i === 1 && ary[2] === '..' || ary[i - 1] === '..') {
++        continue;
++      } else if (i > 0) {
++        ary.splice(i - 1, 2);
++        i -= 2;
++      }
+     }
++  }
+ }
+-function relativeToFile(name, file) {
+-    let fileParts = file && file.split('/');
+-    let nameParts = name.trim().split('/');
+-    if (nameParts[0].charAt(0) === '.' && fileParts) {
+-        let normalizedBaseParts = fileParts.slice(0, fileParts.length - 1);
+-        nameParts.unshift(...normalizedBaseParts);
++export function relativeToFile(name, file) {
++  let fileParts = file && file.split('/');
++  let nameParts = name.trim().split('/');
++  if (nameParts[0].charAt(0) === '.' && fileParts) {
++    let normalizedBaseParts = fileParts.slice(0, fileParts.length - 1);
++    nameParts.unshift(...normalizedBaseParts);
++  }
++  trimDots(nameParts);
++  return nameParts.join('/');
++}
++export function join(path1, path2) {
++  if (!path1) {
++    return path2;
++  }
++  if (!path2) {
++    return path1;
++  }
++  let schemeMatch = path1.match(/^([^/]*?:)\//);
++  let scheme = schemeMatch && schemeMatch.length > 0 ? schemeMatch[1] : '';
++  path1 = path1.substr(scheme.length);
++  let urlPrefix;
++  if (path1.indexOf('///') === 0 && scheme === 'file:') {
++    urlPrefix = '///';
++  } else if (path1.indexOf('//') === 0) {
++    urlPrefix = '//';
++  } else if (path1.indexOf('/') === 0) {
++    urlPrefix = '/';
++  } else {
++    urlPrefix = '';
++  }
++  let trailingSlash = path2.slice(-1) === '/' ? '/' : '';
++  let url1 = path1.split('/');
++  let url2 = path2.split('/');
++  let url3 = [];
++  for (let i = 0, ii = url1.length; i < ii; ++i) {
++    if (url1[i] === '..') {
++      if (url3.length && url3[url3.length - 1] !== '..') {
++        url3.pop();
++      } else {
++        url3.push(url1[i]);
++      }
++    } else if (url1[i] === '.' || url1[i] === '') {
++      continue;
++    } else {
++      url3.push(url1[i]);
+     }
+-    trimDots(nameParts);
+-    return nameParts.join('/');
+-}
+-function join(path1, path2) {
+-    if (!path1) {
+-        return path2;
++  }
++  for (let i = 0, ii = url2.length; i < ii; ++i) {
++    if (url2[i] === '..') {
++      if (url3.length && url3[url3.length - 1] !== '..') {
++        url3.pop();
++      } else {
++        url3.push(url2[i]);
++      }
++    } else if (url2[i] === '.' || url2[i] === '') {
++      continue;
++    } else {
++      url3.push(url2[i]);
+     }
+-    if (!path2) {
+-        return path1;
+-    }
+-    let schemeMatch = path1.match(/^([^/]*?:)\//);
+-    let scheme = (schemeMatch && schemeMatch.length > 0) ? schemeMatch[1] : '';
+-    path1 = path1.substr(scheme.length);
+-    let urlPrefix;
+-    if (path1.indexOf('///') === 0 && scheme === 'file:') {
+-        urlPrefix = '///';
+-    }
+-    else if (path1.indexOf('//') === 0) {
+-        urlPrefix = '//';
+-    }
+-    else if (path1.indexOf('/') === 0) {
+-        urlPrefix = '/';
+-    }
+-    else {
+-        urlPrefix = '';
+-    }
+-    let trailingSlash = path2.slice(-1) === '/' ? '/' : '';
+-    let url1 = path1.split('/');
+-    let url2 = path2.split('/');
+-    let url3 = [];
+-    for (let i = 0, ii = url1.length; i < ii; ++i) {
+-        if (url1[i] === '..') {
+-            if (url3.length && url3[url3.length - 1] !== '..') {
+-                url3.pop();
+-            }
+-            else {
+-                url3.push(url1[i]);
+-            }
+-        }
+-        else if (url1[i] === '.' || url1[i] === '') {
+-            continue;
+-        }
+-        else {
+-            url3.push(url1[i]);
+-        }
+-    }
+-    for (let i = 0, ii = url2.length; i < ii; ++i) {
+-        if (url2[i] === '..') {
+-            if (url3.length && url3[url3.length - 1] !== '..') {
+-                url3.pop();
+-            }
+-            else {
+-                url3.push(url2[i]);
+-            }
+-        }
+-        else if (url2[i] === '.' || url2[i] === '') {
+-            continue;
+-        }
+-        else {
+-            url3.push(url2[i]);
+-        }
+-    }
+-    return scheme + urlPrefix + url3.join('/') + trailingSlash;
++  }
++  return scheme + urlPrefix + url3.join('/') + trailingSlash;
+ }
+ let encode = encodeURIComponent;
+ let encodeKey = k => encode(k).replace('%24', '$');
+ function buildParam(key, value, traditional) {
+-    let result = [];
+-    if (value === null || value === undefined) {
+-        return result;
++  let result = [];
++  if (value === null || value === undefined) {
++    return result;
++  }
++  if (Array.isArray(value)) {
++    for (let i = 0, l = value.length; i < l; i++) {
++      if (traditional) {
++        result.push(`${encodeKey(key)}=${encode(value[i])}`);
++      } else {
++        let arrayKey = key + '[' + (typeof value[i] === 'object' && value[i] !== null ? i : '') + ']';
++        result = result.concat(buildParam(arrayKey, value[i]));
++      }
+     }
+-    if (Array.isArray(value)) {
+-        for (let i = 0, l = value.length; i < l; i++) {
+-            if (traditional) {
+-                result.push(`${encodeKey(key)}=${encode(value[i])}`);
+-            }
+-            else {
+-                let arrayKey = key + '[' + (typeof value[i] === 'object' && value[i] !== null ? i : '') + ']';
+-                result = result.concat(buildParam(arrayKey, value[i]));
+-            }
+-        }
++  } else if (typeof value === 'object' && !traditional) {
++    for (let propertyName in value) {
++      result = result.concat(buildParam(key + '[' + propertyName + ']', value[propertyName]));
+     }
+-    else if (typeof (value) === 'object' && !traditional) {
+-        for (let propertyName in value) {
+-            result = result.concat(buildParam(key + '[' + propertyName + ']', value[propertyName]));
+-        }
+-    }
+-    else {
+-        result.push(`${encodeKey(key)}=${encode(value)}`);
+-    }
+-    return result;
++  } else {
++    result.push(`${encodeKey(key)}=${encode(value)}`);
++  }
++  return result;
+ }
+-function buildQueryString(params, traditional) {
+-    let pairs = [];
+-    let keys = Object.keys(params || {}).sort();
+-    for (let i = 0, len = keys.length; i < len; i++) {
+-        let key = keys[i];
+-        pairs = pairs.concat(buildParam(key, params[key], traditional));
+-    }
+-    if (pairs.length === 0) {
+-        return '';
+-    }
+-    return pairs.join('&');
++export function buildQueryString(params, traditional) {
++  let pairs = [];
++  let keys = Object.keys(params || {}).sort();
++  for (let i = 0, len = keys.length; i < len; i++) {
++    let key = keys[i];
++    pairs = pairs.concat(buildParam(key, params[key], traditional));
++  }
++  if (pairs.length === 0) {
++    return '';
++  }
++  return pairs.join('&');
+ }
+ function processScalarParam(existedParam, value) {
+-    if (Array.isArray(existedParam)) {
+-        existedParam.push(value);
+-        return existedParam;
+-    }
+-    if (existedParam !== undefined) {
+-        return [existedParam, value];
+-    }
+-    return value;
++  if (Array.isArray(existedParam)) {
++    existedParam.push(value);
++    return existedParam;
++  }
++  if (existedParam !== undefined) {
++    return [existedParam, value];
++  }
++  return value;
+ }
+ function parseComplexParam(queryParams, keys, value) {
+-    let currentParams = queryParams;
++  let currentParams = queryParams;
++  let keysLastIndex = keys.length - 1;
++  for (let j = 0; j <= keysLastIndex; j++) {
++    let key = keys[j] === '' ? currentParams.length : keys[j];
++    if (j < keysLastIndex) {
++      let prevValue = !currentParams[key] || typeof currentParams[key] === 'object' ? currentParams[key] : [currentParams[key]];
++      currentParams = currentParams[key] = prevValue || (isNaN(keys[j + 1]) ? {} : []);
++    } else {
++      currentParams = currentParams[key] = value;
++    }
++  }
++}
++export function parseQueryString(queryString) {
++  let queryParams = {};
++  if (!queryString || typeof queryString !== 'string') {
++    return queryParams;
++  }
++  let query = queryString;
++  if (query.charAt(0) === '?') {
++    query = query.substr(1);
++  }
++  let pairs = query.replace(/\+/g, ' ').split('&');
++  for (let i = 0; i < pairs.length; i++) {
++    let pair = pairs[i].split('=');
++    let key = decodeURIComponent(pair[0]);
++    if (!key) {
++      continue;
++    }
++    let keys = key.split('][');
+     let keysLastIndex = keys.length - 1;
+-    for (let j = 0; j <= keysLastIndex; j++) {
+-        let key = keys[j] === '' ? currentParams.length : keys[j];
+-        preventPollution(key);
+-        if (j < keysLastIndex) {
+-            let prevValue = !currentParams[key] || typeof currentParams[key] === 'object' ? currentParams[key] : [currentParams[key]];
+-            currentParams = currentParams[key] = prevValue || (isNaN(keys[j + 1]) ? {} : []);
+-        }
+-        else {
+-            currentParams = currentParams[key] = value;
+-        }
++    if (/\[/.test(keys[0]) && /\]$/.test(keys[keysLastIndex])) {
++      keys[keysLastIndex] = keys[keysLastIndex].replace(/\]$/, '');
++      keys = keys.shift().split('[').concat(keys);
++      keysLastIndex = keys.length - 1;
++    } else {
++      keysLastIndex = 0;
+     }
++    if (pair.length >= 2) {
++      let value = pair[1] ? decodeURIComponent(pair[1]) : '';
++      if (keysLastIndex) {
++        parseComplexParam(queryParams, keys, value);
++      } else {
++        queryParams[key] = processScalarParam(queryParams[key], value);
++      }
++    } else {
++      queryParams[key] = true;
++    }
++  }
++  return queryParams;
+ }
+-function parseQueryString(queryString) {
+-    let queryParams = {};
+-    if (!queryString || typeof queryString !== 'string') {
+-        return queryParams;
+-    }
+-    let query = queryString;
+-    if (query.charAt(0) === '?') {
+-        query = query.substr(1);
+-    }
+-    let pairs = query.replace(/\+/g, ' ').split('&');
+-    for (let i = 0; i < pairs.length; i++) {
+-        let pair = pairs[i].split('=');
+-        let key = decodeURIComponent(pair[0]);
+-        if (!key) {
+-            continue;
+-        }
+-        let keys = key.split('][');
+-        let keysLastIndex = keys.length - 1;
+-        if (/\[/.test(keys[0]) && /\]$/.test(keys[keysLastIndex])) {
+-            keys[keysLastIndex] = keys[keysLastIndex].replace(/\]$/, '');
+-            keys = keys.shift().split('[').concat(keys);
+-            keysLastIndex = keys.length - 1;
+-        }
+-        else {
+-            keysLastIndex = 0;
+-        }
+-        if (pair.length >= 2) {
+-            let value = pair[1] ? decodeURIComponent(pair[1]) : '';
+-            if (keysLastIndex) {
+-                parseComplexParam(queryParams, keys, value);
+-            }
+-            else {
+-                preventPollution(key);
+-                queryParams[key] = processScalarParam(queryParams[key], value);
+-            }
+-        }
+-        else {
+-            queryParams[key] = true;
+-        }
+-    }
+-    return queryParams;
+-}
+-function preventPollution(key) {
+-    if (key === '__proto__') {
+-        throw new Error('Prototype pollution detected.');
+-    }
+-}
+-export { buildQueryString, join, parseQueryString, relativeToFile };
+
+--- a//dev/null
++++ b/dist/es2015/index.js
+@@ -0,0 +1 @@
++export * from './aurelia-path';
+
+--- a//dev/null
++++ b/dist/index.d.ts
+@@ -0,0 +1 @@
++export * from 'aurelia-path/aurelia-path';
+
+--- a/dist/native-modules/aurelia-path.js
++++ b/dist/native-modules/aurelia-path.js
+@@ -1,202 +1,179 @@
++var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) { return typeof obj; } : function (obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; };
+ function trimDots(ary) {
+-    for (var i = 0; i < ary.length; ++i) {
+-        var part = ary[i];
+-        if (part === '.') {
+-            ary.splice(i, 1);
+-            i -= 1;
+-        }
+-        else if (part === '..') {
+-            if (i === 0 || (i === 1 && ary[2] === '..') || ary[i - 1] === '..') {
+-                continue;
+-            }
+-            else if (i > 0) {
+-                ary.splice(i - 1, 2);
+-                i -= 2;
+-            }
+-        }
++  for (var i = 0; i < ary.length; ++i) {
++    var part = ary[i];
++    if (part === '.') {
++      ary.splice(i, 1);
++      i -= 1;
++    } else if (part === '..') {
++      if (i === 0 || i === 1 && ary[2] === '..' || ary[i - 1] === '..') {
++        continue;
++      } else if (i > 0) {
++        ary.splice(i - 1, 2);
++        i -= 2;
++      }
+     }
++  }
+ }
+-function relativeToFile(name, file) {
+-    var fileParts = file && file.split('/');
+-    var nameParts = name.trim().split('/');
+-    if (nameParts[0].charAt(0) === '.' && fileParts) {
+-        var normalizedBaseParts = fileParts.slice(0, fileParts.length - 1);
+-        nameParts.unshift.apply(nameParts, normalizedBaseParts);
++export function relativeToFile(name, file) {
++  var fileParts = file && file.split('/');
++  var nameParts = name.trim().split('/');
++  if (nameParts[0].charAt(0) === '.' && fileParts) {
++    var normalizedBaseParts = fileParts.slice(0, fileParts.length - 1);
++    nameParts.unshift.apply(nameParts, normalizedBaseParts);
++  }
++  trimDots(nameParts);
++  return nameParts.join('/');
++}
++export function join(path1, path2) {
++  if (!path1) {
++    return path2;
++  }
++  if (!path2) {
++    return path1;
++  }
++  var schemeMatch = path1.match(/^([^/]*?:)\//);
++  var scheme = schemeMatch && schemeMatch.length > 0 ? schemeMatch[1] : '';
++  path1 = path1.substr(scheme.length);
++  var urlPrefix = void 0;
++  if (path1.indexOf('///') === 0 && scheme === 'file:') {
++    urlPrefix = '///';
++  } else if (path1.indexOf('//') === 0) {
++    urlPrefix = '//';
++  } else if (path1.indexOf('/') === 0) {
++    urlPrefix = '/';
++  } else {
++    urlPrefix = '';
++  }
++  var trailingSlash = path2.slice(-1) === '/' ? '/' : '';
++  var url1 = path1.split('/');
++  var url2 = path2.split('/');
++  var url3 = [];
++  for (var i = 0, ii = url1.length; i < ii; ++i) {
++    if (url1[i] === '..') {
++      if (url3.length && url3[url3.length - 1] !== '..') {
++        url3.pop();
++      } else {
++        url3.push(url1[i]);
++      }
++    } else if (url1[i] === '.' || url1[i] === '') {
++      continue;
++    } else {
++      url3.push(url1[i]);
+     }
+-    trimDots(nameParts);
+-    return nameParts.join('/');
+-}
+-function join(path1, path2) {
+-    if (!path1) {
+-        return path2;
++  }
++  for (var _i = 0, _ii = url2.length; _i < _ii; ++_i) {
++    if (url2[_i] === '..') {
++      if (url3.length && url3[url3.length - 1] !== '..') {
++        url3.pop();
++      } else {
++        url3.push(url2[_i]);
++      }
++    } else if (url2[_i] === '.' || url2[_i] === '') {
++      continue;
++    } else {
++      url3.push(url2[_i]);
+     }
+-    if (!path2) {
+-        return path1;
+-    }
+-    var schemeMatch = path1.match(/^([^/]*?:)\//);
+-    var scheme = (schemeMatch && schemeMatch.length > 0) ? schemeMatch[1] : '';
+-    path1 = path1.substr(scheme.length);
+-    var urlPrefix;
+-    if (path1.indexOf('///') === 0 && scheme === 'file:') {
+-        urlPrefix = '///';
+-    }
+-    else if (path1.indexOf('//') === 0) {
+-        urlPrefix = '//';
+-    }
+-    else if (path1.indexOf('/') === 0) {
+-        urlPrefix = '/';
+-    }
+-    else {
+-        urlPrefix = '';
+-    }
+-    var trailingSlash = path2.slice(-1) === '/' ? '/' : '';
+-    var url1 = path1.split('/');
+-    var url2 = path2.split('/');
+-    var url3 = [];
+-    for (var i = 0, ii = url1.length; i < ii; ++i) {
+-        if (url1[i] === '..') {
+-            if (url3.length && url3[url3.length - 1] !== '..') {
+-                url3.pop();
+-            }
+-            else {
+-                url3.push(url1[i]);
+-            }
+-        }
+-        else if (url1[i] === '.' || url1[i] === '') {
+-            continue;
+-        }
+-        else {
+-            url3.push(url1[i]);
+-        }
+-    }
+-    for (var i = 0, ii = url2.length; i < ii; ++i) {
+-        if (url2[i] === '..') {
+-            if (url3.length && url3[url3.length - 1] !== '..') {
+-                url3.pop();
+-            }
+-            else {
+-                url3.push(url2[i]);
+-            }
+-        }
+-        else if (url2[i] === '.' || url2[i] === '') {
+-            continue;
+-        }
+-        else {
+-            url3.push(url2[i]);
+-        }
+-    }
+-    return scheme + urlPrefix + url3.join('/') + trailingSlash;
++  }
++  return scheme + urlPrefix + url3.join('/') + trailingSlash;
+ }
+ var encode = encodeURIComponent;
+-var encodeKey = function (k) { return encode(k).replace('%24', '$'); };
++var encodeKey = function encodeKey(k) {
++  return encode(k).replace('%24', '$');
++};
+ function buildParam(key, value, traditional) {
+-    var result = [];
+-    if (value === null || value === undefined) {
+-        return result;
++  var result = [];
++  if (value === null || value === undefined) {
++    return result;
++  }
++  if (Array.isArray(value)) {
++    for (var i = 0, l = value.length; i < l; i++) {
++      if (traditional) {
++        result.push(encodeKey(key) + '=' + encode(value[i]));
++      } else {
++        var arrayKey = key + '[' + (_typeof(value[i]) === 'object' && value[i] !== null ? i : '') + ']';
++        result = result.concat(buildParam(arrayKey, value[i]));
++      }
+     }
+-    if (Array.isArray(value)) {
+-        for (var i = 0, l = value.length; i < l; i++) {
+-            if (traditional) {
+-                result.push(encodeKey(key) + "=" + encode(value[i]));
+-            }
+-            else {
+-                var arrayKey = key + '[' + (typeof value[i] === 'object' && value[i] !== null ? i : '') + ']';
+-                result = result.concat(buildParam(arrayKey, value[i]));
+-            }
+-        }
++  } else if ((typeof value === 'undefined' ? 'undefined' : _typeof(value)) === 'object' && !traditional) {
++    for (var propertyName in value) {
++      result = result.concat(buildParam(key + '[' + propertyName + ']', value[propertyName]));
+     }
+-    else if (typeof (value) === 'object' && !traditional) {
+-        for (var propertyName in value) {
+-            result = result.concat(buildParam(key + '[' + propertyName + ']', value[propertyName]));
+-        }
+-    }
+-    else {
+-        result.push(encodeKey(key) + "=" + encode(value));
+-    }
+-    return result;
++  } else {
++    result.push(encodeKey(key) + '=' + encode(value));
++  }
++  return result;
+ }
+-function buildQueryString(params, traditional) {
+-    var pairs = [];
+-    var keys = Object.keys(params || {}).sort();
+-    for (var i = 0, len = keys.length; i < len; i++) {
+-        var key = keys[i];
+-        pairs = pairs.concat(buildParam(key, params[key], traditional));
+-    }
+-    if (pairs.length === 0) {
+-        return '';
+-    }
+-    return pairs.join('&');
++export function buildQueryString(params, traditional) {
++  var pairs = [];
++  var keys = Object.keys(params || {}).sort();
++  for (var i = 0, len = keys.length; i < len; i++) {
++    var key = keys[i];
++    pairs = pairs.concat(buildParam(key, params[key], traditional));
++  }
++  if (pairs.length === 0) {
++    return '';
++  }
++  return pairs.join('&');
+ }
+ function processScalarParam(existedParam, value) {
+-    if (Array.isArray(existedParam)) {
+-        existedParam.push(value);
+-        return existedParam;
+-    }
+-    if (existedParam !== undefined) {
+-        return [existedParam, value];
+-    }
+-    return value;
++  if (Array.isArray(existedParam)) {
++    existedParam.push(value);
++    return existedParam;
++  }
++  if (existedParam !== undefined) {
++    return [existedParam, value];
++  }
++  return value;
+ }
+ function parseComplexParam(queryParams, keys, value) {
+-    var currentParams = queryParams;
++  var currentParams = queryParams;
++  var keysLastIndex = keys.length - 1;
++  for (var j = 0; j <= keysLastIndex; j++) {
++    var key = keys[j] === '' ? currentParams.length : keys[j];
++    if (j < keysLastIndex) {
++      var prevValue = !currentParams[key] || _typeof(currentParams[key]) === 'object' ? currentParams[key] : [currentParams[key]];
++      currentParams = currentParams[key] = prevValue || (isNaN(keys[j + 1]) ? {} : []);
++    } else {
++      currentParams = currentParams[key] = value;
++    }
++  }
++}
++export function parseQueryString(queryString) {
++  var queryParams = {};
++  if (!queryString || typeof queryString !== 'string') {
++    return queryParams;
++  }
++  var query = queryString;
++  if (query.charAt(0) === '?') {
++    query = query.substr(1);
++  }
++  var pairs = query.replace(/\+/g, ' ').split('&');
++  for (var i = 0; i < pairs.length; i++) {
++    var pair = pairs[i].split('=');
++    var key = decodeURIComponent(pair[0]);
++    if (!key) {
++      continue;
++    }
++    var keys = key.split('][');
+     var keysLastIndex = keys.length - 1;
+-    for (var j = 0; j <= keysLastIndex; j++) {
+-        var key = keys[j] === '' ? currentParams.length : keys[j];
+-        preventPollution(key);
+-        if (j < keysLastIndex) {
+-            var prevValue = !currentParams[key] || typeof currentParams[key] === 'object' ? currentParams[key] : [currentParams[key]];
+-            currentParams = currentParams[key] = prevValue || (isNaN(keys[j + 1]) ? {} : []);
+-        }
+-        else {
+-            currentParams = currentParams[key] = value;
+-        }
++    if (/\[/.test(keys[0]) && /\]$/.test(keys[keysLastIndex])) {
++      keys[keysLastIndex] = keys[keysLastIndex].replace(/\]$/, '');
++      keys = keys.shift().split('[').concat(keys);
++      keysLastIndex = keys.length - 1;
++    } else {
++      keysLastIndex = 0;
+     }
++    if (pair.length >= 2) {
++      var value = pair[1] ? decodeURIComponent(pair[1]) : '';
++      if (keysLastIndex) {
++        parseComplexParam(queryParams, keys, value);
++      } else {
++        queryParams[key] = processScalarParam(queryParams[key], value);
++      }
++    } else {
++      queryParams[key] = true;
++    }
++  }
++  return queryParams;
+ }
+-function parseQueryString(queryString) {
+-    var queryParams = {};
+-    if (!queryString || typeof queryString !== 'string') {
+-        return queryParams;
+-    }
+-    var query = queryString;
+-    if (query.charAt(0) === '?') {
+-        query = query.substr(1);
+-    }
+-    var pairs = query.replace(/\+/g, ' ').split('&');
+-    for (var i = 0; i < pairs.length; i++) {
+-        var pair = pairs[i].split('=');
+-        var key = decodeURIComponent(pair[0]);
+-        if (!key) {
+-            continue;
+-        }
+-        var keys = key.split('][');
+-        var keysLastIndex = keys.length - 1;
+-        if (/\[/.test(keys[0]) && /\]$/.test(keys[keysLastIndex])) {
+-            keys[keysLastIndex] = keys[keysLastIndex].replace(/\]$/, '');
+-            keys = keys.shift().split('[').concat(keys);
+-            keysLastIndex = keys.length - 1;
+-        }
+-        else {
+-            keysLastIndex = 0;
+-        }
+-        if (pair.length >= 2) {
+-            var value = pair[1] ? decodeURIComponent(pair[1]) : '';
+-            if (keysLastIndex) {
+-                parseComplexParam(queryParams, keys, value);
+-            }
+-            else {
+-                preventPollution(key);
+-                queryParams[key] = processScalarParam(queryParams[key], value);
+-            }
+-        }
+-        else {
+-            queryParams[key] = true;
+-        }
+-    }
+-    return queryParams;
+-}
+-function preventPollution(key) {
+-    if (key === '__proto__') {
+-        throw new Error('Prototype pollution detected.');
+-    }
+-}
+-export { buildQueryString, join, parseQueryString, relativeToFile };
+
+--- a//dev/null
++++ b/dist/native-modules/index.js
+@@ -0,0 +1 @@
++export * from './aurelia-path';
+
+--- a/dist/system/aurelia-path.js
++++ b/dist/system/aurelia-path.js
+@@ -1,214 +1,197 @@
+-System.register([], function (exports) {
+-    'use strict';
+-    return {
+-        execute: function () {
+-            exports({
+-                buildQueryString: buildQueryString,
+-                join: join,
+-                parseQueryString: parseQueryString,
+-                relativeToFile: relativeToFile
+-            });
+-            function trimDots(ary) {
+-                for (var i = 0; i < ary.length; ++i) {
+-                    var part = ary[i];
+-                    if (part === '.') {
+-                        ary.splice(i, 1);
+-                        i -= 1;
+-                    }
+-                    else if (part === '..') {
+-                        if (i === 0 || (i === 1 && ary[2] === '..') || ary[i - 1] === '..') {
+-                            continue;
+-                        }
+-                        else if (i > 0) {
+-                            ary.splice(i - 1, 2);
+-                            i -= 2;
+-                        }
+-                    }
+-                }
+-            }
+-            function relativeToFile(name, file) {
+-                var fileParts = file && file.split('/');
+-                var nameParts = name.trim().split('/');
+-                if (nameParts[0].charAt(0) === '.' && fileParts) {
+-                    var normalizedBaseParts = fileParts.slice(0, fileParts.length - 1);
+-                    nameParts.unshift.apply(nameParts, normalizedBaseParts);
+-                }
+-                trimDots(nameParts);
+-                return nameParts.join('/');
+-            }
+-            function join(path1, path2) {
+-                if (!path1) {
+-                    return path2;
+-                }
+-                if (!path2) {
+-                    return path1;
+-                }
+-                var schemeMatch = path1.match(/^([^/]*?:)\//);
+-                var scheme = (schemeMatch && schemeMatch.length > 0) ? schemeMatch[1] : '';
+-                path1 = path1.substr(scheme.length);
+-                var urlPrefix;
+-                if (path1.indexOf('///') === 0 && scheme === 'file:') {
+-                    urlPrefix = '///';
+-                }
+-                else if (path1.indexOf('//') === 0) {
+-                    urlPrefix = '//';
+-                }
+-                else if (path1.indexOf('/') === 0) {
+-                    urlPrefix = '/';
+-                }
+-                else {
+-                    urlPrefix = '';
+-                }
+-                var trailingSlash = path2.slice(-1) === '/' ? '/' : '';
+-                var url1 = path1.split('/');
+-                var url2 = path2.split('/');
+-                var url3 = [];
+-                for (var i = 0, ii = url1.length; i < ii; ++i) {
+-                    if (url1[i] === '..') {
+-                        if (url3.length && url3[url3.length - 1] !== '..') {
+-                            url3.pop();
+-                        }
+-                        else {
+-                            url3.push(url1[i]);
+-                        }
+-                    }
+-                    else if (url1[i] === '.' || url1[i] === '') {
+-                        continue;
+-                    }
+-                    else {
+-                        url3.push(url1[i]);
+-                    }
+-                }
+-                for (var i = 0, ii = url2.length; i < ii; ++i) {
+-                    if (url2[i] === '..') {
+-                        if (url3.length && url3[url3.length - 1] !== '..') {
+-                            url3.pop();
+-                        }
+-                        else {
+-                            url3.push(url2[i]);
+-                        }
+-                    }
+-                    else if (url2[i] === '.' || url2[i] === '') {
+-                        continue;
+-                    }
+-                    else {
+-                        url3.push(url2[i]);
+-                    }
+-                }
+-                return scheme + urlPrefix + url3.join('/') + trailingSlash;
+-            }
+-            var encode = encodeURIComponent;
+-            var encodeKey = function (k) { return encode(k).replace('%24', '$'); };
+-            function buildParam(key, value, traditional) {
+-                var result = [];
+-                if (value === null || value === undefined) {
+-                    return result;
+-                }
+-                if (Array.isArray(value)) {
+-                    for (var i = 0, l = value.length; i < l; i++) {
+-                        if (traditional) {
+-                            result.push(encodeKey(key) + "=" + encode(value[i]));
+-                        }
+-                        else {
+-                            var arrayKey = key + '[' + (typeof value[i] === 'object' && value[i] !== null ? i : '') + ']';
+-                            result = result.concat(buildParam(arrayKey, value[i]));
+-                        }
+-                    }
+-                }
+-                else if (typeof (value) === 'object' && !traditional) {
+-                    for (var propertyName in value) {
+-                        result = result.concat(buildParam(key + '[' + propertyName + ']', value[propertyName]));
+-                    }
+-                }
+-                else {
+-                    result.push(encodeKey(key) + "=" + encode(value));
+-                }
+-                return result;
+-            }
+-            function buildQueryString(params, traditional) {
+-                var pairs = [];
+-                var keys = Object.keys(params || {}).sort();
+-                for (var i = 0, len = keys.length; i < len; i++) {
+-                    var key = keys[i];
+-                    pairs = pairs.concat(buildParam(key, params[key], traditional));
+-                }
+-                if (pairs.length === 0) {
+-                    return '';
+-                }
+-                return pairs.join('&');
+-            }
+-            function processScalarParam(existedParam, value) {
+-                if (Array.isArray(existedParam)) {
+-                    existedParam.push(value);
+-                    return existedParam;
+-                }
+-                if (existedParam !== undefined) {
+-                    return [existedParam, value];
+-                }
+-                return value;
+-            }
+-            function parseComplexParam(queryParams, keys, value) {
+-                var currentParams = queryParams;
+-                var keysLastIndex = keys.length - 1;
+-                for (var j = 0; j <= keysLastIndex; j++) {
+-                    var key = keys[j] === '' ? currentParams.length : keys[j];
+-                    preventPollution(key);
+-                    if (j < keysLastIndex) {
+-                        var prevValue = !currentParams[key] || typeof currentParams[key] === 'object' ? currentParams[key] : [currentParams[key]];
+-                        currentParams = currentParams[key] = prevValue || (isNaN(keys[j + 1]) ? {} : []);
+-                    }
+-                    else {
+-                        currentParams = currentParams[key] = value;
+-                    }
+-                }
+-            }
+-            function parseQueryString(queryString) {
+-                var queryParams = {};
+-                if (!queryString || typeof queryString !== 'string') {
+-                    return queryParams;
+-                }
+-                var query = queryString;
+-                if (query.charAt(0) === '?') {
+-                    query = query.substr(1);
+-                }
+-                var pairs = query.replace(/\+/g, ' ').split('&');
+-                for (var i = 0; i < pairs.length; i++) {
+-                    var pair = pairs[i].split('=');
+-                    var key = decodeURIComponent(pair[0]);
+-                    if (!key) {
+-                        continue;
+-                    }
+-                    var keys = key.split('][');
+-                    var keysLastIndex = keys.length - 1;
+-                    if (/\[/.test(keys[0]) && /\]$/.test(keys[keysLastIndex])) {
+-                        keys[keysLastIndex] = keys[keysLastIndex].replace(/\]$/, '');
+-                        keys = keys.shift().split('[').concat(keys);
+-                        keysLastIndex = keys.length - 1;
+-                    }
+-                    else {
+-                        keysLastIndex = 0;
+-                    }
+-                    if (pair.length >= 2) {
+-                        var value = pair[1] ? decodeURIComponent(pair[1]) : '';
+-                        if (keysLastIndex) {
+-                            parseComplexParam(queryParams, keys, value);
+-                        }
+-                        else {
+-                            preventPollution(key);
+-                            queryParams[key] = processScalarParam(queryParams[key], value);
+-                        }
+-                    }
+-                    else {
+-                        queryParams[key] = true;
+-                    }
+-                }
+-                return queryParams;
+-            }
+-            function preventPollution(key) {
+-                if (key === '__proto__') {
+-                    throw new Error('Prototype pollution detected.');
+-                }
+-            }
++'use strict';
++System.register([], function (_export, _context) {
++  "use strict";
++  var _typeof, encode, encodeKey;
++  function trimDots(ary) {
++    for (var i = 0; i < ary.length; ++i) {
++      var part = ary[i];
++      if (part === '.') {
++        ary.splice(i, 1);
++        i -= 1;
++      } else if (part === '..') {
++        if (i === 0 || i === 1 && ary[2] === '..' || ary[i - 1] === '..') {
++          continue;
++        } else if (i > 0) {
++          ary.splice(i - 1, 2);
++          i -= 2;
+         }
+-    };
++      }
++    }
++  }
++  function relativeToFile(name, file) {
++    var fileParts = file && file.split('/');
++    var nameParts = name.trim().split('/');
++    if (nameParts[0].charAt(0) === '.' && fileParts) {
++      var normalizedBaseParts = fileParts.slice(0, fileParts.length - 1);
++      nameParts.unshift.apply(nameParts, normalizedBaseParts);
++    }
++    trimDots(nameParts);
++    return nameParts.join('/');
++  }
++  _export('relativeToFile', relativeToFile);
++  function join(path1, path2) {
++    if (!path1) {
++      return path2;
++    }
++    if (!path2) {
++      return path1;
++    }
++    var schemeMatch = path1.match(/^([^/]*?:)\//);
++    var scheme = schemeMatch && schemeMatch.length > 0 ? schemeMatch[1] : '';
++    path1 = path1.substr(scheme.length);
++    var urlPrefix = void 0;
++    if (path1.indexOf('///') === 0 && scheme === 'file:') {
++      urlPrefix = '///';
++    } else if (path1.indexOf('//') === 0) {
++      urlPrefix = '//';
++    } else if (path1.indexOf('/') === 0) {
++      urlPrefix = '/';
++    } else {
++      urlPrefix = '';
++    }
++    var trailingSlash = path2.slice(-1) === '/' ? '/' : '';
++    var url1 = path1.split('/');
++    var url2 = path2.split('/');
++    var url3 = [];
++    for (var i = 0, ii = url1.length; i < ii; ++i) {
++      if (url1[i] === '..') {
++        if (url3.length && url3[url3.length - 1] !== '..') {
++          url3.pop();
++        } else {
++          url3.push(url1[i]);
++        }
++      } else if (url1[i] === '.' || url1[i] === '') {
++        continue;
++      } else {
++        url3.push(url1[i]);
++      }
++    }
++    for (var _i = 0, _ii = url2.length; _i < _ii; ++_i) {
++      if (url2[_i] === '..') {
++        if (url3.length && url3[url3.length - 1] !== '..') {
++          url3.pop();
++        } else {
++          url3.push(url2[_i]);
++        }
++      } else if (url2[_i] === '.' || url2[_i] === '') {
++        continue;
++      } else {
++        url3.push(url2[_i]);
++      }
++    }
++    return scheme + urlPrefix + url3.join('/') + trailingSlash;
++  }
++  _export('join', join);
++  function buildParam(key, value, traditional) {
++    var result = [];
++    if (value === null || value === undefined) {
++      return result;
++    }
++    if (Array.isArray(value)) {
++      for (var i = 0, l = value.length; i < l; i++) {
++        if (traditional) {
++          result.push(encodeKey(key) + '=' + encode(value[i]));
++        } else {
++          var arrayKey = key + '[' + (_typeof(value[i]) === 'object' && value[i] !== null ? i : '') + ']';
++          result = result.concat(buildParam(arrayKey, value[i]));
++        }
++      }
++    } else if ((typeof value === 'undefined' ? 'undefined' : _typeof(value)) === 'object' && !traditional) {
++      for (var propertyName in value) {
++        result = result.concat(buildParam(key + '[' + propertyName + ']', value[propertyName]));
++      }
++    } else {
++      result.push(encodeKey(key) + '=' + encode(value));
++    }
++    return result;
++  }
++  function buildQueryString(params, traditional) {
++    var pairs = [];
++    var keys = Object.keys(params || {}).sort();
++    for (var i = 0, len = keys.length; i < len; i++) {
++      var key = keys[i];
++      pairs = pairs.concat(buildParam(key, params[key], traditional));
++    }
++    if (pairs.length === 0) {
++      return '';
++    }
++    return pairs.join('&');
++  }
++  _export('buildQueryString', buildQueryString);
++  function processScalarParam(existedParam, value) {
++    if (Array.isArray(existedParam)) {
++      existedParam.push(value);
++      return existedParam;
++    }
++    if (existedParam !== undefined) {
++      return [existedParam, value];
++    }
++    return value;
++  }
++  function parseComplexParam(queryParams, keys, value) {
++    var currentParams = queryParams;
++    var keysLastIndex = keys.length - 1;
++    for (var j = 0; j <= keysLastIndex; j++) {
++      var key = keys[j] === '' ? currentParams.length : keys[j];
++      if (j < keysLastIndex) {
++        var prevValue = !currentParams[key] || _typeof(currentParams[key]) === 'object' ? currentParams[key] : [currentParams[key]];
++        currentParams = currentParams[key] = prevValue || (isNaN(keys[j + 1]) ? {} : []);
++      } else {
++        currentParams = currentParams[key] = value;
++      }
++    }
++  }
++  function parseQueryString(queryString) {
++    var queryParams = {};
++    if (!queryString || typeof queryString !== 'string') {
++      return queryParams;
++    }
++    var query = queryString;
++    if (query.charAt(0) === '?') {
++      query = query.substr(1);
++    }
++    var pairs = query.replace(/\+/g, ' ').split('&');
++    for (var i = 0; i < pairs.length; i++) {
++      var pair = pairs[i].split('=');
++      var key = decodeURIComponent(pair[0]);
++      if (!key) {
++        continue;
++      }
++      var keys = key.split('][');
++      var keysLastIndex = keys.length - 1;
++      if (/\[/.test(keys[0]) && /\]$/.test(keys[keysLastIndex])) {
++        keys[keysLastIndex] = keys[keysLastIndex].replace(/\]$/, '');
++        keys = keys.shift().split('[').concat(keys);
++        keysLastIndex = keys.length - 1;
++      } else {
++        keysLastIndex = 0;
++      }
++      if (pair.length >= 2) {
++        var value = pair[1] ? decodeURIComponent(pair[1]) : '';
++        if (keysLastIndex) {
++          parseComplexParam(queryParams, keys, value);
++        } else {
++          queryParams[key] = processScalarParam(queryParams[key], value);
++        }
++      } else {
++        queryParams[key] = true;
++      }
++    }
++    return queryParams;
++  }
++  _export('parseQueryString', parseQueryString);
++  return {
++    setters: [],
++    execute: function () {
++      _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) {
++        return typeof obj;
++      } : function (obj) {
++        return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj;
++      };
++      encode = encodeURIComponent;
++      encodeKey = function encodeKey(k) {
++        return encode(k).replace('%24', '$');
++      };
++    }
++  };
+ });
+
+--- a//dev/null
++++ b/dist/system/index.js
+@@ -0,0 +1,14 @@
++'use strict';
++System.register(['./aurelia-path'], function (_export, _context) {
++  "use strict";
++  return {
++    setters: [function (_aureliaPath) {
++      var _exportObj = {};
++      for (var _key in _aureliaPath) {
++        if (_key !== "default" && _key !== "__esModule") _exportObj[_key] = _aureliaPath[_key];
++      }
++      _export(_exportObj);
++    }],
++    execute: function () {}
++  };
++});
+
+--- a/dist/types/index.d.ts
++++ b//dev/null
+@@ -1,4 +0,0 @@
+-export declare function relativeToFile(name: string, file: string): string;
+-export declare function join(path1: string, path2: string): string;
+-export declare function buildQueryString(params?: Object, traditional?: boolean): string;
+-export declare function parseQueryString(queryString: string): Object;
+
+--- a/gulpfile.js
++++ b/gulpfile.js
+@@ -1,71 +1 @@
+-const gulp = require('gulp');
+-const bump = require('gulp-bump');
+-const conventionalChangelog = require('gulp-conventional-changelog');
+-const yargs = require('yargs');
+-const fs = require('fs');
+-const path = require('path');
+-const exec = require('child_process').exec;
+-const promisify = require('util').promisify;
+-const DIR_DOC = './doc';
+-const FILE_DOC = path.resolve(DIR_DOC, 'CHANGELOG.md');
+-/**@type {{ bump: 'major' | 'minor' | 'patch' | 'prerelease' }}
+-const argv = yargs.argv;
+-const validBumpTypes = "major|minor|patch|prerelease".split("|");
+-const bumpType = (argv.bump || 'patch').toLowerCase();
+-if(validBumpTypes.indexOf(bumpType) === -1) {
+-  throw new Error('Unrecognized bump "' + bumpType + '".');
+-}
+-gulp.task('build', async () => {
+-  const { stderr: err1, stdout: out1 } = await promisify(exec)('npm run build');
+-  if (err1) {
+-    console.log('==== build warning ====');
+-    console.log(err1);
+-  }
+-  console.log('==== build output ====');
+-  console.log(out1);
+-});
+-gulp.task('lint', async () => {
+-  const { stderr: err2, stdout: out2 } = await promisify(exec)('npm run lint');
+-  if (err2) {
+-    console.log('==== lint warning ====');
+-    console.log(err2);
+-  }
+-  console.log('==== lint output ====');
+-  console.log(out2);
+-});
+-gulp.task('doc', async () => {
+-  const { stderr, stdout } = await promisify(exec)('npm run doc');
+-  if (stderr) {
+-    console.log('==== doc warning ====');
+-    console.log(stderr);
+-  }
+-  try {
+-    const content = fs.readFileSync(DIR_DOC + '/api.json', { encoding: 'utf-8' });
+-    fs.writeFileSync(path.resolve(DIR_DOC, 'api.json'), JSON.stringify(JSON.parse(content)));
+-  } finally {}
+-  console.log('==== doc output ====');
+-  console.log(stdout);
+-});
+-gulp.task('changelog', function () {
+-  return gulp
+-    .src(FILE_DOC)
+-    .pipe(conventionalChangelog({}))
+-    .pipe(gulp.dest(DIR_DOC));
+-});
+-gulp.task('bump-version', function () {
+-  return gulp.src(['./package.json', './bower.json'])
+-    .pipe(bump({ type: bumpType }))
+-    .pipe(gulp.dest('./'));
+-});
+-gulp.task(
+-  'prepare-release',
+-  gulp.series(
+-    'build',
+-    'lint',
+-    gulp.parallel(
+-      'doc',
+-      'bump-version',
+-      'changelog'
+-    )
+-  )
+-);
++require('require-dir')('build/tasks');
+
+--- a//dev/null
++++ b/karma.conf.js
+@@ -0,0 +1,34 @@
++module.exports = function(config) {
++  config.set({
++    basePath: '',
++    frameworks: ['jspm', 'jasmine'],
++    jspm: {
++      loadFiles: ['src/**/*.js', 'test/**/*.js']
++    },
++    files: [],
++    exclude: [
++    ],
++    preprocessors: {
++      'test/**/*.js': ['babel'],
++      'src/**/*.js': ['babel']
++    },
++    'babelPreprocessor': {
++      options: {
++        sourceMap: 'inline',
++        presets: [ 'es2015-loose', 'stage-1'],
++        plugins: [
++          'syntax-flow',
++          'transform-decorators-legacy',
++          'transform-flow-strip-types'
++        ]
++      }
++    },
++    reporters: ['progress'],
++    port: 9876,
++    colors: true,
++    logLevel: config.LOG_INFO,
++    autoWatch: true,
++    browsers: ['Chrome'],
++    singleRun: false
++  });
++};
+
+--- a/rollup.config.js
++++ b//dev/null
+@@ -1,57 +0,0 @@
+-import typescript from '@rollup/plugin-typescript';
+-const name = require('./package.json').name;
+-/**
+- * @type {import('rollup').RollupOptions[]}
+- */
+-const rollupOptions = [
+-  {
+-    input: 'src/index.ts',
+-    output: [
+-      {
+-        file: `dist/es2015/${name}.js`,
+-        format: 'es',
+-        sourcemap: true,
+-      },
+-    ],
+-    plugins: [
+-      typescript({
+-        removeComments: true,
+-        sourceMap: true,
+-      })
+-    ]
+-  },
+-  {
+-    input: 'src/index.ts',
+-    output: [
+-      {
+-        file: `dist/native-modules/${name}.js`,
+-        format: 'es',
+-        sourcemap: true,
+-      },
+-      {
+-        file: `dist/amd/${name}.js`,
+-        format: 'amd',
+-        name: name,
+-        sourcemap: true,
+-      },
+-      {
+-        file: `dist/commonjs/${name}.js`,
+-        format: 'cjs',
+-        sourcemap: true,
+-      },
+-      {
+-        file: `dist/system/${name}.js`,
+-        format: 'system',
+-        sourcemap: true,
+-      }
+-    ],
+-    plugins: [
+-      typescript({
+-        target: 'es5',
+-        removeComments: true,
+-        sourceMap: true,
+-      })
+-    ]
+-  }
+-];
+-export default rollupOptions;
+
+--- a//dev/null
++++ b/src/index.js
+@@ -0,0 +1,227 @@
++function trimDots(ary: string[]): void {
++  for (let i = 0; i < ary.length; ++i) {
++    let part = ary[i];
++    if (part === '.') {
++      ary.splice(i, 1);
++      i -= 1;
++    } else if (part === '..') {
++      if (i === 0 || (i === 1 && ary[2] === '..') || ary[i - 1] === '..') {
++        continue;
++      } else if (i > 0) {
++        ary.splice(i - 1, 2);
++        i -= 2;
++      }
++    }
++  }
++}
++/**
++* Calculates a path relative to a file.
++*
++* @param name The relative path.
++* @param file The file path.
++* @return The calculated path.
++*/
++export function relativeToFile(name: string, file: string): string {
++  let fileParts = file && file.split('/');
++  let nameParts = name.trim().split('/');
++  if (nameParts[0].charAt(0) === '.' && fileParts) {
++    let normalizedBaseParts = fileParts.slice(0, fileParts.length - 1);
++    nameParts.unshift(...normalizedBaseParts);
++  }
++  trimDots(nameParts);
++  return nameParts.join('/');
++}
++/**
++* Joins two paths.
++*
++* @param path1 The first path.
++* @param path2 The second path.
++* @return The joined path.
++*/
++export function join(path1: string, path2: string): string {
++  if (!path1) {
++    return path2;
++  }
++  if (!path2) {
++    return path1;
++  }
++  let schemeMatch = path1.match(/^([^/]*?:)\//);
++  let scheme = (schemeMatch && schemeMatch.length > 0) ? schemeMatch[1] : '';
++  path1 = path1.substr(scheme.length);
++  let urlPrefix;
++  if (path1.indexOf('///') === 0 && scheme === 'file:') {
++    urlPrefix = '///';
++  } else if (path1.indexOf('//') === 0) {
++    urlPrefix = '//';
++  } else if (path1.indexOf('/') === 0) {
++    urlPrefix = '/';
++  } else {
++    urlPrefix = '';
++  }
++  let trailingSlash = path2.slice(-1) === '/' ? '/' : '';
++  let url1 = path1.split('/');
++  let url2 = path2.split('/');
++  let url3 = [];
++  for (let i = 0, ii = url1.length; i < ii; ++i) {
++    if (url1[i] === '..') {
++      if (url3.length && url3[url3.length - 1] !== '..') {
++        url3.pop();
++      } else {
++        url3.push(url1[i]);
++      }
++    } else if (url1[i] === '.' || url1[i] === '') {
++      continue;
++    } else {
++      url3.push(url1[i]);
++    }
++  }
++  for (let i = 0, ii = url2.length; i < ii; ++i) {
++    if (url2[i] === '..') {
++      if (url3.length && url3[url3.length - 1] !== '..') {
++        url3.pop();
++      } else {
++        url3.push(url2[i]);
++      }
++    } else if (url2[i] === '.' || url2[i] === '') {
++      continue;
++    } else {
++      url3.push(url2[i]);
++    }
++  }
++  return scheme + urlPrefix + url3.join('/') + trailingSlash;
++}
++let encode = encodeURIComponent;
++let encodeKey = k => encode(k).replace('%24', '$');
++/**
++* Recursively builds part of query string for parameter.
++*
++* @param key Parameter name for query string.
++* @param value Parameter value to deserialize.
++* @param traditional Boolean Use the old URI template standard (RFC6570)
++* @return Array with serialized parameter(s)
++*/
++function buildParam(key: string, value: any, traditional?: boolean): Array<string> {
++  let result = [];
++  if (value === null || value === undefined) {
++    return result;
++  }
++  if (Array.isArray(value)) {
++    for (let i = 0, l = value.length; i < l; i++) {
++      if (traditional) {
++        result.push(`${encodeKey(key)}=${encode(value[i])}`);
++      } else {
++        let arrayKey = key + '[' + (typeof value[i] === 'object' && value[i] !== null ? i : '') + ']';
++        result = result.concat(buildParam(arrayKey, value[i]));
++      }
++    }
++  } else if (typeof (value) === 'object' && !traditional) {
++    for (let propertyName in value) {
++      result = result.concat(buildParam(key + '[' + propertyName + ']', value[propertyName]));
++    }
++  } else {
++    result.push(`${encodeKey(key) }=${encode(value) }`);
++  }
++  return result;
++}
++/**
++* Generate a query string from an object.
++*
++* @param params Object containing the keys and values to be used.
++* @param traditional Boolean Use the old URI template standard (RFC6570)
++* @returns The generated query string, excluding leading '?'.
++*/
++export function buildQueryString(params: Object, traditional?: Boolean): string {
++  let pairs = [];
++  let keys = Object.keys(params || {}).sort();
++  for (let i = 0, len = keys.length; i < len; i++) {
++    let key = keys[i];
++    pairs = pairs.concat(buildParam(key, params[key], traditional));
++  }
++  if (pairs.length === 0) {
++    return '';
++  }
++  return pairs.join('&');
++}
++/**
++* Process parameter that was recognized as scalar param (primitive value or shallow array).
++*
++* @param existedParam Object with previously parsed values for specified key.
++* @param value Parameter value to append.
++* @returns Initial primitive value or transformed existedParam if parameter was recognized as an array.
++*/
++function processScalarParam(existedParam: Object, value: Object): Object {
++  if (Array.isArray(existedParam)) {
++    existedParam.push(value);
++    return existedParam;
++  }
++  if (existedParam !== undefined) {
++    return [existedParam, value];
++  }
++  return value;
++}
++/**
++* Sequentially process parameter that was recognized as complex value (object or array).
++* For each keys part, if the current level is undefined create an
++*   object or array based on the type of the next keys part.
++*
++* @param queryParams root-level result object.
++* @param keys Collection of keys related to this parameter.
++* @param value Parameter value to append.
++*/
++function parseComplexParam(queryParams: Object, keys: Object, value: any): void {
++  let currentParams = queryParams;
++  let keysLastIndex = keys.length - 1;
++  for (let j = 0; j <= keysLastIndex; j++) {
++    let key = keys[j] === '' ? currentParams.length : keys[j];
++    if (j < keysLastIndex) {
++      let prevValue = !currentParams[key] || typeof currentParams[key] === 'object' ? currentParams[key] : [currentParams[key]];
++      currentParams = currentParams[key] = prevValue || (isNaN(keys[j + 1]) ? {} : []);
++    } else {
++      currentParams = currentParams[key] = value;
++    }
++  }
++}
++/**
++* Parse a query string.
++*
++* @param queryString The query string to parse.
++* @returns Object with keys and values mapped from the query string.
++*/
++export function parseQueryString(queryString: string): Object {
++  let queryParams = {};
++  if (!queryString || typeof queryString !== 'string') {
++    return queryParams;
++  }
++  let query = queryString;
++  if (query.charAt(0) === '?') {
++    query = query.substr(1);
++  }
++  let pairs = query.replace(/\+/g, ' ').split('&');
++  for (let i = 0; i < pairs.length; i++) {
++    let pair = pairs[i].split('=');
++    let key = decodeURIComponent(pair[0]);
++    if (!key) {
++      continue;
++    }
++    let keys = key.split('][');
++    let keysLastIndex = keys.length - 1;
++    if (/\[/.test(keys[0]) && /\]$/.test(keys[keysLastIndex])) {
++      keys[keysLastIndex] = keys[keysLastIndex].replace(/\]$/, '');
++      keys = keys.shift().split('[').concat(keys);
++      keysLastIndex = keys.length - 1;
++    } else {
++      keysLastIndex = 0;
++    }
++    if (pair.length >= 2) {
++      let value = pair[1] ? decodeURIComponent(pair[1]) : '';
++      if (keysLastIndex) {
++        parseComplexParam(queryParams, keys, value);
++      } else {
++        queryParams[key] = processScalarParam(queryParams[key], value);
++      }
++    } else {
++      queryParams[key] = true;
++    }
++  }
++  return queryParams;
++}
+
+--- a/src/index.ts
++++ b//dev/null
+@@ -1,234 +0,0 @@
+-function trimDots(ary: string[]): void {
+-  for (let i = 0; i < ary.length; ++i) {
+-    let part = ary[i];
+-    if (part === '.') {
+-      ary.splice(i, 1);
+-      i -= 1;
+-    } else if (part === '..') {
+-      if (i === 0 || (i === 1 && ary[2] === '..') || ary[i - 1] === '..') {
+-        continue;
+-      } else if (i > 0) {
+-        ary.splice(i - 1, 2);
+-        i -= 2;
+-      }
+-    }
+-  }
+-}
+-/**
+-* Calculates a path relative to a file.
+-*
+-* @param name The relative path.
+-* @param file The file path.
+-* @return The calculated path.
+-*/
+-export function relativeToFile(name: string, file: string): string {
+-  let fileParts = file && file.split('/');
+-  let nameParts = name.trim().split('/');
+-  if (nameParts[0].charAt(0) === '.' && fileParts) {
+-    let normalizedBaseParts = fileParts.slice(0, fileParts.length - 1);
+-    nameParts.unshift(...normalizedBaseParts);
+-  }
+-  trimDots(nameParts);
+-  return nameParts.join('/');
+-}
+-/**
+-* Joins two paths.
+-*
+-* @param path1 The first path.
+-* @param path2 The second path.
+-* @return The joined path.
+-*/
+-export function join(path1: string, path2: string): string {
+-  if (!path1) {
+-    return path2;
+-  }
+-  if (!path2) {
+-    return path1;
+-  }
+-  let schemeMatch = path1.match(/^([^/]*?:)\//);
+-  let scheme = (schemeMatch && schemeMatch.length > 0) ? schemeMatch[1] : '';
+-  path1 = path1.substr(scheme.length);
+-  let urlPrefix;
+-  if (path1.indexOf('///') === 0 && scheme === 'file:') {
+-    urlPrefix = '///';
+-  } else if (path1.indexOf('//') === 0) {
+-    urlPrefix = '//';
+-  } else if (path1.indexOf('/') === 0) {
+-    urlPrefix = '/';
+-  } else {
+-    urlPrefix = '';
+-  }
+-  let trailingSlash = path2.slice(-1) === '/' ? '/' : '';
+-  let url1 = path1.split('/');
+-  let url2 = path2.split('/');
+-  let url3 = [];
+-  for (let i = 0, ii = url1.length; i < ii; ++i) {
+-    if (url1[i] === '..') {
+-      if (url3.length && url3[url3.length - 1] !== '..') {
+-        url3.pop();
+-      } else {
+-        url3.push(url1[i]);
+-      }
+-    } else if (url1[i] === '.' || url1[i] === '') {
+-      continue;
+-    } else {
+-      url3.push(url1[i]);
+-    }
+-  }
+-  for (let i = 0, ii = url2.length; i < ii; ++i) {
+-    if (url2[i] === '..') {
+-      if (url3.length && url3[url3.length - 1] !== '..') {
+-        url3.pop();
+-      } else {
+-        url3.push(url2[i]);
+-      }
+-    } else if (url2[i] === '.' || url2[i] === '') {
+-      continue;
+-    } else {
+-      url3.push(url2[i]);
+-    }
+-  }
+-  return scheme + urlPrefix + url3.join('/') + trailingSlash;
+-}
+-let encode = encodeURIComponent;
+-let encodeKey = k => encode(k).replace('%24', '$');
+-/**
+-* Recursively builds part of query string for parameter.
+-*
+-* @param key Parameter name for query string.
+-* @param value Parameter value to deserialize.
+-* @param traditional Boolean Use the old URI template standard (RFC6570)
+-* @return Array with serialized parameter(s)
+-*/
+-function buildParam(key: string, value: any, traditional?: boolean): Array<string> {
+-  let result = [];
+-  if (value === null || value === undefined) {
+-    return result;
+-  }
+-  if (Array.isArray(value)) {
+-    for (let i = 0, l = value.length; i < l; i++) {
+-      if (traditional) {
+-        result.push(`${encodeKey(key)}=${encode(value[i])}`);
+-      } else {
+-        let arrayKey = key + '[' + (typeof value[i] === 'object' && value[i] !== null ? i : '') + ']';
+-        result = result.concat(buildParam(arrayKey, value[i]));
+-      }
+-    }
+-  } else if (typeof (value) === 'object' && !traditional) {
+-    for (let propertyName in value) {
+-      result = result.concat(buildParam(key + '[' + propertyName + ']', value[propertyName]));
+-    }
+-  } else {
+-    result.push(`${encodeKey(key) }=${encode(value) }`);
+-  }
+-  return result;
+-}
+-/**
+-* Generate a query string from an object.
+-*
+-* @param params Object containing the keys and values to be used.
+-* @param traditional Boolean Use the old URI template standard (RFC6570)
+-* @returns The generated query string, excluding leading '?'.
+-*/
+-export function buildQueryString(params?: Object, traditional?: boolean): string {
+-  let pairs = [];
+-  let keys = Object.keys(params || {}).sort();
+-  for (let i = 0, len = keys.length; i < len; i++) {
+-    let key = keys[i];
+-    pairs = pairs.concat(buildParam(key, params[key], traditional));
+-  }
+-  if (pairs.length === 0) {
+-    return '';
+-  }
+-  return pairs.join('&');
+-}
+-/**
+-* Process parameter that was recognized as scalar param (primitive value or shallow array).
+-*
+-* @param existedParam Object with previously parsed values for specified key.
+-* @param value Parameter value to append.
+-* @returns Initial primitive value or transformed existedParam if parameter was recognized as an array.
+-*/
+-function processScalarParam(existedParam: Object, value: Object): Object {
+-  if (Array.isArray(existedParam)) {
+-    existedParam.push(value);
+-    return existedParam;
+-  }
+-  if (existedParam !== undefined) {
+-    return [existedParam, value];
+-  }
+-  return value;
+-}
+-/**
+-* Sequentially process parameter that was recognized as complex value (object or array).
+-* For each keys part, if the current level is undefined create an
+-*   object or array based on the type of the next keys part.
+-*
+-* @param queryParams root-level result object.
+-* @param keys Collection of keys related to this parameter.
+-* @param value Parameter value to append.
+-*/
+-function parseComplexParam(queryParams: Object, keys: (string | number)[], value: any): void {
+-  let currentParams = queryParams;
+-  let keysLastIndex = keys.length - 1;
+-  for (let j = 0; j <= keysLastIndex; j++) {
+-    let key = keys[j] === '' ? (currentParams as any).length : keys[j];
+-    preventPollution(key);
+-    if (j < keysLastIndex) {
+-      let prevValue = !currentParams[key] || typeof currentParams[key] === 'object' ? currentParams[key] : [currentParams[key]];
+-      currentParams = currentParams[key] = prevValue || (isNaN(keys[j + 1] as number) ? {} : []);
+-    } else {
+-      currentParams = currentParams[key] = value;
+-    }
+-  }
+-}
+-/**
+-* Parse a query string.
+-*
+-* @param queryString The query string to parse.
+-* @returns Object with keys and values mapped from the query string.
+-*/
+-export function parseQueryString(queryString: string): Object {
+-  let queryParams = {};
+-  if (!queryString || typeof queryString !== 'string') {
+-    return queryParams;
+-  }
+-  let query = queryString;
+-  if (query.charAt(0) === '?') {
+-    query = query.substr(1);
+-  }
+-  let pairs = query.replace(/\+/g, ' ').split('&');
+-  for (let i = 0; i < pairs.length; i++) {
+-    let pair = pairs[i].split('=');
+-    let key = decodeURIComponent(pair[0]);
+-    if (!key) {
+-      continue;
+-    }
+-    let keys = key.split('][');
+-    let keysLastIndex = keys.length - 1;
+-    if (/\[/.test(keys[0]) && /\]$/.test(keys[keysLastIndex])) {
+-      keys[keysLastIndex] = keys[keysLastIndex].replace(/\]$/, '');
+-      keys = keys.shift().split('[').concat(keys);
+-      keysLastIndex = keys.length - 1;
+-    } else {
+-      keysLastIndex = 0;
+-    }
+-    if (pair.length >= 2) {
+-      let value = pair[1] ? decodeURIComponent(pair[1]) : '';
+-      if (keysLastIndex) {
+-        parseComplexParam(queryParams, keys, value);
+-      } else {
+-        preventPollution(key);
+-        queryParams[key] = processScalarParam(queryParams[key], value);
+-      }
+-    } else {
+-      queryParams[key] = true;
+-    }
+-  }
+-  return queryParams;
+-}
+-function preventPollution(key: string) {
+-  if (key === '__proto__') {
+-    throw new Error('Prototype pollution detected.');
+-  }
+-}

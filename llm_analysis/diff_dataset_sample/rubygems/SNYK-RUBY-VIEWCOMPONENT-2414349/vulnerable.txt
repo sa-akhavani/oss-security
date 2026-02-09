@@ -1,0 +1,467 @@
+# ====================================================================
+# FILE: lib/view_component/base.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-234 ---
+     1| require "action_view"
+     2| require "active_support/configurable"
+     3| require "view_component/collection"
+     4| require "view_component/compile_cache"
+     5| require "view_component/previewable"
+     6| require "view_component/slotable"
+     7| require "view_component/slotable_v2"
+     8| require "view_component/with_content_helper"
+     9| module ViewComponent
+    10|   class Base < ActionView::Base
+    11|     include ActiveSupport::Configurable
+    12|     include ViewComponent::Previewable
+    13|     include ViewComponent::SlotableV2
+    14|     include ViewComponent::WithContentHelper
+    15|     ViewContextCalledBeforeRenderError = Class.new(StandardError)
+    16|     RESERVED_PARAMETER = :content
+    17|     delegate :form_authenticity_token, :protect_against_forgery?, :config, to: :helpers
+    18|     class_attribute :content_areas
+    19|     self.content_areas = [] # class_attribute:default doesn't work until Rails 5.2
+    20|     def self._after_compile
+    21|     end
+    22|     def render_in(view_context, &block)
+    23|       self.class.compile(raise_errors: true)
+    24|       @view_context = view_context
+    25|       @lookup_context ||= view_context.lookup_context
+    26|       @view_renderer ||= view_context.view_renderer
+    27|       @view_flow ||= view_context.view_flow
+    28|       @virtual_path ||= virtual_path
+    29|       @variant ||= @lookup_context.variants.first
+    30|       @current_template = nil unless defined?(@current_template)
+    31|       old_current_template = @current_template
+    32|       @current_template = self
+    33|       raise ArgumentError.new("Block provided after calling `with_content`. Use one or the other.") if block && defined?(@_content_set_by_with_content)
+    34|       @_content_evaluated = false
+    35|       @_render_in_block = block
+    36|       before_render
+    37|       if render?
+    38|         render_template_for(@variant) + _output_postamble
+    39|       else
+    40|         ""
+    41|       end
+    42|     ensure
+    43|       @current_template = old_current_template
+    44|     end
+    45|     def _output_postamble
+    46|       ""
+    47|     end
+    48|     def before_render
+    49|       before_render_check
+    50|     end
+    51|     def before_render_check
+    52|     end
+    53|     def render?
+    54|       true
+    55|     end
+    56|     def initialize(*); end
+    57|     def render(options = {}, args = {}, &block)
+    58|       if options.is_a? ViewComponent::Base
+    59|         super
+    60|       else
+    61|         view_context.render(options, args, &block)
+    62|       end
+    63|     end
+    64|     def controller
+    65|       raise ViewContextCalledBeforeRenderError, "`controller` can only be called at render time." if view_context.nil?
+    66|       @controller ||= view_context.controller
+    67|     end
+    68|     def helpers
+    69|       raise ViewContextCalledBeforeRenderError, "`helpers` can only be called at render time." if view_context.nil?
+    70|       @helpers ||= controller.view_context
+    71|     end
+    72|     def virtual_path
+    73|       self.class.virtual_path
+    74|     end
+    75|     def view_cache_dependencies
+    76|       []
+    77|     end
+    78|     def format
+    79|       if defined?(@variant)
+    80|         @variant
+    81|       end
+    82|     end
+    83|     def with(area, content = nil, &block)
+    84|       unless content_areas.include?(area)
+    85|         raise ArgumentError.new "Unknown content_area '#{area}' - expected one of '#{content_areas}'"
+    86|       end
+    87|       if block_given?
+    88|         content = view_context.capture(&block)
+    89|       end
+    90|       instance_variable_set("@#{area}".to_sym, content)
+    91|       nil
+    92|     end
+    93|     def with_variant(variant)
+    94|       @variant = variant
+    95|       self
+    96|     end
+    97|     def request
+    98|       @request ||= controller.request
+    99|     end
+   100|     private
+   101|     attr_reader :view_context
+   102|     def content
+   103|       return @_content if defined?(@_content)
+   104|       @_content_evaluated = true
+   105|       @_content = if @view_context && @_render_in_block
+   106|         view_context.capture(self, &@_render_in_block)
+   107|       elsif defined?(@_content_set_by_with_content)
+   108|         @_content_set_by_with_content
+   109|       end
+   110|     end
+   111|     def content_evaluated?
+   112|       @_content_evaluated
+   113|     end
+   114|     mattr_accessor :test_controller
+   115|     @@test_controller = "ApplicationController"
+   116|     mattr_accessor :render_monkey_patch_enabled, instance_writer: false, default: true
+   117|     class << self
+   118|       attr_accessor :source_location, :virtual_path
+   119|       def _sidecar_files(extensions)
+   120|         return [] unless source_location
+   121|         extensions = extensions.join(",")
+   122|         directory = File.dirname(source_location)
+   123|         filename = File.basename(source_location, ".rb")
+   124|         component_name = name.demodulize.underscore
+   125|         nested_component_files = if name.include?("::") && component_name != filename
+   126|           Dir["#{directory}/#{filename}/#{component_name}.*{#{extensions}}"]
+   127|         else
+   128|           []
+   129|         end
+   130|         sidecar_files = Dir["#{directory}/#{component_name}.*{#{extensions}}"]
+   131|         sidecar_directory_files = Dir["#{directory}/#{component_name}/#{filename}.*{#{extensions}}"]
+   132|         (sidecar_files - [source_location] + sidecar_directory_files + nested_component_files).uniq
+   133|       end
+   134|       def with_collection(collection, **args)
+   135|         Collection.new(self, collection, **args)
+   136|       end
+   137|       def short_identifier
+   138|         @short_identifier ||= defined?(Rails.root) ? source_location.sub("#{Rails.root}/", "") : source_location
+   139|       end
+   140|       def inherited(child)
+   141|         compile
+   142|         if defined?(Rails) && Rails.application
+   143|           child.include Rails.application.routes.url_helpers unless child < Rails.application.routes.url_helpers
+   144|         end
+   145|         child.source_location = caller_locations(1, 10).reject { |l| l.label == "inherited" }[0].absolute_path
+   146|         child.virtual_path = child.source_location.gsub(%r{(.*app/components)|(\.rb)}, "")
+   147|         super
+   148|       end
+   149|       def compiled?
+   150|         compiler.compiled?
+   151|       end
+   152|       def compile(raise_errors: false)
+   153|         compiler.compile(raise_errors: raise_errors)
+   154|       end
+   155|       def compiler
+   156|         @_compiler ||= Compiler.new(self)
+   157|       end
+   158|       def type
+   159|         "text/html"
+   160|       end
+   161|       def format
+   162|         :html
+   163|       end
+   164|       def identifier
+   165|         source_location
+   166|       end
+   167|       def with_content_areas(*areas)
+   168|         ActiveSupport::Deprecation.warn(
+   169|           "`with_content_areas` is deprecated and will be removed in ViewComponent v3.0.0.\n" \
+   170|           "Use slots (https://viewcomponent.org/guide/slots.html) instead."
+   171|         )
+   172|         if areas.include?(:content)
+   173|           raise ArgumentError.new ":content is a reserved content area name. Please use another name, such as ':body'"
+   174|         end
+   175|         areas.each do |area|
+   176|           define_method area.to_sym do
+   177|             content unless content_evaluated? # ensure content is loaded so content_areas will be defined
+   178|             instance_variable_get(:"@#{area}") if instance_variable_defined?(:"@#{area}")
+   179|           end
+   180|         end
+   181|         self.content_areas = areas
+   182|       end
+   183|       def with_collection_parameter(param)
+   184|         @provided_collection_parameter = param
+   185|       end
+   186|       def validate_collection_parameter!(validate_default: false)
+   187|         parameter = validate_default ? collection_parameter : provided_collection_parameter
+   188|         return unless parameter
+   189|         return if initialize_parameter_names.include?(parameter)
+   190|         if initialize_parameters.empty?
+   191|           raise ArgumentError.new(
+   192|             "#{self} initializer is empty or invalid."
+   193|           )
+   194|         end
+   195|         raise ArgumentError.new(
+   196|           "#{self} initializer must accept " \
+   197|           "`#{parameter}` collection parameter."
+   198|         )
+   199|       end
+   200|       def validate_initialization_parameters!
+   201|         return unless initialize_parameter_names.include?(RESERVED_PARAMETER)
+   202|         raise ViewComponent::ComponentError.new(
+   203|           "#{self} initializer cannot contain " \
+   204|           "`#{RESERVED_PARAMETER}` since it will override a " \
+   205|           "public ViewComponent method."
+   206|         )
+   207|       end
+   208|       def collection_parameter
+   209|         if provided_collection_parameter
+   210|           provided_collection_parameter
+   211|         else
+   212|           name && name.demodulize.underscore.chomp("_component").to_sym
+   213|         end
+   214|       end
+   215|       def collection_counter_parameter
+   216|         "#{collection_parameter}_counter".to_sym
+   217|       end
+   218|       def counter_argument_present?
+   219|         initialize_parameter_names.include?(collection_counter_parameter)
+   220|       end
+   221|       private
+   222|       def initialize_parameter_names
+   223|         initialize_parameters.map(&:last)
+   224|       end
+   225|       def initialize_parameters
+   226|         instance_method(:initialize).parameters
+   227|       end
+   228|       def provided_collection_parameter
+   229|         @provided_collection_parameter ||= nil
+   230|       end
+   231|     end
+   232|     ActiveSupport.run_load_hooks(:view_component, self)
+   233|   end
+   234| end
+
+
+# ====================================================================
+# FILE: lib/view_component/engine.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-84 ---
+     1| require "rails"
+     2| require "view_component"
+     3| module ViewComponent
+     4|   class Engine < Rails::Engine # :nodoc:
+     5|     config.view_component = ActiveSupport::OrderedOptions.new
+     6|     config.view_component.preview_paths ||= []
+     7|     initializer "view_component.set_configs" do |app|
+     8|       options = app.config.view_component
+     9|       options.render_monkey_patch_enabled = true if options.render_monkey_patch_enabled.nil?
+    10|       options.show_previews = Rails.env.development? || Rails.env.test? if options.show_previews.nil?
+    11|       options.preview_route ||= ViewComponent::Base.preview_route
+    12|       options.preview_controller ||= ViewComponent::Base.preview_controller
+    13|       if options.show_previews
+    14|         options.preview_paths << "#{Rails.root}/test/components/previews" if defined?(Rails.root) && Dir.exist?(
+    15|           "#{Rails.root}/test/components/previews"
+    16|         )
+    17|         if options.preview_path.present?
+    18|           ActiveSupport::Deprecation.warn(
+    19|             "`preview_path` will be removed in v3.0.0. Use `preview_paths` instead."
+    20|           )
+    21|           options.preview_paths << options.preview_path
+    22|         end
+    23|       end
+    24|       ActiveSupport.on_load(:view_component) do
+    25|         options.each { |k, v| send("#{k}=", v) }
+    26|       end
+    27|     end
+    28|     initializer "view_component.set_autoload_paths" do |app|
+    29|       options = app.config.view_component
+    30|       if options.show_previews && !options.preview_paths.empty?
+    31|         ActiveSupport::Dependencies.autoload_paths.concat(options.preview_paths)
+    32|       end
+    33|     end
+    34|     initializer "view_component.eager_load_actions" do
+    35|       ActiveSupport.on_load(:after_initialize) do
+    36|         ViewComponent::Base.descendants.each(&:compile) if Rails.application.config.eager_load
+    37|       end
+    38|     end
+    39|     initializer "view_component.compile_config_methods" do
+    40|       ActiveSupport.on_load(:view_component) do
+    41|         config.compile_methods! if config.respond_to?(:compile_methods!)
+    42|       end
+    43|     end
+    44|     initializer "view_component.monkey_patch_render" do |app|
+    45|       next if Rails.version.to_f >= 6.1 || !app.config.view_component.render_monkey_patch_enabled
+    46|       ActiveSupport.on_load(:action_view) do
+    47|         require "view_component/render_monkey_patch"
+    48|         ActionView::Base.prepend ViewComponent::RenderMonkeyPatch
+    49|       end
+    50|       ActiveSupport.on_load(:action_controller) do
+    51|         require "view_component/rendering_monkey_patch"
+    52|         require "view_component/render_to_string_monkey_patch"
+    53|         ActionController::Base.prepend ViewComponent::RenderingMonkeyPatch
+    54|         ActionController::Base.prepend ViewComponent::RenderToStringMonkeyPatch
+    55|       end
+    56|     end
+    57|     initializer "view_component.include_render_component" do |app|
+    58|       next if Rails.version.to_f >= 6.1
+    59|       ActiveSupport.on_load(:action_view) do
+    60|         require "view_component/render_component_helper"
+    61|         ActionView::Base.include ViewComponent::RenderComponentHelper
+    62|       end
+    63|       ActiveSupport.on_load(:action_controller) do
+    64|         require "view_component/rendering_component_helper"
+    65|         require "view_component/render_component_to_string_helper"
+    66|         ActionController::Base.include ViewComponent::RenderingComponentHelper
+    67|         ActionController::Base.include ViewComponent::RenderComponentToStringHelper
+    68|       end
+    69|     end
+    70|     config.after_initialize do |app|
+    71|       options = app.config.view_component
+    72|       if options.show_previews
+    73|         app.routes.prepend do
+    74|           preview_controller = options.preview_controller.sub(/Controller$/, "").underscore
+    75|           get options.preview_route, to: "#{preview_controller}#index", as: :preview_view_components, internal: true
+    76|           get "#{options.preview_route}/*path", to: "#{preview_controller}#previews", as: :preview_view_component, internal: true
+    77|         end
+    78|       end
+    79|       app.executor.to_run :before do
+    80|         CompileCache.invalidate! unless ActionView::Base.cache_template_loading
+    81|       end
+    82|     end
+    83|   end
+    84| end
+
+
+# ====================================================================
+# FILE: lib/view_component/slotable_v2.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-113 ---
+     1| require "active_support/concern"
+     2| require "view_component/slot_v2"
+     3| module ViewComponent
+     4|   module SlotableV2
+     5|     extend ActiveSupport::Concern
+     6|     included do
+     7|       class_attribute :registered_slots
+     8|       self.registered_slots = {}
+     9|     end
+    10|     class_methods do
+    11|       def renders_one(slot_name, callable = nil)
+    12|         validate_slot_name(slot_name)
+    13|         define_method slot_name do |*args, **kwargs, &block|
+    14|           if args.empty? && kwargs.empty? && block.nil?
+    15|             get_slot(slot_name)
+    16|           else
+    17|             set_slot(slot_name, *args, **kwargs, &block)
+    18|           end
+    19|         end
+    20|         register_slot(slot_name, collection: false, callable: callable)
+    21|       end
+    22|       def renders_many(slot_name, callable = nil)
+    23|         validate_slot_name(slot_name)
+    24|         singular_name = ActiveSupport::Inflector.singularize(slot_name)
+    25|         define_method singular_name do |*args, **kwargs, &block|
+    26|           set_slot(slot_name, *args, **kwargs, &block)
+    27|         end
+    28|         define_method slot_name do |collection_args = nil, &block|
+    29|           if collection_args.nil? && block.nil?
+    30|             get_slot(slot_name)
+    31|           else
+    32|             collection_args.each do |args|
+    33|               set_slot(slot_name, **args, &block)
+    34|             end
+    35|           end
+    36|         end
+    37|         register_slot(slot_name, collection: true, callable: callable)
+    38|       end
+    39|       def inherited(child)
+    40|         child.registered_slots = self.registered_slots.clone
+    41|         super
+    42|       end
+    43|       private
+    44|       def register_slot(slot_name, collection:, callable:)
+    45|         slot = {
+    46|           collection: collection,
+    47|         }
+    48|         if callable && callable.respond_to?(:method_defined?) && callable.method_defined?(:render_in)
+    49|           slot[:renderable] = callable
+    50|         elsif callable.is_a?(String)
+    51|           slot[:renderable_class_name] = callable
+    52|         elsif callable
+    53|           method_name = :"_call_#{slot_name}"
+    54|           define_method method_name, &callable
+    55|           slot[:renderable_function] = instance_method(method_name)
+    56|         end
+    57|         self.registered_slots[slot_name] = slot
+    58|       end
+    59|       def validate_slot_name(slot_name)
+    60|         if slot_name.to_sym == :content
+    61|           raise ArgumentError.new("#{slot_name} is not a valid slot name.")
+    62|         end
+    63|         if self.registered_slots.key?(slot_name)
+    64|           raise ArgumentError.new("#{slot_name} slot declared multiple times")
+    65|         end
+    66|       end
+    67|     end
+    68|     def get_slot(slot_name)
+    69|       content unless content_evaluated? # ensure content is loaded so slots will be defined
+    70|       slot = self.class.registered_slots[slot_name]
+    71|       @_set_slots ||= {}
+    72|       if @_set_slots[slot_name]
+    73|         return @_set_slots[slot_name]
+    74|       end
+    75|       if slot[:collection]
+    76|         []
+    77|       else
+    78|         nil
+    79|       end
+    80|     end
+    81|     def set_slot(slot_name, *args, **kwargs, &block)
+    82|       slot_definition = self.class.registered_slots[slot_name]
+    83|       slot = SlotV2.new(self)
+    84|       slot._content_block = block if block_given?
+    85|       if slot_definition[:renderable]
+    86|         slot._component_instance = slot_definition[:renderable].new(*args, **kwargs)
+    87|       elsif slot_definition[:renderable_class_name]
+    88|         slot._component_instance = self.class.const_get(slot_definition[:renderable_class_name]).new(*args, **kwargs)
+    89|       elsif slot_definition[:renderable_function]
+    90|         renderable_value = if block_given?
+    91|           slot_definition[:renderable_function].bind(self).call(*args, **kwargs) do |*args, **kwargs|
+    92|             view_context.capture(*args, **kwargs, &block)
+    93|           end
+    94|         else
+    95|           slot_definition[:renderable_function].bind(self).call(*args, **kwargs)
+    96|         end
+    97|         if renderable_value.respond_to?(:render_in)
+    98|           slot._component_instance = renderable_value
+    99|         else
+   100|           slot._content = renderable_value
+   101|         end
+   102|       end
+   103|       @_set_slots ||= {}
+   104|       if slot_definition[:collection]
+   105|         @_set_slots[slot_name] ||= []
+   106|         @_set_slots[slot_name].push(slot)
+   107|       else
+   108|         @_set_slots[slot_name] = slot
+   109|       end
+   110|       slot
+   111|     end
+   112|   end
+   113| end
+
+
+# ====================================================================
+# FILE: lib/view_component/version.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-9 ---
+     1| module ViewComponent
+     2|   module VERSION
+     3|     MAJOR = 2
+     4|     MINOR = 32
+     5|     PATCH = 0
+     6|     STRING = [MAJOR, MINOR, PATCH].join(".")
+     7|   end
+     8| end
+     9| puts ViewComponent::VERSION::STRING if __FILE__ == $PROGRAM_NAME
+

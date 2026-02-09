@@ -1,0 +1,1258 @@
+--- a//dev/null
++++ b/app/controllers/trestle/auth/sessions_controller.rb
+@@ -0,0 +1,19 @@
++class Trestle::Auth::SessionsController < Trestle::ApplicationController
++  layout 'trestle/auth'
++  skip_before_action :authenticate_user, only: [:new, :create]
++  skip_before_action :require_authenticated_user
++  def new
++  end
++  def create
++    if authentication_backend.authenticate!
++      redirect_to authentication_backend.previous_location || instance_exec(&Trestle.config.auth.redirect_on_login)
++    else
++      flash[:error] = t("admin.auth.error", default: "Incorrect login details.")
++      redirect_to action: :new
++    end
++  end
++  def destroy
++    logout!
++    redirect_to instance_exec(&Trestle.config.auth.redirect_on_logout)
++  end
++end
+
+--- a//dev/null
++++ b/config/routes.rb
+@@ -0,0 +1,11 @@
++Trestle::Engine.routes.draw do
++  controller "trestle/auth/sessions" do
++    if Trestle.config.auth.enable_login
++      get  'login'  => :new, as: :login
++      post 'login'  => :create
++    end
++    if Trestle.config.auth.enable_logout
++      get 'logout' => :destroy, as: :logout
++    end
++  end
++end
+
+--- a//dev/null
++++ b/lib/generators/trestle/auth/admin/admin_generator.rb
+@@ -0,0 +1,22 @@
++module Trestle
++  module Auth
++    module Generators
++      class AdminGenerator < ::Rails::Generators::Base
++        desc "Creates a Trestle admin for managing Administrators"
++        argument :model, type: :string, default: "Administrator"
++        class_option :devise, type: :boolean, default: false, desc: "Create admin for a Devise user model"
++        source_root File.expand_path("../templates", __FILE__)
++        def create_admin
++          template "admin.rb.erb", File.join('app/admin/auth', "#{model.underscore.pluralize}_admin.rb")
++        end
++        def devise?
++          options[:devise]
++        end
++      protected
++        def plural_name
++          model.demodulize.underscore.pluralize
++        end
++      end
++    end
++  end
++end
+
+--- a/lib/generators/trestle/auth/install/install_generator.rb
++++ b/lib/generators/trestle/auth/install/install_generator.rb
+@@ -1,57 +1,46 @@
+ module Trestle
+   module Auth
+     module Generators
+       class InstallGenerator < ::Rails::Generators::Base
+         desc "Installs trestle-auth"
+         argument :model, type: :string, default: "Administrator"
+         class_option :devise, type: :boolean, default: false, desc: "Setup trestle-auth with Devise integration"
+-        class_option :skip_account, type: :boolean, default: false, desc: "Skip creation of the current account admin"
+         source_root File.expand_path("../templates", __FILE__)
+         def check_trestle_installed
+           unless ::File.exist?("config/initializers/trestle.rb")
+             raise Thor::Error, "The file config/initializers/trestle.rb does not appear to exist. Please run `trestle:install` first."
+           end
+         end
+         def insert_configuration
+           inject_into_file "config/initializers/trestle.rb", before: /^end/ do
+             format_configuration(template_content(configuration_template))
+           end
+         end
+         def generate_model
+           generate "trestle:auth:model", model unless devise?
+         end
+         def generate_admin
+           generate "trestle:auth:admin", model, ("--devise" if devise?)
+         end
+-        def generate_account
+-          generate "trestle:auth:account", model, ("--devise" if devise?) unless options[:skip_account]
+-        end
+         def devise?
+           options[:devise]
+         end
+         def configuration_template
+           devise? ? "devise.rb.erb" : "basic.rb.erb"
+         end
+       private
+         def format_configuration(source)
+           "\n#{source.indent(2)}\n"
+         end
+         def template_content(path, options={})
+           path = File.expand_path(find_in_source_paths(path.to_s))
+           context = options.delete(:context) || instance_eval("binding")
+-          content = capturable_erb(path).tap do |erb|
++          capturable_erb = CapturableERB.new(::File.binread(path), trim_mode: "-", eoutvar: "@output_buffer")
++          content = capturable_erb.tap do |erb|
+             erb.filename = path
+           end.result(context)
+-        end
+-        def capturable_erb(path)
+-          match = ERB.version.match(/(\d+\.\d+\.\d+)/)
+-          if match && match[1] >= "2.2.0" # Ruby 2.6+
+-            CapturableERB.new(::File.binread(path), trim_mode: "-", eoutvar: "@output_buffer")
+-          else
+-            CapturableERB.new(::File.binread(path), nil, "-", "@output_buffer")
+-          end
+         end
+       end
+     end
+   end
+ end
+
+--- a//dev/null
++++ b/lib/trestle/auth.rb
+@@ -0,0 +1,19 @@
++require_relative "auth/version"
++require "trestle"
++module Trestle
++  module Auth
++    require_relative "auth/backends"
++    require_relative "auth/configuration"
++    require_relative "auth/constraint"
++    require_relative "auth/model_methods"
++    require_relative "auth/null_user"
++    module Controller
++      require_relative "auth/controller/authentication"
++      require_relative "auth/controller/locale"
++      require_relative "auth/controller/time_zone"
++    end
++    require_relative "auth/controller_methods"
++  end
++  Configuration.option :auth, Auth::Configuration.new
++end
++require_relative "auth/engine" if defined?(Rails)
+
+--- a//dev/null
++++ b/lib/trestle/auth/backends.rb
+@@ -0,0 +1,28 @@
++module Trestle
++  module Auth
++    module Backends
++      extend ActiveSupport::Autoload
++      require_relative "backends/base"
++      autoload :Basic
++      autoload :Devise
++      autoload :Warden
++      def self.lookup(backend)
++        case backend
++        when Class
++          backend
++        else
++          registry.fetch(backend) { raise ArgumentError, "Invalid authentication backend: #{backend.inspect}" }
++        end
++      end
++      def self.registry
++        @registry ||= {}
++      end
++      def self.register(name, klass)
++        registry[name] = klass
++      end
++      register(:basic, Basic)
++      register(:devise, Devise)
++      register(:warden, Warden)
++    end
++  end
++end
+
+--- a//dev/null
++++ b/lib/trestle/auth/backends/base.rb
+@@ -0,0 +1,21 @@
++module Trestle
++  module Auth
++    module Backends
++      class Base
++        attr_reader :controller, :request, :session, :cookies
++        def initialize(controller:, request:, session:, cookies:)
++          @controller, @request, @session, @cookies = controller, request, session, cookies
++        end
++        def scope
++          :user
++        end
++        def store_location(url)
++          session[:trestle_return_to] = url
++        end
++        def previous_location
++          session.delete(:trestle_return_to)
++        end
++      end
++    end
++  end
++end
+
+--- a//dev/null
++++ b/lib/trestle/auth/backends/basic.rb
+@@ -0,0 +1,54 @@
++module Trestle
++  module Auth
++    module Backends
++      class Basic < Base
++        attr_reader :user
++        def authenticate!
++          params = login_params
++          if user = Trestle.config.auth.authenticate(params)
++            login!(user)
++            remember_me! if Trestle.config.auth.remember.enabled && params[:remember_me]
++            user
++          end
++        end
++        def authenticate
++          @user = find_authenticated_user || find_remembered_user
++        end
++        def logged_in?
++          !!user
++        end
++        def login!(user)
++          session[:trestle_user] = user.id
++          @user = user
++        end
++        def logout!
++          if logged_in? && Trestle.config.auth.remember.enabled
++            Trestle.config.auth.remember.forget_me(user)
++            cookies.delete(:trestle_remember_token)
++          end
++          session.delete(:trestle_user)
++          @user = nil
++        end
++      protected
++        def remember_me!
++          Trestle.config.auth.remember.remember_me(user)
++          cookies.signed[:trestle_remember_token] = Trestle.config.auth.remember.cookie(user)
++        end
++        def find_authenticated_user
++          Trestle.config.auth.find_user(session[:trestle_user]) if session[:trestle_user]
++        end
++        def find_remembered_user
++          return unless Trestle.config.auth.remember.enabled
++          if token = cookies.signed[:trestle_remember_token]
++            user = Trestle.config.auth.remember.authenticate(token)
++            login!(user) if user
++            user
++          end
++        end
++        def login_params
++          controller.params.require(:user).permit!
++        end
++      end
++    end
++  end
++end
+
+--- a//dev/null
++++ b/lib/trestle/auth/backends/devise.rb
+@@ -0,0 +1,12 @@
++module Trestle
++  module Auth
++    module Backends
++      class Devise < Warden
++        def authenticate!
++          request.env["devise.allow_params_authentication"] = true
++          super
++        end
++      end
++    end
++  end
++end
+
+--- a//dev/null
++++ b/lib/trestle/auth/backends/warden.rb
+@@ -0,0 +1,39 @@
++module Trestle
++  module Auth
++    module Backends
++      class Warden < Base
++        def authenticate!
++          authenticate
++        end
++        def authenticate
++          warden.authenticate(scope: scope)
++        end
++        def logged_in?
++          warden.authenticated?(scope)
++        end
++        def user
++          warden.user(scope)
++        end
++        def login!(user)
++          warden.set_user(user, scope: scope)
++        end
++        def logout!
++          if scope
++            warden.logout(scope)
++            warden.clear_strategies_cache!(scope: scope)
++          else
++            warden.logout
++            warden.clear_strategies_cache!
++          end
++        end
++        def scope
++          Trestle.config.auth.warden.scope
++        end
++      protected
++        def warden
++          request.env['warden']
++        end
++      end
++    end
++  end
++end
+
+--- a//dev/null
++++ b/lib/trestle/auth/configuration.rb
+@@ -0,0 +1,59 @@
++module Trestle
++  module Auth
++    class Configuration
++      require_relative "configuration/rememberable"
++      require_relative "configuration/warden"
++      include Configurable
++      option :user_class, -> { ::Administrator }
++      option :user_scope, -> { Trestle.config.auth.user_class }
++      option :user_admin
++      option :authenticate_with, :email
++      option :authenticate, ->(params) {
++        scope = Trestle.config.auth.user_scope
++        scope.authenticate(
++          params[Trestle.config.auth.authenticate_with],
++          params[:password]
++        )
++      }
++      option :find_user, ->(id) {
++        Trestle.config.auth.user_scope.find_by(id: id)
++      }
++      option :human_attribute_name, ->(field) {
++        model = Trestle.config.auth.user_class rescue nil
++        if model && model.respond_to?(:human_attribute_name)
++          model.human_attribute_name(field)
++        else
++          field.to_s.humanize
++        end
++      }
++      option :avatar, ->(user) {
++        avatar { gravatar(user.email) }
++      }, evaluate: false
++      option :format_user_name, ->(user) {
++        if user.respond_to?(:first_name) && user.respond_to?(:last_name)
++          safe_join([user.first_name, content_tag(:strong, user.last_name)], " ")
++        else
++          display(user)
++        end
++      }, evaluate: false
++      option :locale, ->(user) {
++        user.locale if user.respond_to?(:locale)
++      }, evaluate: false
++      option :time_zone, ->(user) {
++        user.time_zone if user.respond_to?(:time_zone)
++      }, evaluate: false
++      option :enable_login, true
++      option :enable_logout, true
++      option :login_url, -> { login_url }, evaluate: false
++      option :redirect_on_login, -> { Trestle.config.path }, evaluate: false
++      option :redirect_on_logout, -> { login_url }, evaluate: false
++      option :logo
++      option :remember, Rememberable.new
++      option :backend, Backends::Basic
++      def backend=(backend)
++        assign(:backend, Backends.lookup(backend))
++      end
++      option :warden, Warden.new
++    end
++  end
++end
+
+--- a//dev/null
++++ b/lib/trestle/auth/configuration/warden.rb
+@@ -0,0 +1,10 @@
++module Trestle
++  module Auth
++    class Configuration
++      class Warden
++        include Configurable
++        option :scope
++      end
++    end
++  end
++end
+
+--- a/lib/trestle/auth/controller/authentication.rb
++++ b/lib/trestle/auth/controller/authentication.rb
+@@ -1,20 +1,19 @@
+ module Trestle
+   module Auth
+     module Controller
+       module Authentication
+         extend ActiveSupport::Concern
+         included do
+           helper_method :current_user, :logged_in?, :authentication_scope
+           prepend_before_action :require_authenticated_user
+           prepend_before_action :authenticate_user
+-          protect_from_forgery prepend: true
+         end
+       protected
+         def authentication_backend
+           @_authentication_backend ||= Trestle.config.auth.backend.new(controller: self, request: request, session: session, cookies: cookies)
+         end
+         def current_user
+           authentication_backend.user
+         end
+         def logged_in?
+           authentication_backend.logged_in?
+
+--- a//dev/null
++++ b/lib/trestle/auth/controller/locale.rb
+@@ -0,0 +1,16 @@
++module Trestle
++  module Auth
++    module Controller
++      module Locale
++        extend ActiveSupport::Concern
++        included do
++          around_action :set_locale, if: :logged_in? if Trestle.config.auth.locale
++        end
++      protected
++        def set_locale
++          I18n.with_locale(instance_exec(current_user, &Trestle.config.auth.locale) || I18n.default_locale) { yield }
++        end
++      end
++    end
++  end
++end
+
+--- a//dev/null
++++ b/lib/trestle/auth/controller/time_zone.rb
+@@ -0,0 +1,16 @@
++module Trestle
++  module Auth
++    module Controller
++      module TimeZone
++        extend ActiveSupport::Concern
++        included do
++          around_action :set_time_zone, if: :logged_in? if Trestle.config.auth.time_zone
++        end
++      protected
++        def set_time_zone
++          Time.use_zone(instance_exec(current_user, &Trestle.config.auth.time_zone) || Rails.application.config.time_zone) { yield }
++        end
++      end
++    end
++  end
++end
+
+--- a//dev/null
++++ b/lib/trestle/auth/controller_methods.rb
+@@ -0,0 +1,10 @@
++module Trestle
++  module Auth
++    module ControllerMethods
++      extend ActiveSupport::Concern
++      include Trestle::Auth::Controller::Authentication
++      include Trestle::Auth::Controller::Locale
++      include Trestle::Auth::Controller::TimeZone
++    end
++  end
++end
+
+--- a//dev/null
++++ b/lib/trestle/auth/model_methods.rb
+@@ -0,0 +1,17 @@
++module Trestle
++  module Auth
++    module ModelMethods
++      extend ActiveSupport::Concern
++      require_relative "model_methods/rememberable"
++      included do
++        has_secure_password
++      end
++      module ClassMethods
++        def authenticate(identifier, password)
++          user = find_by(Trestle.config.auth.authenticate_with => identifier) || NullUser.new
++          user if user.authenticate(password)
++        end
++      end
++    end
++  end
++end
+
+--- a/lib/trestle/auth/version.rb
++++ b/lib/trestle/auth/version.rb
+@@ -1,5 +1,5 @@
+ module Trestle
+   module Auth
+-    VERSION = "0.4.2"
++    VERSION = "0.4.0"
+   end
+ end
+
+--- a//dev/null
++++ b/spec/dummy/app/admin/auth/administrators_admin.rb
+@@ -0,0 +1,29 @@
++Trestle.resource(:administrators, model: Trestle.config.auth.user_class, scope: Auth) do
++  menu do
++    group :configuration, priority: :last do
++      item :administrators, icon: "fa fa-users"
++    end
++  end
++  table do
++    column :avatar, header: false do |administrator|
++      avatar_for(administrator)
++    end
++    column :email, link: true
++    column :first_name
++    column :last_name
++    actions do |a|
++      a.delete unless a.instance == current_user
++    end
++  end
++  form do |administrator|
++    text_field :email
++    row do
++      col(sm: 6) { text_field :first_name }
++      col(sm: 6) { text_field :last_name }
++    end
++    row do
++      col(sm: 6) { password_field :password }
++      col(sm: 6) { password_field :password_confirmation }
++    end
++  end
++end
+
+--- a//dev/null
++++ b/spec/dummy/app/admin/dashboard_admin.rb
+@@ -0,0 +1,5 @@
++Trestle.admin(:dashboard, path: "/") do
++  menu do
++    item :dashboard, icon: "fa fa-dashboard", priority: :first
++  end
++end
+
+--- a//dev/null
++++ b/spec/dummy/app/controllers/application_controller.rb
+@@ -0,0 +1,2 @@
++class ApplicationController < ActionController::Base
++end
+
+--- a//dev/null
++++ b/spec/dummy/app/helpers/application_helper.rb
+@@ -0,0 +1,2 @@
++module ApplicationHelper
++end
+
+--- a//dev/null
++++ b/spec/dummy/app/mailers/application_mailer.rb
+@@ -0,0 +1,4 @@
++class ApplicationMailer < ActionMailer::Base
++  default from: 'from@example.com'
++  layout 'mailer'
++end
+
+--- a//dev/null
++++ b/spec/dummy/app/models/administrator.rb
+@@ -0,0 +1,4 @@
++class Administrator < ApplicationRecord
++  include Trestle::Auth::ModelMethods
++  include Trestle::Auth::ModelMethods::Rememberable
++end
+
+--- a//dev/null
++++ b/spec/dummy/app/models/application_record.rb
+@@ -0,0 +1,3 @@
++class ApplicationRecord < ActiveRecord::Base
++  self.abstract_class = true
++end
+
+--- a//dev/null
++++ b/spec/dummy/app/models/devise_user.rb
+@@ -0,0 +1,4 @@
++class DeviseUser < ApplicationRecord
++  devise :database_authenticatable, :registerable,
++         :recoverable, :rememberable, :validatable
++end
+
+--- a//dev/null
++++ b/spec/dummy/config/application.rb
+@@ -0,0 +1,19 @@
++require_relative 'boot'
++require "active_model/railtie"
++require "active_record/railtie"
++require "action_controller/railtie"
++require "action_view/railtie"
++require "sprockets/railtie"
++Bundler.require(*Rails.groups)
++module Dummy
++  class Application < Rails::Application
++    case Rails.version.split(".").first(2).join(".")
++    when '6.0'
++      config.load_defaults 6.0
++    when '5.2'
++      config.load_defaults 5.2
++    when '5.1'
++      config.load_defaults 5.1
++    end
++  end
++end
+
+--- a//dev/null
++++ b/spec/dummy/config/boot.rb
+@@ -0,0 +1,3 @@
++ENV['BUNDLE_GEMFILE'] ||= File.expand_path('../../../Gemfile', __dir__)
++require 'bundler/setup' if File.exist?(ENV['BUNDLE_GEMFILE'])
++$LOAD_PATH.unshift File.expand_path('../../../lib', __dir__)
+
+--- a//dev/null
++++ b/spec/dummy/config/environment.rb
+@@ -0,0 +1,2 @@
++require_relative 'application'
++Rails.application.initialize!
+
+--- a//dev/null
++++ b/spec/dummy/config/environments/development.rb
+@@ -0,0 +1,21 @@
++Rails.application.configure do
++  config.cache_classes = false
++  config.eager_load = false
++  config.consider_all_requests_local = true
++  if Rails.root.join('tmp', 'caching-dev.txt').exist?
++    config.action_controller.perform_caching = true
++    config.action_controller.enable_fragment_cache_logging = true
++    config.cache_store = :memory_store
++    config.public_file_server.headers = {
++      'Cache-Control' => "public, max-age=#{2.days.to_i}"
++    }
++  else
++    config.action_controller.perform_caching = false
++    config.cache_store = :null_store
++  end
++  config.active_support.deprecation = :log
++  config.active_record.migration_error = :page_load
++  config.active_record.verbose_query_logs = true
++  config.assets.debug = true
++  config.assets.quiet = true
++end
+
+--- a//dev/null
++++ b/spec/dummy/config/environments/production.rb
+@@ -0,0 +1,19 @@
++Rails.application.configure do
++  config.cache_classes = true
++  config.eager_load = true
++  config.consider_all_requests_local       = false
++  config.action_controller.perform_caching = true
++  config.public_file_server.enabled = ENV['RAILS_SERVE_STATIC_FILES'].present?
++  config.assets.compile = false
++  config.log_level = :debug
++  config.log_tags = [ :request_id ]
++  config.i18n.fallbacks = true
++  config.active_support.deprecation = :notify
++  config.log_formatter = ::Logger::Formatter.new
++  if ENV["RAILS_LOG_TO_STDOUT"].present?
++    logger           = ActiveSupport::Logger.new(STDOUT)
++    logger.formatter = config.log_formatter
++    config.logger    = ActiveSupport::TaggedLogging.new(logger)
++  end
++  config.active_record.dump_schema_after_migration = false
++end
+
+--- a//dev/null
++++ b/spec/dummy/config/initializers/assets.rb
+@@ -0,0 +1 @@
++Rails.application.config.assets.version = '1.0'
+
+--- a//dev/null
++++ b/spec/dummy/config/initializers/cookies_serializer.rb
+@@ -0,0 +1 @@
++Rails.application.config.action_dispatch.cookies_serializer = :json
+
+--- a//dev/null
++++ b/spec/dummy/config/initializers/devise.rb
+@@ -0,0 +1,15 @@
++require "devise"
++Devise.setup do |config|
++  config.mailer_sender = 'please-change-me-at-config-initializers-devise@example.com'
++  require 'devise/orm/active_record'
++  config.case_insensitive_keys = [:email]
++  config.strip_whitespace_keys = [:email]
++  config.skip_session_storage = [:http_auth]
++  config.stretches = Rails.env.test? ? 1 : 11
++  config.reconfirmable = true
++  config.expire_all_remember_me_on_sign_out = true
++  config.password_length = 6..128
++  config.email_regexp = /\A[^@\s]+@[^@\s]+\z/
++  config.reset_password_within = 6.hours
++  config.sign_out_via = :delete
++end
+
+--- a//dev/null
++++ b/spec/dummy/config/initializers/filter_parameter_logging.rb
+@@ -0,0 +1 @@
++Rails.application.config.filter_parameters += [:password]
+
+--- a//dev/null
++++ b/spec/dummy/config/initializers/trestle.rb
+@@ -0,0 +1,5 @@
++Trestle.configure do |config|
++  config.site_title = "Dummy"
++  config.auth.user_class = -> { Administrator }
++  config.auth.user_admin = -> { :"auth/administrators" }
++end
+
+--- a//dev/null
++++ b/spec/dummy/config/initializers/wrap_parameters.rb
+@@ -0,0 +1,3 @@
++ActiveSupport.on_load(:action_controller) do
++  wrap_parameters format: [:json]
++end
+
+--- a//dev/null
++++ b/spec/dummy/config/puma.rb
+@@ -0,0 +1,7 @@
++max_threads_count = ENV.fetch("RAILS_MAX_THREADS") { 5 }
++min_threads_count = ENV.fetch("RAILS_MIN_THREADS") { max_threads_count }
++threads min_threads_count, max_threads_count
++port        ENV.fetch("PORT") { 3000 }
++environment ENV.fetch("RAILS_ENV") { "development" }
++pidfile ENV.fetch("PIDFILE") { "tmp/pids/server.pid" }
++plugin :tmp_restart
+
+--- a//dev/null
++++ b/spec/dummy/config/routes.rb
+@@ -0,0 +1,3 @@
++Rails.application.routes.draw do
++  devise_for :devise_users, skip: :all
++end
+
+--- a//dev/null
++++ b/spec/dummy/config/spring.rb
+@@ -0,0 +1,6 @@
++Spring.watch(
++  ".ruby-version",
++  ".rbenv-vars",
++  "tmp/restart.txt",
++  "tmp/caching-dev.txt"
++)
+
+--- a//dev/null
++++ b/spec/dummy/db/migrate/20200203050837_create_administrators.rb
+@@ -0,0 +1,13 @@
++class CreateAdministrators < ActiveRecord::Migration[6.0]
++  def change
++    create_table :administrators do |t|
++      t.string :email
++      t.string :password_digest
++      t.string :first_name
++      t.string :last_name
++      t.string :remember_token
++      t.datetime :remember_token_expires_at
++      t.timestamps
++    end
++  end
++end
+
+--- a//dev/null
++++ b/spec/dummy/db/migrate/20200210030416_devise_create_devise_users.rb
+@@ -0,0 +1,14 @@
++class DeviseCreateDeviseUsers < ActiveRecord::Migration[6.0]
++  def change
++    create_table :devise_users do |t|
++      t.string :email,              null: false, default: ""
++      t.string :encrypted_password, null: false, default: ""
++      t.string   :reset_password_token
++      t.datetime :reset_password_sent_at
++      t.datetime :remember_created_at
++      t.timestamps null: false
++    end
++    add_index :devise_users, :email,                unique: true
++    add_index :devise_users, :reset_password_token, unique: true
++  end
++end
+
+--- a//dev/null
++++ b/spec/dummy/db/schema.rb
+@@ -0,0 +1,23 @@
++ActiveRecord::Schema.define(version: 2020_02_10_030416) do
++  create_table "administrators", force: :cascade do |t|
++    t.string "email"
++    t.string "password_digest"
++    t.string "first_name"
++    t.string "last_name"
++    t.string "remember_token"
++    t.datetime "remember_token_expires_at"
++    t.datetime "created_at", precision: 6, null: false
++    t.datetime "updated_at", precision: 6, null: false
++  end
++  create_table "devise_users", force: :cascade do |t|
++    t.string "email", default: "", null: false
++    t.string "encrypted_password", default: "", null: false
++    t.string "reset_password_token"
++    t.datetime "reset_password_sent_at"
++    t.datetime "remember_created_at"
++    t.datetime "created_at", precision: 6, null: false
++    t.datetime "updated_at", precision: 6, null: false
++    t.index ["email"], name: "index_devise_users_on_email", unique: true
++    t.index ["reset_password_token"], name: "index_devise_users_on_reset_password_token", unique: true
++  end
++end
+
+--- a//dev/null
++++ b/spec/feature/authentication_spec.rb
+@@ -0,0 +1,41 @@
++require "rails_helper"
++feature "Authentication with basic backend" do
++  before(:all) do
++    Trestle.config.auth.backend = :basic
++  end
++  before(:each) do
++    create_administrator
++  end
++  scenario "prevent unauthenticated access" do
++    visit "/admin"
++    expect(page).to have_current_path("/admin/login")
++  end
++  scenario "successful login" do
++    login
++    expect(page).to have_current_path("/admin")
++    expect(page).to have_content("Admin User")
++  end
++  scenario "failed login" do
++    login(password: "incorrect")
++    expect(page).to have_current_path("/admin/login")
++    expect(page).to have_content("Incorrect login details")
++  end
++  context "remember me" do
++    scenario "remember login between sessions" do
++      login(remember_me: true)
++      expire_cookies
++      visit "/admin"
++      expect(page).to have_current_path("/admin")
++    end
++    scenario "forget login after logging out" do
++      login(remember_me: true)
++      logout
++      expire_cookies
++      visit "/admin"
++      expect(page).to have_current_path("/admin/login")
++    end
++  end
++  def create_administrator
++    Administrator.create!(first_name: "Admin", last_name: "User", email: "admin@example.com", password: "password")
++  end
++end
+
+--- a//dev/null
++++ b/spec/feature/devise_spec.rb
+@@ -0,0 +1,42 @@
++require "rails_helper"
++feature "Authentication with Devise backend" do
++  before(:all) do
++    Trestle.config.auth.backend = :devise
++    Trestle.config.auth.warden.scope = :devise_user
++  end
++  before(:each) do
++    create_devise_user
++  end
++  scenario "prevent unauthenticated access" do
++    visit "/admin"
++    expect(page).to have_current_path("/admin/login")
++  end
++  scenario "successful login" do
++    login
++    expect(page).to have_current_path("/admin")
++    expect(page).to have_content("admin@example.com")
++  end
++  scenario "failed login" do
++    login(password: "incorrect")
++    expect(page).to have_current_path("/admin/login")
++    expect(page).to have_content("Incorrect login details")
++  end
++  context "remember me" do
++    scenario "remember login between sessions" do
++      login(remember_me: true)
++      expire_cookies
++      visit "/admin"
++      expect(page).to have_current_path("/admin")
++    end
++    scenario "forget login after logging out" do
++      login(remember_me: true)
++      logout
++      expire_cookies
++      visit "/admin"
++      expect(page).to have_current_path("/admin/login")
++    end
++  end
++  def create_devise_user
++    DeviseUser.create!(email: "admin@example.com", password: "password")
++  end
++end
+
+--- a//dev/null
++++ b/spec/rails_helper.rb
+@@ -0,0 +1,21 @@
++require 'spec_helper'
++ENV['RAILS_ENV'] ||= 'test'
++require File.expand_path('dummy/config/environment', __dir__)
++require 'rspec/rails'
++require 'show_me_the_cookies'
++require 'timecop'
++begin
++  ActiveRecord::Migrator.migrations_paths = [File.expand_path("../dummy/db/migrate", __FILE__)]
++  ActiveRecord::Migration.maintain_test_schema!
++rescue ActiveRecord::PendingMigrationError => e
++  puts e.to_s.strip
++  exit 1
++end
++RSpec.configure do |config|
++  config.fixture_path = "#{::Rails.root}/spec/fixtures"
++  config.use_transactional_fixtures = true
++  config.infer_spec_type_from_file_location!
++  config.filter_rails_from_backtrace!
++  config.include ShowMeTheCookies, type: :feature
++  config.include Trestle::Auth::Test::LoginHelpers, type: :feature
++end
+
+--- a//dev/null
++++ b/spec/spec_helper.rb
+@@ -0,0 +1,21 @@
++require 'simplecov'
++SimpleCov.start do
++  add_filter '/spec/'
++  add_filter '/config/'
++  add_group 'Controllers', 'app/controllers'
++  add_group 'Helpers', 'app/helpers'
++  add_group 'Libraries', 'lib'
++  track_files "{app,lib}/**/*.rb"
++end
++require 'coveralls'
++Coveralls.wear!
++Dir[File.expand_path(File.join(File.dirname(__FILE__), 'support', '**', '*.rb'))].each { |f| require f }
++RSpec.configure do |config|
++  config.expect_with :rspec do |expectations|
++    expectations.include_chain_clauses_in_custom_matcher_descriptions = true
++  end
++  config.mock_with :rspec do |mocks|
++    mocks.verify_partial_doubles = true
++  end
++  config.shared_context_metadata_behavior = :apply_to_host_groups
++end
+
+--- a//dev/null
++++ b/spec/support/login_helpers.rb
+@@ -0,0 +1,18 @@
++module Trestle
++  module Auth
++    module Test
++      module LoginHelpers
++        def login(email: "admin@example.com", password: "password", remember_me: false)
++          visit "/admin/login"
++          fill_in "Email", with: email
++          fill_in "Password", with: password
++          check "Remember me" if remember_me
++          click_button "Login"
++        end
++        def logout
++          click_link "Logout"
++        end
++      end
++    end
++  end
++end
+
+--- a//dev/null
++++ b/spec/support/matchers/have_accessor.rb
+@@ -0,0 +1,10 @@
++RSpec::Matchers.define :have_accessor do |expected|
++  match do |actual|
++    return false unless actual.respond_to?(expected) && actual.respond_to?("#{expected}=")
++    return false if @expected_default && actual.send(expected) != @expected_default
++    true
++  end
++  chain :with_default do |value|
++    @expected_default = value
++  end
++end
+
+--- a//dev/null
++++ b/spec/trestle/auth/configuration_spec.rb
+@@ -0,0 +1,181 @@
++require "spec_helper"
++describe Trestle::Auth::Configuration do
++  subject(:config) { Trestle::Auth::Configuration.new }
++  let(:model) { double }
++  let(:user) { double(locale: "en-AU", time_zone: "Australia/Adelaide") }
++  let(:params) { double }
++  let(:block) { -> {} }
++  let(:login_url) { "/admin/login" }
++  it "has a user_class configuration option" do
++    expect(config).to have_accessor(:user_class).with_default(::Administrator)
++  end
++  it "has a user_scope configuration option" do
++    expect(config).to have_accessor(:user_scope).with_default(::Administrator)
++  end
++  it "has a user_admin configuration option" do
++    expect(config).to have_accessor(:user_admin)
++  end
++  it "has an authenticate_with configuration option" do
++    expect(config).to have_accessor(:authenticate_with).with_default(:email)
++  end
++  it "has an authenticate configuration block option" do
++    expect(config).to have_accessor(:authenticate)
++    config.authenticate = ->(params) {
++      model.authenticate(params)
++    }
++    expect(model).to receive(:authenticate).with(params)
++    config.authenticate(params)
++  end
++  it "has a find_user configuration block option" do
++    expect(config).to have_accessor(:find_user)
++    config.find_user = ->(id) {
++      model.find_user(id)
++    }
++    expect(model).to receive(:find_user).with(123)
++    config.find_user(123)
++  end
++  it "has a human_attribute_name configuration block option" do
++    expect(config).to have_accessor(:human_attribute_name)
++    config.human_attribute_name = ->(field) { field.to_s.upcase }
++    expect(config.human_attribute_name(:email)).to eq("EMAIL")
++  end
++  it "has a default human_attribute_name block" do
++    Trestle.config.auth.user_class = model
++    expect(model).to receive(:human_attribute_name).with(:email).and_return("Email address")
++    expect(config.human_attribute_name(:email)).to eq("Email address")
++  end
++  it "has an avatar configuration block option" do
++    config.avatar = block
++    expect(config.avatar).to eq(block)
++  end
++  it "has a format_user_name configuration block option" do
++    config.format_user_name = block
++    expect(config.format_user_name).to eq(block)
++  end
++  it "has a locale configuration block option" do
++    config.locale = block
++    expect(config.locale).to eq(block)
++  end
++  it "has a default locale block" do
++    expect(config.locale.call(user)).to eq("en-AU")
++  end
++  it "has a time_zone configuration block option" do
++    config.time_zone = block
++    expect(config.time_zone).to eq(block)
++  end
++  it "has a default time_zone block" do
++    expect(config.time_zone.call(user)).to eq("Australia/Adelaide")
++  end
++  it "has an enable_login configuration option" do
++    expect(config).to have_accessor(:enable_login).with_default(true)
++  end
++  it "has an enable_logout configuration option" do
++    expect(config).to have_accessor(:enable_logout).with_default(true)
++  end
++  it "has a login_url configuration block option" do
++    config.login_url = block
++    expect(config.login_url).to eq(block)
++  end
++  it "has a default login_url block" do
++    expect(instance_exec(&config.login_url)).to eq("/admin/login")
++  end
++  it "has a redirect_on_login configuration block option" do
++    config.redirect_on_login = block
++    expect(config.redirect_on_login).to eq(block)
++  end
++  it "has a default redirect_on_login block" do
++    expect(instance_exec(&config.redirect_on_login)).to eq("/admin")
++  end
++  it "has a redirect_on_logout configuration block option" do
++    config.redirect_on_logout = block
++    expect(config.redirect_on_logout).to eq(block)
++  end
++  it "has a default redirect_on_logout block" do
++    expect(instance_exec(&config.redirect_on_logout)).to eq("/admin/login")
++  end
++  it "has a logo configuration option" do
++    expect(config).to have_accessor(:logo)
++  end
++  describe "#backend=" do
++    it "sets the backend configuration option with :basic" do
++      config.backend = :basic
++      expect(config.backend).to eq(Trestle::Auth::Backends::Basic)
++    end
++    it "sets the backend configuration option with :devise" do
++      config.backend = :devise
++      expect(config.backend).to eq(Trestle::Auth::Backends::Devise)
++    end
++    it "sets the backend configuration option with :warden" do
++      config.backend = :warden
++      expect(config.backend).to eq(Trestle::Auth::Backends::Warden)
++    end
++    it "sets the backend configuration option with a custom class" do
++      custom_class = Class.new
++      config.backend = custom_class
++      expect(config.backend).to eq(custom_class)
++    end
++    it "raises ArgumentError if an invalid option is provided" do
++      expect {
++        config.backend = :invalid
++      }.to raise_error(ArgumentError, "Invalid authentication backend: :invalid")
++    end
++  end
++  it "has a configuration set for remember options" do
++    expect(config.remember).to be_an_instance_of(Trestle::Auth::Configuration::Rememberable)
++  end
++  describe Trestle::Auth::Configuration::Rememberable do
++    subject(:config) { Trestle::Auth::Configuration::Rememberable.new }
++    let(:user) { double(remember_token: "token", remember_token_expires_at: 2.weeks.from_now) }
++    it "has an enabled configuration option" do
++      expect(config).to have_accessor(:enabled).with_default(true)
++    end
++    it "has a cookie duration (#for) configuration option" do
++      expect(config).to have_accessor(:for).with_default(2.weeks)
++    end
++    it "has an authenticate configuration block option" do
++      expect(config).to have_accessor(:authenticate)
++      config.authenticate = ->(token) {
++        model.authenticate_with_remember_token(token)
++      }
++      expect(model).to receive(:authenticate_with_remember_token).with("token")
++      config.authenticate("token")
++    end
++    it "has a remember_me configuration block option" do
++      expect(config).to have_accessor(:remember_me)
++      config.remember_me = ->(user) {
++        user.remember!
++      }
++      expect(user).to receive(:remember!)
++      config.remember_me(user)
++    end
++    it "has a default remember_me block" do
++      expect(user).to receive(:remember_me!)
++      config.remember_me(user)
++    end
++    it "has a forget_me configuration block option" do
++      expect(config).to have_accessor(:forget_me)
++      config.forget_me = ->(user) {
++        user.forget!
++      }
++      expect(user).to receive(:forget!)
++      config.forget_me(user)
++    end
++    it "has a default forget_me block" do
++      expect(user).to receive(:forget_me!)
++      config.forget_me(user)
++    end
++    it "has a cookie configuration block option" do
++      expect(config).to have_accessor(:cookie)
++      expect(config.cookie(user)).to eq({ value: user.remember_token, expires: user.remember_token_expires_at })
++    end
++  end
++  it "has a configuration set for Warden options" do
++    expect(config.warden).to be_an_instance_of(Trestle::Auth::Configuration::Warden)
++  end
++  describe Trestle::Auth::Configuration::Warden do
++    subject(:config) { Trestle::Auth::Configuration::Warden.new }
++    it "has a scope configuration option" do
++      expect(config).to have_accessor(:scope)
++    end
++  end
++end
+
+--- a//dev/null
++++ b/spec/trestle/auth/model_methods_spec.rb
+@@ -0,0 +1,74 @@
++require "rails_helper"
++describe Trestle::Auth::ModelMethods do
++  subject(:model) { Administrator }
++  describe ".authenticate" do
++    before(:each) do
++      @user = model.create!(email: "test@example.com", password: "password", first_name: "Test", last_name: "Example")
++    end
++    it "returns the user matching the given identifier and password" do
++      user = model.authenticate("test@example.com", "password")
++      expect(user).to eq(@user)
++    end
++    it "returns nil if no user matches the given identifier" do
++      user = model.authenticate("none@example.com", "")
++      expect(user).to be_nil
++    end
++    it "returns nil if the password is incorrect for the user matching the given identifier" do
++      user = model.authenticate("test@example.com", "incorrect")
++      expect(user).to be_nil
++    end
++  end
++end
++describe Trestle::Auth::ModelMethods::Rememberable do
++  let(:model) { Administrator }
++  subject(:instance) { Administrator.create!(email: "test@example.com", password: "password", first_name: "Test", last_name: "Example") }
++  describe "#remember_me!" do
++    it "sets the remember token and expiration" do
++      Timecop.freeze do
++        subject.remember_me!
++        expect(subject.remember_token).to match(/[A-Za-z0-9_-]{20}/)
++        expect(subject.remember_token_expires_at).to eq(Time.now + Trestle.config.auth.remember.for)
++      end
++    end
++  end
++  describe "#forget_me!" do
++    before(:each) do
++      subject.remember_me!
++    end
++    it "resets the remember token and expiration" do
++      subject.forget_me!
++      expect(subject.remember_token).to be_nil
++      expect(subject.remember_token_expires_at).to be_nil
++    end
++  end
++  describe "#remember_token_expired?" do
++    it "returns false if the remember token exists and is not expired" do
++      subject.remember_me!
++      expect(subject.remember_token_expired?).to be false
++    end
++    it "returns true if the remember token is nil" do
++      expect(subject.remember_token_expired?).to be true
++    end
++    it "returns true if the remember token exists but is expired" do
++      subject.remember_me!
++      Timecop.travel(Time.now + Trestle.config.auth.remember.for + 1.minute) do
++        expect(subject.remember_token_expired?).to be true
++      end
++    end
++  end
++  describe ".authenticate_with_remember_token" do
++    it "returns the user matching the non-expired remember token" do
++      subject.remember_me!
++      expect(model.authenticate_with_remember_token(subject.remember_token)).to eq(subject)
++    end
++    it "returns nil if no user matches the remember token" do
++      expect(model.authenticate_with_remember_token("invalid")).to be_nil
++    end
++    it "returns nil if the remember token has expired" do
++      subject.remember_me!
++      Timecop.travel(Time.now + Trestle.config.auth.remember.for + 1.minute) do
++        expect(model.authenticate_with_remember_token(subject.remember_token)).to be_nil
++      end
++    end
++  end
++end

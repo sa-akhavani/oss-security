@@ -1,0 +1,95 @@
+--- a/flate.go
++++ b//dev/null
+@@ -1,25 +0,0 @@
+-package saml
+-import (
+-	"compress/flate"
+-	"fmt"
+-	"io"
+-)
+-const flateUncompressLimit = 10 * 1024 * 1024 // 10MB
+-func newSaferFlateReader(r io.Reader) io.ReadCloser {
+-	return &saferFlateReader{r: flate.NewReader(r)}
+-}
+-type saferFlateReader struct {
+-	r     io.ReadCloser
+-	count int
+-}
+-func (r *saferFlateReader) Read(p []byte) (n int, err error) {
+-	if r.count+len(p) > flateUncompressLimit {
+-		return 0, fmt.Errorf("flate: uncompress limit exceeded (%d bytes)", flateUncompressLimit)
+-	}
+-	n, err = r.r.Read(p)
+-	r.count += n
+-	return n, err
+-}
+-func (r *saferFlateReader) Close() error {
+-	return r.r.Close()
+-}
+
+--- a/identity_provider.go
++++ b/identity_provider.go
+@@ -1,13 +1,14 @@
+ package saml
+ import (
+ 	"bytes"
++	"compress/flate"
+ 	"crypto"
+ 	"crypto/tls"
+ 	"crypto/x509"
+ 	"encoding/base64"
+ 	"encoding/xml"
+ 	"fmt"
+ 	"io"
+ 	"io/ioutil"
+ 	"net/http"
+ 	"net/url"
+@@ -249,21 +250,21 @@
+ 		IDP:         idp,
+ 		HTTPRequest: r,
+ 		Now:         TimeNow(),
+ 	}
+ 	switch r.Method {
+ 	case "GET":
+ 		compressedRequest, err := base64.StdEncoding.DecodeString(r.URL.Query().Get("SAMLRequest"))
+ 		if err != nil {
+ 			return nil, fmt.Errorf("cannot decode request: %s", err)
+ 		}
+-		req.RequestBuffer, err = ioutil.ReadAll(newSaferFlateReader(bytes.NewReader(compressedRequest)))
++		req.RequestBuffer, err = ioutil.ReadAll(flate.NewReader(bytes.NewReader(compressedRequest)))
+ 		if err != nil {
+ 			return nil, fmt.Errorf("cannot decompress request: %s", err)
+ 		}
+ 		req.RelayState = r.URL.Query().Get("RelayState")
+ 	case "POST":
+ 		if err := r.ParseForm(); err != nil {
+ 			return nil, err
+ 		}
+ 		var err error
+ 		req.RequestBuffer, err = base64.StdEncoding.DecodeString(r.PostForm.Get("SAMLRequest"))
+
+--- a/service_provider.go
++++ b/service_provider.go
+@@ -1118,21 +1118,21 @@
+ func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData string) error {
+ 	retErr := &InvalidResponseError{
+ 		Now: TimeNow(),
+ 	}
+ 	rawResponseBuf, err := base64.StdEncoding.DecodeString(queryParameterData)
+ 	if err != nil {
+ 		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
+ 		return retErr
+ 	}
+ 	retErr.Response = string(rawResponseBuf)
+-	gr, err := ioutil.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
++	gr, err := ioutil.ReadAll(flate.NewReader(bytes.NewBuffer(rawResponseBuf)))
+ 	if err != nil {
+ 		retErr.PrivateErr = err
+ 		return retErr
+ 	}
+ 	if err := xrv.Validate(bytes.NewReader(gr)); err != nil {
+ 		return err
+ 	}
+ 	doc := etree.NewDocument()
+ 	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+ 		retErr.PrivateErr = err

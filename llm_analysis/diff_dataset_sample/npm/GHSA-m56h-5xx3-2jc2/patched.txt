@@ -1,0 +1,1306 @@
+# ====================================================================
+# FILE: src/compiler.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-520 ---
+     1| import * as fs from 'node:fs';
+     2| import * as path from 'node:path';
+     3| import * as chalk from 'chalk';
+     4| import * as log4js from 'log4js';
+     5| import * as ts from 'typescript';
+     6| import { Assembler } from './assembler';
+     7| import { findDependencyDirectory } from './common/find-utils';
+     8| import { emitDownleveledDeclarations, TYPES_COMPAT } from './downlevel-dts';
+     9| import { Emitter } from './emitter';
+    10| import { normalizeConfigPath } from './helpers';
+    11| import { JsiiDiagnostic } from './jsii-diagnostic';
+    12| import { ProjectInfo } from './project-info';
+    13| import { WARNINGSCODE_FILE_NAME } from './transforms/deprecation-warnings';
+    14| import { TypeScriptConfig, TypeScriptConfigValidationRuleSet } from './tsconfig';
+    15| import { BASE_COMPILER_OPTIONS, convertForJson } from './tsconfig/compiler-options';
+    16| import { TypeScriptConfigValidator } from './tsconfig/tsconfig-validator';
+    17| import { ValidationError } from './tsconfig/validator';
+    18| import * as utils from './utils';
+    19| const LOG = log4js.getLogger('jsii/compiler');
+    20| export const DIAGNOSTICS = 'diagnostics';
+    21| export const JSII_DIAGNOSTICS_CODE = 9999;
+    22| export interface CompilerOptions {
+    23|   /** The information about the project to be built */
+    24|   projectInfo: ProjectInfo;
+    25|   /** Whether the compiler should watch for changes or just compile once */
+    26|   watch?: boolean;
+    27|   /** Whether to detect and generate TypeScript project references */
+    28|   projectReferences?: boolean;
+    29|   /** Whether to fail when a warning is emitted */
+    30|   failOnWarnings?: boolean;
+    31|   /** Whether to strip deprecated members from emitted artifacts */
+    32|   stripDeprecated?: boolean;
+    33|   /** The path to an allowlist of FQNs to strip if stripDeprecated is set */
+    34|   stripDeprecatedAllowListFile?: string;
+    35|   /** Whether to add warnings for deprecated elements */
+    36|   addDeprecationWarnings?: boolean;
+    37|   /**
+    38|    * The name of the tsconfig file to generate.
+    39|    * Cannot be used at the same time as `typeScriptConfig`.
+    40|    * @default "tsconfig.json"
+    41|    */
+    42|   generateTypeScriptConfig?: string;
+    43|   /**
+    44|    * The name of the tsconfig file to use.
+    45|    * Cannot be used at the same time as `generateTypeScriptConfig`.
+    46|    * @default - generate the tsconfig file
+    47|    */
+    48|   typeScriptConfig?: string;
+    49|   /**
+    50|    * The ruleset to validate the provided tsconfig file against.
+    51|    * Can only be used when `typeScriptConfig` is provided.
+    52|    * @default TypeScriptConfigValidationRuleSet.STRICT - if `typeScriptConfig` is provided
+    53|    */
+    54|   validateTypeScriptConfig?: TypeScriptConfigValidationRuleSet;
+    55|   /**
+    56|    * Whether to compress the assembly
+    57|    * @default false
+    58|    */
+    59|   compressAssembly?: boolean;
+    60| }
+    61| export class Compiler implements Emitter {
+    62|   private readonly system: ts.System;
+    63|   private readonly compilerHost: ts.CompilerHost;
+    64|   private readonly userProvidedTypeScriptConfig: boolean;
+    65|   private readonly tsconfig: TypeScriptConfig;
+    66|   private rootFiles: string[] = [];
+    67|   private readonly configPath: string;
+    68|   private readonly projectRoot: string;
+    69|   public constructor(private readonly options: CompilerOptions) {
+    70|     if (options.generateTypeScriptConfig != null && options.typeScriptConfig != null) {
+    71|       throw new utils.JsiiError(
+    72|         'Cannot use `generateTypeScriptConfig` and `typeScriptConfig` together. Provide only one of them.',
+    73|       );
+    74|     }
+    75|     this.projectRoot = this.options.projectInfo.projectRoot;
+    76|     const configFileName = options.typeScriptConfig ?? options.generateTypeScriptConfig ?? 'tsconfig.json';
+    77|     this.configPath = path.join(this.projectRoot, configFileName);
+    78|     this.userProvidedTypeScriptConfig = Boolean(options.typeScriptConfig);
+    79|     this.system = {
+    80|       ...ts.sys,
+    81|       getCurrentDirectory: () => this.projectRoot,
+    82|       createDirectory: (pth) => ts.sys.createDirectory(path.resolve(this.projectRoot, pth)),
+    83|       deleteFile: ts.sys.deleteFile && ((pth) => ts.sys.deleteFile!(path.join(this.projectRoot, pth))),
+    84|       fileExists: (pth) => ts.sys.fileExists(path.resolve(this.projectRoot, pth)),
+    85|       getFileSize: ts.sys.getFileSize && ((pth) => ts.sys.getFileSize!(path.resolve(this.projectRoot, pth))),
+    86|       readFile: (pth, encoding) => ts.sys.readFile(path.resolve(this.projectRoot, pth), encoding),
+    87|       watchFile:
+    88|         ts.sys.watchFile &&
+    89|         ((pth, callback, pollingInterval, watchOptions) =>
+    90|           ts.sys.watchFile!(path.resolve(this.projectRoot, pth), callback, pollingInterval, watchOptions)),
+    91|       writeFile: (pth, data, writeByteOrderMark) =>
+    92|         ts.sys.writeFile(path.resolve(this.projectRoot, pth), data, writeByteOrderMark),
+    93|     };
+    94|     this.tsconfig = this.configureTypeScript();
+    95|     this.compilerHost = ts.createIncrementalCompilerHost(this.tsconfig.compilerOptions, this.system);
+    96|   }
+    97|   /**
+    98|    * Compiles the configured program.
+    99|    *
+   100|    * @param files can be specified to override the standard source code location logic. Useful for example when testing "negatives".
+   101|    */
+   102|   public emit(...files: string[]): ts.EmitResult {
+   103|     this.prepareForBuild(...files);
+   104|     return this.buildOnce();
+   105|   }
+   106|   /**
+   107|    * Watches for file-system changes and dynamically recompiles the project as needed. In non-blocking mode, this
+   108|    * returns the TypeScript watch handle for the application to use.
+   109|    *
+   110|    * @internal
+   111|    */
+   112|   public async watch(opts: NonBlockingWatchOptions): Promise<ts.Watch<ts.BuilderProgram>>;
+   113|   /**
+   114|    * Watches for file-system changes and dynamically recompiles the project as needed. In blocking mode, this results
+   115|    * in a never-resolving promise.
+   116|    */
+   117|   public async watch(): Promise<never>;
+   118|   public async watch(opts?: NonBlockingWatchOptions): Promise<ts.Watch<ts.BuilderProgram> | never> {
+   119|     this.prepareForBuild();
+   120|     const host = ts.createWatchCompilerHost(
+   121|       this.configPath,
+   122|       {
+   123|         ...this.tsconfig.compilerOptions,
+   124|         noEmitOnError: false,
+   125|       },
+   126|       this.system,
+   127|       ts.createEmitAndSemanticDiagnosticsBuilderProgram,
+   128|       opts?.reportDiagnostics,
+   129|       opts?.reportWatchStatus,
+   130|       this.tsconfig.watchOptions,
+   131|     );
+   132|     if (!host.getDefaultLibLocation) {
+   133|       throw new Error('No default library location was found on the TypeScript compiler host!');
+   134|     }
+   135|     const orig = host.afterProgramCreate;
+   136|     host.afterProgramCreate = (builderProgram) => {
+   137|       const emitResult = this.consumeProgram(builderProgram.getProgram(), host.getDefaultLibLocation!());
+   138|       for (const diag of emitResult.diagnostics.filter((d) => d.code === JSII_DIAGNOSTICS_CODE)) {
+   139|         utils.logDiagnostic(diag, this.projectRoot);
+   140|       }
+   141|       if (orig) {
+   142|         orig.call(host, builderProgram);
+   143|       }
+   144|       if (opts?.compilationComplete) {
+   145|         opts.compilationComplete(emitResult);
+   146|       }
+   147|     };
+   148|     const watch = ts.createWatchProgram(host);
+   149|     if (opts?.nonBlocking) {
+   150|       return watch;
+   151|     }
+   152|     return new Promise<never>(() => null);
+   153|   }
+   154|   /**
+   155|    * Prepares the project for build, by creating the necessary configuration
+   156|    * file(s), and assigning the relevant root file(s).
+   157|    *
+   158|    * @param files the files that were specified as input in the CLI invocation.
+   159|    */
+   160|   private configureTypeScript(): TypeScriptConfig {
+   161|     if (this.userProvidedTypeScriptConfig) {
+   162|       const config = this.readTypeScriptConfig();
+   163|       const rules = this.options.validateTypeScriptConfig ?? TypeScriptConfigValidationRuleSet.NONE;
+   164|       if (rules === TypeScriptConfigValidationRuleSet.NONE) {
+   165|         utils.logDiagnostic(
+   166|           JsiiDiagnostic.JSII_4009_DISABLED_TSCONFIG_VALIDATION.create(undefined, this.configPath),
+   167|           this.projectRoot,
+   168|         );
+   169|       }
+   170|       if (rules !== TypeScriptConfigValidationRuleSet.NONE) {
+   171|         const configName = path.relative(this.projectRoot, this.configPath);
+   172|         try {
+   173|           const validator = new TypeScriptConfigValidator(rules);
+   174|           validator.validate({
+   175|             ...config,
+   176|             compilerOptions: convertForJson(config.compilerOptions),
+   177|           });
+   178|         } catch (error: unknown) {
+   179|           if (error instanceof ValidationError) {
+   180|             utils.logDiagnostic(
+   181|               JsiiDiagnostic.JSII_4000_FAILED_TSCONFIG_VALIDATION.create(
+   182|                 undefined,
+   183|                 configName,
+   184|                 rules,
+   185|                 error.violations,
+   186|               ),
+   187|               this.projectRoot,
+   188|             );
+   189|           }
+   190|           throw new utils.JsiiError(
+   191|             `Failed validation of tsconfig "compilerOptions" in "${configName}" against rule set "${rules}"!`,
+   192|           );
+   193|         }
+   194|       }
+   195|       return config;
+   196|     }
+   197|     return this.buildTypeScriptConfig();
+   198|   }
+   199|   /**
+   200|    * Final preparations of the project for build.
+   201|    *
+   202|    * These are preparations that either
+   203|    * - must happen immediately before the build, or
+   204|    * - can be different for every build like assigning the relevant root file(s).
+   205|    *
+   206|    * @param files the files that were specified as input in the CLI invocation.
+   207|    */
+   208|   private prepareForBuild(...files: string[]) {
+   209|     if (!this.userProvidedTypeScriptConfig) {
+   210|       this.writeTypeScriptConfig();
+   211|     }
+   212|     this.rootFiles = this.determineSources(files);
+   213|   }
+   214|   /**
+   215|    * Do a single build
+   216|    */
+   217|   private buildOnce(): ts.EmitResult {
+   218|     if (!this.compilerHost.getDefaultLibLocation) {
+   219|       throw new Error('No default library location was found on the TypeScript compiler host!');
+   220|     }
+   221|     const tsconf = this.tsconfig!;
+   222|     const prog = ts.createIncrementalProgram({
+   223|       rootNames: this.rootFiles.concat(_pathOfLibraries(tsconf.compilerOptions, this.compilerHost)),
+   224|       options: tsconf.compilerOptions,
+   225|       projectReferences: tsconf.references?.map((ref) => ({
+   226|         path: path.resolve(path.dirname(this.configPath), ref.path),
+   227|       })),
+   228|       host: this.compilerHost,
+   229|     });
+   230|     return this.consumeProgram(prog.getProgram(), this.compilerHost.getDefaultLibLocation());
+   231|   }
+   232|   private consumeProgram(program: ts.Program, stdlib: string): ts.EmitResult {
+   233|     const diagnostics = [...ts.getPreEmitDiagnostics(program)];
+   234|     let hasErrors = false;
+   235|     if (!hasErrors && this.diagsHaveAbortableErrors(diagnostics)) {
+   236|       hasErrors = true;
+   237|       LOG.error('Compilation errors prevented the JSII assembly from being created');
+   238|     }
+   239|     const assembler = new Assembler(this.options.projectInfo, this.system, program, stdlib, {
+   240|       stripDeprecated: this.options.stripDeprecated,
+   241|       stripDeprecatedAllowListFile: this.options.stripDeprecatedAllowListFile,
+   242|       addDeprecationWarnings: this.options.addDeprecationWarnings,
+   243|       compressAssembly: this.options.compressAssembly,
+   244|     });
+   245|     try {
+   246|       const assmEmit = assembler.emit();
+   247|       if (!hasErrors && (assmEmit.emitSkipped || this.diagsHaveAbortableErrors(assmEmit.diagnostics))) {
+   248|         hasErrors = true;
+   249|         LOG.error('Type model errors prevented the JSII assembly from being created');
+   250|       }
+   251|       diagnostics.push(...assmEmit.diagnostics);
+   252|     } catch (e: any) {
+   253|       diagnostics.push(JsiiDiagnostic.JSII_9997_UNKNOWN_ERROR.createDetached(e));
+   254|       hasErrors = true;
+   255|     }
+   256|     const emit = program.emit(
+   257|       undefined, // targetSourceFile
+   258|       undefined, // writeFile
+   259|       undefined, // cancellationToken
+   260|       undefined, // emitOnlyDtsFiles
+   261|       assembler.customTransformers,
+   262|     );
+   263|     diagnostics.push(...emit.diagnostics);
+   264|     if (!hasErrors && (emit.emitSkipped || this.diagsHaveAbortableErrors(emit.diagnostics))) {
+   265|       hasErrors = true;
+   266|       LOG.error('Compilation errors prevented the JSII assembly from being created');
+   267|     }
+   268|     if (!hasErrors) {
+   269|       emitDownleveledDeclarations(
+   270|         this.projectRoot,
+   271|         this.options.projectInfo.packageJson,
+   272|         normalizeConfigPath(this.projectRoot, this.tsconfig.compilerOptions.outDir),
+   273|       );
+   274|     }
+   275|     if (this.options.addDeprecationWarnings && this.options.projectInfo.exports !== undefined) {
+   276|       const expected = `./${WARNINGSCODE_FILE_NAME}`;
+   277|       const warningsExport = Object.entries(this.options.projectInfo.exports).filter(
+   278|         ([k, v]) => k === expected && v === expected,
+   279|       );
+   280|       if (warningsExport.length === 0) {
+   281|         hasErrors = true;
+   282|         diagnostics.push(JsiiDiagnostic.JSII_0007_MISSING_WARNINGS_EXPORT.createDetached());
+   283|       }
+   284|     }
+   285|     return {
+   286|       emitSkipped: hasErrors,
+   287|       diagnostics: ts.sortAndDeduplicateDiagnostics(diagnostics),
+   288|       emittedFiles: emit.emittedFiles,
+   289|     };
+   290|   }
+   291|   /**
+   292|    * Build the TypeScript config object from jsii config
+   293|    *
+   294|    * This is the object that will be written to disk
+   295|    * unless an existing tsconfig was provided.
+   296|    */
+   297|   private buildTypeScriptConfig(): TypeScriptConfig {
+   298|     let references: string[] | undefined;
+   299|     const isComposite =
+   300|       this.options.projectReferences !== undefined
+   301|         ? this.options.projectReferences
+   302|         : this.options.projectInfo.projectReferences !== undefined
+   303|         ? this.options.projectInfo.projectReferences
+   304|         : false;
+   305|     if (isComposite) {
+   306|       references = this.findProjectReferences();
+   307|     }
+   308|     const pi = this.options.projectInfo;
+   309|     const configDir = path.dirname(this.configPath);
+   310|     const absoluteTypesCompat = path.resolve(configDir, pi.tsc?.outDir ?? '.', TYPES_COMPAT);
+   311|     const relativeTypesCompat = path.relative(configDir, absoluteTypesCompat);
+   312|     return {
+   313|       compilerOptions: {
+   314|         ...pi.tsc,
+   315|         ...BASE_COMPILER_OPTIONS,
+   316|         composite: isComposite,
+   317|         tsBuildInfoFile: path.join(pi.tsc?.outDir ?? '.', 'tsconfig.tsbuildinfo'),
+   318|       },
+   319|       include: [pi.tsc?.rootDir != null ? path.join(pi.tsc.rootDir, '**', '*.ts') : path.join('**', '*.ts')],
+   320|       exclude: [
+   321|         'node_modules',
+   322|         relativeTypesCompat,
+   323|         ...(pi.excludeTypescript ?? []),
+   324|         ...(pi.tsc?.outDir != null &&
+   325|         (pi.tsc?.rootDir == null || path.resolve(pi.tsc.outDir).startsWith(path.resolve(pi.tsc.rootDir) + path.sep))
+   326|           ? [path.join(pi.tsc.outDir, '**', '*.ts')]
+   327|           : []),
+   328|       ],
+   329|       references: references?.map((p) => ({ path: p })),
+   330|     };
+   331|   }
+   332|   /**
+   333|    * Load the TypeScript config object from a provided file
+   334|    */
+   335|   private readTypeScriptConfig(): TypeScriptConfig {
+   336|     const projectRoot = this.options.projectInfo.projectRoot;
+   337|     const { config, error } = ts.readConfigFile(this.configPath, ts.sys.readFile);
+   338|     if (error) {
+   339|       utils.logDiagnostic(error, projectRoot);
+   340|       throw new utils.JsiiError(`Failed to load tsconfig at ${this.configPath}`);
+   341|     }
+   342|     const extended = ts.parseJsonConfigFileContent(config, ts.sys, projectRoot);
+   343|     delete extended.options.configFilePath;
+   344|     return {
+   345|       compilerOptions: extended.options,
+   346|       watchOptions: extended.watchOptions,
+   347|       include: extended.fileNames,
+   348|     };
+   349|   }
+   350|   /**
+   351|    * Creates a `tsconfig.json` file to improve the IDE experience.
+   352|    *
+   353|    * @return the fully qualified path to the `tsconfig.json` file
+   354|    */
+   355|   private writeTypeScriptConfig(): void {
+   356|     const commentKey = '_generated_by_jsii_';
+   357|     const commentValue = 'Generated by jsii - safe to delete, and ideally should be in .gitignore';
+   358|     (this.tsconfig as any)[commentKey] = commentValue;
+   359|     if (fs.existsSync(this.configPath)) {
+   360|       const currentConfig = JSON.parse(fs.readFileSync(this.configPath, 'utf-8'));
+   361|       if (!(commentKey in currentConfig)) {
+   362|         throw new utils.JsiiError(
+   363|           `A '${this.configPath}' file that was not generated by jsii is in ${this.options.projectInfo.projectRoot}. Aborting instead of overwriting.`,
+   364|         );
+   365|       }
+   366|     }
+   367|     const outputConfig = {
+   368|       ...this.tsconfig,
+   369|       compilerOptions: convertForJson(this.tsconfig?.compilerOptions),
+   370|     };
+   371|     LOG.debug(`Creating or updating ${chalk.blue(this.configPath)}`);
+   372|     fs.writeFileSync(this.configPath, JSON.stringify(outputConfig, null, 2), 'utf8');
+   373|   }
+   374|   /**
+   375|    * Find all dependencies that look like TypeScript projects.
+   376|    *
+   377|    * Enumerate all dependencies, if they have a tsconfig.json file with
+   378|    * "composite: true" we consider them project references.
+   379|    *
+   380|    * (Note: TypeScript seems to only correctly find transitive project references
+   381|    * if there's an "index" tsconfig.json of all projects somewhere up the directory
+   382|    * tree)
+   383|    */
+   384|   private findProjectReferences(): string[] {
+   385|     const pkg = this.options.projectInfo.packageJson;
+   386|     const ret = new Array<string>();
+   387|     const dependencyNames = new Set<string>();
+   388|     for (const dependencyMap of [pkg.dependencies, pkg.devDependencies, pkg.peerDependencies]) {
+   389|       if (dependencyMap === undefined) {
+   390|         continue;
+   391|       }
+   392|       for (const name of Object.keys(dependencyMap)) {
+   393|         dependencyNames.add(name);
+   394|       }
+   395|     }
+   396|     for (const tsconfigFile of Array.from(dependencyNames).map((depName) => this.findMonorepoPeerTsconfig(depName))) {
+   397|       if (!tsconfigFile) {
+   398|         continue;
+   399|       }
+   400|       const { config: tsconfig } = ts.readConfigFile(tsconfigFile, this.system.readFile);
+   401|       if (tsconfig.compilerOptions?.composite) {
+   402|         ret.push(path.relative(this.options.projectInfo.projectRoot, path.dirname(tsconfigFile)));
+   403|       } else {
+   404|         if (tsconfigFile.includes('node_modules')) {
+   405|           LOG.warn('%s: not a composite TypeScript package, but it probably should be', path.dirname(tsconfigFile));
+   406|         }
+   407|       }
+   408|     }
+   409|     return ret;
+   410|   }
+   411|   /**
+   412|    * Find source files using the same mechanism that the TypeScript compiler itself uses.
+   413|    *
+   414|    * Respects includes/excludes/etc.
+   415|    *
+   416|    * This makes it so that running 'typescript' and running 'jsii' has the same behavior.
+   417|    */
+   418|   private determineSources(files: string[]): string[] {
+   419|     if (files.length > 0) {
+   420|       return [...files];
+   421|     }
+   422|     if (this.userProvidedTypeScriptConfig) {
+   423|       return [...(this.tsconfig.include ?? [])];
+   424|     }
+   425|     const parseConfigHost = parseConfigHostFromCompilerHost(this.compilerHost);
+   426|     const parsed = ts.parseJsonConfigFileContent(this.tsconfig, parseConfigHost, this.options.projectInfo.projectRoot);
+   427|     return [...parsed.fileNames];
+   428|   }
+   429|   /**
+   430|    * Resolve the given dependency name from the current package, and find the associated tsconfig.json location
+   431|    *
+   432|    * Because we have the following potential directory layout:
+   433|    *
+   434|    *   package/node_modules/some_dependency
+   435|    *   package/tsconfig.json
+   436|    *
+   437|    * We resolve symlinks and only find a "TypeScript" dependency if doesn't have 'node_modules' in
+   438|    * the path after resolving symlinks (i.e., if it's a peer package in the same monorepo).
+   439|    *
+   440|    * Returns undefined if no such tsconfig could be found.
+   441|    */
+   442|   private findMonorepoPeerTsconfig(depName: string): string | undefined {
+   443|     const { builtinModules } = require('node:module');
+   444|     if ((builtinModules ?? []).includes(depName)) {
+   445|       return undefined;
+   446|     }
+   447|     try {
+   448|       const depDir = findDependencyDirectory(depName, this.options.projectInfo.projectRoot);
+   449|       const dep = path.join(depDir, 'tsconfig.json');
+   450|       if (!fs.existsSync(dep)) {
+   451|         return undefined;
+   452|       }
+   453|       const dependencyRealPath = fs.realpathSync(dep);
+   454|       if (dependencyRealPath.split(path.sep).includes('node_modules')) {
+   455|         return undefined;
+   456|       }
+   457|       return dependencyRealPath;
+   458|     } catch (e: any) {
+   459|       if (['MODULE_NOT_FOUND', 'ERR_PACKAGE_PATH_NOT_EXPORTED'].includes(e.code)) {
+   460|         return undefined;
+   461|       }
+   462|       throw e;
+   463|     }
+   464|   }
+   465|   private diagsHaveAbortableErrors(diags: readonly ts.Diagnostic[]) {
+   466|     return diags.some(
+   467|       (d) =>
+   468|         d.category === ts.DiagnosticCategory.Error ||
+   469|         (this.options.failOnWarnings && d.category === ts.DiagnosticCategory.Warning),
+   470|     );
+   471|   }
+   472| }
+   473| /**
+   474|  * Options for Watch in non-blocking mode.
+   475|  *
+   476|  * @internal
+   477|  */
+   478| export interface NonBlockingWatchOptions {
+   479|   /**
+   480|    * Signals non-blocking execution
+   481|    */
+   482|   readonly nonBlocking: true;
+   483|   /**
+   484|    * Configures the diagnostics reporter
+   485|    */
+   486|   readonly reportDiagnostics: ts.DiagnosticReporter;
+   487|   /**
+   488|    * Configures the watch status reporter
+   489|    */
+   490|   readonly reportWatchStatus: ts.WatchStatusReporter;
+   491|   /**
+   492|    * This hook gets invoked when a compilation cycle (complete with Assembler execution) completes.
+   493|    */
+   494|   readonly compilationComplete: (emitResult: ts.EmitResult) => void;
+   495| }
+   496| function _pathOfLibraries(options: ts.CompilerOptions, host: ts.CompilerHost | ts.WatchCompilerHost<any>): string[] {
+   497|   const libs = options.lib ?? [ts.getDefaultLibFileName(options)] ?? [];
+   498|   if (libs.length === 0) {
+   499|     return [];
+   500|   }
+   501|   const libDir = host.getDefaultLibLocation?.();
+   502|   if (!libDir) {
+   503|     throw new Error(`Compiler host doesn't have a default library directory available for ${libs.join(', ')}`);
+   504|   }
+   505|   return libs.map((name) => path.join(libDir, name));
+   506| }
+   507| function parseConfigHostFromCompilerHost(host: ts.CompilerHost): ts.ParseConfigHost {
+   508|   return {
+   509|     fileExists: (f) => host.fileExists(f),
+   510|     readDirectory(root, extensions, excludes, includes, depth) {
+   511|       if (host.readDirectory === undefined) {
+   512|         throw new Error("'CompilerHost.readDirectory' must be implemented to correctly process 'projectReferences'");
+   513|       }
+   514|       return host.readDirectory(root, extensions, excludes, includes, depth);
+   515|     },
+   516|     readFile: (f) => host.readFile(f),
+   517|     useCaseSensitiveFileNames: host.useCaseSensitiveFileNames(),
+   518|     trace: host.trace ? (s) => host.trace!(s) : undefined,
+   519|   };
+   520| }
+
+
+# ====================================================================
+# FILE: src/jsii-diagnostic.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-773 ---
+     1| import * as spec from '@jsii/spec';
+     2| import { camel, constant, pascal } from 'case';
+     3| import * as ts from 'typescript';
+     4| import { TypeSystemHints } from './docs';
+     5| import { WARNINGSCODE_FILE_NAME } from './transforms/deprecation-warnings';
+     6| import { Violation } from './tsconfig/validator';
+     7| import { JSII_DIAGNOSTICS_CODE, _formatDiagnostic } from './utils';
+     8| /**
+     9|  * Descriptors for all valid jsii diagnostic codes.
+    10|  *
+    11|  * The `category` or non-error codes can be updated, for example to treat
+    12|  * warnings as errors, or to suppress certain undesirable warnings.
+    13|  */
+    14| export class Code<T extends DiagnosticMessageFormatter = DiagnosticMessageFormatter> {
+    15|   /**
+    16|    * @internal
+    17|    */
+    18|   public static message<T extends DiagnosticMessageFormatter>({
+    19|     code,
+    20|     name,
+    21|     formatter,
+    22|   }: {
+    23|     code: number;
+    24|     formatter: T;
+    25|     name: string;
+    26|   }) {
+    27|     return new Code<T>(code, name, ts.DiagnosticCategory.Message, formatter);
+    28|   }
+    29|   /**
+    30|    * @internal
+    31|    */
+    32|   public static suggestion<T extends DiagnosticMessageFormatter>({
+    33|     code,
+    34|     name,
+    35|     formatter,
+    36|   }: {
+    37|     code: number;
+    38|     formatter: T;
+    39|     name: string;
+    40|   }) {
+    41|     return new Code<T>(code, name, ts.DiagnosticCategory.Suggestion, formatter);
+    42|   }
+    43|   /**
+    44|    * @internal
+    45|    */
+    46|   public static warning<T extends DiagnosticMessageFormatter>({
+    47|     code,
+    48|     name,
+    49|     formatter,
+    50|   }: {
+    51|     code: number;
+    52|     formatter: T;
+    53|     name: string;
+    54|   }) {
+    55|     return new Code<T>(code, name, ts.DiagnosticCategory.Warning, formatter);
+    56|   }
+    57|   /**
+    58|    * @internal
+    59|    */
+    60|   public static error<T extends DiagnosticMessageFormatter>({
+    61|     code,
+    62|     name,
+    63|     formatter,
+    64|   }: {
+    65|     code: number;
+    66|     formatter: T;
+    67|     name: string;
+    68|   }) {
+    69|     return new Code<T>(code, name, ts.DiagnosticCategory.Error, formatter);
+    70|   }
+    71|   /**
+    72|    * Get a diagnostic code by code or name.
+    73|    *
+    74|    * @param codeOrName the looked up diagnostic code or name.
+    75|    *
+    76|    * @returns the JsiiDiagnosticCode instande, if one exists, or `undefined`
+    77|    *
+    78|    * @experimental this module is under active development and the error codes
+    79|    *               and names may change in the future.
+    80|    */
+    81|   public static lookup(codeOrName: string | number): Code | undefined {
+    82|     if (typeof codeOrName === 'number') {
+    83|       return this.byCode.get(codeOrName);
+    84|     }
+    85|     return this.byName.get(codeOrName);
+    86|   }
+    87|   private static readonly byCode: Map<number, Code> = new Map();
+    88|   private static readonly byName: Map<string, Code> = new Map();
+    89|   readonly #defaultCategory: ts.DiagnosticCategory;
+    90|   #category?: ts.DiagnosticCategory;
+    91|   #formatter: T;
+    92|   /**
+    93|    * Registers a new diagnostic code.
+    94|    *
+    95|    * @param code            the numeric code for the diagnostic
+    96|    * @param name            the symbolic name for the diagnostic
+    97|    * @param defaultCategory the default category this diagnostic ranks in
+    98|    * @param formatter       a message formatter for easy creation of diagnostics
+    99|    */
+   100|   private constructor(
+   101|     public readonly code: number,
+   102|     public readonly name: string,
+   103|     defaultCategory: ts.DiagnosticCategory,
+   104|     formatter: T,
+   105|   ) {
+   106|     this.#defaultCategory = defaultCategory;
+   107|     this.#formatter = formatter;
+   108|     if (code in Code.byCode) {
+   109|       throw new Error(`Attempted to create two instances of ${this.constructor.name} with code ${code}`);
+   110|     }
+   111|     if (name in Code.byName) {
+   112|       throw new Error(`Attempted to create two instances of ${this.constructor.name} with name ${name}`);
+   113|     }
+   114|     Code.byCode.set(code, this);
+   115|     Code.byName.set(name, this);
+   116|   }
+   117|   /**
+   118|    * Determines whether this diagnostic is a compilation error. Diagnostics
+   119|    * where this is `true` cannot have their `category` overridden to a lower
+   120|    * category.
+   121|    */
+   122|   public get isError(): boolean {
+   123|     return this.#defaultCategory === ts.DiagnosticCategory.Error;
+   124|   }
+   125|   /**
+   126|    * The diagnostic category this particular code is filed as.
+   127|    */
+   128|   public get category(): ts.DiagnosticCategory {
+   129|     return this.#category ?? this.#defaultCategory;
+   130|   }
+   131|   /**
+   132|    * Update the diagnostic category for this particular code. If `isError` is
+   133|    * `true`, attempting to set anything other than `ts.DiagnosticCategory.Error`
+   134|    * will result in an error being throw.
+   135|    *
+   136|    * @param newValue the new diagnostic category to be used.
+   137|    */
+   138|   public set category(newValue: ts.DiagnosticCategory) {
+   139|     if (this.isError && newValue !== ts.DiagnosticCategory.Error) {
+   140|       throw new Error(
+   141|         `Illegal attempt to override category of error ${this.code} to ${ts.DiagnosticCategory[newValue]}`,
+   142|       );
+   143|     }
+   144|     this.#category = newValue;
+   145|   }
+   146|   /**
+   147|    * Creates a new `JsiiDiagnostic` message without any source code location
+   148|    * data.
+   149|    *
+   150|    * @param args the arguments to the message formatter.
+   151|    *
+   152|    * @deprecated It is preferred to specify a source code location for problem
+   153|    *             markers. Prefer the use of `create` while providing a value
+   154|    *             for the `location` parameter whenever possible.
+   155|    */
+   156|   public createDetached(...args: Parameters<T>): JsiiDiagnostic {
+   157|     return new JsiiDiagnostic(this, this.#formatter(...args));
+   158|   }
+   159|   /**
+   160|    * Creates a new `JsiiDiagnostic` message with source code location denoted
+   161|    * by the provided `location` node.
+   162|    *
+   163|    * @param location the source code location attachment of the message.
+   164|    * @param args     the arguments to the message formatter.
+   165|    */
+   166|   public create(location: ts.Node | undefined, ...args: Parameters<T>): JsiiDiagnostic {
+   167|     return new JsiiDiagnostic(this, this.#formatter(...args), location);
+   168|   }
+   169| }
+   170| /**
+   171|  * A jsii-specific diagnostic entry.
+   172|  */
+   173| export class JsiiDiagnostic implements ts.Diagnostic {
+   174|   public static readonly JSII_0001_PKG_MISSING_DESCRIPTION = Code.suggestion({
+   175|     code: 1,
+   176|     formatter: () => 'A "description" field should be specified in "package.json"',
+   177|     name: 'metadata/package-json-missing-description',
+   178|   });
+   179|   public static readonly JSII_0002_PKG_MISSING_HOMEPAGE = Code.suggestion({
+   180|     code: 2,
+   181|     formatter: () => 'A "homepage" field should be specified in "package.json"',
+   182|     name: 'metadata/package-json-missing-homepage',
+   183|   });
+   184|   public static readonly JSII_0003_MISSING_README = Code.warning({
+   185|     code: 3,
+   186|     formatter: () => 'There is no "README.md" file. It is required in order to generate valid PyPI (Python) packages.',
+   187|     name: 'metadata/missing-readme',
+   188|   });
+   189|   public static readonly JSII_0004_COULD_NOT_FIND_ENTRYPOINT = Code.error({
+   190|     code: 4,
+   191|     formatter: (mainFile: string) => `Could not find "main" file: ${mainFile}`,
+   192|     name: 'metadata/could-not-find-entrypoint',
+   193|   });
+   194|   public static readonly JSII_0005_MISSING_PEER_DEPENDENCY = Code.warning({
+   195|     code: 5,
+   196|     formatter: (assm: string, reference: string) =>
+   197|       `The type "${reference}" is exposed in the public API of this module. ` +
+   198|       `Therefore, the module "${assm}" must also be defined under "peerDependencies". ` +
+   199|       'This will be auto-corrected unless --no-fix-peer-dependencies was specified.',
+   200|     name: 'metadata/missing-peer-dependency',
+   201|   });
+   202|   public static readonly JSII_0006_MISSING_DEV_DEPENDENCY = Code.warning({
+   203|     code: 6,
+   204|     formatter: (dependencyName: string, peerRange: string, minVersion: string, actual: string) =>
+   205|       `A "peerDependency" on "${dependencyName}" at "${peerRange}" means you ` +
+   206|       `should take a "devDependency" on "${dependencyName}" at "${minVersion}" ` +
+   207|       `(found ${JSON.stringify(actual)})`,
+   208|     name: 'metadata/missing-dev-dependency',
+   209|   });
+   210|   public static readonly JSII_0007_MISSING_WARNINGS_EXPORT = Code.error({
+   211|     code: 7,
+   212|     formatter: () =>
+   213|       'If you are compiling with --add-deprecation-warnings and your package.json ' +
+   214|       `declares subpath exports, you must include { "./${WARNINGSCODE_FILE_NAME}": "./${WARNINGSCODE_FILE_NAME}" } ` +
+   215|       'in the set of exports.',
+   216|     name: 'metadata/missing-warnings-export',
+   217|   });
+   218|   public static readonly JSII_1000_NO_CONST_ENUM = Code.error({
+   219|     code: 1000,
+   220|     formatter: () => 'Exported "const enum" declarations are not allowed',
+   221|     name: 'typescript-restrictions/no-const-enum',
+   222|   });
+   223|   public static readonly JSII_1001_TYPE_HAS_NO_SYMBOL = Code.error({
+   224|     code: 1001,
+   225|     formatter: () => 'Non-primitive types without a symbol cannot be processed.',
+   226|     name: 'typescript-restrictions/type-has-no-symbol',
+   227|   });
+   228|   public static readonly JSII_1002_UNSPECIFIED_PROMISE = Code.error({
+   229|     code: 1002,
+   230|     formatter: () => 'Un-specified promise type. Specify it using "Promise<T>"',
+   231|     name: 'typescript-restrictions/unspecified-promise',
+   232|   });
+   233|   public static readonly JSII_1003_UNSUPPORTED_TYPE = Code.error({
+   234|     code: 1003,
+   235|     formatter: (messageText) => messageText,
+   236|     name: 'typescript-restrictions/unsupported-type',
+   237|   });
+   238|   public static readonly JSII_1004_DUPLICATE_ENUM_VALUE = Code.error({
+   239|     code: 1004,
+   240|     formatter: (enumValue: string, enumMemberNames: string[]) =>
+   241|       `Value ${enumValue} is used for multiple enum values: ${enumMemberNames.join(', ')}`,
+   242|     name: 'typescript-restrictions/duplicate-enum-value',
+   243|   });
+   244|   public static readonly JSII_1005_SEPARATE_WRITE_TYPE = Code.error({
+   245|     code: 1005,
+   246|     formatter: () => 'Visible property signatures cannot use a separate write type. Use the same type as the getter.',
+   247|     name: 'typescript-restrictions/separate-write-type',
+   248|   });
+   249|   public static readonly JSII_1006_GENERIC_TYPE = Code.error({
+   250|     code: 1006,
+   251|     formatter: () => 'Generic types are not supported because semantics are not uniform in target languages.',
+   252|     name: 'typescript-restriction/generic-type',
+   253|   });
+   254|   public static readonly JSII_1999_UNSUPPORTED = Code.error({
+   255|     code: 1999,
+   256|     formatter: ({
+   257|       what,
+   258|       alternative,
+   259|       suggestInternal,
+   260|     }: {
+   261|       what: string;
+   262|       alternative?: string;
+   263|       suggestInternal?: boolean;
+   264|     }) =>
+   265|       `${what} are not supported in jsii APIs.${alternative ? ` Consider using ${alternative} instead.` : ''}${
+   266|         suggestInternal
+   267|           ? ` This declaration must${alternative ? ' otherwise' : ''} be marked "@internal" or "@jsii ignore".`
+   268|           : ''
+   269|       }`,
+   270|     name: 'typescript-restrictions/unsupported',
+   271|   });
+   272|   public static readonly JSII_2000_MISSING_DIRECTIVE_ARGUMENT = Code.warning({
+   273|     code: 2000,
+   274|     formatter: () =>
+   275|       'Missing argument to @jsii directive. Refer to the jsii compiler documentation for more information.',
+   276|     name: 'jsii-directive/missing-argument',
+   277|   });
+   278|   public static readonly JSII_2100_STRUCT_ON_NON_INTERFACE = Code.warning({
+   279|     code: 2100,
+   280|     formatter: () => 'The "@jsii struct" directive is only applicable to interface declarations.',
+   281|     name: 'jsii-directive/struct-on-non-interface',
+   282|   });
+   283|   public static readonly JSII_2999_UNKNOWN_DIRECTIVE = Code.warning({
+   284|     code: 2999,
+   285|     formatter: (text: string) =>
+   286|       `Unknown @jsii directive: ${JSON.stringify(
+   287|         text,
+   288|       )}. Refer to the jsii compiler documentation for more information.`,
+   289|     name: 'jsii-directive/unknown',
+   290|   });
+   291|   public static readonly JSII_3000_EXPORTED_API_USES_HIDDEN_TYPE = Code.error({
+   292|     code: 3000,
+   293|     formatter: (badFqn) => `Exported APIs cannot use un-exported type "${badFqn}"`,
+   294|     name: 'type-model/exported-api-cannot-use-unexported-type',
+   295|   });
+   296|   public static readonly JSII_3001_EXPOSED_INTERNAL_TYPE = Code.error({
+   297|     code: 3001,
+   298|     formatter: (symbol: ts.Symbol, isThisType: boolean, typeUse: string) =>
+   299|       `Type ${
+   300|         isThisType ? `"this" (aka: "${symbol.name}")` : `"${symbol.name}"`
+   301|       } cannot be used as the ${typeUse} because it is private or @internal`,
+   302|     name: 'type-model/use-of-internal-type',
+   303|   });
+   304|   public static readonly JSII_3002_USE_OF_UNEXPORTED_FOREIGN_TYPE = Code.error({
+   305|     code: 3002,
+   306|     formatter: (fqn: string, typeUse: string, pkg: { readonly name: string }) =>
+   307|       `Type "${fqn}" cannot be used as a ${typeUse} because it is not exported from ${pkg.name}`,
+   308|     name: 'type-model/unexported-foreign-type',
+   309|   });
+   310|   public static readonly JSII_3003_SYMBOL_IS_EXPORTED_TWICE = Code.error({
+   311|     code: 3003,
+   312|     formatter: (ns1: string, ns2: string) => `Symbol is exported under two distinct submodules: ${ns1} and ${ns2}`,
+   313|     name: 'type-model/symbol-is-exported-twice',
+   314|   });
+   315|   public static readonly JSII_3004_INVALID_SUPERTYPE = Code.error({
+   316|     code: 3004,
+   317|     formatter: (clause: ts.HeritageClause, badDeclaration: ts.Declaration) => {
+   318|       return `Illegal ${clauseType(clause.token)} clause for an exported API: ${ts.SyntaxKind[badDeclaration.kind]}`;
+   319|       function clauseType(token: ts.SyntaxKind): string {
+   320|         switch (token) {
+   321|           case ts.SyntaxKind.ExtendsKeyword:
+   322|             return 'extends';
+   323|           case ts.SyntaxKind.ImplementsKeyword:
+   324|             return 'implements';
+   325|           default:
+   326|             return ts.SyntaxKind[token];
+   327|         }
+   328|       }
+   329|     },
+   330|     name: 'type-model/invalid-supertype',
+   331|   });
+   332|   public static readonly JSII_3005_TYPE_USED_AS_INTERFACE = Code.error({
+   333|     code: 3005,
+   334|     formatter: (badType: spec.TypeReference) =>
+   335|       `Type "${spec.describeTypeReference(badType)}" cannot be used as an interface`,
+   336|     name: 'type-model/type-used-as-interface',
+   337|   });
+   338|   public static readonly JSII_3006_TYPE_USED_AS_CLASS = Code.error({
+   339|     code: 3006,
+   340|     formatter: (badType: spec.TypeReference) =>
+   341|       `Type "${spec.describeTypeReference(badType)}" cannot be used as a class`,
+   342|     name: 'type-model/type-used-as-class',
+   343|   });
+   344|   public static readonly JSII_3007_ILLEGAL_STRUCT_EXTENSION = Code.error({
+   345|     code: 3007,
+   346|     formatter: (offender: spec.Type, struct: spec.InterfaceType) =>
+   347|       `Attempt to extend or implement struct "${struct.fqn}" from "${offender.fqn}"`,
+   348|     name: 'type-model/illegal-struct-extension',
+   349|   });
+   350|   public static readonly JSII_3008_STRUCT_PROPS_MUST_BE_READONLY = Code.error({
+   351|     code: 3008,
+   352|     formatter: (propName: string, struct: spec.InterfaceType) =>
+   353|       `The "${propName}" property of struct "${struct.fqn}" must be "readonly". Rename "${struct.fqn}" to "I${struct.name}" if it is meant to be a behavioral interface.`,
+   354|     name: 'type-model/struct-props-must-be-readonly',
+   355|   });
+   356|   public static readonly JSII_3009_OPTIONAL_PARAMETER_BEFORE_REQUIRED = Code.error({
+   357|     code: 3009,
+   358|     formatter: (param: spec.Parameter, nextParam: spec.Parameter) =>
+   359|       `Parameter "${param.name}" cannot be optional, as it precedes required parameter "${nextParam.name}"`,
+   360|     name: 'type-model/optional-parameter-before-required',
+   361|   });
+   362|   public static readonly JSII_3999_INCOHERENT_TYPE_MODEL = Code.error({
+   363|     code: 3999,
+   364|     formatter: (messageText) => messageText,
+   365|     name: 'type-model/incoherent-type-model',
+   366|   });
+   367|   public static readonly JSII_4000_FAILED_TSCONFIG_VALIDATION = Code.error({
+   368|     code: 4000,
+   369|     formatter: (config: string, ruleSet: string, violations: Array<Violation>) => {
+   370|       return `Typescript compiler options in "${config}" are not passing validation against rule set "${ruleSet}", found the following rule violations:\n${violations
+   371|         .map((v) => `  - ${v.field}: ${v.message}`)
+   372|         .join('\n')}`;
+   373|     },
+   374|     name: 'typescript-config/invalid-tsconfig',
+   375|   });
+   376|   public static readonly JSII_4009_DISABLED_TSCONFIG_VALIDATION = Code.warning({
+   377|     code: 4009,
+   378|     formatter: (config: string) =>
+   379|       `Validation of typescript config "${config}" is disabled. This is intended for experimental setups only. Compilation might fail or produce incompatible artifacts.`,
+   380|     name: 'typescript-config/disabled-tsconfig-validation',
+   381|   });
+   382|   public static readonly JSII_5000_JAVA_GETTERS = Code.error({
+   383|     code: 5000,
+   384|     formatter: (badName: string, typeName: string) =>
+   385|       `Methods and properties cannot have names like "getXxx": those conflict with Java property getters. Rename "${typeName}.${badName}"`,
+   386|     name: 'language-compatibility/potential-java-getter-conflict',
+   387|   });
+   388|   public static readonly JSII_5001_JAVA_SETTERS = Code.error({
+   389|     code: 5001,
+   390|     formatter: (badName: string, typeName: string) =>
+   391|       `Methods and properties cannot have names like "setXxx": those conflict with Java property setters. Rename "${typeName}.${badName}"`,
+   392|     name: 'language-compatibility/potential-java-setter-conflict',
+   393|   });
+   394|   public static readonly JSII_5002_OVERRIDE_CHANGES_VISIBILITY = Code.error({
+   395|     code: 5002,
+   396|     formatter: (
+   397|       newElement: string,
+   398|       action: string,
+   399|       newValue: 'protected' | 'public',
+   400|       oldValue: 'protected' | 'public',
+   401|     ) => `"${newElement}" changes visibility to ${newValue} when ${action}. Change it to ${oldValue}`,
+   402|     name: 'language-compatibility/override-changes-visibility',
+   403|   });
+   404|   public static readonly JSII_5003_OVERRIDE_CHANGES_RETURN_TYPE = Code.error({
+   405|     code: 5003,
+   406|     formatter: (newElement: string, action: string, newValue: string, oldValue: string) =>
+   407|       `"${newElement}" changes the return type to "${newValue}" when ${action}. Change it to "${oldValue}"`,
+   408|     name: 'language-compatibility/override-changes-return-type',
+   409|   });
+   410|   public static readonly JSII_5004_OVERRIDE_CHANGES_PROP_TYPE = Code.error({
+   411|     code: 5004,
+   412|     formatter: (newElement: string, action: string, newType: spec.TypeReference, oldType: spec.TypeReference) =>
+   413|       `"${newElement}" changes the property type to "${spec.describeTypeReference(
+   414|         newType,
+   415|       )}" when ${action}. Change it to "${spec.describeTypeReference(oldType)}"`,
+   416|     name: 'language-compatibility/override-changes-property-type',
+   417|   });
+   418|   public static readonly JSII_5005_OVERRIDE_CHANGES_PARAM_COUNT = Code.error({
+   419|     code: 5005,
+   420|     formatter: (newElement: string, action: string, newCount: number, oldCount: number) =>
+   421|       `"${newElement}" has ${newCount} parameters when ${action}. It should accept ${oldCount} parameters`,
+   422|     name: 'language-compatibility/override-changes-param-count',
+   423|   });
+   424|   public static readonly JSII_5006_OVERRIDE_CHANGES_PARAM_TYPE = Code.error({
+   425|     code: 5006,
+   426|     formatter: (newElement: string, action: string, newParam: spec.Parameter, oldParam: spec.Parameter) =>
+   427|       `"${newElement}" changes the type of parameter "${newParam.name}" to ${spec.describeTypeReference(
+   428|         newParam.type,
+   429|       )} when ${action}. Change it to ${spec.describeTypeReference(oldParam.type)}`,
+   430|     name: 'language-compatibility/override-changes-param-type',
+   431|   });
+   432|   public static readonly JSII_5007_OVERRIDE_CHANGES_VARIADIC = Code.error({
+   433|     code: 5007,
+   434|     formatter: (newElement: string, action: string, newVariadic = false, oldVariadic = false) =>
+   435|       `"${newElement}" turns ${newVariadic ? 'variadic' : 'non variadic'} when ${action}. Make it ${
+   436|         oldVariadic ? 'variadic' : 'non-variadic'
+   437|       }`,
+   438|     name: 'language-compatibility/override-changes-variadic',
+   439|   });
+   440|   public static readonly JSII_5008_OVERRIDE_CHANGES_PARAM_OPTIONAL = Code.error({
+   441|     code: 5008,
+   442|     formatter: (newElement: string, action: string, newParam: spec.Parameter, oldParam: spec.Parameter) =>
+   443|       `"${newElement}" turns parameter "${newParam.name}" ${
+   444|         newParam.optional ? 'optional' : 'required'
+   445|       } when ${action}. Make it ${oldParam.optional ? 'optional' : 'required'}`,
+   446|     name: 'language-compatibility/override-changes-param-optional',
+   447|   });
+   448|   public static readonly JSII_5009_OVERRIDE_CHANGES_PROP_OPTIONAL = Code.error({
+   449|     code: 5009,
+   450|     formatter: (newElement: string, action: string, newOptional = false, oldOptional = false) =>
+   451|       `"${newElement}" turns ${newOptional ? 'optional' : 'required'} when ${action}. Make it ${
+   452|         oldOptional ? 'optional' : 'required'
+   453|       }`,
+   454|     name: 'language-compatibility/override-changes-prop-optional',
+   455|   });
+   456|   public static readonly JSII_5010_OVERRIDE_CHANGES_MUTABILITY = Code.error({
+   457|     code: 5010,
+   458|     formatter: (newElement: string, action: string, newReadonly = false, oldReadonly = false) =>
+   459|       `"${newElement}" turns ${newReadonly ? 'readonly' : 'mutable'} when ${action}. Make it ${
+   460|         oldReadonly ? 'readonly' : 'mutable'
+   461|       }`,
+   462|     name: 'language-compatibility/override-changes-mutability',
+   463|   });
+   464|   public static readonly JSII_5011_SUBMODULE_NAME_CONFLICT = Code.error({
+   465|     code: 5011,
+   466|     formatter: (submoduleName: string, typeName: string, reserved: readonly string[]) =>
+   467|       `Submodule "${submoduleName}" conflicts with "${typeName}, as different languages could represent it as: ${reserved
+   468|         .map((x) => `"${x}"`)
+   469|         .join(', ')}"`,
+   470|     name: 'language-compatibility/submodule-name-conflicts',
+   471|   });
+   472|   public static readonly JSII_5012_NAMESPACE_IN_TYPE = Code.error({
+   473|     code: 5012,
+   474|     formatter: (typeName: string, namespaceName: string) =>
+   475|       `All entities nested under a type (e.g: "${typeName}") must be concrete types, but "${namespaceName}" is a namespace. This structure cannot be supported in all languages (e.g: Java)`,
+   476|     name: 'language-compatibility/namespace-in-type',
+   477|   });
+   478|   public static readonly JSII_5013_STATIC_INSTANCE_CONFLICT = Code.error({
+   479|     code: 5013,
+   480|     formatter: (member: string, type: spec.ClassType) =>
+   481|       `Member "${member}" of class "${type.fqn}" has both a static and an instance delcaration`,
+   482|     name: 'language-compatibility/static-instance-conflict',
+   483|   });
+   484|   public static readonly JSII_5014_INHERITED_STATIC_CONFLICT = Code.error({
+   485|     code: 5014,
+   486|     formatter: (
+   487|       member: spec.Method | spec.Property,
+   488|       type: spec.ClassType,
+   489|       baseMember: spec.Method | spec.Property,
+   490|       baseType: spec.ClassType,
+   491|     ) =>
+   492|       `${member.static ? 'Static' : 'Instance'} member "${member.name}" of class "${type.fqn}" conflicts with ${
+   493|         baseMember.static ? 'static' : 'instance'
+   494|       } member in ancestor "${baseType.fqn}"`,
+   495|     name: 'language-compatibility/inherited-static-conflict',
+   496|   });
+   497|   public static readonly JSII_5015_REDECLARED_INTERFACE_MEMBER = Code.error({
+   498|     code: 5015,
+   499|     formatter: (memberName: string, iface: spec.InterfaceType) =>
+   500|       `Interface "${iface.fqn}" re-declares member "${memberName}". This is not supported as it results in invalid C#.`,
+   501|     name: 'language-compatibility/redeclared-interface-member',
+   502|   });
+   503|   public static readonly JSII_5016_PROHIBITED_MEMBER_NAME = Code.error({
+   504|     code: 5016,
+   505|     formatter: (badName: string) =>
+   506|       `Members cannot be named "${badName}" as it conflicts with synthetic declarations in some languages.`,
+   507|     name: 'language-compatibility/prohibited-member-name',
+   508|   });
+   509|   public static readonly JSII_5017_POSITIONAL_KEYWORD_CONFLICT = Code.error({
+   510|     code: 5017,
+   511|     formatter: (badName: string) =>
+   512|       `Parameter name "${badName}" is also the name of a property in a struct parameter. Rename the positional parameter.`,
+   513|     name: 'language-compatibility/positional-keyword-conflict',
+   514|   });
+   515|   public static readonly JSII_5018_RESERVED_WORD = Code.warning({
+   516|     code: 5018,
+   517|     formatter: (badName: string, languages: readonly string[]) =>
+   518|       `"${badName}" is a reserved word in ${languages.join(
+   519|         ', ',
+   520|       )}. Using this name may cause problems when generating language bindings. Consider a different name.`,
+   521|     name: 'language-compatibility/reserved-word',
+   522|   });
+   523|   public static readonly JSII_5019_MEMBER_TYPE_NAME_CONFLICT = Code.warning({
+   524|     code: 5019,
+   525|     formatter: (memberKind: 'method' | 'property', memberSymbol: ts.Symbol, declaringType: spec.Type) =>
+   526|       `The ${memberKind} name "${memberSymbol.name}" conflicts with the declaring ${declaringType.kind} "${declaringType.name}". This will result in renaming the ${declaringType.kind} to "_${declaringType.name}" in C#. Consider renaming "${memberSymbol.name}".`,
+   527|     name: 'language-compatibility/member-name-conflicts-with-type-name',
+   528|   });
+   529|   public static readonly JSII_5020_STATIC_MEMBER_CONFLICTS_WITH_NESTED_TYPE = Code.error({
+   530|     code: 5020,
+   531|     formatter: (
+   532|       nestingType: spec.Type,
+   533|       staticMember: spec.Property | spec.Method | spec.EnumMember,
+   534|       nestedType: spec.Type,
+   535|     ) =>
+   536|       `The static member "${nestingType.name}.${staticMember.name}" has the same PascalCased representation as nested type "${nestingType.name}.${nestedType.name}". This would result in invalid code in Go.`,
+   537|     name: 'language-compatibility/static-member-name-conflicts-with-nested-type',
+   538|   });
+   539|   public static readonly JSII_5021_ABSTRACT_CLASS_MISSING_PROP_IMPL = Code.error({
+   540|     code: 5021,
+   541|     formatter: (intf: spec.InterfaceType, cls: spec.ClassType, prop: string) =>
+   542|       `A declaration of "${intf.name}.${prop}" is missing on class "${cls.name}". Declare the property as "public abstract" if you want to defer it to subclasses.`,
+   543|     name: 'language-compatibility/abstract-class-missing-prop-impl',
+   544|   });
+   545|   public static readonly JSII_7000_NON_EXISTENT_PARAMETER = Code.warning({
+   546|     code: 7000,
+   547|     formatter: (method: spec.Method, param: string) =>
+   548|       `Documentation for method "${method.name}" refers to non-existent @param "${param}"`,
+   549|     name: 'documentation/non-existent-parameter',
+   550|   });
+   551|   public static readonly JSII_7001_ILLEGAL_HINT = Code.error({
+   552|     code: 7001,
+   553|     formatter: (hint: keyof TypeSystemHints, ...valid: readonly string[]) =>
+   554|       `Illegal use of "@${hint}" hint. It is only valid on ${valid.join(', ')}.`,
+   555|     name: 'documentation/illegal-hint',
+   556|   });
+   557|   public static readonly JSII_7999_DOCUMENTATION_ERROR = Code.error({
+   558|     code: 7999,
+   559|     formatter: (messageText) => messageText,
+   560|     name: 'documentation/documentation-error',
+   561|   });
+   562|   public static readonly JSII_8000_PASCAL_CASED_TYPE_NAMES = Code.error({
+   563|     code: 8000,
+   564|     formatter: (badName: string, expectedName: string = pascal(badName)) =>
+   565|       `Type names must be PascalCased. Rename "${badName}" to "${expectedName}"`,
+   566|     name: 'code-style/type-names-must-use-pascal-case',
+   567|   });
+   568|   public static readonly JSII_8001_ALL_CAPS_ENUM_MEMBERS = Code.error({
+   569|     code: 8001,
+   570|     formatter: (badName: string, typeName: string) =>
+   571|       `Enum members must be ALL_CAPS. Rename "${typeName}.${badName}" to "${constant(badName)}"`,
+   572|     name: 'code-style/enum-members-must-use-all-caps',
+   573|   });
+   574|   public static readonly JSII_8002_CAMEL_CASED_MEMBERS = Code.error({
+   575|     code: 8002,
+   576|     formatter: (badName: string, typeName: string) =>
+   577|       `Method and property (unless they are static readonly) names must use camelCase. Rename "${typeName}.${badName}" to "${camel(
+   578|         badName,
+   579|       )}"`,
+   580|     name: 'code-style/member-names-must-use-camel-case',
+   581|   });
+   582|   public static readonly JSII_8003_STATIC_CONST_CASING = Code.error({
+   583|     code: 8003,
+   584|     formatter: (badName: string, typeName: string) =>
+   585|       `Static constant names must use ALL_CAPS, PascalCase, or camelCase. Rename "${typeName}.${badName}" to "${constant(
+   586|         badName,
+   587|       )}"`,
+   588|     name: 'code-style/static-readonly-property-casing',
+   589|   });
+   590|   public static readonly JSII_8004_SUBMOULE_NAME_CASING = Code.error({
+   591|     code: 8004,
+   592|     formatter: (badName: string) =>
+   593|       `Submodule namespaces must be camelCased or snake_cased. Rename "${badName}" to ${camel(badName)}`,
+   594|     name: 'code-style/submodule-name-casing',
+   595|   });
+   596|   public static readonly JSII_8005_INTERNAL_UNDERSCORE = Code.error({
+   597|     code: 8005,
+   598|     formatter: (badName: string) =>
+   599|       `Members marked with @internal must have a name starting with "_". Rename "${badName}" to "_${badName}"`,
+   600|     name: 'code-style/internal-members-underscore-prefix',
+   601|   });
+   602|   public static readonly JSII_8006_UNDERSCORE_INTERNAL = Code.error({
+   603|     code: 8006,
+   604|     formatter: (badName: string) =>
+   605|       `Members with a name starting with "_" (e.g: "${badName}") must be marked @internal`,
+   606|     name: 'code-style/underscored-members-must-be-internal',
+   607|   });
+   608|   public static readonly JSII_8007_BEHAVIORAL_INTERFACE_NAME = Code.error({
+   609|     code: 8007,
+   610|     formatter: (badName: string) => `Interface contains behavior. Rename "${badName}" to "I${badName}"`,
+   611|     name: 'code-style/behavioral-interface-name',
+   612|   });
+   613|   public static readonly JSII_9000_UNKNOWN_MODULE = Code.error({
+   614|     code: 9000,
+   615|     formatter: (moduleName) =>
+   616|       `Encountered use of module that is not declared in "dependencies" or "peerDependencies": "${moduleName}"`,
+   617|     name: 'miscellaneous/unknown-module',
+   618|   });
+   619|   public static readonly JSII_9001_TYPE_NOT_FOUND = Code.error({
+   620|     code: 9001,
+   621|     formatter: (typeRef: spec.NamedTypeReference) => `Type not found in the corresponding assembly: "${typeRef.fqn}"`,
+   622|     name: 'miscellaneous/type-not-found',
+   623|   });
+   624|   public static readonly JSII_9002_UNRESOLVEABLE_TYPE = Code.error({
+   625|     code: 9002,
+   626|     formatter: (reference: string) =>
+   627|       `Unable to resolve type "${reference}". It may be @internal or not exported from the module's entry point (as configured in "package.json" as "main").`,
+   628|     name: 'miscellaneous/unresolveable-type',
+   629|   });
+   630|   public static readonly JSII_9003_UNRESOLVEABLE_MODULE = Code.error({
+   631|     code: 9003,
+   632|     formatter: (location: string) => `Unable to resolve module location "${location}"`,
+   633|     name: 'miscellaneous/unresolveable-module',
+   634|   });
+   635|   public static readonly JSII_9004_UNABLE_TO_COMPUTE_SIGNATURE = Code.error({
+   636|     code: 9004,
+   637|     formatter: (methodName: string, type: spec.Type) =>
+   638|       `Unable to compute signature for method "${methodName}" of "${type.fqn}"`,
+   639|     name: 'miscellaneous/unable-to-compute-signature',
+   640|   });
+   641|   public static readonly JSII_9996_UNNECESSARY_TOKEN = Code.message({
+   642|     code: 9996,
+   643|     formatter: () => 'Unnecessary token, consider removing it',
+   644|     name: 'miscellaneous/unnecessary-token',
+   645|   });
+   646|   public static readonly JSII_9997_UNKNOWN_ERROR = Code.error({
+   647|     code: 9997,
+   648|     formatter: (error: Error) => `Unknown error: ${error.message} -- ${error.stack}`,
+   649|     name: 'miscellaneous/unknown-error',
+   650|   });
+   651|   public static readonly JSII_9998_UNSUPPORTED_NODE = Code.message({
+   652|     code: 9998,
+   653|     formatter: (kindOrMessage: ts.SyntaxKind | string) =>
+   654|       typeof kindOrMessage === 'string'
+   655|         ? kindOrMessage
+   656|         : `Unsupported ${ts.SyntaxKind[kindOrMessage]} node. This declaration will not be accessible from other languages.`,
+   657|     name: 'miscellaneous/unsupported-node',
+   658|   });
+   659|   /**
+   660|    * Determines whether a `Diagnostic` instance is a `JsiiDiagnostic` or not.
+   661|    * @param diag
+   662|    */
+   663|   public static isJsiiDiagnostic(diag: ts.Diagnostic): diag is JsiiDiagnostic {
+   664|     return (diag as unknown as JsiiDiagnostic).domain === JsiiDiagnostic.DOMAIN;
+   665|   }
+   666|   private static readonly JSII_9999_RELATED_INFO = Code.suggestion({
+   667|     code: 9999,
+   668|     formatter: (messageText) => messageText,
+   669|     name: 'miscellaneous/related-info',
+   670|   });
+   671|   /**
+   672|    * This symbol unequivocally identifies the `JsiiDiagnostic` domain.
+   673|    */
+   674|   private static readonly DOMAIN = Symbol('jsii');
+   675|   private readonly domain = JsiiDiagnostic.DOMAIN;
+   676|   public readonly category: ts.DiagnosticCategory;
+   677|   public readonly code: number = JSII_DIAGNOSTICS_CODE;
+   678|   public readonly jsiiCode: number;
+   679|   public readonly messageText: string | ts.DiagnosticMessageChain;
+   680|   public readonly file: ts.SourceFile | undefined;
+   681|   public readonly start: number | undefined;
+   682|   public readonly length: number | undefined;
+   683|   public readonly relatedInformation = new Array<ts.DiagnosticRelatedInformation>();
+   684|   #formatted?: string;
+   685|   /**
+   686|    * Creates a new `JsiiDiagnostic` with the provided properties.
+   687|    *
+   688|    * @internal
+   689|    */
+   690|   public constructor(code: Code, messageText: string | ts.DiagnosticMessageChain, location?: ts.Node) {
+   691|     this.category = code.category;
+   692|     this.jsiiCode = code.code;
+   693|     this.messageText = messageText;
+   694|     if (location != null) {
+   695|       this.file = location.getSourceFile();
+   696|       this.start = location.getStart(this.file);
+   697|       this.length = location.getEnd() - this.start;
+   698|     }
+   699|   }
+   700|   public addRelatedInformation(node: ts.Node, message: JsiiDiagnostic['messageText']): this {
+   701|     if (!/[\\/]typescript[\\/]lib[\\/]lib\..+\.d\.ts$/.test(node.getSourceFile().fileName)) {
+   702|       this.relatedInformation.push(JsiiDiagnostic.JSII_9999_RELATED_INFO.create(node, message));
+   703|     }
+   704|     this.#formatted = undefined;
+   705|     return this;
+   706|   }
+   707|   /**
+   708|    * Links the provided `node` with the specified `message` as related to the
+   709|    * current diagnostic, unless `node` is undefined.
+   710|    *
+   711|    * @param node the node where the message should be attached, if any.
+   712|    * @param message the message to be attached to the diagnostic entry.
+   713|    *
+   714|    * @returns `this`
+   715|    */
+   716|   public addRelatedInformationIf(node: ts.Node | undefined, message: JsiiDiagnostic['messageText']): this {
+   717|     if (node != null) {
+   718|       return this.addRelatedInformation(node, message);
+   719|     } else {
+   720|       return this;
+   721|     }
+   722|   }
+   723|   /**
+   724|    * Adds related information to this `JsiiDiagnostic` instance if the provided
+   725|    * `node` is defined.
+   726|    *
+   727|    * @param node    the node to bind as related information, or `undefined`.
+   728|    * @param message the message to attach to the related information.
+   729|    *
+   730|    * @returns `this`
+   731|    */
+   732|   public maybeAddRelatedInformation(node: ts.Node | undefined, message: JsiiDiagnostic['messageText']): this {
+   733|     if (node == null) {
+   734|       return this;
+   735|     }
+   736|     this.relatedInformation.push(JsiiDiagnostic.JSII_9999_RELATED_INFO.create(node, message));
+   737|     this.#formatted = undefined;
+   738|     return this;
+   739|   }
+   740|   /**
+   741|    * Formats this diagnostic with color and context if possible, and returns it.
+   742|    * The formatted diagnostic is cached, so that it can be re-used. This is
+   743|    * useful for diagnostic messages involving trivia -- as the trivia may have
+   744|    * been obliterated from the `SourceFile` by the `TsCommentReplacer`, which
+   745|    * makes the error messages really confusing.
+   746|    */
+   747|   public format(projectRoot: string): string {
+   748|     if (this.#formatted == null) {
+   749|       this.#formatted = _formatDiagnostic(this, projectRoot);
+   750|     }
+   751|     return this.#formatted;
+   752|   }
+   753| }
+   754| export type DiagnosticMessageFormatter = (...args: any[]) => JsiiDiagnostic['messageText'];
+   755| export function configureCategories(records: { [code: string]: ts.DiagnosticCategory }) {
+   756|   for (const [code, category] of Object.entries(records)) {
+   757|     const diagCode = Code.lookup(diagnosticCode(code));
+   758|     if (!diagCode) {
+   759|       throw new Error(`Unrecognized diagnostic code '${code}'`);
+   760|     }
+   761|     diagCode.category = category;
+   762|   }
+   763| }
+   764| function diagnosticCode(str: string): string | number {
+   765|   if (str.toLowerCase().startsWith('jsii')) {
+   766|     const re = /^JSII(\d+)$/i.exec(str);
+   767|     if (re) {
+   768|       return parseInt(re[1], 10);
+   769|     }
+   770|     throw new Error(`Invalid diagnostic code ${str}. A number must follow code that starts with 'JSII'`);
+   771|   }
+   772|   return str;
+   773| }
+

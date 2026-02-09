@@ -1,0 +1,3339 @@
+--- a/hazelcast-spring/src/main/java/com/hazelcast/spring/transaction/HazelcastTransactionManager.java
++++ b/hazelcast-spring/src/main/java/com/hazelcast/spring/transaction/HazelcastTransactionManager.java
+@@ -9,32 +9,30 @@
+  *
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an "AS IS" BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.spring.transaction;
+ import com.hazelcast.core.HazelcastInstance;
+ import com.hazelcast.transaction.TransactionContext;
+-import com.hazelcast.transaction.TransactionOptions;
+ import org.springframework.transaction.CannotCreateTransactionException;
+ import org.springframework.transaction.NoTransactionException;
+ import org.springframework.transaction.TransactionDefinition;
+ import org.springframework.transaction.TransactionException;
+ import org.springframework.transaction.TransactionSystemException;
+ import org.springframework.transaction.support.AbstractPlatformTransactionManager;
+ import org.springframework.transaction.support.DefaultTransactionStatus;
+ import org.springframework.transaction.support.ResourceTransactionManager;
+ import org.springframework.transaction.support.SmartTransactionObject;
+ import org.springframework.transaction.support.TransactionSynchronizationManager;
+-import java.util.concurrent.TimeUnit;
+ /**
+  * {@link org.springframework.transaction.PlatformTransactionManager} implementation
+  * for a single {@link HazelcastInstance}. Binds a Hazelcast {@link TransactionContext}
+  * from the instance to the thread (as it is already bounded by Hazelcast itself) and makes it available for access.
+  * <p>
+  * <i>Note:</i> This transaction manager doesn't supports nested transactions, since Hazelcast doesn't support them either.
+  *
+  * @author Balint Krivan
+  * @see #getTransactionContext(HazelcastInstance)
+  * @see #getTransactionContext()
+@@ -84,44 +82,34 @@
+     }
+     @Override
+     protected boolean isExistingTransaction(Object transaction) throws TransactionException {
+         return ((HazelcastTransactionObject) transaction).hasTransaction();
+     }
+     @Override
+     protected void doBegin(Object transaction, TransactionDefinition definition) throws TransactionException {
+         HazelcastTransactionObject txObject = (HazelcastTransactionObject) transaction;
+         try {
+             if (txObject.getTransactionContextHolder() == null) {
+-                TransactionContext transactionContext = getTransactionContext(definition);
++                TransactionContext transactionContext = hazelcastInstance.newTransactionContext();
++                if (logger.isDebugEnabled()) {
++                    logger.debug("Opened new TransactionContext [" + transactionContext + "]");
++                }
+                 txObject.setTransactionContextHolder(new TransactionContextHolder(transactionContext), true);
+             }
+             txObject.getTransactionContextHolder().beginTransaction();
+             if (txObject.isNewTransactionContextHolder()) {
+                 TransactionSynchronizationManager.bindResource(hazelcastInstance, txObject.getTransactionContextHolder());
+             }
+         } catch (Throwable ex) {
+             closeTransactionContextAfterFailedBegin(txObject);
+             throw new CannotCreateTransactionException("Could not begin Hazelcast transaction", ex);
+         }
+-    }
+-    private TransactionContext getTransactionContext(TransactionDefinition definition) {
+-        TransactionOptions options = TransactionOptions.getDefault();
+-        if (definition.getTimeout() != TransactionDefinition.TIMEOUT_DEFAULT) {
+-            options.setTimeout(definition.getTimeout(), TimeUnit.SECONDS);
+-        } else if (getDefaultTimeout() != TransactionDefinition.TIMEOUT_DEFAULT) {
+-            options.setTimeout(getDefaultTimeout(), TimeUnit.SECONDS);
+-        }
+-        TransactionContext transactionContext = hazelcastInstance.newTransactionContext(options);
+-        if (logger.isDebugEnabled()) {
+-            logger.debug("Opened new TransactionContext [" + transactionContext + "]");
+-        }
+-        return transactionContext;
+     }
+     private void closeTransactionContextAfterFailedBegin(HazelcastTransactionObject txObject) {
+         if (txObject.isNewTransactionContextHolder()) {
+             TransactionContext context = txObject.getTransactionContextHolder().getContext();
+             try {
+                 context.rollbackTransaction();
+             } catch (Throwable ex) {
+                 logger.debug("Could not rollback Hazelcast transaction after failed transaction begin", ex);
+             }
+             txObject.setTransactionContextHolder(null, false);
+
+--- a/hazelcast/src/main/java/com/hazelcast/aws/AwsMetadataApi.java
++++ b/hazelcast/src/main/java/com/hazelcast/aws/AwsMetadataApi.java
+@@ -12,119 +12,105 @@
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.aws;
+ import com.hazelcast.internal.json.Json;
+ import com.hazelcast.internal.json.JsonObject;
+ import com.hazelcast.logging.ILogger;
+ import com.hazelcast.logging.Logger;
+ import com.hazelcast.spi.utils.RestClient;
+-import com.hazelcast.spi.exception.RestClientException;
+ import java.util.Optional;
+-import java.time.Instant;
+ import static com.hazelcast.aws.AwsRequestUtils.createRestClient;
+ import static com.hazelcast.spi.utils.RestClient.HTTP_NOT_FOUND;
+ import static com.hazelcast.spi.utils.RestClient.HTTP_OK;
+ /**
+  * Responsible for connecting to AWS EC2 and ECS Metadata API.
+  *
+  * @see <a href="http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html">EC2 Instance Metatadata</a>
+  * @see <a href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html">ECS Task IAM Role Metadata</a>
+  * @see <a href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint.html">ECS Task Metadata</a>
+  */
+ class AwsMetadataApi {
+     private static final ILogger LOGGER = Logger.getLogger(AwsMetadataApi.class);
+     private static final String EC2_METADATA_ENDPOINT = "http://169.254.169.254/latest/meta-data";
+     private static final String ECS_IAM_ROLE_METADATA_ENDPOINT = "http://169.254.170.2" + System.getenv(
+         "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI");
+-    private static final String EC2_METADATA_TOKEN_ENDPOINT = "http://169.254.169.254/latest/api/token";
+     private static final String ECS_TASK_METADATA_ENDPOINT = System.getenv("ECS_CONTAINER_METADATA_URI");
+     private static final String SECURITY_CREDENTIALS_URI = "/iam/security-credentials/";
+-    private static final long METADATA_TOKEN_TTL_SECONDS = 21600;
+     private final String ec2MetadataEndpoint;
+-    private final String ec2MetadataTokenEndpoint;
+     private final String ecsIamRoleEndpoint;
+     private final String ecsTaskMetadataEndpoint;
+     private final AwsConfig awsConfig;
+-    private String metadataToken;
+-    private Instant metadataExpiry;
+     AwsMetadataApi(AwsConfig awsConfig) {
+         this.ec2MetadataEndpoint = EC2_METADATA_ENDPOINT;
+-        this.ec2MetadataTokenEndpoint = EC2_METADATA_TOKEN_ENDPOINT;
+         this.ecsIamRoleEndpoint = ECS_IAM_ROLE_METADATA_ENDPOINT;
+         this.ecsTaskMetadataEndpoint = ECS_TASK_METADATA_ENDPOINT;
+         this.awsConfig = awsConfig;
+     }
+     /**
+      * For test purposes only.
+      */
+     AwsMetadataApi(String ec2MetadataEndpoint, String ecsIamRoleEndpoint, String ecsTaskMetadataEndpoint,
+-                   String ec2MetadataTokenEndpoint, AwsConfig awsConfig) {
++                   AwsConfig awsConfig) {
+         this.ec2MetadataEndpoint = ec2MetadataEndpoint;
+-        this.ec2MetadataTokenEndpoint = ec2MetadataTokenEndpoint;
+         this.ecsIamRoleEndpoint = ecsIamRoleEndpoint;
+         this.ecsTaskMetadataEndpoint = ecsTaskMetadataEndpoint;
+         this.awsConfig = awsConfig;
+     }
+     String availabilityZoneEc2() {
+         String uri = ec2MetadataEndpoint.concat("/placement/availability-zone/");
+-        return metadataClient(uri, awsConfig).get().getBody();
++        return createRestClient(uri, awsConfig).get().getBody();
+     }
+     Optional<String> placementGroupEc2() {
+         return getOptionalMetadata(ec2MetadataEndpoint.concat("/placement/group-name/"), "placement group");
+     }
+     Optional<String> placementPartitionNumberEc2() {
+         return getOptionalMetadata(ec2MetadataEndpoint.concat("/placement/partition-number/"), "partition number");
+     }
+     /**
+      * Resolves an optional metadata that exists for some instances only.
+      * HTTP_OK and HTTP_NOT_FOUND responses are assumed valid. Any other
+      * response code or an exception thrown during retries will yield
+      * a warning log and an empty result will be returned.
+      *
+      * @param uri  Metadata URI
+      * @param loggedName  Metadata name to be used when logging.
+      * @return  The metadata if the endpoint exists, empty otherwise.
+      */
+     private Optional<String> getOptionalMetadata(String uri, String loggedName) {
+         RestClient.Response response;
+         try {
+-            response = metadataClient(uri, awsConfig)
++            response = createRestClient(uri, awsConfig)
+                     .expectResponseCodes(HTTP_OK, HTTP_NOT_FOUND)
+                     .get();
+         } catch (Exception e) {
+             LOGGER.warning(String.format("Could not resolve the %s metadata", loggedName));
+             return Optional.empty();
+         }
+         int responseCode = response.getCode();
+         if (responseCode == HTTP_OK) {
+             return Optional.of(response.getBody());
+         } else if (responseCode == HTTP_NOT_FOUND) {
+             LOGGER.fine(String.format("No %s information is found.", loggedName));
+             return Optional.empty();
+         } else {
+             throw new RuntimeException(String.format("Unexpected response code: %d", responseCode));
+         }
+     }
+-    private JsonObject getTaskMetadata() {
+-        String uri = ecsTaskMetadataEndpoint.concat("/task");
+-        String response = createRestClient(uri, awsConfig).get().getBody();
+-        return Json.parse(response).asObject();
+-    }
+     String defaultIamRoleEc2() {
+         String uri = ec2MetadataEndpoint.concat(SECURITY_CREDENTIALS_URI);
+-        return metadataClient(uri, awsConfig).get().getBody();
++        return createRestClient(uri, awsConfig).get().getBody();
+     }
+     AwsCredentials credentialsEc2(String iamRole) {
+         String uri = ec2MetadataEndpoint.concat(SECURITY_CREDENTIALS_URI).concat(iamRole);
+-        String response = metadataClient(uri, awsConfig).get().getBody();
++        String response = createRestClient(uri, awsConfig).get().getBody();
+         return parseCredentials(response);
+     }
+     AwsCredentials credentialsEcs() {
+         String response = createRestClient(ecsIamRoleEndpoint, awsConfig).get().getBody();
+         return parseCredentials(response);
+     }
+     private static AwsCredentials parseCredentials(String response) {
+         JsonObject role = Json.parse(response).asObject();
+         return AwsCredentials.builder()
+             .setAccessKey(role.getString("AccessKeyId", null))
+@@ -150,36 +136,11 @@
+             this.taskArn = taskArn;
+             this.clusterArn = clusterArn;
+         }
+         String getTaskArn() {
+             return taskArn;
+         }
+         String getClusterArn() {
+             return clusterArn;
+         }
+     }
+-    RestClient metadataClient(String url, AwsConfig awsConfig) {
+-        try {
+-            return createRestClient(url, awsConfig)
+-                .withHeader("X-aws-ec2-metadata-token", metadataToken());
+-        } catch (RestClientException ignored) {
+-            return createRestClient(url, awsConfig);
+-        }
+-    }
+-    String metadataToken() {
+-        if (!tokenValid()) {
+-            metadataToken = retrieveToken();
+-        }
+-        return metadataToken;
+-    }
+-    String retrieveToken() {
+-        String response = createRestClient(ec2MetadataTokenEndpoint, awsConfig)
+-            .withHeader("X-aws-ec2-metadata-token-ttl-seconds", Long.toString(METADATA_TOKEN_TTL_SECONDS))
+-            .put()
+-            .getBody();
+-        metadataExpiry = Instant.now().plusSeconds(METADATA_TOKEN_TTL_SECONDS / 2);
+-        return response;
+-    }
+-    boolean tokenValid() {
+-        return metadataExpiry != null && metadataExpiry.isAfter(Instant.now());
+-    }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/dynamicconfig/AddCacheConfigMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/dynamicconfig/AddCacheConfigMessageTask.java
+@@ -19,21 +19,20 @@
+ import com.hazelcast.config.CachePartitionLostListenerConfig;
+ import com.hazelcast.config.CacheSimpleConfig;
+ import com.hazelcast.config.CacheSimpleConfig.ExpiryPolicyFactoryConfig;
+ import com.hazelcast.config.InMemoryFormat;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.dynamicconfig.DynamicConfigurationAwareConfig;
+ import com.hazelcast.internal.nio.Connection;
+ import com.hazelcast.nio.serialization.IdentifiedDataSerializable;
+ import java.util.ArrayList;
+ import java.util.List;
+-@SuppressWarnings("checkstyle:npathcomplexity")
+ public class AddCacheConfigMessageTask
+         extends AbstractAddConfigMessageTask<DynamicConfigAddCacheConfigCodec.RequestParameters> {
+     public AddCacheConfigMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+     protected DynamicConfigAddCacheConfigCodec.RequestParameters decodeClientMessage(ClientMessage clientMessage) {
+         return DynamicConfigAddCacheConfigCodec.decodeRequest(clientMessage);
+     }
+     @Override
+@@ -44,57 +43,49 @@
+     protected IdentifiedDataSerializable getConfig() {
+         CacheSimpleConfig config = new CacheSimpleConfig();
+         config.setAsyncBackupCount(parameters.asyncBackupCount);
+         config.setBackupCount(parameters.backupCount);
+         config.setCacheEntryListeners(parameters.cacheEntryListeners);
+         config.setCacheLoader(parameters.cacheLoader);
+         config.setCacheLoaderFactory(parameters.cacheLoaderFactory);
+         config.setCacheWriter(parameters.cacheWriter);
+         config.setCacheWriterFactory(parameters.cacheWriterFactory);
+         config.setDisablePerEntryInvalidationEvents(parameters.disablePerEntryInvalidationEvents);
+-        if (parameters.evictionConfig != null) {
+-            config.setEvictionConfig(parameters.evictionConfig.asEvictionConfg(serializationService));
+-        }
++        config.setEvictionConfig(parameters.evictionConfig.asEvictionConfg(serializationService));
+         if (parameters.expiryPolicyFactoryClassName != null) {
+             config.setExpiryPolicyFactory(parameters.expiryPolicyFactoryClassName);
+         } else if (parameters.timedExpiryPolicyFactoryConfig != null) {
+             ExpiryPolicyFactoryConfig expiryPolicyFactoryConfig =
+                     new ExpiryPolicyFactoryConfig(parameters.timedExpiryPolicyFactoryConfig);
+             config.setExpiryPolicyFactoryConfig(expiryPolicyFactoryConfig);
+         }
+-        if (parameters.eventJournalConfig != null) {
+-            config.setEventJournalConfig(parameters.eventJournalConfig);
+-        }
+-        if (parameters.hotRestartConfig != null) {
+-            config.setHotRestartConfig(parameters.hotRestartConfig);
+-        }
++        config.setEventJournalConfig(parameters.eventJournalConfig);
++        config.setHotRestartConfig(parameters.hotRestartConfig);
+         config.setInMemoryFormat(InMemoryFormat.valueOf(parameters.inMemoryFormat));
+         config.setKeyType(parameters.keyType);
+         config.setManagementEnabled(parameters.managementEnabled);
+-        if (parameters.mergePolicy != null) {
+-            config.setMergePolicyConfig(mergePolicyConfig(parameters.mergePolicy, parameters.mergeBatchSize));
+-        }
++        config.setMergePolicyConfig(mergePolicyConfig(parameters.mergePolicy, parameters.mergeBatchSize));
+         config.setName(parameters.name);
+         if (parameters.partitionLostListenerConfigs != null && !parameters.partitionLostListenerConfigs.isEmpty()) {
+             List<CachePartitionLostListenerConfig> listenerConfigs = (List<CachePartitionLostListenerConfig>)
+                     adaptListenerConfigs(parameters.partitionLostListenerConfigs);
+             config.setPartitionLostListenerConfigs(listenerConfigs);
+         } else {
+             config.setPartitionLostListenerConfigs(new ArrayList<>());
+         }
+         config.setSplitBrainProtectionName(parameters.splitBrainProtectionName);
+         config.setReadThrough(parameters.readThrough);
+         config.setStatisticsEnabled(parameters.statisticsEnabled);
+         config.setValueType(parameters.valueType);
+         config.setWanReplicationRef(parameters.wanReplicationRef);
+         config.setWriteThrough(parameters.writeThrough);
+-        if (parameters.isMerkleTreeConfigExists && parameters.merkleTreeConfig != null) {
++        if (parameters.isMerkleTreeConfigExists) {
+             config.setMerkleTreeConfig(parameters.merkleTreeConfig);
+         }
+         return config;
+     }
+     @Override
+     public String getMethodName() {
+         return "addCacheConfig";
+     }
+     @Override
+     protected boolean checkStaticConfigDoesNotExist(IdentifiedDataSerializable config) {
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/ExecutorServiceCancelOnAddressMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/ExecutorServiceCancelOnAddressMessageTask.java
+@@ -14,22 +14,20 @@
+  * limitations under the License.
+  */
+ package com.hazelcast.client.impl.protocol.task.executorservice;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.ExecutorServiceCancelOnMemberCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractTargetMessageTask;
+ import com.hazelcast.executor.impl.DistributedExecutorService;
+ import com.hazelcast.executor.impl.operations.CancellationOperation;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+-import com.hazelcast.security.permission.ActionConstants;
+-import com.hazelcast.security.permission.ExecutorServicePermission;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+ import java.security.Permission;
+ import java.util.UUID;
+ public class ExecutorServiceCancelOnAddressMessageTask
+         extends AbstractTargetMessageTask<ExecutorServiceCancelOnMemberCodec.RequestParameters> {
+     public ExecutorServiceCancelOnAddressMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+     protected Operation prepareOperation() {
+@@ -42,34 +40,29 @@
+     @Override
+     protected ExecutorServiceCancelOnMemberCodec.RequestParameters decodeClientMessage(ClientMessage clientMessage) {
+         return ExecutorServiceCancelOnMemberCodec.decodeRequest(clientMessage);
+     }
+     @Override
+     protected ClientMessage encodeResponse(Object response) {
+         return ExecutorServiceCancelOnMemberCodec.encodeResponse((Boolean) response);
+     }
+     @Override
+     public String getDistributedObjectName() {
+-        DistributedExecutorService service = getService(getServiceName());
+-        return service.getName(parameters.uuid);
++        return null;
+     }
+     @Override
+     public String getServiceName() {
+         return DistributedExecutorService.SERVICE_NAME;
+     }
+     @Override
+     public Permission getRequiredPermission() {
+-        String name = getDistributedObjectName();
+-        if (name == null) {
+-            name = ExecutorServicePermission.EMPTY_EXECUTOR_NAME;
+-        }
+-        return new ExecutorServicePermission(name, ActionConstants.ACTION_MODIFY);
++        return null;
+     }
+     @Override
+     public String getMethodName() {
+         return "cancel";
+     }
+     @Override
+     public Object[] getParameters() {
+         return null;
+     }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/ExecutorServiceCancelOnPartitionMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/ExecutorServiceCancelOnPartitionMessageTask.java
+@@ -14,56 +14,49 @@
+  * limitations under the License.
+  */
+ package com.hazelcast.client.impl.protocol.task.executorservice;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.ExecutorServiceCancelOnPartitionCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractPartitionMessageTask;
+ import com.hazelcast.executor.impl.DistributedExecutorService;
+ import com.hazelcast.executor.impl.operations.CancellationOperation;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+-import com.hazelcast.security.permission.ActionConstants;
+-import com.hazelcast.security.permission.ExecutorServicePermission;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+ import java.security.Permission;
+ public class ExecutorServiceCancelOnPartitionMessageTask
+         extends AbstractPartitionMessageTask<ExecutorServiceCancelOnPartitionCodec.RequestParameters> {
+     public ExecutorServiceCancelOnPartitionMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+     protected Operation prepareOperation() {
+         return new CancellationOperation(parameters.uuid, parameters.interrupt);
+     }
+     @Override
+     protected ExecutorServiceCancelOnPartitionCodec.RequestParameters decodeClientMessage(ClientMessage clientMessage) {
+         return ExecutorServiceCancelOnPartitionCodec.decodeRequest(clientMessage);
+     }
+     protected ClientMessage encodeResponse(Object response) {
+         return ExecutorServiceCancelOnPartitionCodec.encodeResponse((Boolean) response);
+     }
+     @Override
+     public String getDistributedObjectName() {
+-        DistributedExecutorService service = getService(getServiceName());
+-        return service.getName(parameters.uuid);
++        return null;
+     }
+     @Override
+     public String getServiceName() {
+         return DistributedExecutorService.SERVICE_NAME;
+     }
+     @Override
+     public Permission getRequiredPermission() {
+-        String name = getDistributedObjectName();
+-        if (name == null) {
+-            name = ExecutorServicePermission.EMPTY_EXECUTOR_NAME;
+-        }
+-        return new ExecutorServicePermission(name, ActionConstants.ACTION_MODIFY);
++        return null;
+     }
+     @Override
+     public String getMethodName() {
+         return "cancel";
+     }
+     @Override
+     public Object[] getParameters() {
+         return null;
+     }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/ExecutorServiceIsShutdownMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/ExecutorServiceIsShutdownMessageTask.java
+@@ -13,22 +13,20 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.client.impl.protocol.task.executorservice;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.ExecutorServiceIsShutdownCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractCallableMessageTask;
+ import com.hazelcast.executor.impl.DistributedExecutorService;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+-import com.hazelcast.security.permission.ActionConstants;
+-import com.hazelcast.security.permission.ExecutorServicePermission;
+ import java.security.Permission;
+ public class ExecutorServiceIsShutdownMessageTask
+         extends AbstractCallableMessageTask<String> {
+     public ExecutorServiceIsShutdownMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+     protected Object call() throws Exception {
+         final DistributedExecutorService service = getService(DistributedExecutorService.SERVICE_NAME);
+         return service.isShutdown(parameters);
+@@ -40,25 +38,25 @@
+     @Override
+     protected ClientMessage encodeResponse(Object response) {
+         return ExecutorServiceIsShutdownCodec.encodeResponse((Boolean) response);
+     }
+     @Override
+     public String getServiceName() {
+         return DistributedExecutorService.SERVICE_NAME;
+     }
+     @Override
+     public Permission getRequiredPermission() {
+-        return new ExecutorServicePermission(parameters, ActionConstants.ACTION_READ);
++        return null;
+     }
+     @Override
+     public String getDistributedObjectName() {
+-        return parameters;
++        return null;
+     }
+     @Override
+     public String getMethodName() {
+         return "isShutdown";
+     }
+     @Override
+     public Object[] getParameters() {
+         return null;
+     }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/ExecutorServiceShutdownMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/ExecutorServiceShutdownMessageTask.java
+@@ -13,22 +13,20 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.client.impl.protocol.task.executorservice;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.ExecutorServiceShutdownCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractCallableMessageTask;
+ import com.hazelcast.executor.impl.DistributedExecutorService;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+-import com.hazelcast.security.permission.ActionConstants;
+-import com.hazelcast.security.permission.ExecutorServicePermission;
+ import java.security.Permission;
+ public class ExecutorServiceShutdownMessageTask
+         extends AbstractCallableMessageTask<String> {
+     public ExecutorServiceShutdownMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+     protected Object call() throws Exception {
+         final DistributedExecutorService service = getService(DistributedExecutorService.SERVICE_NAME);
+         service.shutdownExecutor(parameters);
+@@ -41,25 +39,25 @@
+     @Override
+     protected ClientMessage encodeResponse(Object response) {
+         return ExecutorServiceShutdownCodec.encodeResponse();
+     }
+     @Override
+     public String getServiceName() {
+         return DistributedExecutorService.SERVICE_NAME;
+     }
+     @Override
+     public Permission getRequiredPermission() {
+-        return new ExecutorServicePermission(parameters, ActionConstants.ACTION_MODIFY);
++        return null;
+     }
+     @Override
+     public String getDistributedObjectName() {
+-        return parameters;
++        return null;
+     }
+     @Override
+     public String getMethodName() {
+         return "shutdown";
+     }
+     @Override
+     public Object[] getParameters() {
+         return null;
+     }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/ExecutorServiceSubmitToAddressMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/ExecutorServiceSubmitToAddressMessageTask.java
+@@ -16,22 +16,20 @@
+ package com.hazelcast.client.impl.protocol.task.executorservice;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.ExecutorServiceSubmitToMemberCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractTargetMessageTask;
+ import com.hazelcast.executor.impl.DistributedExecutorService;
+ import com.hazelcast.executor.impl.operations.MemberCallableTaskOperation;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+ import com.hazelcast.internal.serialization.Data;
+ import com.hazelcast.security.SecurityContext;
+-import com.hazelcast.security.permission.ActionConstants;
+-import com.hazelcast.security.permission.ExecutorServicePermission;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+ import javax.security.auth.Subject;
+ import java.security.Permission;
+ import java.util.UUID;
+ import java.util.concurrent.Callable;
+ public class ExecutorServiceSubmitToAddressMessageTask
+         extends AbstractTargetMessageTask<ExecutorServiceSubmitToMemberCodec.RequestParameters> {
+     public ExecutorServiceSubmitToAddressMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+@@ -66,21 +64,21 @@
+     protected ClientMessage encodeResponse(Object response) {
+         Data data = serializationService.toData(response);
+         return ExecutorServiceSubmitToMemberCodec.encodeResponse(data);
+     }
+     @Override
+     public String getServiceName() {
+         return DistributedExecutorService.SERVICE_NAME;
+     }
+     @Override
+     public Permission getRequiredPermission() {
+-        return new ExecutorServicePermission(parameters.name, ActionConstants.ACTION_MODIFY);
++        return null;
+     }
+     @Override
+     public String getDistributedObjectName() {
+         return parameters.name;
+     }
+     @Override
+     public String getMethodName() {
+         return null;
+     }
+     @Override
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/ExecutorServiceSubmitToPartitionMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/ExecutorServiceSubmitToPartitionMessageTask.java
+@@ -16,22 +16,20 @@
+ package com.hazelcast.client.impl.protocol.task.executorservice;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.ExecutorServiceSubmitToPartitionCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractPartitionMessageTask;
+ import com.hazelcast.executor.impl.DistributedExecutorService;
+ import com.hazelcast.executor.impl.operations.CallableTaskOperation;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+ import com.hazelcast.internal.serialization.Data;
+ import com.hazelcast.security.SecurityContext;
+-import com.hazelcast.security.permission.ActionConstants;
+-import com.hazelcast.security.permission.ExecutorServicePermission;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+ import javax.security.auth.Subject;
+ import java.security.Permission;
+ import java.util.concurrent.Callable;
+ public class ExecutorServiceSubmitToPartitionMessageTask
+         extends AbstractPartitionMessageTask<ExecutorServiceSubmitToPartitionCodec.RequestParameters> {
+     public ExecutorServiceSubmitToPartitionMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+@@ -59,21 +57,21 @@
+     protected ClientMessage encodeResponse(Object response) {
+         Data data = serializationService.toData(response);
+         return ExecutorServiceSubmitToPartitionCodec.encodeResponse(data);
+     }
+     @Override
+     public String getServiceName() {
+         return DistributedExecutorService.SERVICE_NAME;
+     }
+     @Override
+     public Permission getRequiredPermission() {
+-        return new ExecutorServicePermission(parameters.name, ActionConstants.ACTION_MODIFY);
++        return null;
+     }
+     @Override
+     public String getDistributedObjectName() {
+         return parameters.name;
+     }
+     @Override
+     public String getMethodName() {
+         return null;
+     }
+     @Override
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/durable/DurableExecutorDisposeResultMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/durable/DurableExecutorDisposeResultMessageTask.java
+@@ -13,22 +13,20 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.client.impl.protocol.task.executorservice.durable;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.DurableExecutorDisposeResultCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractPartitionMessageTask;
+ import com.hazelcast.durableexecutor.impl.operations.DisposeResultOperation;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+-import com.hazelcast.security.permission.ActionConstants;
+-import com.hazelcast.security.permission.DurableExecutorServicePermission;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+ import java.security.Permission;
+ import static com.hazelcast.durableexecutor.impl.DistributedDurableExecutorService.SERVICE_NAME;
+ public class DurableExecutorDisposeResultMessageTask
+         extends AbstractPartitionMessageTask<DurableExecutorDisposeResultCodec.RequestParameters> {
+     public DurableExecutorDisposeResultMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+     protected Operation prepareOperation() {
+@@ -41,21 +39,21 @@
+     @Override
+     protected ClientMessage encodeResponse(Object response) {
+         return DurableExecutorDisposeResultCodec.encodeResponse();
+     }
+     @Override
+     public String getServiceName() {
+         return SERVICE_NAME;
+     }
+     @Override
+     public Permission getRequiredPermission() {
+-        return new DurableExecutorServicePermission(parameters.name, ActionConstants.ACTION_MODIFY);
++        return null;
+     }
+     @Override
+     public String getDistributedObjectName() {
+         return parameters.name;
+     }
+     @Override
+     public String getMethodName() {
+         return null;
+     }
+     @Override
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/durable/DurableExecutorIsShutdownMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/durable/DurableExecutorIsShutdownMessageTask.java
+@@ -13,22 +13,20 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.client.impl.protocol.task.executorservice.durable;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.DurableExecutorIsShutdownCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractCallableMessageTask;
+ import com.hazelcast.durableexecutor.impl.DistributedDurableExecutorService;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+-import com.hazelcast.security.permission.ActionConstants;
+-import com.hazelcast.security.permission.DurableExecutorServicePermission;
+ import java.security.Permission;
+ import static com.hazelcast.durableexecutor.impl.DistributedDurableExecutorService.SERVICE_NAME;
+ public class DurableExecutorIsShutdownMessageTask
+         extends AbstractCallableMessageTask<String> {
+     public DurableExecutorIsShutdownMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+     protected Object call() throws Exception {
+         DistributedDurableExecutorService service = getService(SERVICE_NAME);
+@@ -41,21 +39,21 @@
+     @Override
+     protected ClientMessage encodeResponse(Object response) {
+         return DurableExecutorIsShutdownCodec.encodeResponse((Boolean) response);
+     }
+     @Override
+     public String getServiceName() {
+         return SERVICE_NAME;
+     }
+     @Override
+     public Permission getRequiredPermission() {
+-        return new DurableExecutorServicePermission(parameters, ActionConstants.ACTION_READ);
++        return null;
+     }
+     @Override
+     public String getDistributedObjectName() {
+         return parameters;
+     }
+     @Override
+     public String getMethodName() {
+         return "isShutdown";
+     }
+     @Override
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/durable/DurableExecutorRetrieveAndDisposeResultMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/durable/DurableExecutorRetrieveAndDisposeResultMessageTask.java
+@@ -14,22 +14,20 @@
+  * limitations under the License.
+  */
+ package com.hazelcast.client.impl.protocol.task.executorservice.durable;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.DurableExecutorRetrieveAndDisposeResultCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractPartitionMessageTask;
+ import com.hazelcast.durableexecutor.impl.operations.RetrieveAndDisposeResultOperation;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+ import com.hazelcast.internal.serialization.Data;
+-import com.hazelcast.security.permission.ActionConstants;
+-import com.hazelcast.security.permission.DurableExecutorServicePermission;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+ import java.security.Permission;
+ import static com.hazelcast.durableexecutor.impl.DistributedDurableExecutorService.SERVICE_NAME;
+ public class DurableExecutorRetrieveAndDisposeResultMessageTask
+         extends AbstractPartitionMessageTask<DurableExecutorRetrieveAndDisposeResultCodec.RequestParameters> {
+     public DurableExecutorRetrieveAndDisposeResultMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+     protected Operation prepareOperation() {
+@@ -43,21 +41,21 @@
+     protected ClientMessage encodeResponse(Object response) {
+         Data data = serializationService.toData(response);
+         return DurableExecutorRetrieveAndDisposeResultCodec.encodeResponse(data);
+     }
+     @Override
+     public String getServiceName() {
+         return SERVICE_NAME;
+     }
+     @Override
+     public Permission getRequiredPermission() {
+-        return new DurableExecutorServicePermission(parameters.name, ActionConstants.ACTION_READ, ActionConstants.ACTION_MODIFY);
++        return null;
+     }
+     @Override
+     public String getDistributedObjectName() {
+         return parameters.name;
+     }
+     @Override
+     public String getMethodName() {
+         return null;
+     }
+     @Override
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/durable/DurableExecutorRetrieveResultMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/durable/DurableExecutorRetrieveResultMessageTask.java
+@@ -14,22 +14,20 @@
+  * limitations under the License.
+  */
+ package com.hazelcast.client.impl.protocol.task.executorservice.durable;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.DurableExecutorRetrieveResultCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractPartitionMessageTask;
+ import com.hazelcast.durableexecutor.impl.operations.RetrieveResultOperation;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+ import com.hazelcast.internal.serialization.Data;
+-import com.hazelcast.security.permission.ActionConstants;
+-import com.hazelcast.security.permission.DurableExecutorServicePermission;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+ import java.security.Permission;
+ import static com.hazelcast.durableexecutor.impl.DistributedDurableExecutorService.SERVICE_NAME;
+ public class DurableExecutorRetrieveResultMessageTask
+         extends AbstractPartitionMessageTask<DurableExecutorRetrieveResultCodec.RequestParameters> {
+     public DurableExecutorRetrieveResultMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+     protected Operation prepareOperation() {
+@@ -43,21 +41,21 @@
+     protected ClientMessage encodeResponse(Object response) {
+         Data data = serializationService.toData(response);
+         return DurableExecutorRetrieveResultCodec.encodeResponse(data);
+     }
+     @Override
+     public String getServiceName() {
+         return SERVICE_NAME;
+     }
+     @Override
+     public Permission getRequiredPermission() {
+-        return new DurableExecutorServicePermission(parameters.name, ActionConstants.ACTION_READ);
++        return null;
+     }
+     @Override
+     public String getDistributedObjectName() {
+         return parameters.name;
+     }
+     @Override
+     public String getMethodName() {
+         return null;
+     }
+     @Override
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/durable/DurableExecutorShutdownMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/durable/DurableExecutorShutdownMessageTask.java
+@@ -13,22 +13,20 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.client.impl.protocol.task.executorservice.durable;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.DurableExecutorShutdownCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractCallableMessageTask;
+ import com.hazelcast.durableexecutor.impl.DistributedDurableExecutorService;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+-import com.hazelcast.security.permission.ActionConstants;
+-import com.hazelcast.security.permission.DurableExecutorServicePermission;
+ import java.security.Permission;
+ import static com.hazelcast.durableexecutor.impl.DistributedDurableExecutorService.SERVICE_NAME;
+ public class DurableExecutorShutdownMessageTask
+         extends AbstractCallableMessageTask<String> {
+     public DurableExecutorShutdownMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+     protected Object call() throws Exception {
+         DistributedDurableExecutorService service = getService(SERVICE_NAME);
+@@ -42,21 +40,21 @@
+     @Override
+     protected ClientMessage encodeResponse(Object response) {
+         return DurableExecutorShutdownCodec.encodeResponse();
+     }
+     @Override
+     public String getServiceName() {
+         return SERVICE_NAME;
+     }
+     @Override
+     public Permission getRequiredPermission() {
+-        return new DurableExecutorServicePermission(parameters, ActionConstants.ACTION_MODIFY);
++        return null;
+     }
+     @Override
+     public String getDistributedObjectName() {
+         return parameters;
+     }
+     @Override
+     public String getMethodName() {
+         return "shutdown";
+     }
+     @Override
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/durable/DurableExecutorSubmitToPartitionMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/executorservice/durable/DurableExecutorSubmitToPartitionMessageTask.java
+@@ -15,22 +15,20 @@
+  */
+ package com.hazelcast.client.impl.protocol.task.executorservice.durable;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.DurableExecutorSubmitToPartitionCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractPartitionMessageTask;
+ import com.hazelcast.durableexecutor.impl.operations.TaskOperation;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+ import com.hazelcast.internal.serialization.Data;
+ import com.hazelcast.security.SecurityContext;
+-import com.hazelcast.security.permission.ActionConstants;
+-import com.hazelcast.security.permission.DurableExecutorServicePermission;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+ import javax.security.auth.Subject;
+ import java.security.Permission;
+ import java.util.concurrent.Callable;
+ import static com.hazelcast.durableexecutor.impl.DistributedDurableExecutorService.SERVICE_NAME;
+ public class DurableExecutorSubmitToPartitionMessageTask
+         extends AbstractPartitionMessageTask<DurableExecutorSubmitToPartitionCodec.RequestParameters> {
+     public DurableExecutorSubmitToPartitionMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+@@ -58,21 +56,21 @@
+     @Override
+     protected ClientMessage encodeResponse(Object response) {
+         return DurableExecutorSubmitToPartitionCodec.encodeResponse((Integer) response);
+     }
+     @Override
+     public String getServiceName() {
+         return SERVICE_NAME;
+     }
+     @Override
+     public Permission getRequiredPermission() {
+-        return new DurableExecutorServicePermission(parameters.name, ActionConstants.ACTION_MODIFY);
++        return null;
+     }
+     @Override
+     public String getDistributedObjectName() {
+         return parameters.name;
+     }
+     @Override
+     public String getMethodName() {
+         return null;
+     }
+     @Override
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/scheduledexecutor/ScheduledExecutorSubmitToPartitionMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/scheduledexecutor/ScheduledExecutorSubmitToPartitionMessageTask.java
+@@ -15,42 +15,34 @@
+  */
+ package com.hazelcast.client.impl.protocol.task.scheduledexecutor;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.ScheduledExecutorSubmitToPartitionCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractPartitionMessageTask;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+ import com.hazelcast.scheduledexecutor.impl.DistributedScheduledExecutorService;
+ import com.hazelcast.scheduledexecutor.impl.TaskDefinition;
+ import com.hazelcast.scheduledexecutor.impl.operations.ScheduleTaskOperation;
+-import com.hazelcast.security.SecurityContext;
+ import com.hazelcast.security.permission.ActionConstants;
+ import com.hazelcast.security.permission.ScheduledExecutorPermission;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+-import javax.security.auth.Subject;
+ import java.security.Permission;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.TimeUnit;
+ public class ScheduledExecutorSubmitToPartitionMessageTask
+         extends AbstractPartitionMessageTask<ScheduledExecutorSubmitToPartitionCodec.RequestParameters> {
+     public ScheduledExecutorSubmitToPartitionMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+     protected Operation prepareOperation() {
+         Callable callable = serializationService.toObject(parameters.task);
+-        SecurityContext securityContext = clientEngine.getSecurityContext();
+-        if (securityContext != null) {
+-            Subject subject = endpoint.getSubject();
+-            callable = securityContext.createSecureCallable(subject, callable);
+-            serializationService.getManagedContext().initialize(callable);
+-        }
+         TaskDefinition def = new TaskDefinition(TaskDefinition.Type.getById(parameters.type),
+                 parameters.taskName, callable, parameters.initialDelayInMillis, parameters.periodInMillis,
+                 TimeUnit.MILLISECONDS, isAutoDisposable());
+         return new ScheduleTaskOperation(parameters.schedulerName, def);
+     }
+     @Override
+     protected ScheduledExecutorSubmitToPartitionCodec.RequestParameters decodeClientMessage(ClientMessage clientMessage) {
+         return ScheduledExecutorSubmitToPartitionCodec.decodeRequest(clientMessage);
+     }
+     @Override
+
+--- a/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/scheduledexecutor/ScheduledExecutorSubmitToTargetMessageTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/client/impl/protocol/task/scheduledexecutor/ScheduledExecutorSubmitToTargetMessageTask.java
+@@ -16,43 +16,35 @@
+ package com.hazelcast.client.impl.protocol.task.scheduledexecutor;
+ import com.hazelcast.client.impl.protocol.ClientMessage;
+ import com.hazelcast.client.impl.protocol.codec.ScheduledExecutorSubmitToMemberCodec;
+ import com.hazelcast.client.impl.protocol.task.AbstractTargetMessageTask;
+ import com.hazelcast.cluster.Member;
+ import com.hazelcast.instance.impl.Node;
+ import com.hazelcast.internal.nio.Connection;
+ import com.hazelcast.scheduledexecutor.impl.DistributedScheduledExecutorService;
+ import com.hazelcast.scheduledexecutor.impl.TaskDefinition;
+ import com.hazelcast.scheduledexecutor.impl.operations.ScheduleTaskOperation;
+-import com.hazelcast.security.SecurityContext;
+ import com.hazelcast.security.permission.ActionConstants;
+ import com.hazelcast.security.permission.ScheduledExecutorPermission;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+-import javax.security.auth.Subject;
+ import java.security.Permission;
+ import java.util.UUID;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.TimeUnit;
+ public class ScheduledExecutorSubmitToTargetMessageTask
+         extends AbstractTargetMessageTask<ScheduledExecutorSubmitToMemberCodec.RequestParameters> {
+     public ScheduledExecutorSubmitToTargetMessageTask(ClientMessage clientMessage, Node node, Connection connection) {
+         super(clientMessage, node, connection);
+     }
+     @Override
+     protected Operation prepareOperation() {
+         Callable callable = serializationService.toObject(parameters.task);
+-        SecurityContext securityContext = clientEngine.getSecurityContext();
+-        if (securityContext != null) {
+-            Subject subject = endpoint.getSubject();
+-            callable = securityContext.createSecureCallable(subject, callable);
+-            serializationService.getManagedContext().initialize(callable);
+-        }
+         TaskDefinition def = new TaskDefinition(TaskDefinition.Type.getById(parameters.type),
+                 parameters.taskName, callable, parameters.initialDelayInMillis, parameters.periodInMillis,
+                 TimeUnit.MILLISECONDS, isAutoDisposable());
+         return new ScheduleTaskOperation(parameters.schedulerName, def);
+     }
+     @Override
+     protected UUID getTargetUuid() {
+         return parameters.memberUuid;
+     }
+     @Override
+
+--- a/hazelcast/src/main/java/com/hazelcast/config/ConfigXmlGenerator.java
++++ b/hazelcast/src/main/java/com/hazelcast/config/ConfigXmlGenerator.java
+@@ -160,23 +160,20 @@
+         instanceTrackingConfig(gen, config);
+         sqlConfig(gen, config);
+         jetConfig(gen, config);
+         factoryWithPropertiesXmlGenerator(gen, "auditlog", config.getAuditlogConfig());
+         userCodeDeploymentConfig(gen, config);
+         xml.append("</hazelcast>");
+         String xmlString = xml.toString();
+         return formatted ? formatXml(xmlString, INDENT) : xmlString;
+     }
+     private String getOrMaskValue(String value) {
+-        if (value == null) {
+-            return null;
+-        }
+         return maskSensitiveFields ? MASK_FOR_SENSITIVE_DATA : value;
+     }
+     private void managementCenterXmlGenerator(XmlGenerator gen, Config config) {
+         ManagementCenterConfig mcConfig = config.getManagementCenterConfig();
+         if (mcConfig != null) {
+             gen.open("management-center",
+                     "scripting-enabled", mcConfig.isScriptingEnabled());
+             trustedInterfacesXmlGenerator(gen, mcConfig.getTrustedInterfaces());
+             gen.close();
+         }
+@@ -301,69 +298,69 @@
+         gen.close();
+     }
+     private static void tlsAuthenticationGenerator(XmlGenerator gen, TlsAuthenticationConfig c) {
+         if (c == null) {
+             return;
+         }
+         XmlGenerator tlsGen = gen.open("tls", "roleAttribute", c.getRoleAttribute());
+         addClusterLoginElements(tlsGen, c)
+                 .close();
+     }
+-    private void ldapAuthenticationGenerator(XmlGenerator gen, LdapAuthenticationConfig c) {
++    private static void ldapAuthenticationGenerator(XmlGenerator gen, LdapAuthenticationConfig c) {
+         if (c == null) {
+             return;
+         }
+         addClusterLoginElements(gen.open("ldap"), c)
+                 .node("url", c.getUrl())
+                 .nodeIfContents("socket-factory-class-name", c.getSocketFactoryClassName())
+                 .nodeIfContents("parse-dn", c.getParseDn())
+                 .nodeIfContents("role-context", c.getRoleContext())
+                 .nodeIfContents("role-filter", c.getRoleFilter())
+                 .nodeIfContents("role-mapping-attribute", c.getRoleMappingAttribute())
+                 .nodeIfContents("role-mapping-mode", c.getRoleMappingMode())
+                 .nodeIfContents("role-name-attribute", c.getRoleNameAttribute())
+                 .nodeIfContents("role-recursion-max-depth", c.getRoleRecursionMaxDepth())
+                 .nodeIfContents("role-search-scope", c.getRoleSearchScope())
+                 .nodeIfContents("user-name-attribute", c.getUserNameAttribute())
+                 .nodeIfContents("system-user-dn", c.getSystemUserDn())
+-                .nodeIfContents("system-user-password", getOrMaskValue(c.getSystemUserPassword()))
++                .nodeIfContents("system-user-password", c.getSystemUserPassword())
+                 .nodeIfContents("system-authentication", c.getSystemAuthentication())
+                 .nodeIfContents("security-realm", c.getSecurityRealm())
+                 .nodeIfContents("password-attribute", c.getPasswordAttribute())
+                 .nodeIfContents("user-context", c.getUserContext())
+                 .nodeIfContents("user-filter", c.getUserFilter())
+                 .nodeIfContents("user-search-scope", c.getUserSearchScope())
+                 .nodeIfContents("skip-authentication", c.getSkipAuthentication())
+                 .close();
+     }
+-    private void kerberosAuthenticationGenerator(XmlGenerator gen, KerberosAuthenticationConfig c) {
++    private static void kerberosAuthenticationGenerator(XmlGenerator gen, KerberosAuthenticationConfig c) {
+         if (c == null) {
+             return;
+         }
+         XmlGenerator kerberosGen = gen.open("kerberos");
+         addClusterLoginElements(kerberosGen, c)
+                 .nodeIfContents("relax-flags-check", c.getRelaxFlagsCheck())
+                 .nodeIfContents("use-name-without-realm", c.getUseNameWithoutRealm())
+                 .nodeIfContents("security-realm", c.getSecurityRealm())
+                 .nodeIfContents("keytab-file", c.getKeytabFile())
+                 .nodeIfContents("principal", c.getPrincipal());
+         ldapAuthenticationGenerator(kerberosGen, c.getLdapAuthenticationConfig());
+         kerberosGen.close();
+     }
+-    private void simpleAuthenticationGenerator(XmlGenerator gen, SimpleAuthenticationConfig c) {
++    private static void simpleAuthenticationGenerator(XmlGenerator gen, SimpleAuthenticationConfig c) {
+         if (c == null) {
+             return;
+         }
+         XmlGenerator simpleGen = gen.open("simple");
+         addClusterLoginElements(simpleGen, c).nodeIfContents("role-separator", c.getRoleSeparator());
+         for (String username : c.getUsernames()) {
+-            simpleGen.open("user", "username", username, "password", getOrMaskValue(c.getPassword(username)));
++            simpleGen.open("user", "username", username, "password", c.getPassword(username));
+             for (String role : c.getRoles(username)) {
+                 simpleGen.node("role", role);
+             }
+             simpleGen.close();
+         }
+         simpleGen.close();
+     }
+     private static void kerberosIdentityGenerator(XmlGenerator gen, KerberosIdentityConfig c) {
+         if (c == null) {
+             return;
+
+--- a/hazelcast/src/main/java/com/hazelcast/cp/internal/session/RaftSessionService.java
++++ b/hazelcast/src/main/java/com/hazelcast/cp/internal/session/RaftSessionService.java
+@@ -445,19 +445,17 @@
+         for (RaftSessionRegistry registry : registries.values()) {
+             CPGroupId groupId = registry.groupId();
+             for (CPSession session : registry.getSessions()) {
+                 MetricDescriptor desc = root.copy()
+                         .withDiscriminator("id", session.id() + "@" + groupId.getName())
+                         .withTag("sessionId", String.valueOf(session.id()))
+                         .withTag("group", groupId.getName());
+                 context.collect(desc.copy().withTag("endpoint", session.endpoint().toString()).withMetric("endpoint"), 0);
+                 context.collect(desc.copy().withTag("endpointType", session.endpointType().toString())
+                         .withMetric("endpointType"), 0);
+-                context.collect(desc.copy().withTag("endpointName", session.endpointName())
+-                        .withMetric("endpointName"), 0);
+                 context.collect(desc.copy().withMetric("version"), session.version());
+                 context.collect(desc.copy().withUnit(ProbeUnit.MS).withMetric("creationTime"), session.creationTime());
+                 context.collect(desc.copy().withUnit(ProbeUnit.MS).withMetric("expirationTime"), session.expirationTime());
+             }
+         }
+     }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/internal/cluster/impl/ClusterJoinManager.java
++++ b/hazelcast/src/main/java/com/hazelcast/internal/cluster/impl/ClusterJoinManager.java
+@@ -579,23 +579,21 @@
+         MemberImpl member = clusterService.getMember(target);
+         if (member == null) {
+             return checkIfUsingAnExistingMemberUuid(joinMessage);
+         }
+         if (joinMessage.getUuid().equals(member.getUuid())) {
+             sendMasterAnswer(target);
+             if (clusterService.isMaster() && !isMastershipClaimInProgress()) {
+                 if (logger.isFineEnabled()) {
+                     logger.fine(format("Ignoring join request, member already exists: %s", joinMessage));
+                 }
+-                MemberMap memberMap = clusterService.getMembershipManager().getMemberMap();
+-                boolean deferPartitionProcessing = isMemberRestartingWithPersistence(member.getAttributes())
+-                        && isMemberRejoining(memberMap, member.getAddress(), member.getUuid());
++                boolean deferPartitionProcessing = isMemberRestartingWithPersistence(member.getAttributes());
+                 OnJoinOp preJoinOp = preparePreJoinOps();
+                 OnJoinOp postJoinOp = preparePostJoinOp();
+                 PartitionRuntimeState partitionRuntimeState = node.getPartitionService().createPartitionState();
+                 Operation op = new FinalizeJoinOp(member.getUuid(),
+                         clusterService.getMembershipManager().getMembersView(), preJoinOp, postJoinOp,
+                         clusterClock.getClusterTime(), clusterService.getClusterId(),
+                         clusterClock.getClusterStartTime(), clusterStateManager.getState(),
+                         clusterService.getClusterVersion(), partitionRuntimeState, deferPartitionProcessing);
+                 op.setCallerUuid(clusterService.getThisUuid());
+                 invokeClusterOp(op, target);
+
+--- a/hazelcast/src/main/java/com/hazelcast/internal/diagnostics/HealthMonitor.java
++++ b/hazelcast/src/main/java/com/hazelcast/internal/diagnostics/HealthMonitor.java
+@@ -235,69 +235,56 @@
+                 = metricRegistry.newLongGauge("operation.priorityQueueSize");
+         final LongGauge operationServiceResponseQueueSize
+                 = metricRegistry.newLongGauge("operation.responseQueueSize");
+         final LongGauge operationServiceRunningOperationsCount
+                 = metricRegistry.newLongGauge("operation.runningCount");
+         final LongGauge operationServiceCompletedOperationsCount
+                 = metricRegistry.newLongGauge("operation.completedCount");
+         final LongGauge operationServicePendingInvocationsCount
+                 = metricRegistry.newLongGauge("operation.invocations.pending");
+         final DoubleGauge operationServicePendingInvocationsPercentage
+-                = metricRegistry.newDoubleGauge("operation.invocations.usedPercentage");
++                = metricRegistry.newDoubleGauge("operation.invocations.used");
+         final LongGauge proxyCount
+                 = metricRegistry.newLongGauge("proxy.proxyCount");
+         final LongGauge tcpConnectionActiveCount
+                 = metricRegistry.newLongGauge("tcp.connection.activeCount");
+         final LongGauge tcpConnectionCount
+                 = metricRegistry.newLongGauge("tcp.connection.count");
+         final LongGauge tcpConnectionClientCount
+                 = metricRegistry.newLongGauge("tcp.connection.clientCount");
+         private final StringBuilder sb = new StringBuilder();
+         private double memoryUsedOfTotalPercentage;
+         private double memoryUsedOfMaxPercentage;
+-        private long runtimeUsedMemory0;
+-        private long runtimeTotalMemory0;
+-        private long runtimeMaxMemory0;
+-        private double osProcessCpuLoad0;
+-        private double osSystemCpuLoad0;
+-        private double operationServicePendingInvocationsPercentage0;
+-        private long operationServicePendingInvocationsCount0;
+         public void update() {
+-            runtimeUsedMemory0 = runtimeUsedMemory.read();
+-            runtimeTotalMemory0 = runtimeTotalMemory.read();
+-            runtimeMaxMemory0 = runtimeMaxMemory.read();
+-            osProcessCpuLoad0 = osProcessCpuLoad.read();
+-            osSystemCpuLoad0 = osSystemCpuLoad.read();
+-            operationServicePendingInvocationsPercentage0 = operationServicePendingInvocationsPercentage.read();
+-            operationServicePendingInvocationsCount0 = operationServicePendingInvocationsCount.read();
+-            memoryUsedOfTotalPercentage = (PERCENTAGE_MULTIPLIER * runtimeUsedMemory0) / runtimeTotalMemory0;
+-            memoryUsedOfMaxPercentage = (PERCENTAGE_MULTIPLIER * runtimeUsedMemory0) / runtimeMaxMemory0;
++            memoryUsedOfTotalPercentage = (PERCENTAGE_MULTIPLIER * runtimeUsedMemory.read()) / runtimeTotalMemory.read();
++            memoryUsedOfMaxPercentage = (PERCENTAGE_MULTIPLIER * runtimeUsedMemory.read()) / runtimeMaxMemory.read();
+         }
+         boolean exceedsThreshold() {
+             if (memoryUsedOfMaxPercentage > thresholdMemoryPercentage) {
+                 return true;
+             }
+-            if (osProcessCpuLoad0 > thresholdCPUPercentage) {
++            if (osProcessCpuLoad.read() > thresholdCPUPercentage) {
+                 return true;
+             }
+-            if (osSystemCpuLoad0 > thresholdCPUPercentage) {
++            if (osSystemCpuLoad.read() > thresholdCPUPercentage) {
+                 return true;
+             }
+-            if (operationServicePendingInvocationsPercentage0 > THRESHOLD_PERCENTAGE_INVOCATIONS) {
++            if (operationServicePendingInvocationsPercentage.read() > THRESHOLD_PERCENTAGE_INVOCATIONS) {
+                 return true;
+             }
+-            if (operationServicePendingInvocationsCount0 > THRESHOLD_INVOCATIONS) {
++            if (operationServicePendingInvocationsCount.read() > THRESHOLD_INVOCATIONS) {
+                 return true;
+             }
+             return false;
+         }
+         public String render() {
++            update();
+             sb.setLength(0);
+             renderProcessors();
+             renderPhysicalMemory();
+             renderSwap();
+             renderHeap();
+             renderNativeMemory();
+             renderGc();
+             renderLoad();
+             renderThread();
+             renderCluster();
+@@ -320,56 +307,56 @@
+         private void renderClient() {
+             sb.append("clientEndpoint.count=")
+                     .append(clientEndpointCount.read()).append(", ");
+         }
+         private void renderProxy() {
+             sb.append("proxy.count=")
+                     .append(proxyCount.read()).append(", ");
+         }
+         private void renderLoad() {
+             sb.append("load.process").append('=')
+-                    .append(format("%.2f", osProcessCpuLoad0)).append("%, ");
++                    .append(format("%.2f", osProcessCpuLoad.read())).append("%, ");
+             sb.append("load.system").append('=')
+-                    .append(format("%.2f", osSystemCpuLoad0)).append("%, ");
++                    .append(format("%.2f", osSystemCpuLoad.read())).append("%, ");
+             double value = osSystemLoadAverage.read();
+             if (value < 0) {
+                 sb.append("load.systemAverage").append("=n/a ");
+             } else {
+                 sb.append("load.systemAverage").append('=')
+-                        .append(format("%.2f", value)).append(", ");
++                        .append(format("%.2f", osSystemLoadAverage.read())).append(", ");
+             }
+         }
+         private void renderProcessors() {
+             sb.append("processors=")
+                     .append(runtimeAvailableProcessors.read()).append(", ");
+         }
+         private void renderPhysicalMemory() {
+             sb.append("physical.memory.total=")
+                     .append(numberToUnit(osTotalPhysicalMemorySize.read())).append(", ");
+             sb.append("physical.memory.free=")
+                     .append(numberToUnit(osFreePhysicalMemorySize.read())).append(", ");
+         }
+         private void renderSwap() {
+             sb.append("swap.space.total=")
+                     .append(numberToUnit(osTotalSwapSpaceSize.read())).append(", ");
+             sb.append("swap.space.free=")
+                     .append(numberToUnit(osFreeSwapSpaceSize.read())).append(", ");
+         }
+         private void renderHeap() {
+             sb.append("heap.memory.used=")
+-                    .append(numberToUnit(runtimeUsedMemory0)).append(", ");
++                    .append(numberToUnit(runtimeUsedMemory.read())).append(", ");
+             sb.append("heap.memory.free=")
+                     .append(numberToUnit(runtimeFreeMemory.read())).append(", ");
+             sb.append("heap.memory.total=")
+-                    .append(numberToUnit(runtimeTotalMemory0)).append(", ");
++                    .append(numberToUnit(runtimeTotalMemory.read())).append(", ");
+             sb.append("heap.memory.max=")
+-                    .append(numberToUnit(runtimeMaxMemory0)).append(", ");
++                    .append(numberToUnit(runtimeMaxMemory.read())).append(", ");
+             sb.append("heap.memory.used/total=")
+                     .append(percentageString(memoryUsedOfTotalPercentage)).append(", ");
+             sb.append("heap.memory.used/max=")
+                     .append(percentageString(memoryUsedOfMaxPercentage)).append((", "));
+         }
+         private void renderEvents() {
+             sb.append("event.q.size=")
+                     .append(eventQueueSize.read()).append(", ");
+         }
+         private void renderCluster() {
+@@ -450,23 +437,23 @@
+                     .append(executorMapLoadAllKeysQueueSize.read()).append(", ");
+             sb.append("executor.q.cluster.size=")
+                     .append(executorClusterQueueSize.read()).append(", ");
+         }
+         private void renderOperationService() {
+             sb.append("executor.q.response.size=")
+                     .append(operationServiceResponseQueueSize.read()).append(", ");
+             sb.append("operations.running.count=")
+                     .append(operationServiceRunningOperationsCount.read()).append(", ");
+             sb.append("operations.pending.invocations.percentage=")
+-                    .append(format("%.2f", operationServicePendingInvocationsPercentage0)).append("%, ");
++                    .append(format("%.2f", operationServicePendingInvocationsPercentage.read())).append("%, ");
+             sb.append("operations.pending.invocations.count=")
+-                    .append(operationServicePendingInvocationsCount0).append(", ");
++                    .append(operationServicePendingInvocationsCount.read()).append(", ");
+         }
+     }
+     /**
+      * Given a number, returns that number as a percentage string.
+      *
+      * @param p the given number
+      * @return a string of the given number as a format float with two decimal places and a period
+      */
+     private static String percentageString(double p) {
+         return format("%.2f%%", p);
+
+--- a/hazelcast/src/main/java/com/hazelcast/internal/eviction/ClearExpiredRecordsTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/internal/eviction/ClearExpiredRecordsTask.java
+@@ -85,27 +85,24 @@
+                 newBackupExpiryOpFilter(), nodeEngine);
+     }
+     protected BiFunction<Integer, Integer, Boolean> newBackupExpiryOpFilter() {
+         return (partitionId, replicaIndex) -> {
+             IPartition partition = partitionService.getPartition(partitionId);
+             return partition.getReplicaAddress(replicaIndex) != null;
+         };
+     }
+     @Override
+     public void run() {
+-        if (!nodeEngine.isStartCompleted()) {
+-            return;
+-        }
+-        if (!singleRunPermit.compareAndSet(false, true)) {
+-            return;
+-        }
+         try {
++            if (!singleRunPermit.compareAndSet(false, true)) {
++                return;
++            }
+             runInternal();
+         } finally {
+             singleRunPermit.set(false);
+         }
+     }
+     private void runInternal() {
+         runningCleanupOperationsCount = 0;
+         long nowInMillis = nowInMillis();
+         boolean lostPartitionDetected = lostPartitionDetected();
+         List<T> containersToProcess = null;
+
+--- a/hazelcast/src/main/java/com/hazelcast/internal/metrics/MetricDescriptorConstants.java
++++ b/hazelcast/src/main/java/com/hazelcast/internal/metrics/MetricDescriptorConstants.java
+@@ -329,23 +329,23 @@
+     public static final String OPERATION_METRIC_INVOCATION_MONITOR_BACKUP_TIMEOUTS = "backupTimeouts";
+     public static final String OPERATION_METRIC_INVOCATION_MONITOR_NORMAL_TIMEOUTS = "normalTimeouts";
+     public static final String OPERATION_METRIC_INVOCATION_MONITOR_HEARTBEAT_PACKETS_RECEIVED = "heartbeatPacketsReceived";
+     public static final String OPERATION_METRIC_INVOCATION_MONITOR_HEARTBEAT_PACKETS_SENT = "heartbeatPacketsSent";
+     public static final String OPERATION_METRIC_INVOCATION_MONITOR_DELAYED_EXECUTION_COUNT = "delayedExecutionCount";
+     public static final String OPERATION_METRIC_INVOCATION_MONITOR_BACKUP_TIMEOUT_MILLIS = "backupTimeoutMillis";
+     public static final String OPERATION_METRIC_INVOCATION_MONITOR_INVOCATION_TIMEOUT_MILLIS = "invocationTimeoutMillis";
+     public static final String OPERATION_METRIC_INVOCATION_MONITOR_HEARTBEAT_BROADCAST_PERIOD_MILLIS =
+             "heartbeatBroadcastPeriodMillis";
+     public static final String OPERATION_METRIC_INVOCATION_MONITOR_INVOCATION_SCAN_PERIOD_MILLIS = "invocationScanPeriodMillis";
+-    public static final String OPERATION_METRIC_INVOCATION_REGISTRY_INVOCATIONS_USED_PERCENTAGE = "usedPercentage";
+-    public static final String OPERATION_METRIC_INVOCATION_REGISTRY_INVOCATIONS_LAST_CALL_ID = "lastCallId";
+-    public static final String OPERATION_METRIC_INVOCATION_REGISTRY_INVOCATIONS_PENDING = "pending";
++    public static final String OPERATION_METRIC_INVOCATION_REGISTRY_INVOCATIONS_USED_PERCENTAGE = "invocations.usedPercentage";
++    public static final String OPERATION_METRIC_INVOCATION_REGISTRY_INVOCATIONS_LAST_CALL_ID = "invocations.lastCallId";
++    public static final String OPERATION_METRIC_INVOCATION_REGISTRY_INVOCATIONS_PENDING = "invocations.pending";
+     public static final String OPERATION_METRIC_OPERATION_RUNNER_EXECUTED_OPERATIONS_COUNT = "executedOperationsCount";
+     public static final String OPERATION_METRIC_OPERATION_SERVICE_ASYNC_OPERATIONS = "asyncOperations";
+     public static final String OPERATION_METRIC_OPERATION_SERVICE_TIMEOUT_COUNT = "operationTimeoutCount";
+     public static final String OPERATION_METRIC_OPERATION_SERVICE_CALL_TIMEOUT_COUNT = "callTimeoutCount";
+     public static final String OPERATION_METRIC_OPERATION_SERVICE_RETRY_COUNT = "retryCount";
+     public static final String OPERATION_METRIC_OPERATION_SERVICE_FAILED_BACKUPS = "failedBackups";
+     public static final String OS_FULL_METRIC_COMMITTED_VIRTUAL_MEMORY_SIZE = "os.committedVirtualMemorySize";
+     public static final String OS_FULL_METRIC_FREE_PHYSICAL_MEMORY_SIZE = "os.freePhysicalMemorySize";
+     public static final String OS_FULL_METRIC_FREE_SWAP_SPACE_SIZE = "os.freeSwapSpaceSize";
+     public static final String OS_FULL_METRIC_PROCESS_CPU_TIME = "os.processCpuTime";
+
+--- a/hazelcast/src/main/java/com/hazelcast/internal/networking/InboundPipeline.java
++++ b/hazelcast/src/main/java/com/hazelcast/internal/networking/InboundPipeline.java
+@@ -33,47 +33,47 @@
+  * PacketDecoder, the whole pipeline (in this case the PacketDecoder) is
+  * automatically reprocessed.
+  */
+ public interface InboundPipeline {
+     /**
+      * Adds the handlers at the end of the pipeline.
+      *
+      * No verification is done if the handler is already added and a handler
+      * should only be added once.
+      *
+-     * This method should only be made on the thread 'owning' the pipeline.
++     * This method should only be made on the thread 'owning' the handler.
+      *
+      * @param handlers the handlers to add
+      * @return this
+      */
+     InboundPipeline addLast(InboundHandler... handlers);
+     /**
+      * Replaces the old InboundHandler by the new ones. So if there
+      * is a sequence of handlers [H1,H2,H3] and H2 gets replaced by [H4,H5]
+      * the new pipeline will be [H1,H4,H5,H3].
+      *
+      * No verification is done if any of the handlers is already added and a
+      * handler should only be added once.
+      *
+-     * This method should only be made on the thread 'owning' the pipeline.
++     * This method should only be made on the thread 'owning' the handler.
+      *
+      * @param oldHandler  the handler to replace
+      * @param newHandlers the new handlers to insert
+      * @return this
+      * @throws IllegalArgumentException is the oldHandler isn't part of this
+      *                                  pipeline.
+      */
+     InboundPipeline replace(InboundHandler oldHandler, InboundHandler... newHandlers);
+     /**
+      * Removes the given handler from the pipeline.
+      *
+-     * This method should only be made on the thread 'owning' the pipeline.
++     * This method should only be made on the thread 'owning' the handler.
+      *
+      * @param handler the handler to remove
+      * @return this
+      * @throws IllegalArgumentException is the handler isn't part of this
+      *                                  pipeline.
+      */
+     InboundPipeline remove(InboundHandler handler);
+     /**
+      * Wakes up the inbound pipeline and lets it to start reading again from the
+      * network.
+
+--- a/hazelcast/src/main/java/com/hazelcast/internal/networking/OutboundPipeline.java
++++ b/hazelcast/src/main/java/com/hazelcast/internal/networking/OutboundPipeline.java
+@@ -18,47 +18,47 @@
+  * The outbound pipeline of a {@link Channel}. So all data that gets
+  * written to the network, goes through the outbound pipeline.
+  */
+ public interface OutboundPipeline {
+     /**
+      * Adds the handlers at the end of the pipeline
+      *
+      * No verification is done if the handler is already added and a handler
+      * should only be added once.
+      *
+-     * This method should only be made on the thread 'owning' the pipeline.
++     * This method should only be made on the thread 'owning' the handler.
+      *
+      * @param handlers the handlers to add.
+      * @return this
+      */
+     OutboundPipeline addLast(OutboundHandler... handlers);
+     /**
+      * Replaces the old OutboundHandler by the new ones. So if there
+      * is a sequence of handlers [H1,H2,H3] and H2 gets replaced by [H4,H5]
+      * the new pipeline will be [H1,H4,H5,H3].
+      *
+      * No verification is done if any of the handlers is already added and a
+      * handler should only be added once.
+      *
+-     * This method should only be made on the thread 'owning' the pipeline.
++     * This method should only be made on the thread 'owning' the handler.
+      *
+      * @param oldHandler  the handlers to replace
+      * @param newHandlers the new handlers to insert.
+      * @return this
+      * @throws IllegalArgumentException is the oldHandler isn't part of this
+      *                                  pipeline.
+      */
+     OutboundPipeline replace(OutboundHandler oldHandler, OutboundHandler... newHandlers);
+     /**
+      * Removes the given handler from the pipeline.
+      *
+-     * This method should only be made on the thread 'owning' the pipeline.
++     * This method should only be made on the thread 'owning' the handler.
+      *
+      * @param handler the handler to remove.
+      * @return this
+      * @throws IllegalArgumentException is the handler isn't part of this
+      *                                  pipeline.
+      */
+     OutboundPipeline remove(OutboundHandler handler);
+     /**
+      * Request to flush all data to flush from the handlers to
+      * the network.
+
+--- a/hazelcast/src/main/java/com/hazelcast/internal/server/tcp/MemberChannelInitializer.java
++++ b/hazelcast/src/main/java/com/hazelcast/internal/server/tcp/MemberChannelInitializer.java
+@@ -25,25 +25,17 @@
+ public class MemberChannelInitializer
+         extends AbstractChannelInitializer {
+     MemberChannelInitializer(ServerContext serverContext, EndpointConfig config) {
+         super(serverContext, config);
+     }
+     @Override
+     public void initChannel(Channel channel) {
+         ServerConnection connection = (TcpServerConnection) channel.attributeMap().get(ServerConnection.class);
+         OutboundHandler[] outboundHandlers = serverContext.createOutboundHandlers(EndpointQualifier.MEMBER, connection);
+         InboundHandler[] inboundHandlers = serverContext.createInboundHandlers(EndpointQualifier.MEMBER, connection);
+-        OutboundHandler outboundHandler;
+-        SingleProtocolEncoder protocolEncoder;
+-        if (channel.isClientMode()) {
+-            protocolEncoder = new SingleProtocolEncoder(outboundHandlers);
+-            outboundHandler = new MemberProtocolEncoder(protocolEncoder);
+-        } else {
+-            protocolEncoder = new SingleProtocolEncoder(new MemberProtocolEncoder(outboundHandlers));
+-            outboundHandler = protocolEncoder;
+-        }
++        SingleProtocolEncoder protocolEncoder = new SingleProtocolEncoder(new MemberProtocolEncoder(outboundHandlers));
+         SingleProtocolDecoder protocolDecoder = new SingleProtocolDecoder(ProtocolType.MEMBER,
+-                inboundHandlers, protocolEncoder);
+-        channel.outboundPipeline().addLast(outboundHandler);
++                inboundHandlers, protocolEncoder, true);
++        channel.outboundPipeline().addLast(protocolEncoder);
+         channel.inboundPipeline().addLast(protocolDecoder);
+     }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/internal/server/tcp/MemberProtocolEncoder.java
++++ b/hazelcast/src/main/java/com/hazelcast/internal/server/tcp/MemberProtocolEncoder.java
+@@ -19,52 +19,64 @@
+ import com.hazelcast.internal.nio.ConnectionType;
+ import com.hazelcast.internal.server.ServerConnection;
+ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+ import java.nio.ByteBuffer;
+ import static com.hazelcast.internal.networking.HandlerStatus.CLEAN;
+ import static com.hazelcast.internal.networking.HandlerStatus.DIRTY;
+ import static com.hazelcast.internal.nio.IOUtil.compactOrClear;
+ import static com.hazelcast.internal.nio.Protocols.CLUSTER;
+ import static com.hazelcast.internal.nio.Protocols.PROTOCOL_LENGTH;
+ import static com.hazelcast.internal.util.StringUtil.stringToBytes;
+-/**
+- * Writes the member protocol header bytes (HZC) to dst buffer and replaces itself by the next {@link OutboundHandler
+- * OutboundHandlers}.
+- */
+ public class MemberProtocolEncoder extends OutboundHandler<Void, ByteBuffer> {
+     private final OutboundHandler[] outboundHandlers;
++    private volatile boolean encoderCanReplace;
++    private boolean clusterProtocolBuffered;
+     /**
++     * Decodes first 3 incoming bytes, validates against {@code supportedProtocol} and, when
++     * matching, replaces itself in the inbound pipeline with the {@code next InboundHandler}.
++     *
+      * @param next the {@link OutboundHandler} to replace this one in the outbound pipeline
+      *             upon match of protocol bytes
+      */
+     @SuppressFBWarnings("EI_EXPOSE_REP2")
+-    public MemberProtocolEncoder(OutboundHandler... next) {
++    public MemberProtocolEncoder(OutboundHandler[] next) {
+         this.outboundHandlers = next;
+     }
+     @Override
+     public void handlerAdded() {
+-        initDstBuffer(PROTOCOL_LENGTH, stringToBytes(CLUSTER));
++        initDstBuffer(PROTOCOL_LENGTH);
+     }
+     @Override
+     public HandlerStatus onWrite() {
+         compactOrClear(dst);
+         try {
+-            if (isProtocolBufferDrained()) {
++            if (!clusterProtocolBuffered) {
++                clusterProtocolBuffered = true;
++                dst.put(stringToBytes(CLUSTER));
++                return DIRTY;
++            }
++            if (!isProtocolBufferDrained()) {
++                return DIRTY;
++            }
++            if (encoderCanReplace) {
+                 ServerConnection connection = (TcpServerConnection) channel.attributeMap().get(ServerConnection.class);
+                 connection.setConnectionType(ConnectionType.MEMBER);
+                 channel.outboundPipeline().replace(this, outboundHandlers);
+-                return CLEAN;
+             }
+-            return DIRTY;
++            return CLEAN;
+         } finally {
+             dst.flip();
+         }
++    }
++    public void signalEncoderCanReplace() {
++        encoderCanReplace = true;
++        channel.outboundPipeline().wakeup();
+     }
+     /**
+      * Checks if the protocol bytes have been drained.
+      *
+      * The protocol buffer is in write mode, so if position is 0, the protocol
+      * buffer has been drained.
+      *
+      * @return true if the protocol buffer has been drained.
+      */
+     private boolean isProtocolBufferDrained() {
+
+--- a/hazelcast/src/main/java/com/hazelcast/internal/server/tcp/SingleProtocolDecoder.java
++++ b/hazelcast/src/main/java/com/hazelcast/internal/server/tcp/SingleProtocolDecoder.java
+@@ -37,46 +37,53 @@
+         extends InboundHandler<ByteBuffer, Void> {
+     protected final InboundHandler[] inboundHandlers;
+     protected final ProtocolType supportedProtocol;
+     /**
+      * This flag is used to ensure that {@link #verifyProtocol(String)} is called only once
+      * with initial bytes of connection. Formerly, this method would be called multiple times
+      * with new incoming data, although it failed after its first call.
+      */
+     protected volatile boolean verifyProtocolCalled;
+     final SingleProtocolEncoder encoder;
++    private final boolean shouldSignalMemberProtocolEncoder;
+     public SingleProtocolDecoder(ProtocolType supportedProtocol, InboundHandler next, SingleProtocolEncoder encoder) {
+-        this(supportedProtocol, new InboundHandler[]{next}, encoder);
++        this(supportedProtocol, new InboundHandler[]{next}, encoder, false);
+     }
+     /**
+      * Decodes first 3 incoming bytes, validates against {@code
+      * supportedProtocol} and, when matching, replaces itself in the inbound
+      * pipeline with the {@code next InboundHandler}s.
+      *
+      * @param supportedProtocol                 the {@link ProtocolType}
+      *                                          supported by this {@code
+      *                                          ProtocolDecoder}
+      * @param next                              the {@link InboundHandler}s to
+      *                                          replace this one in the inbound
+      *                                          pipeline upon match of protocol
+      *                                          bytes
+      * @param encoder                           a {@link SingleProtocolEncoder}
+      *                                          that will be notified when
+      *                                          non-matching protocol bytes have
+      *                                          been received
++     * @param shouldSignalMemberProtocolEncoder a boolean used to notify the
++     *                                          next encoder in the pipeline
++     *                                          after the {@link SingleProtocolEncoder}
++     *                                          when matching protocol bytes
++     *                                          have been received
+      */
+     @SuppressFBWarnings("EI_EXPOSE_REP2")
+     public SingleProtocolDecoder(ProtocolType supportedProtocol, InboundHandler[] next,
+-                                 SingleProtocolEncoder encoder) {
++                                 SingleProtocolEncoder encoder, boolean shouldSignalMemberProtocolEncoder) {
+         this.supportedProtocol = supportedProtocol;
+         this.inboundHandlers = next;
+         this.encoder = encoder;
++        this.shouldSignalMemberProtocolEncoder = shouldSignalMemberProtocolEncoder;
+         this.verifyProtocolCalled = false;
+     }
+     @Override
+     public void handlerAdded() {
+         initSrcBuffer(PROTOCOL_LENGTH);
+     }
+     @Override
+     public HandlerStatus onRead() {
+         src.flip();
+         try {
+@@ -86,20 +93,26 @@
+             boolean verifyProtocolPreviouslyCalled = verifyProtocolCalled;
+             if (verifyProtocolPreviouslyCalled || !verifyProtocol(loadProtocol())) {
+                 if (verifyProtocolPreviouslyCalled) {
+                     src.position(src.limit());
+                 }
+                 return CLEAN;
+             }
+             encoder.signalProtocolVerified();
+             initConnection();
+             setupNextDecoder();
++            if (!channel.isClientMode()) {
++                encoder.setupNextEncoder();
++            }
++            if (shouldSignalMemberProtocolEncoder) {
++                ((MemberProtocolEncoder) encoder.getFirstOutboundHandler()).signalEncoderCanReplace();
++            }
+             return CLEAN;
+         } finally {
+             compactOrClear(src);
+         }
+     }
+     protected void setupNextDecoder() {
+         channel.inboundPipeline().replace(this, inboundHandlers);
+     }
+     protected boolean verifyProtocol(String incomingProtocol) {
+         verifyProtocolCalled = true;
+
+--- a/hazelcast/src/main/java/com/hazelcast/internal/server/tcp/SingleProtocolEncoder.java
++++ b/hazelcast/src/main/java/com/hazelcast/internal/server/tcp/SingleProtocolEncoder.java
+@@ -11,94 +11,93 @@
+  * distributed under the License is distributed on an "AS IS" BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.internal.server.tcp;
+ import com.hazelcast.internal.networking.HandlerStatus;
+ import com.hazelcast.internal.networking.OutboundHandler;
+ import com.hazelcast.internal.nio.Protocols;
+ import java.nio.ByteBuffer;
+-import static com.hazelcast.internal.networking.HandlerStatus.BLOCKED;
+ import static com.hazelcast.internal.networking.HandlerStatus.CLEAN;
+ import static com.hazelcast.internal.networking.HandlerStatus.DIRTY;
+ import static com.hazelcast.internal.nio.IOUtil.compactOrClear;
+ import static com.hazelcast.internal.nio.Protocols.PROTOCOL_LENGTH;
+ import static com.hazelcast.internal.nio.Protocols.UNEXPECTED_PROTOCOL;
+ import static com.hazelcast.internal.util.StringUtil.stringToBytes;
+ /**
+- * Together with {@link SingleProtocolDecoder}, this encoder-decoder pair is used to check if correct protocol is used.
+- * {@link SingleProtocolDecoder} checks if the proper protocol is received. If the protocol is correct, both encoder and decoder
+- * are replaced by the next handlers in the pipeline. If it isn't the {@link SingleProtocolEncoder} sends
+- * {@link Protocols#UNEXPECTED_PROTOCOL} response and throws a {@link ProtocolException}. Note that in client mode the
+- * {@link SingleProtocolEncoder} allows blocking packet writes until the (member-)protocol is confirmed.
++ * Together with {@link SingleProtocolDecoder}, this encoder decoder pair is
++ * used for checking correct protocol is used or not. {@link
++ * SingleProtocolDecoder} checks if the correct protocol is received. If the
++ * protocol is correct, both encoder and decoder swaps itself with the next
++ * handler in the pipeline. If it isn't {@link SingleProtocolEncoder} throws
++ * {@link ProtocolException} and {@link SingleProtocolDecoder} sends {@value
++ * Protocols#UNEXPECTED_PROTOCOL}. Note that in client mode {@link
++ * SingleProtocolEncoder} has no effect, and it swaps itself with the next
++ * handler.
+  */
+ public class SingleProtocolEncoder extends OutboundHandler<Void, ByteBuffer> {
+     private final OutboundHandler[] outboundHandlers;
+     private boolean clusterProtocolBuffered;
+     private volatile boolean isDecoderVerifiedProtocol;
+     private volatile boolean isDecoderReceivedProtocol;
+     private volatile String exceptionMessage;
+     public SingleProtocolEncoder(OutboundHandler next) {
+         this(new OutboundHandler[]{next});
+     }
+     public SingleProtocolEncoder(OutboundHandler[] next) {
+         this.outboundHandlers = next;
+     }
+     @Override
+     public HandlerStatus onWrite() throws Exception {
+         compactOrClear(dst);
+         try {
+-            if (!isDecoderReceivedProtocol) {
+-                return BLOCKED;
+-            }
+-            if (isDecoderVerifiedProtocol) {
+-                setupNextEncoder();
++            if (!isDecoderReceivedProtocol && !channel.isClientMode()) {
+                 return CLEAN;
+             }
+-            if (!channel.isClientMode()) {
++            if (!isDecoderVerifiedProtocol && !channel.isClientMode()) {
+                 if (!sendProtocol()) {
+                     return DIRTY;
+                 }
++                throw new ProtocolException(exceptionMessage);
+             }
+-            throw new ProtocolException(exceptionMessage);
++            if (channel.isClientMode()) {
++                setupNextEncoder();
++            }
++            return CLEAN;
+         } finally {
+             dst.flip();
+         }
+     }
+     private boolean sendProtocol() {
+         if (!clusterProtocolBuffered) {
+             clusterProtocolBuffered = true;
+             dst.put(stringToBytes(UNEXPECTED_PROTOCOL));
+             return false;
+         }
+         return isProtocolBufferDrained();
+     }
+-    private void setupNextEncoder() {
++    protected void setupNextEncoder() {
+         channel.outboundPipeline().replace(this, outboundHandlers);
+     }
+     @Override
+     public void handlerAdded() {
+         initDstBuffer(PROTOCOL_LENGTH);
+     }
+     private boolean isProtocolBufferDrained() {
+         return dst.position() == 0;
+     }
+     public void signalProtocolVerified() {
+         isDecoderVerifiedProtocol = true;
+         isDecoderReceivedProtocol = true;
+-        if (channel != null) {
+-            channel.outboundPipeline().wakeup();
+-        }
++        channel.outboundPipeline().wakeup();
+     }
+     public void signalWrongProtocol(String exceptionMessage) {
+         this.exceptionMessage = exceptionMessage;
+         isDecoderVerifiedProtocol = false;
+         isDecoderReceivedProtocol = true;
+-        if (channel != null) {
+-            channel.outboundPipeline().wakeup();
+-        }
++        channel.outboundPipeline().wakeup();
+     }
+     public OutboundHandler getFirstOutboundHandler() {
+         return outboundHandlers[0];
+     }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/internal/util/phonehome/CloudInfoCollector.java
++++ b/hazelcast/src/main/java/com/hazelcast/internal/util/phonehome/CloudInfoCollector.java
+@@ -58,22 +58,20 @@
+             environmentInfo.forEach(metricsConsumer);
+             return;
+         }
+         Map<PhoneHomeMetrics, String> info = MapUtil.createHashMap(2);
+         if (MetricsCollector.fetchWebService(awsEndpoint)) {
+             info.put(PhoneHomeMetrics.CLOUD, "A");
+         } else if (MetricsCollector.fetchWebService(azureEndpoint)) {
+             info.put(PhoneHomeMetrics.CLOUD, "Z");
+         } else if (MetricsCollector.fetchWebService(gcpEndpoint)) {
+             info.put(PhoneHomeMetrics.CLOUD, "G");
+-        } else if (MetricsCollector.fetchWebService(awsEndpoint, MetricsCollector.RESPONSE_UNAUTHORIZED)) {
+-            info.put(PhoneHomeMetrics.CLOUD, "A");
+         } else {
+             info.put(PhoneHomeMetrics.CLOUD, "N");
+         }
+         try {
+             dockerFilePath.toRealPath();
+             try {
+                 kubernetesTokenPath.toRealPath();
+                 info.put(PhoneHomeMetrics.DOCKER, "K");
+             } catch (IOException e) {
+                 info.put(PhoneHomeMetrics.DOCKER, "D");
+
+--- a/hazelcast/src/main/java/com/hazelcast/internal/util/phonehome/MetricsCollector.java
++++ b/hazelcast/src/main/java/com/hazelcast/internal/util/phonehome/MetricsCollector.java
+@@ -20,21 +20,20 @@
+ import java.util.function.BiConsumer;
+ import static com.hazelcast.internal.util.EmptyStatement.ignore;
+ /**
+  * Class responsible for collecting phone home data (phone home metrics).
+  *
+  * @see PhoneHomeMetrics
+  */
+ interface MetricsCollector {
+     int TIMEOUT = 2000;
+     int RESPONSE_OK = 200;
+-    int RESPONSE_UNAUTHORIZED = 401;
+     int A_INTERVAL = 5;
+     int B_INTERVAL = 10;
+     int C_INTERVAL = 20;
+     int D_INTERVAL = 40;
+     int E_INTERVAL = 60;
+     int F_INTERVAL = 100;
+     int G_INTERVAL = 150;
+     int H_INTERVAL = 300;
+     int J_INTERVAL = 600;
+     /**
+@@ -62,34 +61,31 @@
+             letter = "G";
+         } else if (size < H_INTERVAL) {
+             letter = "H";
+         } else if (size < J_INTERVAL) {
+             letter = "J";
+         } else {
+             letter = "I";
+         }
+         return letter;
+     }
+-    static boolean fetchWebService(String urlStr, int responseCode) {
++    static boolean fetchWebService(String urlStr) {
+         HttpURLConnection conn = null;
+         boolean response;
+         try {
+             URL url = new URL(urlStr);
+             conn = (HttpURLConnection) url.openConnection();
+             conn.setConnectTimeout(TIMEOUT);
+             conn.setReadTimeout(TIMEOUT);
+             conn.connect();
+-            response = conn.getResponseCode() == responseCode;
++            response = conn.getResponseCode() == RESPONSE_OK;
+         } catch (Exception ignored) {
+             ignore(ignored);
+             return false;
+         } finally {
+             if (conn != null) {
+                 conn.disconnect();
+             }
+         }
+         return response;
+     }
+-    static boolean fetchWebService(String url) {
+-        return fetchWebService(url, RESPONSE_OK);
+-    }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/jet/impl/JetInstanceImpl.java
++++ b/hazelcast/src/main/java/com/hazelcast/jet/impl/JetInstanceImpl.java
+@@ -15,39 +15,35 @@
+  */
+ package com.hazelcast.jet.impl;
+ import com.hazelcast.cluster.Address;
+ import com.hazelcast.cluster.Member;
+ import com.hazelcast.core.MemberLeftException;
+ import com.hazelcast.instance.impl.HazelcastInstanceImpl;
+ import com.hazelcast.internal.util.Preconditions;
+ import com.hazelcast.jet.Job;
+ import com.hazelcast.jet.config.JetConfig;
+ import com.hazelcast.jet.config.JobConfig;
+-import com.hazelcast.jet.datamodel.Tuple2;
+ import com.hazelcast.jet.impl.operation.GetJobIdsOperation;
+ import com.hazelcast.jet.impl.operation.GetJobIdsOperation.GetJobIdsResult;
+ import com.hazelcast.logging.ILogger;
+ import com.hazelcast.map.impl.MapService;
+ import com.hazelcast.spi.exception.TargetNotMemberException;
+ import com.hazelcast.spi.impl.NodeEngineImpl;
++import com.hazelcast.spi.impl.operationservice.impl.InvocationFuture;
+ import javax.annotation.Nonnull;
+-import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashMap;
+-import java.util.List;
+ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.ExecutionException;
+ import static com.hazelcast.cluster.memberselector.MemberSelectors.DATA_MEMBER_SELECTOR;
+-import static com.hazelcast.jet.datamodel.Tuple2.tuple2;
+-import static com.hazelcast.jet.impl.util.ExceptionUtil.isOrHasCause;
+ import static com.hazelcast.jet.impl.util.ExceptionUtil.rethrow;
+ import static java.util.Collections.singleton;
+ /**
+  * Member-side {@code JetInstance} implementation
+  */
+ public class JetInstanceImpl extends AbstractJetInstance<Address> {
+     private final NodeEngineImpl nodeEngine;
+     private final JetConfig config;
+     JetInstanceImpl(HazelcastInstanceImpl hazelcastInstance, JetConfig config) {
+         super(hazelcastInstance);
+@@ -58,74 +54,54 @@
+     public JetConfig getConfig() {
+         return config;
+     }
+     @Override
+     public Address getMasterId() {
+         return Preconditions.checkNotNull(nodeEngine.getMasterAddress(), "Cluster has not elected a master");
+     }
+     @Override
+     public Map<Address, GetJobIdsResult> getJobsInt(String onlyName, Long onlyJobId) {
+         Map<Address, CompletableFuture<GetJobIdsResult>> futures = new HashMap<>();
++        Address masterAddress = null;
+         Collection<Member> targetMembers = onlyName == null
+                 ? nodeEngine.getClusterService().getMembers(DATA_MEMBER_SELECTOR)
+                 : singleton(nodeEngine.getClusterService().getMembers().iterator().next());
+-        GetJobIdsOperation masterOperation = new GetJobIdsOperation(onlyName, onlyJobId);
+-        CompletableFuture<GetJobIdsResult> masterFuture = nodeEngine
+-                .getOperationService()
+-                .createMasterInvocationBuilder(JetServiceBackend.SERVICE_NAME, masterOperation)
+-                .invoke();
+         for (Member member : targetMembers) {
++            if (masterAddress == null) {
++                masterAddress = member.getAddress();
++            }
+             GetJobIdsOperation operation = new GetJobIdsOperation(onlyName, onlyJobId);
+-            futures.put(member.getAddress(), nodeEngine
++            InvocationFuture<GetJobIdsResult> future = nodeEngine
+                     .getOperationService()
+                     .createInvocationBuilder(JetServiceBackend.SERVICE_NAME, operation, member.getAddress())
+-                    .invoke());
++                    .invoke();
++            futures.put(member.getAddress(), future);
+         }
+         Map<Address, GetJobIdsResult> res = new HashMap<>(futures.size());
+         for (Entry<Address, CompletableFuture<GetJobIdsResult>> en : futures.entrySet()) {
+             GetJobIdsResult result;
+             try {
+                 result = en.getValue().get();
+             } catch (InterruptedException e) {
+                 Thread.currentThread().interrupt();
+                 result = GetJobIdsResult.EMPTY;
+             } catch (ExecutionException e) {
+-                if (isOrHasCause(e, MemberLeftException.class) || isOrHasCause(e, TargetNotMemberException.class)) {
++                if (!en.getKey().equals(masterAddress)
++                        && (e.getCause() instanceof TargetNotMemberException || e.getCause() instanceof MemberLeftException)) {
+                     result = GetJobIdsResult.EMPTY;
+                 } else {
+                     throw new RuntimeException("Error when getting job IDs: " + e, e);
+                 }
+             }
+             res.put(en.getKey(), result);
+         }
+-        res.put(null, filterNonLightJobs(masterFuture));
+         return res;
+-    }
+-    private GetJobIdsResult filterNonLightJobs(CompletableFuture<GetJobIdsResult> masterFuture) {
+-        GetJobIdsResult result;
+-        try {
+-            result = masterFuture.get();
+-        } catch (InterruptedException e) {
+-            Thread.currentThread().interrupt();
+-            return GetJobIdsResult.EMPTY;
+-        } catch (Exception e) {
+-            throw rethrow(e);
+-        }
+-        List<Tuple2<Long, Boolean>> nonLightJobs = new ArrayList<>();
+-        for (int i = 0; i < result.getJobIds().length; i++) {
+-            long jobId = result.getJobIds()[i];
+-            if (result.getIsLightJobs()[i]) {
+-                continue;
+-            }
+-            nonLightJobs.add(tuple2(jobId, false));
+-        }
+-        return new GetJobIdsResult(nonLightJobs);
+     }
+     @Override
+     public void shutdown() {
+         try {
+             JetServiceBackend jetServiceBackend = nodeEngine.getService(JetServiceBackend.SERVICE_NAME);
+             jetServiceBackend.shutDownJobs();
+             super.shutdown();
+         } catch (Throwable t) {
+             throw rethrow(t);
+         }
+
+--- a/hazelcast/src/main/java/com/hazelcast/jet/impl/util/ExceptionUtil.java
++++ b/hazelcast/src/main/java/com/hazelcast/jet/impl/util/ExceptionUtil.java
+@@ -185,21 +185,11 @@
+         while (cause != null) {
+             if (cause instanceof ClassCastException
+                     && cause.getMessage().startsWith("cannot assign instance of java.lang.invoke.SerializedLambda")) {
+                 throw new JetException("Class containing the lambda probably missing from class path, did you add it " +
+                         "using JobConfig.addClass()?: " + e, e);
+             }
+             cause = cause.getCause();
+         }
+         throw e;
+     }
+-    /**
+-     * Checks, if {@code t} itself or any exception in its cause chain is an
+-     * instance of {@code classToFind}.
+-     */
+-    public static boolean isOrHasCause(Throwable t, Class<?> classToFind) {
+-        while (t != null && t.getCause() != t && !classToFind.isAssignableFrom(t.getClass())) {
+-            t = t.getCause();
+-        }
+-        return t != null && classToFind.isAssignableFrom(t.getClass());
+-    }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/map/impl/EntryViews.java
++++ b/hazelcast/src/main/java/com/hazelcast/map/impl/EntryViews.java
+@@ -22,46 +22,40 @@
+ import com.hazelcast.map.impl.wan.WanMapEntryView;
+ /**
+  * A class providing static factory methods that create various entry view objects.
+  */
+ public final class EntryViews {
+     private EntryViews() {
+     }
+     public static <K, V> EntryView<K, V> createSimpleEntryView() {
+         return new SimpleEntryView<>();
+     }
+-    public static <K, V> EntryView<K, V> createSimpleEntryView(K key, V value, Record<V> record,
++    public static <K, V> EntryView<K, V> createSimpleEntryView(K key, V value, Record record,
+                                                                ExpiryMetadata expiryMetadata) {
+         return new SimpleEntryView<>(key, value)
+                 .withCost(record.getCost())
+                 .withVersion(record.getVersion())
+                 .withHits(record.getHits())
+                 .withLastAccessTime(record.getLastAccessTime())
+-                .withLastUpdateTime(calculateLastUpdateTime(record, expiryMetadata))
++                .withLastUpdateTime(record.getLastUpdateTime())
+                 .withCreationTime(record.getCreationTime())
+                 .withLastStoredTime(record.getLastStoredTime())
+                 .withTtl(expiryMetadata.getTtl())
+                 .withMaxIdle(expiryMetadata.getMaxIdle())
+                 .withExpirationTime(expiryMetadata.getExpirationTime());
+     }
+     public static <K, V> WanMapEntryView<K, V> createWanEntryView(Data key, Data value,
+                                                                   Record<V> record, ExpiryMetadata expiryMetadata,
+                                                                   SerializationService serializationService) {
+         return new WanMapEntryView<K, V>(key, value, serializationService)
+                 .withCost(record.getCost())
+                 .withVersion(record.getVersion())
+                 .withHits(record.getHits())
+                 .withLastAccessTime(record.getLastAccessTime())
+-                .withLastUpdateTime(calculateLastUpdateTime(record, expiryMetadata))
++                .withLastUpdateTime(record.getLastUpdateTime())
+                 .withCreationTime(record.getCreationTime())
+                 .withLastStoredTime(record.getLastStoredTime())
+                 .withTtl(expiryMetadata.getTtl())
+                 .withMaxIdle(expiryMetadata.getMaxIdle())
+                 .withExpirationTime(expiryMetadata.getExpirationTime());
+     }
+-    private static <V> long calculateLastUpdateTime(Record<V> record, ExpiryMetadata expiryMetadata) {
+-        if (expiryMetadata != ExpiryMetadata.NULL) {
+-            return expiryMetadata.getLastUpdateTime();
+-        }
+-        return record.getLastUpdateTime();
+-    }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/map/impl/MapPartitionAwareService.java
++++ b/hazelcast/src/main/java/com/hazelcast/map/impl/MapPartitionAwareService.java
+@@ -7,49 +7,47 @@
+  *
+  * http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an "AS IS" BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.map.impl;
++import com.hazelcast.core.DistributedObject;
++import com.hazelcast.map.impl.proxy.MapProxyImpl;
+ import com.hazelcast.cluster.Address;
+ import com.hazelcast.spi.impl.NodeEngine;
+ import com.hazelcast.internal.partition.PartitionAwareService;
+-import com.hazelcast.spi.impl.eventservice.impl.EventServiceImpl;
+-import com.hazelcast.spi.impl.eventservice.impl.EventServiceSegment;
++import com.hazelcast.spi.impl.proxyservice.ProxyService;
+ import com.hazelcast.internal.partition.IPartitionLostEvent;
+-import java.util.Set;
++import java.util.Collection;
+ /**
+  * Defines partition-aware operations' behavior of map service.
+  * Currently, it only defines the behavior for partition lost occurrences
+  *
+  * @see IPartitionLostEvent
+  */
+ class MapPartitionAwareService implements PartitionAwareService {
+     private final MapServiceContext mapServiceContext;
+     private final NodeEngine nodeEngine;
+-    private final EventServiceImpl eventService;
++    private final ProxyService proxyService;
+     MapPartitionAwareService(MapServiceContext mapServiceContext) {
+         this.mapServiceContext = mapServiceContext;
+         this.nodeEngine = mapServiceContext.getNodeEngine();
+-        this.eventService = (EventServiceImpl) this.nodeEngine.getEventService();
++        this.proxyService = this.nodeEngine.getProxyService();
+     }
+     @Override
+     public void onPartitionLost(IPartitionLostEvent partitionLostEvent) {
+         final Address thisAddress = nodeEngine.getThisAddress();
+         final int partitionId = partitionLostEvent.getPartitionId();
+-        EventServiceSegment eventServiceSegment = eventService.getSegment(MapService.SERVICE_NAME, false);
+-        if (eventServiceSegment == null) {
+-            return;
+-        }
+-        Set<String> maps = eventServiceSegment.getRegistrations().keySet();
+-        for (String mapName : maps) {
+-            int totalBackupCount = nodeEngine.getConfig().getMapConfig(mapName).getTotalBackupCount();
+-            if (totalBackupCount <= partitionLostEvent.getLostReplicaIndex()) {
++        Collection<DistributedObject> result = proxyService.getDistributedObjects(MapService.SERVICE_NAME);
++        for (DistributedObject object : result) {
++            final MapProxyImpl mapProxy = (MapProxyImpl) object;
++            final String mapName = mapProxy.getName();
++            if (mapProxy.getTotalBackupCount() <= partitionLostEvent.getLostReplicaIndex()) {
+                 mapServiceContext.getMapEventPublisher().publishMapPartitionLostEvent(thisAddress, mapName, partitionId);
+             }
+         }
+     }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/map/impl/MapService.java
++++ b/hazelcast/src/main/java/com/hazelcast/map/impl/MapService.java
+@@ -16,21 +16,20 @@
+ package com.hazelcast.map.impl;
+ import com.hazelcast.cluster.ClusterState;
+ import com.hazelcast.config.WanAcknowledgeType;
+ import com.hazelcast.core.DistributedObject;
+ import com.hazelcast.internal.cluster.ClusterStateListener;
+ import com.hazelcast.internal.metrics.DynamicMetricsProvider;
+ import com.hazelcast.internal.metrics.MetricDescriptor;
+ import com.hazelcast.internal.metrics.MetricsCollectionContext;
+ import com.hazelcast.internal.partition.FragmentedMigrationAwareService;
+ import com.hazelcast.internal.partition.IPartitionLostEvent;
+-import com.hazelcast.internal.partition.IPartitionService;
+ import com.hazelcast.internal.partition.OffloadedReplicationPreparation;
+ import com.hazelcast.internal.partition.PartitionAwareService;
+ import com.hazelcast.internal.partition.PartitionMigrationEvent;
+ import com.hazelcast.internal.partition.PartitionReplicationEvent;
+ import com.hazelcast.internal.serialization.Data;
+ import com.hazelcast.internal.services.ClientAwareService;
+ import com.hazelcast.internal.services.DistributedObjectNamespace;
+ import com.hazelcast.internal.services.LockInterceptorService;
+ import com.hazelcast.internal.services.ManagedService;
+ import com.hazelcast.internal.services.NotifiableEventListener;
+@@ -82,25 +81,25 @@
+  * @see MapPostJoinAwareService
+  * @see MapSplitBrainHandlerService
+  * @see WanMapSupportingService
+  * @see MapPartitionAwareService
+  * @see MapSplitBrainProtectionAwareService
+  * @see MapClientAwareService
+  * @see MapServiceContext
+  */
+ @SuppressWarnings({"checkstyle:ClassFanOutComplexity", "checkstyle:MethodCount"})
+ public class MapService implements ManagedService, FragmentedMigrationAwareService, TransactionalService, RemoteService,
+-        EventPublishingService<Object, ListenerAdapter>, PostJoinAwareService,
+-        SplitBrainHandlerService, WanSupportingService, StatisticsAwareService<LocalMapStats>,
+-        PartitionAwareService, ClientAwareService, SplitBrainProtectionAwareService,
+-        NotifiableEventListener, ClusterStateListener, LockInterceptorService<Data>,
+-        DynamicMetricsProvider, TenantContextAwareService, OffloadedReplicationPreparation {
++                                   EventPublishingService<Object, ListenerAdapter>, PostJoinAwareService,
++                                   SplitBrainHandlerService, WanSupportingService, StatisticsAwareService<LocalMapStats>,
++                                   PartitionAwareService, ClientAwareService, SplitBrainProtectionAwareService,
++                                   NotifiableEventListener, ClusterStateListener, LockInterceptorService<Data>,
++                                   DynamicMetricsProvider, TenantContextAwareService, OffloadedReplicationPreparation {
+     public static final String SERVICE_NAME = "hz:impl:mapService";
+     protected ManagedService managedService;
+     protected CountingMigrationAwareService migrationAwareService;
+     protected TransactionalService transactionalService;
+     protected RemoteService remoteService;
+     protected EventPublishingService eventPublishingService;
+     protected PostJoinAwareService postJoinAwareService;
+     protected SplitBrainHandlerService splitBrainHandlerService;
+     protected WanSupportingService wanSupportingService;
+     protected StatisticsAwareService statisticsAwareService;
+@@ -230,25 +229,23 @@
+     }
+     public boolean validateMigrationStamp(int stamp) {
+         return migrationAwareService.validateMigrationStamp(stamp);
+     }
+     @Override
+     public void onClusterStateChange(ClusterState newState) {
+         mapServiceContext.onClusterStateChange(newState);
+     }
+     @Override
+     public void onBeforeLock(String distributedObjectName, Data key) {
+-        IPartitionService partitionService = mapServiceContext.getNodeEngine().getPartitionService();
+-        int partitionId = partitionService.getPartitionId(key);
++        int partitionId = mapServiceContext.getNodeEngine().getPartitionService().getPartitionId(key);
+         RecordStore recordStore = mapServiceContext.getRecordStore(partitionId, distributedObjectName);
+-        boolean owner = partitionService.isPartitionOwner(partitionId);
+-        recordStore.getRecordOrNull(key, !owner);
++        recordStore.getRecordOrNull(key);
+     }
+     public static ObjectNamespace getObjectNamespace(String mapName) {
+         return new DistributedObjectNamespace(SERVICE_NAME, mapName);
+     }
+     @Override
+     public void provideDynamicMetrics(MetricDescriptor descriptor, MetricsCollectionContext context) {
+         Map<String, LocalMapStats> stats = getStats();
+         if (stats == null) {
+             return;
+         }
+
+--- a/hazelcast/src/main/java/com/hazelcast/map/impl/operation/GetEntryViewOperation.java
++++ b/hazelcast/src/main/java/com/hazelcast/map/impl/operation/GetEntryViewOperation.java
+@@ -26,21 +26,21 @@
+ import com.hazelcast.spi.impl.operationservice.WaitNotifyKey;
+ public class GetEntryViewOperation extends ReadonlyKeyBasedMapOperation implements BlockingOperation {
+     private EntryView<Data, Data> result;
+     public GetEntryViewOperation() {
+     }
+     public GetEntryViewOperation(String name, Data dataKey) {
+         super(name, dataKey);
+     }
+     @Override
+     protected void runInternal() {
+-        Record record = recordStore.getRecordOrNull(dataKey, false);
++        Record record = recordStore.getRecordOrNull(dataKey);
+         if (record != null) {
+             Data value = mapServiceContext.toData(record.getValue());
+             ExpiryMetadata expiredMetadata = recordStore.getExpirySystem().getExpiredMetadata(dataKey);
+             result = EntryViews.createSimpleEntryView(dataKey, value, record, expiredMetadata);
+         }
+     }
+     @Override
+     public WaitNotifyKey getWaitKey() {
+         return new LockWaitNotifyKey(getServiceNamespace(), dataKey);
+     }
+
+--- a/hazelcast/src/main/java/com/hazelcast/map/impl/operation/PartitionWideEntryOperation.java
++++ b/hazelcast/src/main/java/com/hazelcast/map/impl/operation/PartitionWideEntryOperation.java
+@@ -129,22 +129,20 @@
+             if (response != null) {
+                 responses.add(dataKey, response);
+             }
+             EntryEventType eventType = operator.getEventType();
+             if (eventType != null) {
+                 outComes.add(dataKey);
+                 outComes.add(operator.getOldValue());
+                 outComes.add(operator.getByPreferringDataNewValue());
+                 outComes.add(eventType);
+                 outComes.add(operator.getEntry().getNewTtl());
+-            } else {
+-                operator.doPostOperateOps();
+             }
+         }, false);
+         while (!outComes.isEmpty()) {
+             Data dataKey = (Data) outComes.poll();
+             Object oldValue = outComes.poll();
+             Object newValue = outComes.poll();
+             EntryEventType eventType = (EntryEventType) outComes.poll();
+             long newTtl = (long) outComes.poll();
+             operator.init(dataKey, oldValue, newValue, null, eventType,
+                     null, newTtl).doPostOperateOps();
+
+--- a/hazelcast/src/main/java/com/hazelcast/map/impl/operation/PostJoinMapOperation.java
++++ b/hazelcast/src/main/java/com/hazelcast/map/impl/operation/PostJoinMapOperation.java
+@@ -45,23 +45,20 @@
+ public class PostJoinMapOperation extends Operation implements IdentifiedDataSerializable, TargetAware {
+     private List<InterceptorInfo> interceptorInfoList = new LinkedList<>();
+     private List<AccumulatorInfo> infoList;
+     @Override
+     public String getServiceName() {
+         return MapService.SERVICE_NAME;
+     }
+     public void addMapInterceptors(MapContainer mapContainer) {
+         InterceptorRegistry interceptorRegistry = mapContainer.getInterceptorRegistry();
+         List<MapInterceptor> interceptorList = interceptorRegistry.getInterceptors();
+-        if (interceptorList.isEmpty()) {
+-            return;
+-        }
+         Map<String, MapInterceptor> interceptorMap = interceptorRegistry.getId2InterceptorMap();
+         Map<MapInterceptor, String> revMap = createHashMap(interceptorMap.size());
+         for (Map.Entry<String, MapInterceptor> entry : interceptorMap.entrySet()) {
+             revMap.put(entry.getValue(), entry.getKey());
+         }
+         InterceptorInfo interceptorInfo = new InterceptorInfo(mapContainer.getName());
+         for (MapInterceptor interceptor : interceptorList) {
+             interceptorInfo.addInterceptor(revMap.get(interceptor), interceptor);
+         }
+         interceptorInfoList.add(interceptorInfo);
+
+--- a/hazelcast/src/main/java/com/hazelcast/map/impl/recordstore/DefaultRecordStore.java
++++ b/hazelcast/src/main/java/com/hazelcast/map/impl/recordstore/DefaultRecordStore.java
+@@ -169,20 +169,21 @@
+     @Override
+     public Record putReplicatedRecord(Data dataKey, Record replicatedRecord,
+                                       ExpiryMetadata expiryMetadata,
+                                       boolean populateIndexes, long now) {
+         Record newRecord = createRecord(replicatedRecord, now);
+         storage.put(dataKey, newRecord);
+         expirySystem.add(dataKey, expiryMetadata.getTtl(),
+                 expiryMetadata.getMaxIdle(), expiryMetadata.getExpirationTime(),
+                 now, expiryMetadata.getLastUpdateTime());
+         mutationObserver.onReplicationPutRecord(dataKey, newRecord, populateIndexes);
++        updateStatsOnPut(replicatedRecord.getHits(), now);
+         return newRecord;
+     }
+     @Override
+     public void removeReplicatedRecord(Data dataKey, boolean backup) {
+         Record record = storage.get(dataKey);
+         if (record != null) {
+             mutationObserver.onRemoveRecord(dataKey, record, backup);
+             removeKeyFromExpirySystem(dataKey);
+             storage.removeRecord(dataKey, record);
+         }
+@@ -974,23 +975,23 @@
+                 mapDataStore.remove(key, now, transactionId);
+             }
+             onStore(record);
+         }
+         mutationObserver.onRemoveRecord(key, record, false);
+         removeKeyFromExpirySystem(key);
+         storage.removeRecord(key, record);
+         return oldValue;
+     }
+     @Override
+-    public Record getRecordOrNull(Data key, boolean backup) {
+-        long now = getNow();
+-        return getRecordOrNull(key, now, backup);
++    public Record getRecordOrNull(Data key) {
++        long now = getNow();
++        return getRecordOrNull(key, now, false);
+     }
+     protected Record getRecordOrNull(Data key, long now, boolean backup) {
+         Record record = storage.get(key);
+         if (record != null) {
+             return evictIfExpired(key, now, backup) ? null : record;
+         }
+         return null;
+     }
+     protected void onStore(Record record) {
+         if (record == null || mapDataStore == EMPTY_MAP_DATA_STORE) {
+
+--- a/hazelcast/src/main/java/com/hazelcast/map/impl/recordstore/RecordStore.java
++++ b/hazelcast/src/main/java/com/hazelcast/map/impl/recordstore/RecordStore.java
+@@ -391,26 +391,25 @@
+     InvalidationQueue<ExpiredKey> getExpiredKeysQueue();
+     /**
+      * Returns the partition id this RecordStore belongs to.
+      *
+      * @return the partition id.
+      */
+     int getPartitionId();
+     /**
+      * Returns live record or null if record is already expired. Does not load missing keys from a map store.
+      *
+-     * @param key      key to be accessed
+-     * @param backup true if partition is a backup-partition otherwise set false
++     * @param key key to be accessed
+      * @return live record or null
+      * @see #get
+      */
+-    R getRecordOrNull(Data key, boolean backup);
++    R getRecordOrNull(Data key);
+     /**
+      * Check if record is reachable according to TTL or idle times.
+      *
+      * @param now    current time in millis
+      * @param backup <code>true</code> if a backup
+      *               partition, otherwise <code>false</code>.
+      * @return {@code true} if record has been evicted
+      * due to the expiry, otherwise return {@code false}.
+      */
+     boolean evictIfExpired(Data key, long now, boolean backup);
+
+--- a/hazelcast/src/main/java/com/hazelcast/map/impl/tx/TxnLockAndGetOperation.java
++++ b/hazelcast/src/main/java/com/hazelcast/map/impl/tx/TxnLockAndGetOperation.java
+@@ -45,21 +45,21 @@
+         this.shouldLoad = shouldLoad;
+         this.blockReads = blockReads;
+         this.ttl = ttl;
+         setWaitTimeout(timeout);
+     }
+     @Override
+     protected void runInternal() {
+         if (!recordStore.txnLock(getKey(), ownerUuid, getThreadId(), getCallId(), ttl, blockReads)) {
+             throw new TransactionException("Transaction couldn't obtain lock.");
+         }
+-        Record record = recordStore.getRecordOrNull(dataKey, false);
++        Record record = recordStore.getRecordOrNull(dataKey);
+         if (record == null && shouldLoad) {
+             record = recordStore.loadRecordOrNull(dataKey, false, getCallerAddress());
+         }
+         Data value = record == null ? null : mapServiceContext.toData(record.getValue());
+         response = new VersionedValue(value, record == null ? 0 : record.getVersion());
+     }
+     public boolean shouldWait() {
+         return !recordStore.canAcquireLock(dataKey, ownerUuid, getThreadId());
+     }
+     @Override
+
+--- a/hazelcast/src/main/java/com/hazelcast/map/impl/tx/TxnSetOperation.java
++++ b/hazelcast/src/main/java/com/hazelcast/map/impl/tx/TxnSetOperation.java
+@@ -58,21 +58,21 @@
+     public void innerBeforeRun() throws Exception {
+         super.innerBeforeRun();
+         if (!recordStore.canAcquireLock(dataKey, ownerUuid, threadId)) {
+             wbqCapacityCounter().decrement(transactionId);
+             throw new TransactionException("Cannot acquire lock UUID: " + ownerUuid + ", threadId: " + threadId);
+         }
+     }
+     @Override
+     protected void runInternal() {
+         recordStore.unlock(dataKey, ownerUuid, threadId, getCallId());
+-        Record record = recordStore.getRecordOrNull(dataKey, false);
++        Record record = recordStore.getRecordOrNull(dataKey);
+         if (record == null || version == record.getVersion()) {
+             EventService eventService = getNodeEngine().getEventService();
+             if (eventService.hasEventRegistration(MapService.SERVICE_NAME, getName())) {
+                 oldValue = record == null ? null : mapServiceContext.toData(record.getValue());
+             }
+             eventType = record == null ? EntryEventType.ADDED : EntryEventType.UPDATED;
+             recordStore.setTxn(dataKey, dataValue, ttl, UNSET, transactionId);
+             shouldBackup = true;
+         }
+     }
+
+--- a/hazelcast/src/main/java/com/hazelcast/query/impl/getters/AbstractJsonGetter.java
++++ b/hazelcast/src/main/java/com/hazelcast/query/impl/getters/AbstractJsonGetter.java
+@@ -187,21 +187,24 @@
+             return false;
+         }
+         while (true) {
+             token = parser.nextToken();
+             if (token == JsonToken.END_OBJECT) {
+                 return false;
+             }
+             if (pathCursor.getCurrent().equals(parser.getCurrentName())) {
+                 parser.nextToken();
+                 return true;
+-            } else if (!multiValue) {
++            } else if (multiValue) {
++                parser.nextToken();
++            } else {
++                parser.nextToken();
+                 parser.skipChildren();
+             }
+         }
+     }
+     /**
+      * Traverses given array. If {@code pathCursor#getNext()} is
+      * {@code null}, this method adds all the scalar values in current
+      * array to the result. Otherwise, it traverses all objects in
+      * given array and adds their scalar values named
+      * {@code pathCursor#getNext()} to the result.
+
+--- a/hazelcast/src/main/java/com/hazelcast/security/permission/ActionConstants.java
++++ b/hazelcast/src/main/java/com/hazelcast/security/permission/ActionConstants.java
+@@ -28,21 +28,20 @@
+ import com.hazelcast.executor.impl.DistributedExecutorService;
+ import com.hazelcast.flakeidgen.impl.FlakeIdGeneratorService;
+ import com.hazelcast.internal.crdt.pncounter.PNCounterService;
+ import com.hazelcast.internal.locksupport.LockSupportService;
+ import com.hazelcast.internal.usercodedeployment.UserCodeDeploymentService;
+ import com.hazelcast.jet.impl.JetServiceBackend;
+ import com.hazelcast.map.impl.MapService;
+ import com.hazelcast.multimap.impl.MultiMapService;
+ import com.hazelcast.replicatedmap.impl.ReplicatedMapService;
+ import com.hazelcast.ringbuffer.impl.RingbufferService;
+-import com.hazelcast.scheduledexecutor.impl.DistributedScheduledExecutorService;
+ import com.hazelcast.sql.impl.SqlInternalService;
+ import com.hazelcast.topic.impl.TopicService;
+ import com.hazelcast.topic.impl.reliable.ReliableTopicService;
+ import java.security.Permission;
+ import java.util.HashMap;
+ import java.util.Map;
+ @SuppressWarnings({"checkstyle:executablestatementcount"})
+ public final class ActionConstants {
+     public static final String ACTION_ALL = "all";
+     public static final String ACTION_CREATE = "create";
+@@ -91,21 +90,20 @@
+         PERMISSION_FACTORY_MAP.put(CacheService.SERVICE_NAME, CachePermission::new);
+         PERMISSION_FACTORY_MAP.put(RingbufferService.SERVICE_NAME, RingBufferPermission::new);
+         PERMISSION_FACTORY_MAP.put(DistributedDurableExecutorService.SERVICE_NAME, DurableExecutorServicePermission::new);
+         PERMISSION_FACTORY_MAP.put(CardinalityEstimatorService.SERVICE_NAME, CardinalityEstimatorPermission::new);
+         PERMISSION_FACTORY_MAP.put(UserCodeDeploymentService.SERVICE_NAME,
+                 (name, actions) -> new UserCodeDeploymentPermission(actions));
+         PERMISSION_FACTORY_MAP.put(PNCounterService.SERVICE_NAME, PNCounterPermission::new);
+         PERMISSION_FACTORY_MAP.put(ReliableTopicService.SERVICE_NAME, ReliableTopicPermission::new);
+         PERMISSION_FACTORY_MAP.put(JetServiceBackend.SERVICE_NAME, (name, actions) -> new JobPermission(actions));
+         PERMISSION_FACTORY_MAP.put(SqlInternalService.SERVICE_NAME, SqlPermission::new);
+-        PERMISSION_FACTORY_MAP.put(DistributedScheduledExecutorService.SERVICE_NAME, ScheduledExecutorPermission::new);
+     }
+     private ActionConstants() {
+     }
+     private interface PermissionFactory {
+         Permission create(String name, String... actions);
+     }
+     /**
+      * Creates a permission
+      *
+      * @param name        the permission name
+
+--- a/hazelcast/src/main/java/com/hazelcast/security/permission/DurableExecutorServicePermission.java
++++ b/hazelcast/src/main/java/com/hazelcast/security/permission/DurableExecutorServicePermission.java
+@@ -8,36 +8,30 @@
+  * http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an "AS IS" BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.security.permission;
+ public class DurableExecutorServicePermission extends InstancePermission {
+-    private static final int READ = 4;
+-    private static final int MODIFY = 8;
+-    private static final int ALL = CREATE | DESTROY | READ | MODIFY;
++    private static final int ALL = CREATE | DESTROY;
+     public DurableExecutorServicePermission(String name, String... actions) {
+         super(name, actions);
+     }
+     @Override
+     protected int initMask(String[] actions) {
+         int mask = NONE;
+         for (String action : actions) {
+             if (ActionConstants.ACTION_ALL.equals(action)) {
+                 return ALL;
+             }
+             if (ActionConstants.ACTION_CREATE.equals(action)) {
+                 mask |= CREATE;
+             } else if (ActionConstants.ACTION_DESTROY.equals(action)) {
+                 mask |= DESTROY;
+-            } else if (ActionConstants.ACTION_READ.equals(action)) {
+-                mask |= READ;
+-            } else if (ActionConstants.ACTION_MODIFY.equals(action)) {
+-                mask |= MODIFY;
+             }
+         }
+         return mask;
+     }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/security/permission/ExecutorServicePermission.java
++++ b/hazelcast/src/main/java/com/hazelcast/security/permission/ExecutorServicePermission.java
+@@ -8,41 +8,30 @@
+  * http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an "AS IS" BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.security.permission;
+ public class ExecutorServicePermission extends InstancePermission {
+-    /**
+-     * The name of the executor used when no such executor
+-     * is found for the client invocations.
+-     */
+-    public static final String EMPTY_EXECUTOR_NAME = "<EMPTY>";
+-    private static final int READ = 4;
+-    private static final int MODIFY = 8;
+-    private static final int ALL = CREATE | DESTROY | READ | MODIFY;
++    private static final int ALL = CREATE | DESTROY;
+     public ExecutorServicePermission(String name, String... actions) {
+         super(name, actions);
+     }
+     @Override
+     protected int initMask(String[] actions) {
+         int mask = NONE;
+         for (String action : actions) {
+             if (ActionConstants.ACTION_ALL.equals(action)) {
+                 return ALL;
+             }
+             if (ActionConstants.ACTION_CREATE.equals(action)) {
+                 mask |= CREATE;
+             } else if (ActionConstants.ACTION_DESTROY.equals(action)) {
+                 mask |= DESTROY;
+-            } else if (ActionConstants.ACTION_READ.equals(action)) {
+-                mask |= READ;
+-            } else if (ActionConstants.ACTION_MODIFY.equals(action)) {
+-                mask |= MODIFY;
+             }
+         }
+         return mask;
+     }
+ }
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/impl/AbstractInvocationFuture.java
++++ b/hazelcast/src/main/java/com/hazelcast/spi/impl/AbstractInvocationFuture.java
+@@ -717,24 +717,20 @@
+     /**
+      * @param value the resolved state of this future
+      * @return an {@link ExceptionalResult} wrapping a {@link Throwable} in case value is resolved
+      * to an exception, or the normal completion value. Subclasses may choose to treat
+      * specific normal completion values in a special way (eg deserialize when the completion
+      * value is an instance of {@code Data}.
+      */
+     protected Object resolve(Object value) {
+         return value;
+     }
+-    protected ExceptionalResult toExceptionalResult(Object object) {
+-        assert object instanceof ExceptionalResult;
+-        return (ExceptionalResult) object;
+-    }
+     protected V resolveAndThrowWithJoinConvention(Object state) {
+         Object value = resolve(state);
+         return returnOrThrowWithJoinConventions(value);
+     }
+     protected <U> void unblockApply(@Nonnull final Function<? super V, ? extends U> function,
+                                     @Nonnull Executor executor,
+                                     @Nonnull InternalCompletableFuture<U> future) {
+         final Object value = resolve(state);
+         if (cascadeException(value, future)) {
+             return;
+@@ -1080,22 +1076,22 @@
+                 return false;
+             }
+             if (compareAndSetState(oldState, value)) {
+                 onComplete();
+                 unblockAll(oldState, defaultExecutor());
+                 return true;
+             }
+         }
+     }
+     protected void onComplete() {
+-        if (isCompletedExceptionally()) {
+-            super.completeExceptionally(toExceptionalResult(state).getCause());
++        if (state instanceof ExceptionalResult) {
++            super.completeExceptionally(((ExceptionalResult) state).getCause());
+         } else {
+             super.complete((V) state);
+         }
+     }
+     private void warnIfSuspiciousDoubleCompletion(Object s0, Object s1) {
+         if (s0 != s1 && !(isStateCancelled(s0)) && !(isStateCancelled(s1))) {
+             logger.warning(String.format("Future.complete(Object) on completed future. "
+                             + "Request: %s, current value: %s, offered value: %s",
+                     invocationToString(), s0, s1), new Exception());
+         }
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/impl/NodeEngine.java
++++ b/hazelcast/src/main/java/com/hazelcast/spi/impl/NodeEngine.java
+@@ -188,25 +188,20 @@
+      * @throws com.hazelcast.nio.serialization.HazelcastSerializationException when deserialization fails
+      */
+     <T> T toObject(Object object, Class klazz);
+     /**
+      * Indicates that node is not shutting down or it has not already shut down
+      *
+      * @return {@code true} if node is not shutting down or it has not already shut down, {@code false} otherwise
+      */
+     boolean isRunning();
+     /**
+-     * @return      {@code true} if this {@code Node} has completed startup, {@code false} otherwise.
+-     * @see         com.hazelcast.instance.impl.NodeExtension#isStartCompleted()
+-     */
+-    boolean isStartCompleted();
+-    /**
+      * Returns the HazelcastInstance that this {@link NodeEngine} belongs to.
+      *
+      * @return the HazelcastInstance
+      */
+     HazelcastInstance getHazelcastInstance();
+     /**
+      * Gets the service with the given name.
+      *
+      * @param serviceName the name of the service
+      * @param <T>         the type of the service
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/impl/NodeEngineImpl.java
++++ b/hazelcast/src/main/java/com/hazelcast/spi/impl/NodeEngineImpl.java
+@@ -338,24 +338,20 @@
+     }
+     @Override
+     public <T> T toObject(Object object, Class klazz) {
+         return serializationService.toObject(object, klazz);
+     }
+     @Override
+     public boolean isRunning() {
+         return node.isRunning();
+     }
+     @Override
+-    public boolean isStartCompleted() {
+-        return node.getNodeExtension().isStartCompleted();
+-    }
+-    @Override
+     public HazelcastInstance getHazelcastInstance() {
+         return node.hazelcastInstance;
+     }
+     @Override
+     public ILogger getLogger(String name) {
+         return loggingService.getLogger(name);
+     }
+     @Override
+     public ILogger getLogger(Class clazz) {
+         return loggingService.getLogger(clazz);
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/Operation.java
++++ b/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/Operation.java
+@@ -8,33 +8,31 @@
+  * http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an "AS IS" BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.spi.impl.operationservice;
+ import com.hazelcast.cluster.Address;
+-import com.hazelcast.core.MemberLeftException;
+ import com.hazelcast.internal.cluster.ClusterClock;
+ import com.hazelcast.internal.partition.InternalPartition;
+ import com.hazelcast.internal.server.ServerConnection;
+ import com.hazelcast.internal.util.UUIDSerializationUtil;
+ import com.hazelcast.logging.ILogger;
+ import com.hazelcast.logging.Logger;
+ import com.hazelcast.nio.ObjectDataInput;
+ import com.hazelcast.nio.ObjectDataOutput;
+ import com.hazelcast.nio.serialization.DataSerializable;
+ import com.hazelcast.spi.exception.RetryableException;
+ import com.hazelcast.spi.exception.SilentException;
+-import com.hazelcast.spi.exception.WrongTargetException;
+ import com.hazelcast.spi.impl.NodeEngine;
+ import com.hazelcast.spi.properties.ClusterProperty;
+ import com.hazelcast.spi.tenantcontrol.TenantControl;
+ import com.hazelcast.spi.tenantcontrol.TenantControl.Closeable;
+ import com.hazelcast.spi.tenantcontrol.Tenantable;
+ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+ import java.io.IOException;
+ import java.util.UUID;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+@@ -500,37 +498,20 @@
+      * <p>
+      * This method is called on caller side of the invocation.
+      *
+      * @param throwable <code>Exception</code>/<code>Error</code> thrown during
+      *                  invocation
+      * @return <code>ExceptionAction</code>
+      */
+     public ExceptionAction onInvocationException(Throwable throwable) {
+         return throwable instanceof RetryableException ? RETRY_INVOCATION : THROW_EXCEPTION;
+     }
+-    /**
+-     * Called when an <code>Exception</code>/<code>Error</code> is thrown
+-     * during an invocation on master member. Invocation process will continue,
+-     * it will retry or fail according to returned <code>ExceptionAction</code>.
+-     * <p>
+-     * This method is called on caller side of the invocation.
+-     *
+-     * @param throwable <code>Exception</code>/<code>Error</code> thrown during
+-     *                  invocation
+-     * @return <code>ExceptionAction</code>
+-     */
+-    public ExceptionAction onMasterInvocationException(Throwable throwable) {
+-        if (throwable instanceof WrongTargetException || throwable instanceof MemberLeftException) {
+-            return RETRY_INVOCATION;
+-        }
+-        return onInvocationException(throwable);
+-    }
+     public UUID getCallerUuid() {
+         return callerUuid;
+     }
+     public Operation setCallerUuid(UUID callerUuid) {
+         this.callerUuid = callerUuid;
+         setFlag(callerUuid != null, BITMASK_CALLER_UUID_SET);
+         return this;
+     }
+     protected final ILogger getLogger() {
+         final NodeEngine ne = nodeEngine;
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/OperationService.java
++++ b/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/OperationService.java
+@@ -103,24 +103,22 @@
+     <E> InvocationFuture<E> invokeOnPartitionAsync(String serviceName, Operation op, int partitionId, int replicaIndex);
+     /**
+      * Executes an operation on a partition.
+      *
+      * @param op  the operation
+      * @param <E> the return type of the operation response
+      * @return the future.
+      */
+     <E> InvocationFuture<E> invokeOnPartition(Operation op);
+     <E> InvocationFuture<E> invokeOnTarget(String serviceName, Operation op, Address target);
+-    <E> InvocationFuture<E> invokeOnMaster(String serviceName, Operation op);
+     InvocationBuilder createInvocationBuilder(String serviceName, Operation op, int partitionId);
+     InvocationBuilder createInvocationBuilder(String serviceName, Operation op, Address target);
+-    InvocationBuilder createMasterInvocationBuilder(String serviceName, Operation op);
+     /**
+      * Invokes a set of operations on each partition.
+      * <p>
+      * This method blocks until the operations complete.
+      * <p>
+      * If the operations have sync backups, this method will <b>not</b> wait for their completion.
+      * Instead, it will return once the operations are completed on primary replicas of the
+      * given {@code partitions}.
+      *
+      * @param serviceName      the name of the service.
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/InvocationBuilderImpl.java
++++ b/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/InvocationBuilderImpl.java
+@@ -10,51 +10,41 @@
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an "AS IS" BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.spi.impl.operationservice.impl;
+ import com.hazelcast.cluster.Address;
+ import com.hazelcast.spi.impl.operationservice.InvocationBuilder;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+-import com.hazelcast.spi.impl.operationservice.impl.Invocation.Context;
+ /**
+  * An {@link InvocationBuilder} that is tied to the {@link OperationServiceImpl}.
+  */
+-final class InvocationBuilderImpl extends InvocationBuilder {
+-    private final Context context;
+-    private final boolean executeOnMaster;
+-    private InvocationBuilderImpl(Context context, String serviceName, Operation op,
+-                                  int partitionId, Address target, boolean executeOnMaster) {
++class InvocationBuilderImpl extends InvocationBuilder {
++    private final Invocation.Context context;
++    InvocationBuilderImpl(Invocation.Context context, String serviceName, Operation op, int partitionId) {
++        this(context, serviceName, op, partitionId, null);
++    }
++    InvocationBuilderImpl(Invocation.Context context, String serviceName, Operation op, Address target) {
++        this(context, serviceName, op, Operation.GENERIC_PARTITION_ID, target);
++    }
++    private InvocationBuilderImpl(Invocation.Context context, String serviceName, Operation op,
++                                  int partitionId, Address target) {
+         super(serviceName, op, partitionId, target);
+         this.context = context;
+-        this.executeOnMaster = executeOnMaster;
+-    }
+-    static InvocationBuilderImpl createForPartition(Context context, String serviceName, Operation op, int partitionId) {
+-        return new InvocationBuilderImpl(context, serviceName, op, partitionId, null, false);
+-    }
+-    static InvocationBuilderImpl createForTarget(Context context, String serviceName, Operation op, Address target) {
+-        return new InvocationBuilderImpl(context, serviceName, op, Operation.GENERIC_PARTITION_ID, target, false);
+-    }
+-    static InvocationBuilderImpl createForMaster(Context context, String serviceName, Operation op) {
+-        return new InvocationBuilderImpl(context, serviceName, op, Operation.GENERIC_PARTITION_ID, null, true);
+     }
+     @Override
+     public InvocationFuture invoke() {
+         op.setServiceName(serviceName);
+         Invocation invocation;
+-        if (executeOnMaster) {
+-            invocation = new MasterInvocation(
+-                    context, op, doneCallback, tryCount, tryPauseMillis,
+-                    callTimeout, resultDeserialized, connectionManager);
+-        } else if (target == null) {
++        if (target == null) {
+             op.setPartitionId(partitionId).setReplicaIndex(replicaIndex);
+             invocation = new PartitionInvocation(
+                     context, op, doneCallback, tryCount, tryPauseMillis, callTimeout, resultDeserialized,
+                     failOnIndeterminateOperationState, connectionManager);
+         } else {
+             invocation = new TargetInvocation(
+                     context, op, target, doneCallback, tryCount, tryPauseMillis,
+                     callTimeout, resultDeserialized, connectionManager);
+         }
+         return invocation.invoke();
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/InvocationFuture.java
++++ b/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/InvocationFuture.java
+@@ -104,22 +104,27 @@
+             throw (InterruptedException) response;
+         } else {
+             throw new ExecutionException((Throwable) response);
+         }
+     }
+     @SuppressWarnings({"checkstyle:npathcomplexity", "checkstyle:cyclomaticcomplexity"})
+     @Override
+     protected Object resolve(Object unresolved) {
+         if (unresolved == null) {
+             return null;
+-        } else if (unresolved == INTERRUPTED || unresolved == CALL_TIMEOUT || unresolved == HEARTBEAT_TIMEOUT) {
+-            return toExceptionalResult(unresolved);
++        } else if (unresolved == INTERRUPTED) {
++            return new ExceptionalResult(
++                    new InterruptedException(invocation.op.getClass().getSimpleName() + " was interrupted. " + invocation));
++        } else if (unresolved == CALL_TIMEOUT) {
++            return new ExceptionalResult(newOperationTimeoutException(false));
++        } else if (unresolved == HEARTBEAT_TIMEOUT) {
++            return new ExceptionalResult(newOperationTimeoutException(true));
+         } else if (unresolved.getClass() == Packet.class) {
+             NormalResponse response = invocation.context.serializationService.toObject(unresolved);
+             unresolved = response.getValue();
+         }
+         Object value = unresolved;
+         if (deserialize && value instanceof Data) {
+             value = invocation.context.serializationService.toObject(value);
+             if (value == null) {
+                 return null;
+             }
+@@ -127,32 +132,20 @@
+         Throwable cause = (value instanceof ExceptionalResult)
+                 ? ((ExceptionalResult) value).getCause()
+                 : null;
+         if (invocation.shouldFailOnIndeterminateOperationState()
+                 && (value instanceof IndeterminateOperationState
+                 || cause instanceof IndeterminateOperationState)) {
+             value = wrapThrowable(new IndeterminateOperationStateException("indeterminate operation state",
+                     cause == null ? (Throwable) value : cause));
+         }
+         return value;
+-    }
+-    @Override
+-    protected ExceptionalResult toExceptionalResult(Object object) {
+-        if (object == INTERRUPTED) {
+-            return new ExceptionalResult(
+-                    new InterruptedException(invocation.op.getClass().getSimpleName() + " was interrupted. " + invocation));
+-        } else if (object == CALL_TIMEOUT) {
+-            return new ExceptionalResult(newOperationTimeoutException(false));
+-        } else if (object == HEARTBEAT_TIMEOUT) {
+-            return new ExceptionalResult(newOperationTimeoutException(true));
+-        }
+-        return super.toExceptionalResult(object);
+     }
+     private OperationTimeoutException newOperationTimeoutException(boolean heartbeatTimeout) {
+         StringBuilder sb = new StringBuilder();
+         if (heartbeatTimeout) {
+             sb.append(invocation.op.getClass().getSimpleName())
+                     .append(" invocation failed to complete due to operation-heartbeat-timeout. ");
+             sb.append("Current time: ").append(timeToString(currentTimeMillis())).append(". ");
+             sb.append("Start time: ").append(timeToString(invocation.firstInvocationTimeMillis)).append(". ");
+             sb.append("Total elapsed time: ")
+                     .append(currentTimeMillis() - invocation.firstInvocationTimeMillis).append(" ms. ");
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/InvocationRegistry.java
++++ b/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/InvocationRegistry.java
+@@ -29,21 +29,21 @@
+ import com.hazelcast.spi.impl.sequence.CallIdSequence;
+ import com.hazelcast.spi.properties.HazelcastProperties;
+ import java.util.Iterator;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentMap;
+ import static com.hazelcast.internal.metrics.MetricDescriptorConstants.OPERATION_METRIC_INVOCATION_REGISTRY_INVOCATIONS_LAST_CALL_ID;
+ import static com.hazelcast.internal.metrics.MetricDescriptorConstants.OPERATION_METRIC_INVOCATION_REGISTRY_INVOCATIONS_PENDING;
+ import static com.hazelcast.internal.metrics.MetricDescriptorConstants.OPERATION_METRIC_INVOCATION_REGISTRY_INVOCATIONS_USED_PERCENTAGE;
+-import static com.hazelcast.internal.metrics.MetricDescriptorConstants.OPERATION_PREFIX_INVOCATIONS;
++import static com.hazelcast.internal.metrics.MetricDescriptorConstants.OPERATION_PREFIX;
+ import static com.hazelcast.internal.metrics.ProbeLevel.MANDATORY;
+ import static com.hazelcast.internal.metrics.ProbeUnit.PERCENT;
+ import static com.hazelcast.spi.impl.operationservice.OperationAccessor.deactivate;
+ import static com.hazelcast.spi.impl.operationservice.OperationAccessor.setCallId;
+ /**
+  * Responsible for the registration of all pending invocations.
+  * <p>
+  * By using the InvocationRegistry, the Invocation and its response(s) can be linked to each other.
+  * <p>
+  * When an invocation is registered, a callId is determined. Based on this call ID, when a
+@@ -77,21 +77,21 @@
+         this.logger = logger;
+         this.callIdSequence = callIdSequence;
+         int coreSize = RuntimeAvailableProcessors.get();
+         boolean reallyMultiCore = coreSize >= CORE_SIZE_CHECK;
+         int concurrencyLevel = reallyMultiCore ? coreSize * CORE_SIZE_FACTOR : CONCURRENCY_LEVEL;
+         this.invocations = new ConcurrentHashMap<>(INITIAL_CAPACITY, LOAD_FACTOR, concurrencyLevel);
+         this.profilerEnabled = properties.getInteger(InvocationProfilerPlugin.PERIOD_SECONDS) > 0;
+     }
+     @Override
+     public void provideStaticMetrics(MetricsRegistry registry) {
+-        registry.registerStaticMetrics(this, OPERATION_PREFIX_INVOCATIONS);
++        registry.registerStaticMetrics(this, OPERATION_PREFIX);
+     }
+     @Probe(name = OPERATION_METRIC_INVOCATION_REGISTRY_INVOCATIONS_USED_PERCENTAGE, unit = PERCENT)
+     private double invocationsUsedPercentage() {
+         int maxConcurrentInvocations = callIdSequence.getMaxConcurrentInvocations();
+         if (maxConcurrentInvocations == Integer.MAX_VALUE) {
+             return 0;
+         }
+         return (HUNDRED_PERCENT * invocations.size()) / maxConcurrentInvocations;
+     }
+     @Probe(name = OPERATION_METRIC_INVOCATION_REGISTRY_INVOCATIONS_LAST_CALL_ID)
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/MasterInvocation.java
++++ b//dev/null
+@@ -1,65 +0,0 @@
+-/*
+- * Copyright (c) 2008-2021, Hazelcast, Inc. All Rights Reserved.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package com.hazelcast.spi.impl.operationservice.impl;
+-import com.hazelcast.cluster.Address;
+-import com.hazelcast.cluster.Member;
+-import com.hazelcast.internal.server.ServerConnectionManager;
+-import com.hazelcast.spi.impl.operationservice.ExceptionAction;
+-import com.hazelcast.spi.impl.operationservice.Operation;
+-/**
+- * An {@link Invocation} evaluates an Operation Invocation for a master member running on top of the
+- * {@link OperationServiceImpl}.
+- */
+-final class MasterInvocation extends Invocation<Address> {
+-    MasterInvocation(
+-            Context context,
+-            Operation op,
+-            Runnable doneCallback,
+-            int tryCount,
+-            long tryPauseMillis,
+-            long callTimeoutMillis,
+-            boolean deserialize,
+-            ServerConnectionManager connectionManager
+-    ) {
+-        super(context, op, doneCallback, tryCount, tryPauseMillis, callTimeoutMillis, deserialize, connectionManager);
+-    }
+-    MasterInvocation(
+-            Context context,
+-            Operation op,
+-            int tryCount,
+-            long tryPauseMillis,
+-            long callTimeoutMillis,
+-            boolean deserialize
+-    ) {
+-        this(context, op, null, tryCount, tryPauseMillis, callTimeoutMillis, deserialize, null);
+-    }
+-    @Override
+-    Address getInvocationTarget() {
+-        return context.clusterService.getMasterAddress();
+-    }
+-    @Override
+-    Address toTargetAddress(Address target) {
+-        return target;
+-    }
+-    @Override
+-    Member toTargetMember(Address target) {
+-        return context.clusterService.getMember(target);
+-    }
+-    @Override
+-    ExceptionAction onException(Throwable t) {
+-        return op.onMasterInvocationException(t);
+-    }
+-}
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/OperationServiceImpl.java
++++ b/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/OperationServiceImpl.java
+@@ -235,35 +235,29 @@
+     public void execute(PartitionSpecificRunnable task) {
+         operationExecutor.execute(task);
+     }
+     @Override
+     public void executeOnPartitions(PartitionTaskFactory taskFactory, BitSet partitions) {
+         operationExecutor.executeOnPartitions(taskFactory, partitions);
+     }
+     @Override
+     public InvocationBuilder createInvocationBuilder(String serviceName, Operation op, int partitionId) {
+         checkNotNegative(partitionId, "Partition ID cannot be negative!");
+-        return InvocationBuilderImpl.createForPartition(invocationContext, serviceName, op, partitionId)
++        return new InvocationBuilderImpl(invocationContext, serviceName, op, partitionId)
+                 .setTryCount(invocationMaxRetryCount)
+                 .setTryPauseMillis(invocationRetryPauseMillis)
+                 .setFailOnIndeterminateOperationState(failOnIndeterminateOperationState);
+     }
+     @Override
+     public InvocationBuilder createInvocationBuilder(String serviceName, Operation op, Address target) {
+         checkNotNull(target, "Target cannot be null!");
+-        return InvocationBuilderImpl.createForTarget(invocationContext, serviceName, op, target)
+-                .setTryCount(invocationMaxRetryCount)
+-                .setTryPauseMillis(invocationRetryPauseMillis);
+-    }
+-    @Override
+-    public InvocationBuilder createMasterInvocationBuilder(String serviceName, Operation op) {
+-        return InvocationBuilderImpl.createForMaster(invocationContext, serviceName, op)
++        return new InvocationBuilderImpl(invocationContext, serviceName, op, target)
+                 .setTryCount(invocationMaxRetryCount)
+                 .setTryPauseMillis(invocationRetryPauseMillis);
+     }
+     @Override
+     public void run(Operation op) {
+         operationExecutor.run(op);
+     }
+     @Override
+     public void execute(Operation op) {
+         operationExecutor.execute(op);
+@@ -303,26 +297,20 @@
+         return new PartitionInvocation(
+                 invocationContext, op, invocationMaxRetryCount, invocationRetryPauseMillis,
+                 DEFAULT_CALL_TIMEOUT, DEFAULT_DESERIALIZE_RESULT, failOnIndeterminateOperationState).invoke();
+     }
+     @Override
+     @SuppressWarnings("unchecked")
+     public <E> InvocationFuture<E> invokeOnTarget(String serviceName, Operation op, Address target) {
+         op.setServiceName(serviceName);
+         return new TargetInvocation(invocationContext, op, target, invocationMaxRetryCount, invocationRetryPauseMillis,
+                 DEFAULT_CALL_TIMEOUT, DEFAULT_DESERIALIZE_RESULT).invoke();
+-    }
+-    @Override
+-    public <E> InvocationFuture<E> invokeOnMaster(String serviceName, Operation op) {
+-        op.setServiceName(serviceName);
+-        return new MasterInvocation(invocationContext, op, invocationMaxRetryCount,
+-                invocationRetryPauseMillis, DEFAULT_CALL_TIMEOUT, DEFAULT_DESERIALIZE_RESULT).invoke();
+     }
+     @Override
+     public void onStartAsyncOperation(Operation op) {
+         asyncOperations.add(op);
+     }
+     @Override
+     public void onCompletionAsyncOperation(Operation op) {
+         asyncOperations.remove(op);
+     }
+     @Override
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/PartitionInvocation.java
++++ b/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/PartitionInvocation.java
+@@ -7,35 +7,35 @@
+  *
+  * http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an "AS IS" BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.spi.impl.operationservice.impl;
+-import com.hazelcast.cluster.Address;
+ import com.hazelcast.cluster.ClusterState;
+ import com.hazelcast.cluster.Member;
+ import com.hazelcast.core.MemberLeftException;
+ import com.hazelcast.internal.partition.InternalPartition;
+ import com.hazelcast.internal.partition.PartitionReplica;
++import com.hazelcast.cluster.Address;
+ import com.hazelcast.internal.server.ServerConnectionManager;
+ import com.hazelcast.partition.NoDataMemberInClusterException;
+ import com.hazelcast.spi.impl.operationservice.ExceptionAction;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+ import com.hazelcast.spi.impl.operationservice.ReadonlyOperation;
+ import static com.hazelcast.cluster.memberselector.MemberSelectors.DATA_MEMBER_SELECTOR;
+ import static com.hazelcast.spi.impl.operationservice.ExceptionAction.THROW_EXCEPTION;
+ /**
+- * An {@link Invocation} evaluates an Operation Invocation for a particular partition running on top of the
++ * A {@link Invocation} evaluates a Operation Invocation for a particular partition running on top of the
+  * {@link OperationServiceImpl}.
+  */
+ final class PartitionInvocation extends Invocation<PartitionReplica> {
+     private final boolean failOnIndeterminateOperationState;
+     PartitionInvocation(Context context,
+                         Operation op,
+                         Runnable doneCallback,
+                         int tryCount,
+                         long tryPauseMillis,
+                         long callTimeoutMillis,
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/TargetInvocation.java
++++ b/hazelcast/src/main/java/com/hazelcast/spi/impl/operationservice/impl/TargetInvocation.java
+@@ -7,29 +7,29 @@
+  *
+  * http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an "AS IS" BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+ package com.hazelcast.spi.impl.operationservice.impl;
+-import com.hazelcast.cluster.Address;
+ import com.hazelcast.cluster.Member;
+ import com.hazelcast.core.MemberLeftException;
++import com.hazelcast.cluster.Address;
+ import com.hazelcast.internal.server.ServerConnectionManager;
+ import com.hazelcast.spi.impl.operationservice.ExceptionAction;
+ import com.hazelcast.spi.impl.operationservice.Operation;
+ import static com.hazelcast.spi.impl.operationservice.ExceptionAction.THROW_EXCEPTION;
+ /**
+- * An {@link Invocation} evaluates an Operation Invocation for a particular target running on top of the
++ * A {@link Invocation} evaluates a Operation Invocation for a particular target running on top of the
+  * {@link OperationServiceImpl}.
+  */
+ final class TargetInvocation extends Invocation<Address> {
+     private final Address target;
+     TargetInvocation(Context context,
+                      Operation op,
+                      Address target,
+                      Runnable doneCallback,
+                      int tryCount,
+                      long tryPauseMillis,
+
+--- a/hazelcast/src/main/java/com/hazelcast/spi/utils/RestClient.java
++++ b/hazelcast/src/main/java/com/hazelcast/spi/utils/RestClient.java
+@@ -99,23 +99,20 @@
+         }
+         expectedResponseCodes.addAll(Arrays.asList(codes));
+         return this;
+     }
+     public Response get() {
+         return callWithRetries("GET");
+     }
+     public Response post() {
+         return callWithRetries("POST");
+     }
+-    public Response put() {
+-        return callWithRetries("PUT");
+-    }
+     private Response callWithRetries(String method) {
+         return RetryUtils.retry(() -> call(method), retries);
+     }
+     private Response call(String method) {
+         HttpURLConnection connection = null;
+         try {
+             URL urlToConnect = new URL(url);
+             connection = (HttpURLConnection) urlToConnect.openConnection();
+             if (connection instanceof HttpsURLConnection && caCertificate != null) {
+                 ((HttpsURLConnection) connection).setSSLSocketFactory(buildSslSocketFactory());
+@@ -173,21 +170,21 @@
+         try {
+             KeyStore keyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+             keyStore.load(null, null);
+             int i = 0;
+             for (Certificate certificate : generateCertificates()) {
+                 String alias = String.format("ca-%d", i++);
+                 keyStore.setCertificateEntry(alias, certificate);
+             }
+             TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+             tmf.init(keyStore);
+-            SSLContext context = SSLContext.getInstance("TLS");
++            SSLContext context = SSLContext.getInstance("TLSv1.2");
+             context.init(null, tmf.getTrustManagers(), null);
+             return context.getSocketFactory();
+         } catch (Exception e) {
+             throw new RestClientException("Failure in generating SSLSocketFactory", e);
+         }
+     }
+     /**
+      * Generates CA Certificate from the default CA Cert file or from the externally provided "ca-certificate" property.
+      */
+     private Collection<? extends Certificate> generateCertificates()

@@ -1,0 +1,1357 @@
+--- a/panel/command/serve.py
++++ b/panel/command/serve.py
+@@ -276,61 +276,54 @@
+             action  = 'store',
+             type    = str,
+             help    = "The endpoint for the liveness API.",
+             default = "liveness"
+         )),
+         ('--plugins', dict(
+             action  = 'append',
+             type    = str
+         )),
+         ('--reuse-sessions', Argument(
+-            action  = 'store',
++            action  = 'store_true',
+             help    = "Whether to reuse sessions when serving the initial request.",
+-            default = False,
+-            const   = True,
+-            nargs   = "?"
+         )),
+         ('--global-loading-spinner', Argument(
+             action  = 'store_true',
+             help    = "Whether to add a global loading spinner to the application(s).",
+         )),
+     )) # type: ignore[assignment]
+     _extensions = ['.py', '.ipynb', '.md']
+     def customize_applications(self, args, applications):
+         if args.index and not args.index.endswith('.html'):
+             index = args.index.split(os.path.sep)[-1]
+             for ext in self._extensions:
+                 if index.endswith(ext):
+                     index = index[:-len(ext)]
+             if f'/{index}' in applications:
+                 applications['/'] = applications[f'/{index}']
+         return super().customize_applications(args, applications)
+-    def warm_applications(self, applications, reuse_sessions, error=True, initialize_session=True, index=None):
++    def warm_applications(self, applications, reuse_sessions, error=True, initialize_session=True):
+         from ..io.session import generate_session
+         for path, app in applications.items():
+             try:
+                 session = generate_session(app, initialize=initialize_session)
+             except Exception as e:
+                 if error:
+                     raise e
+                 else:
+                     continue
+             with set_curdoc(session.document):
+                 if config.session_key_func:
+                     reuse_sessions = False
+                 else:
+                     state._session_key_funcs[path] = lambda r: r.path
+                     state._sessions[path] = session
+-                    if index and index.endswith('.py'):
+-                        index_path, _ = os.path.splitext(os.path.basename(index))
+-                        if path == f'/{index_path}':
+-                            state._sessions['/'] = session
+                     session.block_expiration()
+                 state._on_load(None)
+             _cleanup_doc(session.document, destroy=not reuse_sessions)
+     def customize_kwargs(self, args, server_kwargs):
+         '''Allows subclasses to customize ``server_kwargs``.
+         Should modify and return a copy of the ``server_kwargs`` dictionary.
+         '''
+         kwargs = dict(server_kwargs)
+         if 'index' not in kwargs:
+             kwargs['index'] = INDEX_HTML
+@@ -409,24 +402,24 @@
+             else:
+                 state._setup_file_callback = None
+                 setup_file()
+         if args.warm or config.autoreload:
+             argvs = {f: args.args for f in files}
+             applications = build_single_handler_applications(files, argvs)
+             initialize_session = not (args.num_procs != 1 and sys.version_info < (3, 12))
+             if config.autoreload:
+                 with record_modules(list(applications.values())):
+                     self.warm_applications(
+-                        applications, args.reuse_sessions, error=False, initialize_session=initialize_session, index=kwargs['index']
++                        applications, args.reuse_sessions, error=False, initialize_session=initialize_session
+                     )
+             else:
+-                self.warm_applications(applications, args.reuse_sessions, initialize_session=initialize_session, index=kwargs['index'])
++                self.warm_applications(applications, args.reuse_sessions, initialize_session=initialize_session)
+         if args.dev:
+             del server_kwargs['autoreload']
+         if args.liveness:
+             argvs = {f: args.args for f in files}
+             applications = build_single_handler_applications(files, argvs)
+             patterns += [(rf"/{args.liveness_endpoint}", LivenessHandler, dict(applications=applications))]
+         config.profiler = args.profiler
+         if args.admin:
+             from ..io.admin import admin_panel
+             from ..io.server import per_app_patterns
+
+--- a/panel/config.py
++++ b/panel/config.py
+@@ -129,29 +129,27 @@
+     loading_max_height = param.Integer(default=400, doc="""
+         Maximum height of the loading indicator.""")
+     notifications = param.Boolean(default=False, doc="""
+         Whether to enable notifications functionality.""")
+     profiler = param.Selector(default=None, allow_None=True, objects=[
+         'pyinstrument', 'snakeviz', 'memray'], doc="""
+         The profiler engine to enable.""")
+     ready_notification = param.String(doc="""
+         The notification to display when the application is ready and
+         fully loaded.""")
+-    reuse_sessions = param.Selector(default=False, objects=[True, False, 'warm'], doc="""
++    reuse_sessions = param.Boolean(default=False, doc="""
+         Whether to reuse a session for the initial request to speed up
+         the initial page render. Note that if the initial page differs
+         between sessions, e.g. because it uses query parameters to modify
+         the rendered content, then this option will result in the wrong
+         content being rendered. Define a session_key_func to ensure that
+-        reused sessions are only reused when appropriate. If set to 'warm'
+-        session reuse is enabled and the session is warmed up as soon as
+-        the initial request arrives.""")
++        reused sessions are only reused when appropriate.""")
+     session_key_func = param.Callable(default=None, doc="""
+         Used in conjunction with the reuse_sessions option, the
+         session_key_func is given a tornado.httputil.HTTPServerRequest
+         and should return a key that uniquely captures a session.""")
+     safe_embed = param.Boolean(default=False, doc="""
+         Ensure all bokeh property changes trigger events which are
+         embedded. Useful when only partial updates are made in an
+         app, e.g. when working with HoloViews.""")
+     session_history = param.Integer(default=0, bounds=(-1, None), doc="""
+         If set to a non-negative value this determines the maximum length
+
+--- a/panel/custom.py
++++ b/panel/custom.py
+@@ -11,21 +11,20 @@
+ from collections.abc import Callable, Mapping
+ from functools import partial
+ from typing import (
+     TYPE_CHECKING, Any, ClassVar, Literal,
+ )
+ import param
+ from param.parameterized import ParameterizedMetaclass
+ from .config import config
+ from .io.datamodel import construct_data_model
+ from .io.document import freeze_doc, hold
+-from .io.model import apply_changes_without_dispatch
+ from .io.resources import component_resource_path
+ from .io.state import state
+ from .layout.base import Panel
+ from .models import (
+     AnyWidgetComponent as _BkAnyWidgetComponent,
+     ReactComponent as _BkReactComponent, ReactiveESM as _BkReactiveESM,
+ )
+ from .models.esm import DataEvent, ESMEvent
+ from .models.reactive_html import DOMEvent
+ from .pane.base import PaneBase  # noqa
+@@ -364,32 +363,29 @@
+     def _get_properties(self, doc: Document | None) -> dict[str, Any]:
+         props = super()._get_properties(doc)
+         cls = type(self)
+         data_params = {}
+         ignored = [
+             p for p in Reactive.param
+             if not issubclass(cls.param[p].owner, ReactiveESM) or
+             (p in Viewable.param and p not in ('name', 'use_shadow_dom')
+              and type(Reactive.param[p]) is type(cls.param[p]))
+         ]
+-        events = []
+         for k, v in self.param.values().items():
+             p = self.param[k]
+             if is_viewable_param(p) or type(self)._property_mapping.get(k, "") is None:
+                 props.pop(k, None)
+                 continue
+             elif (k in ignored and k != 'name') or ((p.precedence or 0) < 0):
+                 continue
+             if k in props:
+                 props.pop(k)
+-            if isinstance(p, param.Event):
+-                events.append(k)
+             data_params[k] = v
+         bundle_path = self._bundle_path
+         importmap = self._process_importmap()
+         is_session = False
+         css_bundle = None
+         if bundle_path:
+             is_session = bool(doc and doc.session_context and doc.session_context.server_context)
+             if bundle_path == self._esm_path(not config.autoreload) and cls.__module__ in sys.modules and is_session:
+                 bundle_hash = 'url'
+                 if self._bundle_css:
+@@ -401,21 +397,20 @@
+             bundle_hash = None
+         data_props = self._process_param_change(data_params)
+         data_props['esm_constants'] = self._constants
+         props.update({
+             'bundle': bundle_hash,
+             'css_bundle': css_bundle,
+             'class_name': cls.__name__,
+             'data': self._data_model(**{p: v for p, v in data_props.items() if p not in ignored}),
+             'dev': config.autoreload or getattr(self, '_debug', False),
+             'esm': self._render_esm(not config.autoreload, server=is_session),
+-            'events': events,
+             'importmap': importmap,
+             'name': cls.__name__
+         })
+         return props
+     @classmethod
+     def _process_importmap(cls):
+         return cls._importmap
+     def _get_child_model(
+         self, child: Viewable, doc: Document, root: Model, parent: Model, comm: Comm | None
+     ) -> tuple[list[UIElement] | UIElement | None, list[UIElement]]:
+@@ -484,30 +479,28 @@
+         elif not isinstance(event, DOMEvent):
+             return
+         if hasattr(self, f'_handle_{event.node}'):
+             getattr(self, f'_handle_{event.node}')(event)
+         for cb in self._event__callbacks.get(event.node, []):
+             state.execute(partial(cb, event), schedule=False)
+     def _update_model(
+         self, events: dict[str, param.parameterized.Event], msg: dict[str, Any],
+         root: Model, model: Model, doc: Document, comm: Comm | None
+     ) -> None:
+-        model_msg, data_msg, data_resets  = {}, {}, {}
++        model_msg, data_msg  = {}, {}
+         for prop, v in list(msg.items()):
+             if prop in list(Reactive.param)+['esm', 'importmap']:
+                 model_msg[prop] = v
+             elif prop in model.children:
+                 continue
+             else:
+                 data_msg[prop] = v
+-                if prop in self.param and isinstance(self.param[prop], param.Event) and v:
+-                    data_resets[prop] = False
+         for name, event in events.items():
+             if name not in model.children:
+                 continue
+             new = event.new
+             old_objects = event.old if isinstance(event.old, list) else [event.old]
+             for old in old_objects:
+                 if old is None or old is new or (isinstance(new, list) and old in new):
+                     continue
+                 old._cleanup(root)
+         update_children = any(e in model.children for e in events)
+@@ -516,35 +509,31 @@
+             data_msg.update(children)
+             model_msg['children'] = list(children)
+         ref = root.ref['id']
+         prev_changing = self._changing.get(ref, [])
+         try:
+             update = Panel._batch_update
+             Panel._batch_update = True
+             with hold(doc):
+                 changing = []
+                 with freeze_doc(doc, model, msg, force=update_children):
+-                    if model_msg:
+-                        changing += self._set_on_model(model_msg, root, model)
+-                    if data_msg:
+-                        changing += self._set_on_model(data_msg, root, model.data)
++                    changing += self._set_on_model(model_msg, root, model)
++                    changing += self._set_on_model(data_msg, root, model.data)
+                     if update and update_children and ref in state._views:
+                         state._views[ref][0]._preprocess(root, self, old_children)
+                 self._changing[ref] = changing
+         finally:
+             Panel._batch_update = update
+             if prev_changing:
+                 self._changing[ref] = prev_changing
+             elif ref in self._changing:
+                 del self._changing[ref]
+-        if data_resets:
+-            apply_changes_without_dispatch(doc, model.data, data_resets)
+     def _handle_msg(self, data: Any) -> None:
+         """
+         Message handler for messages sent from the frontend using the
+         `model.send_msg` API.
+         Parameters
+         ----------
+         data: any
+             Data received from the frontend.
+         """
+     def _send_msg(self, data: Any) -> None:
+
+--- a/panel/io/document.py
++++ b/panel/io/document.py
+@@ -69,24 +69,22 @@
+     unlocked decorator.
+     """
+     for event in events:
+         doc.callbacks.trigger_on_change(event)
+ def _cleanup_doc(doc, destroy=True):
+     for callback in doc.session_destroyed_callbacks:
+         try:
+             callback(None)
+         except Exception:
+             pass
+-    if not destroy:
+-        doc.callbacks._change_callbacks.clear()
+-    elif None not in doc.callbacks._change_callbacks:
+-        doc.callbacks._change_callbacks[None] = lambda e: e
++    if hasattr(doc.callbacks, '_change_callbacks'):
++        doc.callbacks._change_callbacks[None] = {}
+     from ..viewable import Viewable
+     views = {}
+     for ref, (pane, root, vdoc, comm) in list(state._views.items()):
+         if vdoc is doc:
+             pane._cleanup(root)
+             if isinstance(pane, Viewable):
+                 pane._hooks = []
+                 for p in pane.select():
+                     p._hooks = []
+                     p.param.watchers = {}
+
+--- a/panel/io/model.py
++++ b/panel/io/model.py
+@@ -135,34 +135,20 @@
+         props.append(f'{k}={v}')
+     props_repr = ', '.join(props)
+     if isinstance(obj, FlexBox):
+         r += f'{cls}(children=[\n'
+         for child_obj in obj.children: # type: ignore
+             r += textwrap.indent(bokeh_repr(child_obj, depth=depth+1) + ',\n', '  ')
+         r += f'], {props_repr})'
+     else:
+         r += f'{cls}({props_repr})'
+     return r
+-def apply_changes_without_dispatch(doc, model, changes):
+-    hold_value = doc.callbacks.hold_value
+-    doc.callbacks._hold = 'collect'
+-    try:
+-        model.update(**changes)
+-    finally:
+-        doc.callbacks._held_events = [
+-            e for e in doc.callbacks._held_events
+-            if not isinstance(e, ModelChangedEvent) or
+-            e.model is not model or
+-            e.attr not in changes or
+-            e.new is not changes[e.attr]
+-        ]
+-        doc.callbacks._hold = hold_value
+ @contextmanager
+ def hold(doc: Document | None = None, policy: HoldPolicyType = 'combine', comm: Comm | None = None):
+     """
+     Context manager that holds events on a particular Document
+     allowing them all to be collected and dispatched when the context
+     manager exits. This allows multiple events on the same object to
+     be combined if the policy is set to 'combine'.
+     Parameters
+     ----------
+     doc: Document
+
+--- a/panel/io/pyodide.py
++++ b/panel/io/pyodide.py
+@@ -1,18 +1,17 @@
+ from __future__ import annotations
+ import asyncio
+ import functools
+ import io
+ import json
+ import os
+ import sys
+-import time
+ import uuid
+ from collections.abc import Callable
+ from typing import TYPE_CHECKING, Any
+ import bokeh
+ import js
+ import param
+ import pyodide # isort: split
+ from bokeh import __version__
+ from bokeh.core.serialization import Buffer, Serialized, Serializer
+ from bokeh.document import Document
+@@ -63,22 +62,20 @@
+     os.environ['MPLBACKEND'] = 'agg'
+ try:
+     import pyodide_http
+     pyodide_http.patch_all()
+ except Exception:
+     pyodide_http = None
+ try:
+     import fsspec.implementations.http_sync  # noqa
+ except Exception:
+     pass
+-DEBOUNCE = 50
+-TIMEOUT = 500
+ if 'pyolite' in sys.modules and os.path.exists('/drive/assets/sampledata'):
+     def _sampledata_dir(create=None):
+         return '/drive/assets/sampledata'
+     bokeh.util.sampledata.external_data_dir = _sampledata_dir
+ if pyodide_http is None:
+     import pandas
+     def _read_file(*args, **kwargs):
+         if args and isurl(args[0]):
+             args = (pyodide.http.open_url(args[0]),)+args[1:]
+         elif isurl(kwargs.get('filepath_or_buffer')):
+@@ -231,65 +228,39 @@
+         Buffer(id=uid, data=value['buffer'].to_bytes())
+     )
+     return {'id': uid}
+ def _convert_json_patch(json_patch):
+     try:
+         patch = json_patch.to_py(default_converter=_bytes_converter)
+         serialized = Serialized(content=patch, buffers=list(_current_buffers))
+     finally:
+         _current_buffers.clear()
+     return serialized
+-_proxies = []
+ def _link_docs(pydoc: Document, jsdoc: Any) -> None:
+     """
+     Links Python and JS documents in Pyodide ensuring that messages
+     are passed between them.
+     Parameters
+     ----------
+     pydoc: bokeh.document.Document
+         The Python Bokeh Document instance to sync.
+     jsdoc: Javascript Document
+         The Javascript Bokeh Document instance to sync.
+     """
+-    event_buffer: list[Any] = []
+-    blocked: list[float] = []
+-    def jssync(event, debounce=DEBOUNCE, timeout=TIMEOUT, append=True):
++    def jssync(event):
+         setter_id = getattr(event, 'setter_id', None)
+         if (setter_id is not None and setter_id == 'python') or _patching:
+             return
+-        if event.kind == "ModelChanged":
+-            if append:
+-                event_buffer.append(event)
+-            else:
+-                blocked.clear()
+-            now = time.monotonic()
+-            if blocked and now < blocked[0]:
+-                sync_proxy = pyodide.ffi.create_proxy(
+-                    lambda: jssync_proxy(event, debounce, timeout, append=False)
+-                )
+-                _proxies.append(sync_proxy)
+-                js.setTimeout(
+-                    sync_proxy,
+-                    debounce
+-                )
+-                return
+-            events = event_buffer
+-            blocked.append(now+TIMEOUT/1000)
+-        else:
+-            events = [event]
+-        json_patch = jsdoc.create_json_patch(pyodide.ffi.to_js(events))
+-        events.clear()
++        json_patch = jsdoc.create_json_patch(pyodide.ffi.to_js([event]))
+         patch = _convert_json_patch(json_patch)
+         pydoc.apply_json_patch(patch, setter='js')
+-    jssync_proxy = pyodide.ffi.create_proxy(jssync)
+-    _proxies.append(jssync_proxy)
+-    jsdoc.on_change(jssync_proxy, pyodide.ffi.to_js(False))
++    jsdoc.on_change(pyodide.ffi.create_proxy(jssync), pyodide.ffi.to_js(False))
+     def pysync(event):
+         global _patching
+         setter = getattr(event, 'setter', None)
+         if setter is not None and setter == 'js':
+             return
+         json_patch, buffer_map = _process_document_events(pydoc, [event])
+         json_patch = pyodide.ffi.to_js(json_patch, dict_converter=_dict_converter)
+         buffer_map = pyodide.ffi.to_js(buffer_map)
+         _patching = True
+         try:
+
+--- a/panel/io/resources.py
++++ b/panel/io/resources.py
+@@ -238,24 +238,21 @@
+     component_path = COMPONENT_PATH
+     if state.rel_path:
+         component_path = f"{state.rel_path}/{component_path}"
+     custom_path = resolve_custom_path(component, path, relative=True)
+     if custom_path:
+         rel_path = os.fspath(custom_path).replace(os.path.sep, '/')
+     else:
+         rel_path = path
+     return f'{component_path}{component.__module__}/{component.__name__}/{attr}/{rel_path}'
+ def patch_stylesheet(stylesheet, dist_url):
+-    try:
+-        url = stylesheet.url
+-    except Exception:
+-        return
++    url = stylesheet.url
+     if url.startswith(CDN_DIST+dist_url) and dist_url != CDN_DIST:
+         patched_url = url.replace(CDN_DIST+dist_url, dist_url)
+     elif url.startswith(CDN_DIST) and dist_url != CDN_DIST:
+         patched_url = url.replace(CDN_DIST, dist_url)
+     elif url.startswith(LOCAL_DIST) and dist_url.lstrip('./').startswith(LOCAL_DIST):
+         patched_url = url.replace(LOCAL_DIST, dist_url)
+     else:
+         return
+     version_suffix = f'?v={JS_VERSION}'
+     if not patched_url.endswith(version_suffix):
+
+--- a/panel/io/server.py
++++ b/panel/io/server.py
+@@ -417,39 +417,30 @@
+                 return
+         app = self.application
+         key_func = state._session_key_funcs.get(self.request.path, lambda r: r.path)
+         old_request = key_func(self.request) in state._sessions
+         session = await self.get_session()
+         if old_request and state._sessions.get(key_func(self.request)) is session:
+             session_id = generate_session_id(
+                 secret_key=self.application.secret_key,
+                 signed=self.application.sign_sessions
+             )
+-            extra_payload = get_token_payload(session.token)
+-            extra_payload.update(payload)
+-            del extra_payload['session_expiry']
++            payload = get_token_payload(session.token)
++            payload.update(payload)
++            del payload['session_expiry']
+             token = generate_jwt_token(
+                 session_id,
+                 secret_key=app.secret_key,
+                 signed=app.sign_sessions,
+                 expiration=app.session_token_expiration,
+-                extra_payload=extra_payload
++                extra_payload=payload
+             )
+-            if config.reuse_sessions == 'warm':
+-                state.execute(
+-                    partial(
+-                        self.application_context.create_session_if_needed,
+-                        session_id,
+-                        self.request,
+-                        token
+-                    )
+-                )
+         else:
+             token = session.token
+         logger.info(LOG_SESSION_CREATED, id(session.document))
+         with set_curdoc(session.document):
+             resources = Resources.from_bokeh(self.application.resources())
+             authorized, auth_error = self._authorize(session=True)
+             if authorized:
+                 page = server_html_page_for_session(
+                     session, resources=resources, title=session.document.title,
+                     token=token, template=session.document.template,
+
+--- a/panel/models/esm.py
++++ b/panel/models/esm.py
+@@ -17,21 +17,20 @@
+ class ESMEvent(DataEvent):
+     event_name = 'esm_event'
+ class ReactiveESM(HTMLBox):
+     css_bundle = bp.Nullable(bp.String)
+     bundle = bp.Nullable(bp.String)
+     class_name = bp.String()
+     children = bp.List(bp.String)
+     data = bp.Instance(DataModel)
+     dev = bp.Bool(False)
+     esm = bp.String()
+-    events = bp.List(bp.String)
+     importmap = bp.Dict(bp.String, bp.Dict(bp.String, bp.String))
+     __javascript_raw__ = [
+         f"{config.npm_cdn}/es-module-shims@^1.10.0/dist/es-module-shims.min.js"
+     ]
+     @classproperty
+     def __javascript__(cls):
+         return bundled_files(cls)
+ class ReactComponent(ReactiveESM):
+     """
+     Renders jsx/tsx based ESM bundles using React.
+
+--- a/panel/models/jsoneditor.ts
++++ b/panel/models/jsoneditor.ts
+@@ -20,21 +20,21 @@
+   editor: any
+   _menu_context: any
+   override connect_signals(): void {
+     super.connect_signals()
+     const {data, disabled, templates, menu, mode, search, schema} = this.model.properties
+     this.on_change([data], () => this.editor.update(this.model.data))
+     this.on_change([templates], () => {
+       this.editor.options.templates = this.model.templates
+     })
+     this.on_change([menu], () => {
+-      this.editor.options.mainMenuBar = this.model.menu
++      this.editor.options.menu = this.model.menu
+     })
+     this.on_change([search], () => {
+       this.editor.options.search = this.model.search
+     })
+     this.on_change([schema], () => {
+       this.editor.options.schema = this.model.schema
+     })
+     this.on_change([disabled, mode], () => {
+       const mode = this.model.disabled ? "view": this.model.mode
+       this.editor.setMode(mode)
+@@ -48,28 +48,28 @@
+     return styles
+   }
+   override remove(): void {
+     super.remove()
+     this.editor.destroy()
+   }
+   override render(): void {
+     super.render()
+     const mode = this.model.disabled ? "view": this.model.mode
+     this.editor = new (window as any).JSONEditor(this.shadow_el, {
+-      mainMenuBar: this.model.menu,
++      menu: this.model.menu,
+       mode,
+       onChangeJSON: (json: any) => {
+-        this.model.trigger_event(new JSONEditEvent(json))
++        this.model.data = json
+       },
+       onChangeText: (text: any) => {
+         try {
+-          this.model.trigger_event(new JSONEditEvent(JSON.parse(text)))
++          this.model.data = JSON.parse(text)
+         } catch (e) {
+           console.warn(e)
+         }
+       },
+       onSelectionChange: (start: any, end: any) => {
+         this.model.selection = [start, end]
+       },
+       search: this.model.search,
+       schema: this.model.schema,
+       templates: this.model.templates,
+
+--- a/panel/models/modal.ts
++++ b/panel/models/modal.ts
+@@ -93,21 +93,21 @@
+     dialog.append(content)
+     content.append(this.close_button)
+     this.shadow_el.append(dialog)
+     let first_open = false
+     this.modal = new A11yDialog(dialog)
+     this.update_close_button()
+     this.modal.on("show", () => {
+       this.model.open = true
+       dialog.style.display = ""
+       if (!first_open) {
+-        requestAnimationFrame(() => { this.invalidate_layout(); dialog.focus() })
++        requestAnimationFrame(() => { this.invalidate_layout() })
+         first_open = true
+       }
+     })
+     this.modal.on("hide", () => {
+       this.model.open = false
+       dialog.style.display = "none"
+     })
+     if (this.model.open) { this.modal.show() }
+   }
+   update_close_button(): void {
+
+--- a/panel/models/player.ts
++++ b/panel/models/player.ts
+@@ -257,21 +257,20 @@
+     this.loop_state.appendChild(reflect_label)
+     this.groupEl.appendChild(this.titleEl)
+     this.groupEl.appendChild(this.sliderEl)
+     this.groupEl.appendChild(button_div)
+     if (this.model.show_loop_controls) {
+       this.groupEl.appendChild(this.loop_state)
+     }
+     this.toggle_disable()
+     this.update_css()
+     this.shadow_el.appendChild(this.groupEl)
+-    this.set_direction()
+   }
+   set_frame(frame: number, throttled: boolean = true): void {
+     this.model.value = frame
+     this.update_title_and_value()
+     if (throttled) {
+       this.model.value_throttled = frame
+     }
+     if (this.sliderEl.value != String(frame)) {
+       this.sliderEl.value = String(frame)
+     }
+
+--- a/panel/models/react_component.ts
++++ b/panel/models/react_component.ts
+@@ -360,34 +360,26 @@
+             targetModel = null
+             break
+           }
+         }
+         if (targetModel && targetModel.attributes && propPath[propPath.length - 1] in targetModel.attributes) {
+           resolvedProp = propPath[propPath.length - 1]
+         }
+         if (resolvedProp && targetModel) {
+           const [value, setValue] = React.useState(targetModel.attributes[resolvedProp])
+           React.useEffect(() => {
+-            const cb = () => {
+-              if (target.model.events.includes(resolvedProp)) {
+-                targetModel.attributes[resolvedProp] && (setValue((v) => v+1) || targetModel.setv({[resolvedProp]: false}))
+-              } else {
+-                setValue(targetModel.attributes[resolvedProp])
+-              }
+-            }
+-            react_proxy.on(prop, cb, true)
++            const cb = () => setValue(targetModel.attributes[resolvedProp])
++            react_proxy.on(prop, cb)
+             return () => react_proxy.off(prop, cb)
+           }, [])
+           React.useEffect(() => {
+-            if (!target.model.events.includes(resolvedProp)) {
+-              targetModel.setv({ [resolvedProp]: value })
+-            }
++            targetModel.setv({ [resolvedProp]: value })
+           }, [value])
+           return [value, setValue]
+         }
+         throw ReferenceError("Could not resolve " + prop + " on " + target.model.class_name)
+       }
+     } else if (name === "get_child") {
+       return (child) => {
+         const data_model = target.model.data
+         const value = data_model.attributes[child]
+         if (Array.isArray(value)) {
+
+--- a/panel/models/reactive_esm.ts
++++ b/panel/models/reactive_esm.ts
+@@ -85,28 +85,28 @@
+           const handlers = target._lifecycle_handlers.get(p)
+           if (handlers && handlers.includes(callback)) {
+             target._lifecycle_handlers.set(p, handlers.filter(v => v !== callback))
+           }
+           continue
+         }
+         console.warn(`Could not unregister callback for event type '${p}'`)
+       }
+     }
+   } else if (name === "on") {
+-    return (prop: string | string[], callback: any, force: boolean = false) => {
++    return (prop: string | string[], callback: any) => {
+       const props = isArray(prop) ? prop : [prop]
+       for (let p of props) {
+         if (p.startsWith("change:")) {
+           p = p.slice("change:".length)
+         }
+         if (p in model.attributes || p.split(".")[0] in model.data.attributes) {
+-          model.watch(target, p, callback, force)
++          model.watch(target, p, callback)
+           continue
+         } else if (p === "msg:custom") {
+           target.on_event(callback)
+           continue
+         }
+         if (p.startsWith("lifecycle:")) {
+           p = p.slice("lifecycle:".length)
+         }
+         if (target._lifecycle_handlers.has(p)) {
+           (target._lifecycle_handlers.get(p) || []).push(callback)
+@@ -488,82 +488,70 @@
+ export namespace ReactiveESM {
+   export type Attrs = p.AttrsOf<Props>
+   export type Props = HTMLBox.Props & {
+     css_bundle: p.Property<string | null>
+     bundle: p.Property<string | null>
+     children: p.Property<any>
+     class_name: p.Property<string>
+     data: p.Property<any>
+     dev: p.Property<boolean>
+     esm: p.Property<string>
+-    events: p.Property<string[]>
+     importmap: p.Property<any>
+   }
+ }
+ export interface ReactiveESM extends ReactiveESM.Attrs {}
+ export class ReactiveESM extends HTMLBox {
+   declare properties: ReactiveESM.Props
+   compiled: string | null = null
+   compiled_module: Promise<any> | null = null
+   compile_error: Error | null = null
+   model_proxy: any
+   render_module: Promise<any> | null = null
+   sucrase_transforms: Transform[] = ["typescript"]
+   _destroyer: any | null = null
+   _esm_watchers: any = {}
+-  _event_callbacks: Map<(data: unknown) => void, (data: unknown) => void> = new Map()
+   constructor(attrs?: Partial<ReactiveESM.Attrs>) {
+     super(attrs)
+   }
+   override initialize(): void {
+     super.initialize()
+     this.model_proxy = new Proxy(this, {
+       get: init_model_getter,
+       set: init_model_setter,
+     })
+     this.recompile()
+   }
+   override connect_signals(): void {
+     super.connect_signals()
+     this.connect(this.properties.esm.change, () => this.recompile())
+     this.connect(this.properties.importmap.change, () => this.recompile())
+   }
+-  watch(view: ReactiveESMView | null, prop: string, cb: any, force: boolean = false): void {
++  watch(view: ReactiveESMView | null, prop: string, cb: any): void {
+     if (prop in this._esm_watchers) {
+       this._esm_watchers[prop].push([view, cb])
+     } else {
+       this._esm_watchers[prop] = [[view, cb]]
+     }
+     const propPath = prop.split(".")
+     let target: any = this.data
+     let resolvedProp: string | null = null
+     for (let i = 0; i < propPath.length - 1; i++) {
+       if (target && target.properties && propPath[i] in target.properties) {
+         target = target[propPath[i]]
+       } else {
+         target = null
+         break
+       }
+     }
+     if (target && target.properties && propPath[propPath.length - 1] in target.properties) {
+       resolvedProp = propPath[propPath.length - 1]
+     }
+-    if (!force && target === this.data && resolvedProp && this.events.includes(resolvedProp)) {
+-      const orig_cb = cb
+-      cb = () => {
+-        if (resolvedProp && this.data[resolvedProp]) {
+-          orig_cb()
+-          this.data.setv({[resolvedProp]: false})
+-        }
+-      }
+-      this._event_callbacks.set(orig_cb, cb)
+-    }
+     if (resolvedProp && target) {
+       target.property(resolvedProp).change.connect(cb)
+     } else if (prop in this.properties) {
+       this.property(prop).change.connect(cb)
+     }
+   }
+   unwatch(view: ReactiveESMView | null, prop: string, cb: any): boolean {
+     if (!(prop in this._esm_watchers)) {
+       return false
+     }
+@@ -584,24 +572,20 @@
+     for (let i = 0; i < propPath.length - 1; i++) {
+       if (target && target.properties && propPath[i] in target.properties) {
+         target = target[propPath[i]]
+       } else {
+         target = null
+         break
+       }
+     }
+     if (target && target.properties && propPath[propPath.length - 1] in target.properties) {
+       resolvedProp = propPath[propPath.length - 1]
+-    }
+-    if (this._event_callbacks.has(cb)) {
+-      cb = this._event_callbacks.get(cb)
+-      this._event_callbacks.delete(cb)
+     }
+     if (resolvedProp && target) {
+       return target.property(resolvedProp).change.disconnect(cb)
+     } else if (prop in this.properties) {
+       return this.property(prop).change.disconnect(cb)
+     }
+     return false
+   }
+   disconnect_watchers(view: ReactiveESMView): void {
+     for (const p in this._esm_watchers) {
+@@ -767,15 +751,14 @@
+   static {
+     this.prototype.default_view = ReactiveESMView
+     this.define<ReactiveESM.Props>(({Any, Array, Bool, Nullable, Str}) => ({
+       css_bundle:  [ Nullable(Str),     null ],
+       bundle:      [ Nullable(Str),     null ],
+       children:    [ Array(Str),          [] ],
+       class_name:  [ Str,                 "" ],
+       data:        [ Any                     ],
+       dev:         [ Bool,             false ],
+       esm:         [ Str,                 "" ],
+-      events:      [ Array(Str),          [] ],
+       importmap:   [ Any,                 {} ],
+     }))
+   }
+ }
+
+--- a/panel/pane/base.py
++++ b/panel/pane/base.py
+@@ -464,21 +464,21 @@
+         params['object'] = self.object
+         return params
+     def _transform_object(self, obj: Any) -> dict[str, Any]:
+         return dict(object=obj)
+     def _process_param_change(self, params):
+         if 'object' in params:
+             params.update(self._transform_object(params.pop('object')))
+         if self._bokeh_model is not None and 'stylesheets' in params:
+             css = getattr(self._bokeh_model, '__css__', [])
+             params['stylesheets'] = [
+-                ImportedStyleSheet(url=ss) for ss in css if ss
++                ImportedStyleSheet(url=ss) for ss in css
+             ] + params['stylesheets']
+         return super()._process_param_change(params)
+ class ReplacementPane(Pane):
+     """
+     ReplacementPane provides a baseclass for dynamic components that
+     may have to dynamically update or switch out their contents, e.g.
+     a dynamic callback that may return different objects to be rendered.
+     When the pane updates it either entirely replaces the underlying
+     `bokeh.model.Model`, by creating an internal layout to replace the
+     children on, or updates the existing model in place.
+
+--- a/panel/pane/holoviews.py
++++ b/panel/pane/holoviews.py
+@@ -109,32 +109,25 @@
+         self._restore_plot = None
+         super().__init__(object, **params)
+         self.widget_box = self.widget_layout()
+         self._widget_container = []
+         self._plots = {}
+         self._syncing_props = False
+         self._overrides = [
+             p for p, v in params.items()
+             if p in Layoutable.param and v != self.param[p].default
+         ]
+-        sync_params = [p for p in Layoutable.param if p != 'name' and p not in self._skip_layoutable]
+-        self._internal_callbacks.extend([
+-            self.param.watch(self._update_widgets, self._rerender_params),
+-            self.param.watch(self._sync_viewable_param, sync_params)
+-        ])
++        watcher = self.param.watch(self._update_widgets, self._rerender_params)
++        self._internal_callbacks.append(watcher)
+         self._update_responsive()
+         self._update_widgets()
+         self._initialized = True
+-    def _sync_viewable_param(self, *events):
+-        params = {e.name: e.new for e in events}
+-        for _, pane in self._plots.values():
+-            pane.param.update(params)
+     def _param_change(self, *events: param.parameterized.Event) -> None:
+         if self._object_changing:
+             return
+         self._track_overrides(*(e for e in events if e.name in Layoutable.param))
+         super()._param_change(*(e for e in events if e.name in self._overrides+['css_classes']))
+     @param.depends('backend', watch=True, on_init=True)
+     def _load_backend(self):
+         from holoviews import Store, extension
+         if self.backend and self.backend not in Store.renderers:
+             ext = extension._backends[self.backend]
+
+--- a/panel/pane/plot.py
++++ b/panel/pane/plot.py
+@@ -67,21 +67,21 @@
+     }
+     def __init__(self, object=None, **params):
+         super().__init__(object, **params)
+         self._syncing_props = False
+         self._overrides = [
+             p for p, v in params.items()
+             if p in Layoutable.param and v != self.param[p].default
+         ]
+     def _param_change(self, *events: param.parameterized.Event) -> None:
+         self._track_overrides(*(e for e in events if e.name in Layoutable.param))
+-        super()._param_change(*(e for e in events if e.name in self._overrides+['css_classes', 'visible']))
++        super()._param_change(*(e for e in events if e.name in self._overrides+['css_classes']))
+     @classmethod
+     def applies(cls, obj: Any) -> float | bool | None:
+         return isinstance(obj, LayoutDOM)
+     @classmethod
+     def _property_callback_wrapper(cls, cb, doc, comm, callbacks):
+         def wrapped_callback(attr, old, new):
+             with _wrap_callback(cb, wrapped_callback, doc, comm, callbacks):
+                 cb(attr, old, new)
+         return wrapped_callback
+     @classmethod
+
+--- a/panel/param.py
++++ b/panel/param.py
+@@ -20,23 +20,22 @@
+ from typing import TYPE_CHECKING, Any, ClassVar
+ import param
+ try:
+     from param import Skip
+ except Exception:
+     class Skip(Exception):  # type: ignore
+         """
+         Exception that allows skipping an update for function-level updates.
+         """
+ from param.parameterized import (
+-    Undefined, bothmethod, classlist, discard_events, edit_constant,
+-    eval_function_with_deps, get_method_owner, iscoroutinefunction,
+-    resolve_ref, resolve_value,
++    Undefined, bothmethod, classlist, discard_events, eval_function_with_deps,
++    get_method_owner, iscoroutinefunction, resolve_ref, resolve_value,
+ )
+ from param.reactive import rx
+ from .config import config
+ from .io import state
+ from .layout import (
+     Column, HSpacer, ListLike, Panel, Row, Spacer, Tabs, WidgetBox,
+ )
+ from .pane import DataFrame as DataFramePane
+ from .pane.base import Pane, ReplacementPane
+ from .reactive import Reactive
+@@ -514,46 +513,47 @@
+                 if supports_bounds:
+                     updates['start'] = start
+                     updates['end'] = end
+                 if rerender and is_instance:
+                     self_or_cls._rerender_widget(p_name)
+                     return
+             elif change.what == 'step':
+                 updates['step'] = p_obj.step
+             elif change.what == 'label':
+                 updates['name'] = p_obj.label
+-            elif p_key in updating or isinstance(p_obj, param.Event):
++            elif p_key in updating:
++                return
++            elif hasattr(param, 'Event') and isinstance(p_obj, param.Event):
+                 return
+             elif isinstance(p_obj, param.Action):
+                 prev_watcher = watchers[0]
+                 widget.param.unwatch(prev_watcher)
+                 def action(event):
+                     change.new(parameterized)
+                 watchers[0] = widget.param.watch(action, 'clicks')
++                idx = self_or_cls._internal_callbacks.index(prev_watcher)
++                self_or_cls._internal_callbacks[idx] = watchers[0]
+                 return
+             elif throttled and hasattr(widget, 'value_throttled'):
+                 updates['value_throttled'] = change.new
+                 updates['value'] = change.new
+             elif isinstance(widget, Row) and len(widget) == 2:
+                 updates['value'] = change.new
+                 widget = widget[0]
+             else:
+                 updates['value'] = change.new
+             try:
+                 updating.append(p_key)
+                 if change.type == 'triggered':
+                     with discard_events(widget):
+                         widget.param.update(**updates)
+                     widget.param.trigger(*updates)
+-                elif 'value_throttled' in updates:
+-                    with edit_constant(widget):
+-                        widget.param.update(**updates)
+                 else:
+                     widget.param.update(**updates)
+             finally:
+                 updating.remove(p_key)
+         watchers.append(parameterized.param.watch(link, p_name, 'constant'))
+         watchers.append(parameterized.param.watch(link, p_name, 'precedence'))
+         watchers.append(parameterized.param.watch(link, p_name, 'label'))
+         if hasattr(p_obj, 'get_range'):
+             watchers.append(parameterized.param.watch(link, p_name, 'objects'))
+         if hasattr(p_obj, 'get_soft_bounds'):
+
+--- a/panel/reactive.py
++++ b/panel/reactive.py
+@@ -161,22 +161,20 @@
+                 resolve_stylesheet(self, css_file, '_stylesheets')
+                 for css_file in self._stylesheets
+             ]
+             stylesheets += properties['stylesheets']
+             wrapped = []
+             if state.curdoc:
+                 css_cache = state._stylesheets.get(state.curdoc, {})
+             else:
+                 css_cache = {}
+             for stylesheet in stylesheets:
+-                if not stylesheet:
+-                    continue
+                 if isinstance(stylesheet, str) and (stylesheet.split('?')[0].endswith('.css') or stylesheet.startswith('http')):
+                     if stylesheet in css_cache:
+                         conv_stylesheet = css_cache[stylesheet]
+                     else:
+                         css_cache[stylesheet] = conv_stylesheet = ImportedStyleSheet(url=stylesheet)
+                     stylesheet = conv_stylesheet
+                 wrapped.append(stylesheet)
+             properties['stylesheets'] = wrapped
+         return properties
+     @property
+@@ -1361,21 +1359,21 @@
+     def _process_param_change(self, params):
+         props = super()._process_param_change(params)
+         if 'stylesheets' in params:
+             css = getattr(self, '__css__', []) or []
+             if state.rel_path:
+                 css = [
+                     ss if ss.startswith('http') else f'{state.rel_path}/{ss}'
+                     for ss in css
+                 ]
+             props['stylesheets'] = [
+-                ImportedStyleSheet(url=ss) for ss in css if ss
++                ImportedStyleSheet(url=ss) for ss in css
+             ] + props['stylesheets']
+         return props
+     @classmethod
+     def _patch_datamodel_ref(cls, props, ref):
+         """
+         Ensure all DataModels have reference to the root model to ensure
+         that they can be cleaned up correctly.
+         """
+         ref_str = f"__ref:{ref}"
+         for m in props.select({'type': DataModel}):
+@@ -1593,21 +1591,21 @@
+     def _process_param_change(self, params):
+         props = super()._process_param_change(params)
+         if 'stylesheets' in params:
+             css = getattr(self, '__css__', []) or []
+             if state.rel_path:
+                 css = [
+                     ss if ss.startswith('http') else f'{state.rel_path}/{ss}'
+                     for ss in css
+                 ]
+             props['stylesheets'] = [
+-                ImportedStyleSheet(url=ss) for ss in css if ss
++                ImportedStyleSheet(url=ss) for ss in css
+             ] + props['stylesheets']
+         return props
+     def _init_params(self) -> dict[str, Any]:
+         ignored = list(Reactive.param)
+         for child in self._parser.children.values():
+             if self._child_config.get(child) != 'literal':
+                 ignored.append(child)
+         params = {
+             p : getattr(self, p) for p in list(Layoutable.param)
+             if getattr(self, p) is not None and p != 'name'
+
+--- a/panel/widgets/base.py
++++ b/panel/widgets/base.py
+@@ -43,22 +43,20 @@
+         bi-directionally.
+         Parameters
+         ----------
+         parameter: param.Parameter
+           A parameter to create the widget from.
+         Returns
+         -------
+         Widget instance linked to the supplied parameter
+         """
+         from ..param import Param
+-        if not isinstance(parameter, param.Parameter):
+-            raise ValueError(f"{cls.__name__}.from_param only accepts Parameter types, provided value is of type {type(parameter)}.")
+         return Param.widget(parameter.name, parameter.owner, dict(type=cls, **params))
+     @classmethod
+     def _infer_params(cls, values, **params):
+         if 'name' not in params and getattr(values, 'name', None):
+             params['name'] = values.name
+         if 'start' in cls.param and 'start' not in params:
+             params['start'] = np.nanmin(values)
+         if 'end' in cls.param and 'end' not in params:
+             params['end'] = np.nanmax(values)
+         if 'options' in cls.param and 'options' not in params:
+
+--- a/panel/widgets/misc.py
++++ b/panel/widgets/misc.py
+@@ -263,15 +263,11 @@
+     value = param.Parameter(default={}, doc="""
+         JSON data to be edited.""")
+     _rename: ClassVar[Mapping[str, str | None]] = {
+         'name': None, 'value': 'data'
+     }
+     def _get_model(self, doc, root=None, parent=None, comm=None):
+         JSONEditor._widget_type = lazy_load(
+             "panel.models.jsoneditor", "JSONEditor", isinstance(comm, JupyterComm)
+         )
+         model = super()._get_model(doc, root, parent, comm)
+-        self._register_events('json_edit', model=model, doc=doc, comm=comm)
+         return model
+-    def _process_event(self, event) -> None:
+-        if event.event_name == 'json_edit':
+-            self.value  = event.data
+
+--- a/panel/widgets/select.py
++++ b/panel/widgets/select.py
+@@ -57,59 +57,57 @@
+         else:
+             return self.options
+     @property
+     def _items(self):
+         return dict(zip(self.labels, self.values))
+ class SingleSelectBase(SelectBase):
+     value = param.Parameter(default=None)
+     _allows_values: ClassVar[bool] = True
+     _allows_none: ClassVar[bool] = False
+     _supports_embed: bool = True
+-    _restrict: bool = True
+     __abstract = True
+     def __init__(self, **params):
+         super().__init__(**params)
+         values = self.values
+         if self.value is None and None not in values and values and not self._allows_none:
+             self.value = values[0]
+     def _process_param_change(self, msg):
+         msg = super()._process_param_change(msg)
+         labels, values = self.labels, self.values
+         unique = len(set(self.unicode_values)) == len(labels) and self._allows_values
+         if 'value' in msg:
+             val = msg['value']
+             if isIn(val, values):
+                 unicode_values = self.unicode_values if unique else labels
+                 msg['value'] = unicode_values[indexOf(val, values)]
+             elif values:
+                 self.value = self.param['value'].default if self._allows_none else self.values[0]
+                 if not self._allows_none:
+                     del msg['value']
+             else:
+-                if self._restrict:
+-                    self.value = self.param['value'].default
++                self.value = self.param['value'].default
+                 if self._allows_none:
+                     msg['value'] = self.value
+         option_prop = self._property_mapping.get('options', 'options')
+         is_list = isinstance(self.param['value'], param.List)
+         if option_prop in msg and not is_list:
+             if isinstance(self.options, dict):
+                 if unique and self._allows_values:
+                     options = [(v, l) for l,v in zip(labels, self.unicode_values)]
+                 else:
+                     options = labels
+                 msg[option_prop] = options
+             else:
+                 msg[option_prop] = self.unicode_values
+             val = self.value
+             if values:
+-                if not isIn(val, values) and self._restrict:
++                if not isIn(val, values):
+                     self.value = self.param['value'].default if self._allows_none else values[0]
+             else:
+                 self.value = self.param['value'].default
+         return msg
+     @property
+     def unicode_values(self):
+         return [str(v) for v in self.values]
+     def _process_property_change(self, msg):
+         msg = super()._process_property_change(msg)
+         if 'value' in msg:
+@@ -792,23 +790,20 @@
+       Initial or entered text value updated on every key press.""")
+     width = param.Integer(default=300, allow_None=True, doc="""
+       Width of this component. If sizing_mode is set to stretch
+       or scale mode this will merely be used as a suggestion.""")
+     description = param.String(default=None, doc="""
+         An HTML string describing the function of this component.""")
+     _allows_values: ClassVar[bool] = False
+     _allows_none: ClassVar[bool] = True
+     _rename: ClassVar[Mapping[str, str | None]] = {'name': 'title', 'options': 'completions'}
+     _widget_type: ClassVar[type[Model]] = _BkAutocompleteInput
+-    @property
+-    def _restrict(self):
+-        return self.restrict
+     def _process_property_change(self, msg):
+         if not self.restrict and 'value' in msg:
+             try:
+                 return super()._process_property_change(msg)
+             except Exception:
+                 return Widget._process_property_change(self, msg)
+         return super()._process_property_change(msg)
+     def _process_param_change(self, msg):
+         if 'value' in msg and not self.restrict and not isIn(msg['value'], self.values):
+             with param.parameterized.discard_events(self):
+
+--- a/panel/widgets/tables.py
++++ b/panel/widgets/tables.py
+@@ -555,29 +555,25 @@
+             dep.owner.param.watch(self._update_cds, dep.name)
+         self._filters.append((column, filter))
+         self._update_cds()
+     def remove_filter(self, filter):
+         """
+         Removes a filter which was previously added.
+         """
+         self._filters = [(column, filt) for (column, filt) in self._filters
+                          if filt is not filter]
+         self._update_cds()
+-    def _process_column(self, values: TDataColumn, col: str, df: pd.DataFrame | None = None):
++    def _process_column(self, values: TDataColumn):
+         if not isinstance(values, (list, np.ndarray)):
+             return [str(v) for v in values]
+-        if isinstance(values, np.ndarray):
+-            if values.dtype.kind == "b":
+-                return values.tolist()
+-            import pandas as pd
+-            if df is not None and col in df.columns and isinstance(df[col].dtype, pd.StringDtype):
+-                values[df[col].isna()] = None
++        if isinstance(values, np.ndarray) and values.dtype.kind == "b":
++            return values.tolist()
+         return values
+     def _get_data(self) -> tuple[pd.DataFrame, DataDict]:
+         return self._process_df_and_convert_to_cds(self.value)
+     def _process_df_and_convert_to_cds(self, df: pd.DataFrame) -> tuple[pd.DataFrame, DataDict]:
+         import pandas as pd
+         df = self._filter_dataframe(df, header_filters=False)
+         if df is None:
+             return [], {}
+         indexes: list[Any]
+         if isinstance(self.value.index, pd.MultiIndex):
+@@ -586,21 +582,21 @@
+                 for i, n in enumerate(df.index.names)
+             ]
+         else:
+             default_index = ('level_0' if 'index' in df.columns else 'index')
+             indexes = [df.index.name or default_index]
+         if df.columns.nlevels > 1 and len(indexes) > 1:
+             indexes = [i + "_" * (df.columns.nlevels - 1) for i in indexes]
+         data = ColumnDataSource.from_df(df.reset_index() if len(indexes) > 1 else df)
+         if not self.show_index and len(indexes) > 1:
+             data = {k: v for k, v in data.items() if k not in indexes}
+-        return df, {k if isinstance(k, str) else str(k): self._process_column(v, k, df) for k, v in data.items()}
++        return df, {k if isinstance(k, str) else str(k): self._process_column(v) for k, v in data.items()}
+     def _update_column(self, column: str, array: TDataColumn):
+         import pandas as pd
+         self.value[column] = array
+         if self._processed is not None and self.value is not self._processed:
+             with pd.option_context('mode.chained_assignment', None):
+                 self._processed[column] = array
+     @property
+     def indexes(self):
+         import pandas as pd
+         if self.value is None or not self.show_index:
+@@ -1242,21 +1238,21 @@
+             indexes = [
+                 f'level_{i}' if n is None else n
+                 for i, n in enumerate(df.index.names)
+             ]
+         else:
+             default_index = ('level_0' if 'index' in df.columns else 'index')
+             indexes = [df.index.name or default_index]
+         if len(indexes) > 1:
+             page_df = page_df.reset_index()
+         data = ColumnDataSource.from_df(page_df).items()
+-        return df, {k if isinstance(k, str) else str(k): self._process_column(v, k, page_df) for k, v in data}
++        return df, {k if isinstance(k, str) else str(k): v for k, v in data}
+     def _get_style_data(self, recompute=True):
+         if self.value is None or self.style is None or self.value.empty:
+             return {}
+         df = self._processed
+         if len(self.indexes) > 1:
+             df = df.reset_index()
+         if recompute:
+             try:
+                 self._computed_styler = styler = df.style
+             except Exception:
+@@ -1569,24 +1565,23 @@
+             page_size = self.page_size or self.initial_page_size
+             properties['max_page'] = max(length//page_size + bool(length % page_size), 1)
+         if isinstance(self.selectable, str) and self.selectable.startswith('checkbox'):
+             properties['select_mode'] = 'checkbox'
+         else:
+             properties['select_mode'] = self.selectable
+         return properties
+     def _process_param_change(self, params):
+         if 'theme' in params or 'stylesheets' in params:
+             theme_url = self._get_theme(params.pop('theme', self.theme))
+-            if theme_url:
+-                params['stylesheets'] = params.get('stylesheets', self.stylesheets) + [
+-                    ImportedStyleSheet(url=theme_url)
+-                ]
++            params['stylesheets'] = params.get('stylesheets', self.stylesheets) + [
++                ImportedStyleSheet(url=theme_url)
++            ]
+         params = Reactive._process_param_change(self, params)
+         if 'disabled' in params:
+             params['editable'] = not params.pop('disabled') and len(self.indexes) <= 1
+         if 'frozen_rows' in params:
+             length = self._length
+             params['frozen_rows'] = [
+                 length+r if r < 0 else r for r in params['frozen_rows']
+             ]
+         if 'hidden_columns' in params:
+             import pandas as pd

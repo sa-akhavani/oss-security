@@ -1,0 +1,625 @@
+# ====================================================================
+# FILE: lib/gollum.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-25 ---
+     1| require 'digest/md5'
+     2| require 'digest/sha1'
+     3| require 'ostruct'
+     4| require 'github/markup'
+     5| require 'rhino' if RUBY_PLATFORM == 'java'
+     6| require File.expand_path('../gollum/uri_encode_component', __FILE__)
+     7| module Gollum
+     8|   VERSION = '5.1.2'
+     9|   def self.assets_path
+    10|     ::File.expand_path('gollum/public', ::File.dirname(__FILE__))
+    11|   end
+    12|   class Error < StandardError;
+    13|   end
+    14|   class DuplicatePageError < Error
+    15|     attr_accessor :dir
+    16|     attr_accessor :existing_path
+    17|     attr_accessor :attempted_path
+    18|     def initialize(dir, existing, attempted, message = nil)
+    19|       @dir            = dir
+    20|       @existing_path  = existing
+    21|       @attempted_path = attempted
+    22|       super(message || "Cannot write #{@dir}/#{@attempted_path}, found #{@dir}/#{@existing_path}.")
+    23|     end
+    24|   end
+    25| end
+
+
+# ====================================================================
+# FILE: lib/gollum/app.rb
+# Total hunks: 5
+# ====================================================================
+# --- HUNK 1: Lines 5-62 ---
+     5| require 'mustache/sinatra'
+     6| require 'json'
+     7| require 'sprockets'
+     8| require 'sprockets-helpers'
+     9| require 'octicons'
+    10| require 'sass'
+    11| require 'pathname'
+    12| require 'gollum'
+    13| require 'gollum/assets'
+    14| require 'gollum/views/helpers'
+    15| require 'gollum/views/layout'
+    16| require 'gollum/views/editable'
+    17| require 'gollum/views/has_page'
+    18| require 'gollum/views/has_user_icons'
+    19| require 'gollum/views/pagination'
+    20| require 'gollum/views/rss.rb'
+    21| require File.expand_path '../helpers', __FILE__
+    22| Gollum::set_git_timeout(120)
+    23| Gollum::set_git_max_filesize(190 * 10**6)
+    24| module Precious
+    25|   class MapGollum
+    26|     def initialize(base_path)
+    27|       @mg = Rack::Builder.new do
+    28|         map "/#{base_path}" do
+    29|           run Precious::App
+    30|         end
+    31|         map '/' do
+    32|           run Proc.new { [302, { 'Location' => "/#{base_path}" }, []] }
+    33|         end
+    34|         map '/*' do
+    35|           run Proc.new { [302, { 'Location' => "/#{base_path}" }, []] }
+    36|         end
+    37|       end
+    38|     end
+    39|     def call(env)
+    40|       @mg.call(env)
+    41|     end
+    42|   end
+    43|   class App < Sinatra::Base
+    44|     register Mustache::Sinatra
+    45|     register Sinatra::Namespace
+    46|     include Precious::Helpers
+    47|     dir = File.dirname(File.expand_path(__FILE__))
+    48|     set :sprockets, ::Precious::Assets.sprockets(dir)
+    49|     set :default_markup, :markdown
+    50|     set :mustache, {
+    51|         :namespace => Precious,
+    52|         :templates => "#{dir}/templates",
+    53|         :views     => "#{dir}/views"
+    54|     }
+    55|     configure :development, :staging do
+    56|       enable :show_exceptions, :dump_errors
+    57|       disable :raise_errors, :clean_trace
+    58|     end
+    59|     configure :test do
+    60|       enable :logging, :raise_errors, :dump_errors
+    61|     end
+    62|     before do
+
+# --- HUNK 2: Lines 140-197 ---
+   140|         forbid('Changing this resource is not allowed.')
+   141|       end
+   142|       post %r{/revert/(\.redirects.gollum|(custom|mathjax\.config\.)\.(js|css)/.*/.*)} do
+   143|         forbid('Changing this resource is not allowed.')
+   144|       end
+   145|       get '/edit/*' do
+   146|         forbid unless @allow_editing
+   147|         wikip = wiki_page(params[:splat].first)
+   148|         @name = wikip.fullname
+   149|         @path = wikip.path
+   150|         @upload_dest = find_upload_dest(wikip.fullpath)
+   151|         wiki = wikip.wiki
+   152|         @allow_uploads = wiki.allow_uploads
+   153|           if page = wikip.page
+   154|               @page         = page
+   155|               @content      = page.text_data
+   156|               @mathjax      = wiki.mathjax
+   157|               @etag         = page.sha
+   158|               mustache :edit
+   159|           else
+   160|             path = ::File.join('gollum/create', @path, @name)
+   161|             redirect to(clean_url(encodeURIComponent(path)))
+   162|           end
+   163|         end
+   164|       post '/upload_file' do
+   165|         wiki = wiki_new
+   166|         halt 405 unless wiki.allow_uploads
+   167|         if params[:file]
+   168|           fullname = params[:file][:filename]
+   169|           tempfile = params[:file][:tempfile]
+   170|         end
+   171|         halt 500 unless tempfile.is_a? Tempfile
+   172|         if wiki.per_page_uploads
+   173|           dir = request.referer.sub(request.base_url, '')
+   174|           dir.sub!(/^#{wiki.base_path}/, '') if wiki.base_path
+   175|           dir.sub!(/^\/gollum\/[-\w]+\//, '')
+   176|           dir.sub!(/#{::File.extname(dir)}$/, '')
+   177|           dir.gsub!(/%20/, ' ')
+   178|           dir = ::File.join('uploads', dir)
+   179|         else
+   180|           dir = 'uploads'
+   181|         end
+   182|         halt 500 if dir.include?('..')
+   183|         halt 500 unless Pathname(dir).relative?
+   184|         ext      = ::File.extname(fullname)
+   185|         format   = ext.split('.').last || 'txt'
+   186|         filename = ::File.basename(fullname, ext)
+   187|         contents = ::File.read(tempfile)
+   188|         reponame = "#{dir}/#{filename}.#{format}"
+   189|         options = { :message => "Uploaded file to #{reponame}" }
+   190|         options[:parent] = wiki.repo.head.commit if wiki.repo.head
+   191|         author  = session['gollum.author']
+   192|         unless author.nil?
+   193|           options.merge! author
+   194|         end
+   195|         normalize = Gollum::Page.valid_extension?(fullname)
+   196|         begin
+   197|           wiki.write_file(reponame, contents, options)
+
+# --- HUNK 3: Lines 218-259 ---
+   218|           target_dir                = target_dir == '' ? source_dir : "#{source_dir}/#{target_dir}"
+   219|           rename                    = "#{target_dir}/#{target_name}"
+   220|         end
+   221|         committer = Gollum::Committer.new(wiki, commit_message)
+   222|         commit    = { :committer => committer }
+   223|         success = wiki.rename_page(page, rename, commit)
+   224|         if !success
+   225|           redirect to("/#{page.escaped_url_path}")
+   226|           return
+   227|         end
+   228|         committer.commit
+   229|         new_path = "#{rename}.#{Gollum::Page.format_to_ext(page.format)}"
+   230|         wiki.add_redirect(page.url_path, clean_url(new_path)) if @redirects_enabled
+   231|         page = wiki_page(new_path).page
+   232|         return if page.nil?
+   233|         redirect to("/#{page.escaped_url_path}")
+   234|       end
+   235|       post '/edit/*' do
+   236|         etag      = params[:etag]        
+   237|         path      = "/#{clean_url(sanitize_empty_params(params[:path]))}"
+   238|         wiki      = wiki_new
+   239|         page      = wiki.page(::File.join(path, params[:page]))
+   240|         return if page.nil?
+   241|         if etag != page.sha
+   242|           halt 412, {etag: page.sha, text_data: page.text_data}.to_json
+   243|         end
+   244|         committer = Gollum::Committer.new(wiki, commit_message)
+   245|         commit    = { :committer => committer }
+   246|         update_wiki_page(wiki, page, params[:content], commit, page.name, params[:format])
+   247|         update_wiki_page(wiki, page.header, params[:header], commit) if params[:header]
+   248|         update_wiki_page(wiki, page.footer, params[:footer], commit) if params[:footer]
+   249|         update_wiki_page(wiki, page.sidebar, params[:sidebar], commit) if params[:sidebar]
+   250|         committer.commit
+   251|       end
+   252|       post '/delete/*' do
+   253|         forbid unless @allow_editing
+   254|         wiki = wiki_new
+   255|         filepath = params[:splat].first
+   256|         unless filepath.nil?
+   257|           commit           = commit_message
+   258|           commit[:message] = "Deleted #{filepath}"
+   259|           wiki.delete_file(filepath, commit)
+
+# --- HUNK 4: Lines 301-444 ---
+   301|         @path = wikip.path
+   302|         @name = wikip.fullname
+   303|         wiki  = wikip.wiki
+   304|         @page = wikip.page
+   305|         sha1  = params[:sha1]
+   306|         sha2  = params[:sha2]
+   307|         commit           = commit_message
+   308|         commit[:message] = "Revert commit #{sha2.chars.take(7).join}"
+   309|         if wiki.revert_page(@page, sha1, sha2, commit)
+   310|           redirect to("/#{@page.escaped_url_path}")
+   311|         else
+   312|           sha2, sha1 = sha1, "#{sha1}^" if !sha2
+   313|           @versions  = [sha1, sha2]
+   314|           @diff      = wiki.repo.diff(@versions.first, @versions.last, @page.path)
+   315|           @message   = 'The patch does not apply.'
+   316|           mustache :compare
+   317|         end
+   318|       end
+   319|       post '/preview' do
+   320|         wiki           = wiki_new
+   321|         @name          = params[:page] ? strip_page_name(params[:page]) : 'Preview'
+   322|         @page          = wiki.preview_page(@name, params[:content], params[:format])
+   323|         ['sidebar', 'header', 'footer'].each do |subpage|
+   324|           @page.send("set_#{subpage}".to_sym, params[subpage]) if params[subpage]
+   325|         end
+   326|         @content       = @page.formatted_data
+   327|         @toc_content   = wiki.universal_toc ? @page.toc_data : nil
+   328|         @h1_title      = wiki.h1_title
+   329|         @editable      = false
+   330|         @bar_side      = wiki.bar_side
+   331|         @allow_uploads = false
+   332|         @navbar        = false
+   333|         @preview       = true
+   334|         mustache :page
+   335|       end
+   336|       get '/history/*' do
+   337|         wikip      = wiki_page(params[:splat].first)
+   338|         @name      = wikip.fullname
+   339|         @page      = wikip.page
+   340|         @page_num  = [params[:page_num].to_i, 1].max
+   341|         @max_count = settings.wiki_options.fetch(:pagination_count, 10)
+   342|         unless @page.nil?
+   343|           @wiki      = @page.wiki
+   344|           @versions = @page.versions(
+   345|             per_page: @max_count,
+   346|             page_num: @page_num,
+   347|             follow: settings.wiki_options.fetch(:follow_renames, true)
+   348|           )
+   349|           mustache :history
+   350|         else
+   351|           redirect to("/")
+   352|         end
+   353|       end
+   354|       get '/latest_changes' do
+   355|         @wiki = wiki_new
+   356|         @page_num = [params[:page_num].to_i, 1].max
+   357|         @max_count = settings.wiki_options.fetch(:pagination_count, 10)
+   358|         @versions = @wiki.latest_changes(::Gollum::Page.log_pagination_options(per_page: @max_count, page_num: @page_num))
+   359|         mustache :latest_changes
+   360|       end
+   361|       get %r{
+   362|         /compare/ # match any URL beginning with /compare/
+   363|         (.+)      # extract the full path (including any directories)
+   364|         /         # match the final slash
+   365|         ([^.]+)   # match the first SHA1
+   366|         \.{2,3}   # match .. or ...
+   367|         (.+)      # match the second SHA1
+   368|       }x do |path, start_version, end_version|
+   369|         wikip     = wiki_page(path)
+   370|         @path     = wikip.path
+   371|         @name     = wikip.fullname
+   372|         @versions = [start_version, end_version]
+   373|         wiki      = wikip.wiki
+   374|         @page     = wikip.page
+   375|         @diff     = wiki.repo.diff(@versions.first, @versions.last, @page.path)
+   376|         if @diff.empty?
+   377|           @message = 'Could not compare these two revisions, no differences were found.'
+   378|           mustache :error
+   379|         else
+   380|           mustache :compare
+   381|         end
+   382|       end
+   383|       get '/compare/*' do
+   384|         @file     = clean_url(encodeURIComponent(params[:splat].first))
+   385|         @versions = params[:versions] || []
+   386|         if @versions.size == 1
+   387|           wikip  = wiki_page(params[:splat].first)
+   388|           commit = wikip.wiki.repo.commit(@versions.first)
+   389|           parent = commit.parent
+   390|           if parent.nil?
+   391|             redirect to("#{@file}/#{@commit.id}")
+   392|           else
+   393|             @versions.push(parent.id)
+   394|           end
+   395|         end
+   396|         if @versions.empty?
+   397|           redirect to("gollum/history/#{@file}")
+   398|         else
+   399|           redirect to("gollum/compare/%s/%s...%s" % [
+   400|               @file,
+   401|               @versions.last,
+   402|               @versions.first]
+   403|                    )
+   404|         end
+   405|       end
+   406|       get %r{
+   407|         /commit/  # match any URL beginning with /show/
+   408|         (\w+)     # match the SHA1
+   409|       }x do |version|
+   410|         @version = version
+   411|         wiki = wiki_new
+   412|         begin
+   413|           @commit = wiki.repo.commit(version)
+   414|           parent = @commit.parent
+   415|           parent_id = parent.nil? ? nil : parent.id
+   416|           @diff = wiki.repo.diff(parent_id, version)
+   417|           mustache :commit
+   418|         rescue Gollum::Git::NoSuchShaFound
+   419|           @message = "Invalid commit: #{@version}"
+   420|           mustache :error
+   421|         end
+   422|       end
+   423|       get '/search' do
+   424|         @query     = params[:q] || ''
+   425|         @name      = @query
+   426|         if @query.empty?
+   427|           @results = []
+   428|           @search_terms = []
+   429|         else
+   430|           @page_num  = [params[:page_num].to_i, 1].max
+   431|           @max_count = 10
+   432|           wiki       = wiki_new
+   433|           @results, @search_terms = wiki.search(@query)
+   434|         end
+   435|         mustache :search
+   436|       end
+   437|       get %r{
+   438|         /overview  # match any URL beginning with /overview
+   439|         (?:     # begin an optional non-capturing group
+   440|           /(.+) # capture any path after the "/overview" excluding the leading slash
+   441|         )?      # end the optional non-capturing group
+   442|       }x do |path|
+   443|         wiki         = wiki_new
+   444|         @results     = wiki.tree_list
+
+
+# ====================================================================
+# FILE: lib/gollum/views/overview.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-60 ---
+     1| require 'pathname'
+     2| module Precious
+     3|   module Views
+     4|     class Overview < Layout
+     5|       attr_reader :results, :ref, :allow_editing, :newable
+     6|       def title
+     7|         "Overview of #{@ref}"
+     8|       end
+     9|       def current_path
+    10|         @path ? @path : '/'
+    11|       end
+    12|       def breadcrumb
+    13|         if @path
+    14|           path       = Pathname.new(@path)
+    15|           breadcrumb = [%{<nav aria-label="Breadcrumb"><ol><li class="breadcrumb-item"><a href="#{overview_path}">Home</a></li>}]
+    16|           path.descend do |crumb|
+    17|             title = crumb.basename
+    18|             if title == path.basename
+    19|               breadcrumb << %{<li class="breadcrumb-item" aria-current="page">#{CGI.escape(title.to_s)}</li>}
+    20|             else
+    21|               breadcrumb << %{<li class="breadcrumb-item"><a href="#{overview_path}/#{crumb}/">#{CGI.escape(title.to_s)}</a></li>}
+    22|             end
+    23|           end
+    24|           breadcrumb << %{</ol></nav>}
+    25|           breadcrumb.join("\n")
+    26|         else
+    27|           'Home'
+    28|         end
+    29|       end
+    30|       def files_folders
+    31|         if has_results
+    32|           files_and_folders = []
+    33|           @results.each do |result|
+    34|             result_path = result.url_path
+    35|             result_path = result_path.sub(/^#{Regexp.escape(@path)}\//, '') unless @path.nil?            
+    36|             if result_path.include?('/')
+    37|               folder_name = result_path.split('/').first
+    38|               folder_path = @path ? "#{@path}/#{folder_name}" : folder_name
+    39|               folder_url  = "#{overview_path}/#{folder_path}/"
+    40|               files_and_folders << {name: folder_name, icon: rocticon('file-directory'), type: 'dir', url: folder_url, is_file: false}
+    41|             elsif result_path != '.gitkeep'
+    42|               file_url = page_route(result.escaped_url_path)
+    43|               files_and_folders << {name: result.filename, icon: rocticon('file'), type: 'file', url: file_url, is_file: true}
+    44|             end
+    45|           end
+    46|           files_and_folders.uniq{|f| f[:name]}.sort_by!{|f| [f[:type], f[:name]]}
+    47|         end
+    48|       end
+    49|       def has_results
+    50|         !@results.empty?
+    51|       end
+    52|       def no_results
+    53|         @results.empty?
+    54|       end
+    55|       def latest_changes
+    56|         true
+    57|       end
+    58|     end
+    59|   end
+    60| end
+
+
+# ====================================================================
+# FILE: lib/gollum/views/page.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-205 ---
+     1| module Precious
+     2|   module Views
+     3|     class Page < Layout
+     4|       include HasPage
+     5|       attr_reader :content, :page, :header, :footer, :preview, :historical
+     6|       VALID_COUNTER_STYLES = ['decimal', 'decimal-leading-zero', 'arabic-indic', 'armenian', 'upper-armenian',
+     7|         'lower-armenian', 'bengali', 'cambodian', 'khmer', 'cjk-decimal', 'devanagari', 'georgian', 'gujarati', 'gurmukhi',
+     8|         'hebrew', 'kannada', 'lao', 'malayalam', 'mongolian', 'myanmar', 'oriya', 'persian', 'lower-roman', 'upper-roman',
+     9|         'tamil', 'telugu', 'thai', 'tibetan', 'lower-alpha', 'lower-latin', 'upper-alpha', 'upper-latin', 'cjk-earthly-branch',
+    10|         'cjk-heavenly-stem', 'lower-greek', 'hiragana', 'hiragana-iroha', 'katakana', 'katakana-iroha', 'disc', 'circle', 'square',
+    11|         'disclosure-open', 'disclosure-closed'] # https://www.w3.org/TR/css-counter-styles-3/
+    12|       DATE_FORMAT    = "%Y-%m-%d %H:%M:%S"
+    13|       DEFAULT_AUTHOR = 'you'
+    14|       @@to_xml       = { :save_with => Nokogiri::XML::Node::SaveOptions::DEFAULT_XHTML ^ 1, :indent => 0, :encoding => 'UTF-8' }
+    15|       def title
+    16|         h1 = @h1_title ? page_header_from_content(@content) : false
+    17|         h1 || @page.url_path_title # url_path_title is the metadata title if present, otherwise the filename-based title
+    18|       end
+    19|       def page_header
+    20|         title
+    21|       end
+    22|       def breadcrumb
+    23|         path = Pathname.new(@page.url_path).parent
+    24|         return '' if path.to_s == '.'
+    25|         breadcrumb = [%{<nav aria-label="Breadcrumb"><ol>}]
+    26|         path.descend do |crumb|
+    27|           element = "#{crumb.basename}"
+    28|           next if element == @page.title
+    29|           breadcrumb << %{<li class="breadcrumb-item"><a href="#{overview_path}/#{crumb}/">#{CGI.escape(element.to_s)}</a></li>}
+    30|         end
+    31|         breadcrumb << %{</ol></nav>}
+    32|         breadcrumb.join("\n")
+    33|       end
+    34|       def content
+    35|         content_without_page_header(@content)
+    36|       end
+    37|       def author
+    38|         first = @version ? page.version : page.last_version
+    39|         return DEFAULT_AUTHOR unless first
+    40|         first.author.name.respond_to?(:force_encoding) ? first.author.name.force_encoding('UTF-8') : first.author.name
+    41|       end
+    42|       def date
+    43|         first = @version ? page.version : page.last_version
+    44|         return Time.now.strftime(DATE_FORMAT) unless first
+    45|         first.authored_date.strftime(DATE_FORMAT)
+    46|       end
+    47|       def noindex
+    48|         @version ? true : false
+    49|       end
+    50|       def editable
+    51|         @editable
+    52|       end
+    53|       def search
+    54|         true
+    55|       end
+    56|       def history
+    57|         true
+    58|       end
+    59|       def latest_changes
+    60|         true
+    61|       end
+    62|       def overview
+    63|         true 
+    64|       end
+    65|       def allow_editing
+    66|         @allow_editing
+    67|       end
+    68|       def allow_uploads
+    69|         @allow_uploads
+    70|       end
+    71|       def has_header
+    72|         if @header
+    73|           @header.formatted_data.strip.empty? ? false : true
+    74|         else
+    75|           @header = (@page.header || false)
+    76|           !!@header
+    77|         end
+    78|       end
+    79|       def header_content
+    80|         has_header && @header.formatted_data
+    81|       end
+    82|       def header_format
+    83|         has_header && @header.format.to_s
+    84|       end
+    85|       def has_footer
+    86|         if @footer
+    87|           @footer.formatted_data.strip.empty? ? false : true
+    88|         else
+    89|           @footer = (@page.footer || false)
+    90|           !!@footer
+    91|         end
+    92|       end
+    93|       def footer_content
+    94|         has_footer && @footer.formatted_data
+    95|       end
+    96|       def footer_format
+    97|         has_footer && @footer.format.to_s
+    98|       end
+    99|       def bar_side
+   100|         @bar_side.to_s
+   101|       end
+   102|       def left_bar
+   103|         @bar_side == :left
+   104|       end
+   105|       def has_sidebar
+   106|         if @sidebar
+   107|           @sidebar.formatted_data.strip.empty? ? false : true
+   108|         else
+   109|           @sidebar = (@page.sidebar || false)
+   110|           !!@sidebar
+   111|         end
+   112|       end
+   113|       def sidebar_content
+   114|         has_sidebar && @sidebar.formatted_data
+   115|       end
+   116|       def sidebar_format
+   117|         has_sidebar && @sidebar.format.to_s
+   118|       end
+   119|       def has_toc
+   120|         !@toc_content.nil?
+   121|       end
+   122|       def toc_content
+   123|         @toc_content
+   124|       end
+   125|       def mathjax
+   126|         @mathjax
+   127|       end
+   128|       def mathjax_config
+   129|         @mathjax_config
+   130|       end
+   131|       def use_identicon
+   132|         @page.wiki.user_icons == 'identicon'
+   133|       end
+   134|       def navbar?
+   135|         @navbar
+   136|       end
+   137|       def full_url_path
+   138|         page_route(@page.escaped_url_path)
+   139|       end
+   140|       def metadata
+   141|         @page.metadata
+   142|       end   
+   143|       def rendered_metadata
+   144|         return '' unless page.display_metadata? && !metadata.empty?
+   145|         @rendered_metadata ||= table(metadata)
+   146|       end
+   147|       def header_enum?
+   148|         !!metadata['header_enum']
+   149|       end
+   150|       def header_enum_style
+   151|         if header_enum?
+   152|           VALID_COUNTER_STYLES.include?(metadata['header_enum']) ? metadata['header_enum'] : 'decimal'
+   153|         end
+   154|       end
+   155|       private
+   156|       def build_document(content)
+   157|         Nokogiri::HTML::fragment(%{<div id="gollum-root">} + content.to_s + %{</div>}, 'UTF-8')
+   158|       end
+   159|       def find_header_node(doc)
+   160|         case @page.format
+   161|           when :asciidoc
+   162|             doc.css("div#gollum-root > h1:first-child")
+   163|           when :pod
+   164|             doc.css("div#gollum-root > a.dummyTopAnchor:first-child + h1")
+   165|           when :rst
+   166|             doc.css("div#gollum-root > div > div > h1:first-child")
+   167|           else
+   168|             doc.css("div#gollum-root > h1:first-child")
+   169|         end
+   170|       end
+   171|       def page_header_from_content(content)
+   172|         doc   = build_document(content)
+   173|         title = find_header_node(doc).inner_text.strip
+   174|         title = nil if title.empty?
+   175|         title
+   176|       end
+   177|       def content_without_page_header(content)
+   178|         doc = build_document(content)
+   179|           if @h1_title
+   180|             title = find_header_node(doc)
+   181|             title.remove unless title.empty?
+   182|           end
+   183|         doc.css("div#gollum-root").children.to_xml(@@to_xml)
+   184|       end
+   185|       def table(data)
+   186|         return data.to_s if data.empty?
+   187|         result = "<table>\n"
+   188|         keys = data.respond_to?(:keys) && data.respond_to?(:values) ? data.keys : nil
+   189|           if keys
+   190|             data = data.values
+   191|             result << "<tr>\n"
+   192|             keys.each do |heading|
+   193|               result << "<th>#{CGI.escapeHTML(heading.to_s)}</th>\n"
+   194|             end
+   195|             result << "</tr>\n"
+   196|           end
+   197|         result << "<tr>\n"
+   198|           data.each do |value|
+   199|             result << "<td>" << (value.respond_to?(:each) ? table(value) : CGI.escapeHTML(value.to_s)) << "</td>\n"
+   200|           end
+   201|         result << "</tr>\n</table>\n"
+   202|       end
+   203|     end
+   204|   end
+   205| end
+

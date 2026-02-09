@@ -1,0 +1,500 @@
+# ====================================================================
+# FILE: modules/tinymce/src/core/main/ts/content/GetContentImpl.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-54 ---
+     1| import { Fun, Optional, Type } from '@ephox/katamari';
+     2| import { Attribute, Css, Html, Insert, Remove, SugarElement, SugarShadowDom } from '@ephox/sugar';
+     3| import Editor from '../api/Editor';
+     4| import AstNode from '../api/html/Node';
+     5| import * as Options from '../api/Options';
+     6| import Tools from '../api/util/Tools';
+     7| import * as ElementType from '../dom/ElementType';
+     8| import * as TrimBody from '../dom/TrimBody';
+     9| import * as Zwsp from '../text/Zwsp';
+    10| import { cleanupBogusElements, cleanupInputNames } from './ContentCleanup';
+    11| import { Content, GetContentArgs } from './ContentTypes';
+    12| const trimEmptyContents = (editor: Editor, html: string): string => {
+    13|   const blockName = Options.getForcedRootBlock(editor);
+    14|   const emptyRegExp = new RegExp(`^(<${blockName}[^>]*>(&nbsp;|&#160;|\\s|\u00a0|<br \\/>|)<\\/${blockName}>[\r\n]*|<br \\/>[\r\n]*)$`);
+    15|   return html.replace(emptyRegExp, '');
+    16| };
+    17| const getPlainTextContent = (editor: Editor, body: HTMLElement) => {
+    18|   const doc = editor.getDoc();
+    19|   const dos = SugarShadowDom.getRootNode(SugarElement.fromDom(editor.getBody()));
+    20|   const offscreenDiv = SugarElement.fromTag('div', doc);
+    21|   Attribute.set(offscreenDiv, 'data-mce-bogus', 'all');
+    22|   Css.setAll(offscreenDiv, {
+    23|     position: 'fixed',
+    24|     left: '-9999999px',
+    25|     top: '0'
+    26|   });
+    27|   Html.set(offscreenDiv, body.innerHTML);
+    28|   cleanupBogusElements(offscreenDiv);
+    29|   cleanupInputNames(offscreenDiv);
+    30|   const root = SugarShadowDom.getContentContainer(dos);
+    31|   Insert.append(root, offscreenDiv);
+    32|   const content = Zwsp.trim(offscreenDiv.dom.innerText);
+    33|   Remove.remove(offscreenDiv);
+    34|   return content;
+    35| };
+    36| const getContentFromBody = (editor: Editor, args: GetContentArgs, body: HTMLElement): Content => {
+    37|   let content: Content;
+    38|   if (args.format === 'raw') {
+    39|     content = Tools.trim(Zwsp.trim(TrimBody.trim(body, editor.serializer.getTempAttrs()).innerHTML));
+    40|   } else if (args.format === 'text') {
+    41|     content = getPlainTextContent(editor, body);
+    42|   } else if (args.format === 'tree') {
+    43|     content = editor.serializer.serialize(body, args);
+    44|   } else {
+    45|     content = trimEmptyContents(editor, editor.serializer.serialize(body, args));
+    46|   }
+    47|   const shouldTrim = args.format !== 'text' && !ElementType.isWsPreserveElement(SugarElement.fromDom(body));
+    48|   return shouldTrim && Type.isString(content) ? Tools.trim(content) : content;
+    49| };
+    50| export const getContentInternal = (editor: Editor, args: GetContentArgs): Content => Optional.from(editor.getBody())
+    51|   .fold(
+    52|     Fun.constant(args.format === 'tree' ? new AstNode('body', 11) : ''),
+    53|     (body) => getContentFromBody(editor, args, body)
+    54|   );
+
+
+# ====================================================================
+# FILE: modules/tinymce/src/core/main/ts/dom/TrimBody.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-60 ---
+     1| import { Arr, Type } from '@ephox/katamari';
+     2| import { Attribute, Remove, SugarElement } from '@ephox/sugar';
+     3| import * as Zwsp from '../text/Zwsp';
+     4| const getTemporaryNodeSelector = (tempAttrs: string[]): string =>
+     5|   `${tempAttrs.length === 0 ? '' : `${Arr.map(tempAttrs, (attr) => `[${attr}]`).join(',')},`}[data-mce-bogus="all"]`;
+     6| const getTemporaryNodes = (body: HTMLElement, tempAttrs: string[]): NodeListOf<Element> =>
+     7|   body.querySelectorAll(getTemporaryNodeSelector(tempAttrs));
+     8| const createCommentWalker = (body: HTMLElement): TreeWalker =>
+     9|   document.createTreeWalker(body, NodeFilter.SHOW_COMMENT, null);
+    10| const hasComments = (body: HTMLElement): boolean =>
+    11|   createCommentWalker(body).nextNode() !== null;
+    12| const hasTemporaryNodes = (body: HTMLElement, tempAttrs: string[]): boolean =>
+    13|   body.querySelector(getTemporaryNodeSelector(tempAttrs)) !== null;
+    14| const trimTemporaryNodes = (body: HTMLElement, tempAttrs: string[]): void => {
+    15|   Arr.each(getTemporaryNodes(body, tempAttrs), (elm) => {
+    16|     const element = SugarElement.fromDom(elm);
+    17|     if (Attribute.get(element, 'data-mce-bogus') === 'all') {
+    18|       Remove.remove(element);
+    19|     } else {
+    20|       Arr.each(tempAttrs, (attr) => {
+    21|         if (Attribute.has(element, attr)) {
+    22|           Attribute.remove(element, attr);
+    23|         }
+    24|       });
+    25|     }
+    26|   });
+    27| };
+    28| const removeCommentsContainingZwsp = (body: HTMLElement): void => {
+    29|   const walker = createCommentWalker(body);
+    30|   let nextNode = walker.nextNode();
+    31|   while (nextNode !== null) {
+    32|     const comment = walker.currentNode as Comment;
+    33|     nextNode = walker.nextNode();
+    34|     if (Type.isString(comment.nodeValue) && comment.nodeValue.includes(Zwsp.ZWSP)) {
+    35|       Remove.remove(SugarElement.fromDom(comment));
+    36|     }
+    37|   }
+    38| };
+    39| const deepClone = (body: HTMLElement): HTMLElement => body.cloneNode(true) as HTMLElement;
+    40| const trim = (body: HTMLElement, tempAttrs: string[]): HTMLElement => {
+    41|   let trimmed = body;
+    42|   if (hasComments(body)) {
+    43|     trimmed = deepClone(body);
+    44|     removeCommentsContainingZwsp(trimmed);
+    45|     if (hasTemporaryNodes(trimmed, tempAttrs)) {
+    46|       trimTemporaryNodes(trimmed, tempAttrs);
+    47|     }
+    48|   } else if (hasTemporaryNodes(body, tempAttrs)) {
+    49|     trimmed = deepClone(body);
+    50|     trimTemporaryNodes(trimmed, tempAttrs);
+    51|   }
+    52|   return trimmed;
+    53| };
+    54| export {
+    55|   trim,
+    56|   hasComments,
+    57|   hasTemporaryNodes,
+    58|   removeCommentsContainingZwsp,
+    59|   trimTemporaryNodes
+    60| };
+
+
+# ====================================================================
+# FILE: modules/tinymce/src/core/main/ts/undo/Fragments.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-74 ---
+     1| import { Arr, Fun } from '@ephox/katamari';
+     2| import Entities from '../api/html/Entities';
+     3| import * as NodeType from '../dom/NodeType';
+     4| import * as Zwsp from '../text/Zwsp';
+     5| import * as Diff from './Diff';
+     6| /**
+     7|  * This module reads and applies html fragments from/to dom nodes.
+     8|  *
+     9|  * @class tinymce.undo.Fragments
+    10|  * @private
+    11|  */
+    12| const getOuterHtml = (elm: Node): string => {
+    13|   if (NodeType.isElement(elm)) {
+    14|     return elm.outerHTML;
+    15|   } else if (NodeType.isText(elm)) {
+    16|     return Entities.encodeRaw(elm.data, false);
+    17|   } else if (NodeType.isComment(elm)) {
+    18|     return '<!--' + elm.data + '-->';
+    19|   }
+    20|   return '';
+    21| };
+    22| const createFragment = (html: string): DocumentFragment => {
+    23|   let node;
+    24|   const container = document.createElement('div');
+    25|   const frag = document.createDocumentFragment();
+    26|   if (html) {
+    27|     container.innerHTML = html;
+    28|   }
+    29|   while ((node = container.firstChild)) {
+    30|     frag.appendChild(node);
+    31|   }
+    32|   return frag;
+    33| };
+    34| const insertAt = (elm: Element, html: string, index: number) => {
+    35|   const fragment = createFragment(html);
+    36|   if (elm.hasChildNodes() && index < elm.childNodes.length) {
+    37|     const target = elm.childNodes[index];
+    38|     elm.insertBefore(fragment, target);
+    39|   } else {
+    40|     elm.appendChild(fragment);
+    41|   }
+    42| };
+    43| const removeAt = (elm: Element, index: number) => {
+    44|   if (elm.hasChildNodes() && index < elm.childNodes.length) {
+    45|     const target = elm.childNodes[index];
+    46|     elm.removeChild(target);
+    47|   }
+    48| };
+    49| const applyDiff = (diff: Diff.Diff<string>[], elm: Element) => {
+    50|   let index = 0;
+    51|   Arr.each(diff, (action) => {
+    52|     if (action[0] === Diff.KEEP) {
+    53|       index++;
+    54|     } else if (action[0] === Diff.INSERT) {
+    55|       insertAt(elm, action[1], index);
+    56|       index++;
+    57|     } else if (action[0] === Diff.DELETE) {
+    58|       removeAt(elm, index);
+    59|     }
+    60|   });
+    61| };
+    62| const read = (elm: Element, trimZwsp?: boolean): string[] =>
+    63|   Arr.filter(Arr.map(Arr.from(elm.childNodes), trimZwsp ? Fun.compose(Zwsp.trim, getOuterHtml) : getOuterHtml), (item) => {
+    64|     return item.length > 0;
+    65|   });
+    66| const write = (fragments: string[], elm: Element): Element => {
+    67|   const currentFragments = Arr.map(Arr.from(elm.childNodes), getOuterHtml);
+    68|   applyDiff(Diff.diff(currentFragments, fragments), elm);
+    69|   return elm;
+    70| };
+    71| export {
+    72|   read,
+    73|   write
+    74| };
+
+
+# ====================================================================
+# FILE: modules/tinymce/src/core/main/ts/undo/Levels.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-77 ---
+     1| import { Arr, Thunk, Type } from '@ephox/katamari';
+     2| import { Html, Remove, SelectorFilter, SugarElement } from '@ephox/sugar';
+     3| import Editor from '../api/Editor';
+     4| import { isPathBookmark } from '../bookmark/BookmarkTypes';
+     5| import * as TrimBody from '../dom/TrimBody';
+     6| import * as Zwsp from '../text/Zwsp';
+     7| import * as Fragments from './Fragments';
+     8| import { CompleteUndoLevel, FragmentedUndoLevel, NewUndoLevel, UndoLevel } from './UndoManagerTypes';
+     9| const lazyTempDocument = Thunk.cached(() => document.implementation.createHTMLDocument('undo'));
+    10| const hasIframes = (body: HTMLElement) => body.querySelector('iframe') !== null;
+    11| const createFragmentedLevel = (fragments: string[]): FragmentedUndoLevel => {
+    12|   return {
+    13|     type: 'fragmented',
+    14|     fragments,
+    15|     content: '',
+    16|     bookmark: null,
+    17|     beforeBookmark: null
+    18|   };
+    19| };
+    20| const createCompleteLevel = (content: string): CompleteUndoLevel => {
+    21|   return {
+    22|     type: 'complete',
+    23|     fragments: null,
+    24|     content,
+    25|     bookmark: null,
+    26|     beforeBookmark: null
+    27|   };
+    28| };
+    29| const createFromEditor = (editor: Editor): NewUndoLevel => {
+    30|   const tempAttrs = editor.serializer.getTempAttrs();
+    31|   const body = TrimBody.trim(editor.getBody(), tempAttrs);
+    32|   return hasIframes(body) ? createFragmentedLevel(Fragments.read(body, true)) : createCompleteLevel(Zwsp.trim(body.innerHTML));
+    33| };
+    34| const applyToEditor = (editor: Editor, level: UndoLevel, before: boolean): void => {
+    35|   const bookmark = before ? level.beforeBookmark : level.bookmark;
+    36|   if (level.type === 'fragmented') {
+    37|     Fragments.write(level.fragments, editor.getBody());
+    38|   } else {
+    39|     editor.setContent(level.content, {
+    40|       format: 'raw',
+    41|       no_selection: Type.isNonNullable(bookmark) && isPathBookmark(bookmark) ? !bookmark.isFakeCaret : true
+    42|     });
+    43|   }
+    44|   if (bookmark) {
+    45|     editor.selection.moveToBookmark(bookmark);
+    46|     editor.selection.scrollIntoView();
+    47|   }
+    48| };
+    49| const getLevelContent = (level: NewUndoLevel): string => {
+    50|   return level.type === 'fragmented' ? level.fragments.join('') : level.content;
+    51| };
+    52| const getCleanLevelContent = (level: NewUndoLevel): string => {
+    53|   const elm = SugarElement.fromTag('body', lazyTempDocument());
+    54|   Html.set(elm, getLevelContent(level));
+    55|   Arr.each(SelectorFilter.descendants(elm, '*[data-mce-bogus]'), Remove.unwrap);
+    56|   return Html.get(elm);
+    57| };
+    58| const hasEqualContent = (level1: NewUndoLevel, level2: NewUndoLevel): boolean =>
+    59|   getLevelContent(level1) === getLevelContent(level2);
+    60| const hasEqualCleanedContent = (level1: NewUndoLevel, level2: NewUndoLevel): boolean =>
+    61|   getCleanLevelContent(level1) === getCleanLevelContent(level2);
+    62| const isEq = (level1: NewUndoLevel | undefined, level2: NewUndoLevel | undefined): boolean => {
+    63|   if (!level1 || !level2) {
+    64|     return false;
+    65|   } else if (hasEqualContent(level1, level2)) {
+    66|     return true;
+    67|   } else {
+    68|     return hasEqualCleanedContent(level1, level2);
+    69|   }
+    70| };
+    71| export {
+    72|   createFragmentedLevel,
+    73|   createCompleteLevel,
+    74|   createFromEditor,
+    75|   applyToEditor,
+    76|   isEq
+    77| };
+
+
+# ====================================================================
+# FILE: modules/tinymce/src/themes/silver/main/ts/ui/general/Notification.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-201 ---
+     1| import {
+     2|   AddEventsBehaviour, AlloyComponent, AlloyEvents, AlloySpec, Behaviour, Button, DomFactory, Focusing, GuiFactory, Memento, NativeEvents, Replacing, Sketcher,
+     3|   UiSketcher
+     4| } from '@ephox/alloy';
+     5| import { FieldSchema } from '@ephox/boulder';
+     6| import { Arr, Optional } from '@ephox/katamari';
+     7| import { TranslatedString, Untranslated } from 'tinymce/core/api/util/I18n';
+     8| import * as HtmlSanitizer from '../core/HtmlSanitizer';
+     9| import * as Icons from '../icons/Icons';
+    10| export interface NotificationSketchApis {
+    11|   updateProgress: (comp: AlloyComponent, percent: number) => void;
+    12|   updateText: (comp: AlloyComponent, text: string) => void;
+    13| }
+    14| export interface NotificationSketchSpec extends Sketcher.SingleSketchSpec {
+    15|   readonly text: string;
+    16|   readonly level?: 'info' | 'warn' | 'warning' | 'error' | 'success';
+    17|   readonly icon?: string;
+    18|   readonly closeButton?: boolean;
+    19|   readonly progress: boolean;
+    20|   readonly onAction: Function;
+    21|   readonly iconProvider: Icons.IconProvider;
+    22|   readonly translationProvider: (text: Untranslated) => TranslatedString;
+    23| }
+    24| export interface NotificationSketchDetail extends Sketcher.SingleSketchDetail {
+    25|   readonly text: string;
+    26|   readonly level: Optional<'info' | 'warn' | 'warning' | 'error' | 'success'>;
+    27|   readonly icon: Optional<string>;
+    28|   readonly closeButton: boolean;
+    29|   readonly onAction: Function;
+    30|   readonly progress: boolean;
+    31|   readonly iconProvider: Icons.IconProvider;
+    32|   readonly translationProvider: (text: Untranslated) => TranslatedString;
+    33| }
+    34| export interface NotificationSketcher extends Sketcher.SingleSketch<NotificationSketchSpec>, NotificationSketchApis {
+    35| }
+    36| const notificationIconMap = {
+    37|   success: 'checkmark',
+    38|   error: 'warning',
+    39|   err: 'error',
+    40|   warning: 'warning',
+    41|   warn: 'warning',
+    42|   info: 'info'
+    43| };
+    44| const factory: UiSketcher.SingleSketchFactory<NotificationSketchDetail, NotificationSketchSpec> = (detail) => {
+    45|   const memBannerText = Memento.record({
+    46|     dom: DomFactory.fromHtml(`<p>${HtmlSanitizer.sanitizeHtmlString(detail.translationProvider(detail.text))}</p>`),
+    47|     behaviours: Behaviour.derive([
+    48|       Replacing.config({ })
+    49|     ])
+    50|   });
+    51|   const renderPercentBar = (percent: number) => ({
+    52|     dom: {
+    53|       tag: 'div',
+    54|       classes: [ 'tox-bar' ],
+    55|       styles: {
+    56|         width: `${percent}%`
+    57|       }
+    58|     }
+    59|   });
+    60|   const renderPercentText = (percent: number) => ({
+    61|     dom: {
+    62|       tag: 'div',
+    63|       classes: [ 'tox-text' ],
+    64|       innerHtml: `${percent}%`
+    65|     }
+    66|   });
+    67|   const memBannerProgress = Memento.record({
+    68|     dom: {
+    69|       tag: 'div',
+    70|       classes: detail.progress ? [ 'tox-progress-bar', 'tox-progress-indicator' ] : [ 'tox-progress-bar' ]
+    71|     },
+    72|     components: [
+    73|       {
+    74|         dom: {
+    75|           tag: 'div',
+    76|           classes: [ 'tox-bar-container' ]
+    77|         },
+    78|         components: [
+    79|           renderPercentBar(0)
+    80|         ]
+    81|       },
+    82|       renderPercentText(0)
+    83|     ],
+    84|     behaviours: Behaviour.derive([
+    85|       Replacing.config({ })
+    86|     ])
+    87|   });
+    88|   const updateProgress: NotificationSketchApis['updateProgress'] = (comp, percent) => {
+    89|     if (comp.getSystem().isConnected()) {
+    90|       memBannerProgress.getOpt(comp).each((progress) => {
+    91|         Replacing.set(progress, [
+    92|           {
+    93|             dom: {
+    94|               tag: 'div',
+    95|               classes: [ 'tox-bar-container' ]
+    96|             },
+    97|             components: [
+    98|               renderPercentBar(percent)
+    99|             ]
+   100|           },
+   101|           renderPercentText(percent)
+   102|         ]);
+   103|       });
+   104|     }
+   105|   };
+   106|   const updateText: NotificationSketchApis['updateText'] = (comp, text) => {
+   107|     if (comp.getSystem().isConnected()) {
+   108|       const banner = memBannerText.get(comp);
+   109|       Replacing.set(banner, [
+   110|         GuiFactory.text(text)
+   111|       ]);
+   112|     }
+   113|   };
+   114|   const apis: NotificationSketchApis = {
+   115|     updateProgress,
+   116|     updateText
+   117|   };
+   118|   const iconChoices = Arr.flatten([
+   119|     detail.icon.toArray(),
+   120|     detail.level.toArray(),
+   121|     detail.level.bind((level) => Optional.from(notificationIconMap[level])).toArray()
+   122|   ]);
+   123|   const memButton = Memento.record(Button.sketch({
+   124|     dom: {
+   125|       tag: 'button',
+   126|       classes: [ 'tox-notification__dismiss', 'tox-button', 'tox-button--naked', 'tox-button--icon' ]
+   127|     },
+   128|     components: [
+   129|       Icons.render('close', {
+   130|         tag: 'span',
+   131|         classes: [ 'tox-icon' ],
+   132|         attributes: {
+   133|           'aria-label': detail.translationProvider('Close')
+   134|         }
+   135|       }, detail.iconProvider)
+   136|     ],
+   137|     action: (comp) => {
+   138|       detail.onAction(comp);
+   139|     }
+   140|   }));
+   141|   const notificationIconSpec = Icons.renderFirst(iconChoices, { tag: 'div', classes: [ 'tox-notification__icon' ] }, detail.iconProvider);
+   142|   const notificationBodySpec = {
+   143|     dom: {
+   144|       tag: 'div',
+   145|       classes: [ 'tox-notification__body' ]
+   146|     },
+   147|     components: [
+   148|       memBannerText.asSpec()
+   149|     ],
+   150|     behaviours: Behaviour.derive([
+   151|       Replacing.config({ })
+   152|     ])
+   153|   };
+   154|   const components: AlloySpec[] = [ notificationIconSpec, notificationBodySpec ];
+   155|   return {
+   156|     uid: detail.uid,
+   157|     dom: {
+   158|       tag: 'div',
+   159|       attributes: {
+   160|         role: 'alert'
+   161|       },
+   162|       classes: detail.level.map((level) => [ 'tox-notification', 'tox-notification--in', `tox-notification--${level}` ]).getOr(
+   163|         [ 'tox-notification', 'tox-notification--in' ]
+   164|       )
+   165|     },
+   166|     behaviours: Behaviour.derive([
+   167|       Focusing.config({ }),
+   168|       AddEventsBehaviour.config('notification-events', [
+   169|         AlloyEvents.run(NativeEvents.focusin(), (comp) => {
+   170|           memButton.getOpt(comp).each(Focusing.focus);
+   171|         })
+   172|       ])
+   173|     ]),
+   174|     components: components
+   175|       .concat(detail.progress ? [ memBannerProgress.asSpec() ] : [])
+   176|       .concat(!detail.closeButton ? [] : [ memButton.asSpec() ]),
+   177|     apis
+   178|   };
+   179| };
+   180| export const Notification: NotificationSketcher = Sketcher.single({
+   181|   name: 'Notification',
+   182|   factory,
+   183|   configFields: [
+   184|     FieldSchema.option('level'),
+   185|     FieldSchema.required('progress'),
+   186|     FieldSchema.option('icon'),
+   187|     FieldSchema.required('onAction'),
+   188|     FieldSchema.required('text'),
+   189|     FieldSchema.required('iconProvider'),
+   190|     FieldSchema.required('translationProvider'),
+   191|     FieldSchema.defaultedBoolean('closeButton', true)
+   192|   ],
+   193|   apis: {
+   194|     updateProgress: (apis: NotificationSketchApis, comp: AlloyComponent, percent: number) => {
+   195|       apis.updateProgress(comp, percent);
+   196|     },
+   197|     updateText: (apis: NotificationSketchApis, comp: AlloyComponent, text: string) => {
+   198|       apis.updateText(comp, text);
+   199|     }
+   200|   }
+   201| }) as NotificationSketcher;
+

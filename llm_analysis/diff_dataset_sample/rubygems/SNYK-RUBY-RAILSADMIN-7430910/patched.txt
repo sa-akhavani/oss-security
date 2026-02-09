@@ -1,0 +1,2571 @@
+# ====================================================================
+# FILE: lib/rails_admin/adapters/active_record.rb
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 7-51 ---
+     7|     module ActiveRecord
+     8|       DISABLED_COLUMN_TYPES = %i[tsvector blob binary spatial hstore geometry].freeze
+     9|       def new(params = {})
+    10|         model.new(params).extend(ObjectExtension)
+    11|       end
+    12|       def get(id, scope = scoped)
+    13|         object = scope.where(primary_key => id).first
+    14|         return unless object
+    15|         object.extend(ObjectExtension)
+    16|       end
+    17|       def scoped
+    18|         model.all
+    19|       end
+    20|       def first(options = {}, scope = nil)
+    21|         all(options, scope).first
+    22|       end
+    23|       def all(options = {}, scope = nil)
+    24|         scope ||= scoped
+    25|         scope = scope.includes(options[:include]) if options[:include]
+    26|         scope = scope.limit(options[:limit]) if options[:limit]
+    27|         scope = bulk_scope(scope, options) if options[:bulk_ids]
+    28|         scope = query_scope(scope, options[:query]) if options[:query]
+    29|         scope = filter_scope(scope, options[:filters]) if options[:filters]
+    30|         scope = scope.send(Kaminari.config.page_method_name, options[:page]).per(options[:per]) if options[:page] && options[:per]
+    31|         scope = sort_scope(scope, options) if options[:sort]
+    32|         scope
+    33|       end
+    34|       def count(options = {}, scope = nil)
+    35|         all(options.merge(limit: false, page: false), scope).count(:all)
+    36|       end
+    37|       def destroy(objects)
+    38|         Array.wrap(objects).each(&:destroy)
+    39|       end
+    40|       def associations
+    41|         model.reflect_on_all_associations.collect do |association|
+    42|           Association.new(association, model)
+    43|         end
+    44|       end
+    45|       def properties
+    46|         columns = model.columns.reject do |c|
+    47|           c.type.blank? ||
+    48|             DISABLED_COLUMN_TYPES.include?(c.type.to_sym) ||
+    49|             c.try(:array)
+    50|         end
+    51|         columns.collect do |property|
+
+# --- HUNK 2: Lines 69-165 ---
+    69|         when 'mysql2'
+    70|           if RUBY_ENGINE == 'jruby'
+    71|             ::ActiveRecord::Base.connection.select_one("SELECT '' AS str;").values.first.encoding
+    72|           else
+    73|             ::ActiveRecord::Base.connection.raw_connection.encoding
+    74|           end
+    75|         when 'oracle_enhanced'
+    76|           ::ActiveRecord::Base.connection.select_one('SELECT dummy FROM DUAL').values.first.encoding
+    77|         else
+    78|           ::ActiveRecord::Base.connection.select_one("SELECT '' AS str;").values.first.encoding
+    79|         end
+    80|       end
+    81|       def embedded?
+    82|         false
+    83|       end
+    84|       def cyclic?
+    85|         false
+    86|       end
+    87|       def adapter_supports_joins?
+    88|         true
+    89|       end
+    90|     private
+    91|       def bulk_scope(scope, options)
+    92|         scope.where(primary_key => options[:bulk_ids])
+    93|       end
+    94|       def sort_scope(scope, options)
+    95|         direction = options[:sort_reverse] ? :asc : :desc
+    96|         case options[:sort]
+    97|         when String, Symbol
+    98|           scope.reorder("#{options[:sort]} #{direction}")
+    99|         when Array
+   100|           scope.reorder(options[:sort].zip(Array.new(options[:sort].size) { direction }).to_h)
+   101|         when Hash
+   102|           scope.reorder(options[:sort].map { |table_name, column| "#{table_name}.#{column}" }.
+   103|             zip(Array.new(options[:sort].size) { direction }).to_h)
+   104|         else
+   105|           raise ArgumentError.new("Unsupported sort value: #{options[:sort]}")
+   106|         end
+   107|       end
+   108|       class WhereBuilder
+   109|         def initialize(scope)
+   110|           @statements = []
+   111|           @values = []
+   112|           @tables = []
+   113|           @scope = scope
+   114|         end
+   115|         def add(field, value, operator)
+   116|           field.searchable_columns.flatten.each do |column_infos|
+   117|             statement, value1, value2 = StatementBuilder.new(column_infos[:column], column_infos[:type], value, operator, @scope.connection.adapter_name).to_statement
+   118|             @statements << statement if statement.present?
+   119|             @values << value1 unless value1.nil?
+   120|             @values << value2 unless value2.nil?
+   121|             table, column = column_infos[:column].split('.')
+   122|             @tables.push(table) if column
+   123|           end
+   124|         end
+   125|         def build
+   126|           scope = @scope.where(@statements.join(' OR '), *@values)
+   127|           scope = scope.references(*@tables.uniq) if @tables.any?
+   128|           scope
+   129|         end
+   130|       end
+   131|       def query_scope(scope, query, fields = config.list.fields.select(&:queryable?))
+   132|         if config.list.search_by
+   133|           scope.send(config.list.search_by, query)
+   134|         else
+   135|           wb = WhereBuilder.new(scope)
+   136|           fields.each do |field|
+   137|             value = parse_field_value(field, query)
+   138|             wb.add(field, value, field.search_operator)
+   139|           end
+   140|           wb.build
+   141|         end
+   142|       end
+   143|       def filter_scope(scope, filters, fields = config.list.fields.select(&:filterable?))
+   144|         filters.each_pair do |field_name, filters_dump|
+   145|           filters_dump.each_value do |filter_dump|
+   146|             wb = WhereBuilder.new(scope)
+   147|             field = fields.detect { |f| f.name.to_s == field_name }
+   148|             value = parse_field_value(field, filter_dump[:v])
+   149|             wb.add(field, value, (filter_dump[:o] || RailsAdmin::Config.default_search_operator))
+   150|             scope = wb.build
+   151|           end
+   152|         end
+   153|         scope
+   154|       end
+   155|       def build_statement(column, type, value, operator)
+   156|         StatementBuilder.new(column, type, value, operator, model.connection.adapter_name).to_statement
+   157|       end
+   158|       class StatementBuilder < RailsAdmin::AbstractModel::StatementBuilder
+   159|         def initialize(column, type, value, operator, adapter_name)
+   160|           super column, type, value, operator
+   161|           @adapter_name = adapter_name
+   162|         end
+   163|       protected
+   164|         def unary_operators
+   165|           case @type
+
+# --- HUNK 3: Lines 197-237 ---
+   197|           elsif min && max
+   198|             ["(#{@column} BETWEEN ? AND ?)", min, max]
+   199|           elsif min
+   200|             ["(#{@column} >= ?)", min]
+   201|           elsif max
+   202|             ["(#{@column} <= ?)", max]
+   203|           end
+   204|         end
+   205|         def build_statement_for_type
+   206|           case @type
+   207|           when :boolean                   then build_statement_for_boolean
+   208|           when :integer, :decimal, :float then build_statement_for_integer_decimal_or_float
+   209|           when :string, :text, :citext    then build_statement_for_string_or_text
+   210|           when :enum                      then build_statement_for_enum
+   211|           when :belongs_to_association    then build_statement_for_belongs_to_association
+   212|           when :uuid                      then build_statement_for_uuid
+   213|           end
+   214|         end
+   215|         def build_statement_for_boolean
+   216|           return ["(#{@column} IS NULL OR #{@column} = ?)", false] if %w[false f 0].include?(@value)
+   217|           ["(#{@column} = ?)", true] if %w[true t 1].include?(@value)
+   218|         end
+   219|         def column_for_value(value)
+   220|           ["(#{@column} = ?)", value]
+   221|         end
+   222|         def build_statement_for_belongs_to_association
+   223|           return if @value.blank?
+   224|           ["(#{@column} = ?)", @value.to_i] if @value.to_i.to_s == @value
+   225|         end
+   226|         def build_statement_for_string_or_text
+   227|           return if @value.blank?
+   228|           return ["(#{@column} = ?)", @value] if ['is', '='].include?(@operator)
+   229|           @value = @value.mb_chars.downcase unless %w[postgresql postgis].include? ar_adapter
+   230|           @value =
+   231|             case @operator
+   232|             when 'default', 'like', 'not_like'
+   233|               "%#{@value}%"
+   234|             when 'starts_with'
+   235|               "#{@value}%"
+   236|             when 'ends_with'
+   237|               "%#{@value}"
+
+
+# ====================================================================
+# FILE: lib/rails_admin/adapters/active_record/association.rb
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-90 ---
+     1| module RailsAdmin
+     2|   module Adapters
+     3|     module ActiveRecord
+     4|       class Association
+     5|         attr_reader :association, :model
+     6|         def initialize(association, model)
+     7|           @association = association
+     8|           @model = model
+     9|         end
+    10|         def name
+    11|           association.name.to_sym
+    12|         end
+    13|         def pretty_name
+    14|           name.to_s.tr('_', ' ').capitalize
+    15|         end
+    16|         def type
+    17|           association.macro
+    18|         end
+    19|         def field_type
+    20|           if polymorphic?
+    21|             :polymorphic_association
+    22|           else
+    23|             :"#{association.macro}_association"
+    24|           end
+    25|         end
+    26|         def klass
+    27|           if options[:polymorphic]
+    28|             polymorphic_parents(:active_record, model.name.to_s, name) || []
+    29|           else
+    30|             association.klass
+    31|           end
+    32|         end
+    33|         def primary_key
+    34|           return nil if polymorphic?
+    35|           case type
+    36|           when :has_one
+    37|             association.klass.primary_key
+    38|           else
+    39|             association.association_primary_key
+    40|           end.try(:to_sym)
+    41|         end
+    42|         def foreign_key
+    43|           association.foreign_key.to_sym
+    44|         end
+    45|         def foreign_key_nullable?
+    46|           return true if foreign_key.nil? || type != :has_many
+    47|           (column = klass.columns_hash[foreign_key.to_s]).nil? || column.null
+    48|         end
+    49|         def foreign_type
+    50|           options[:foreign_type].try(:to_sym) || :"#{name}_type" if options[:polymorphic]
+    51|         end
+    52|         def foreign_inverse_of
+    53|           nil
+    54|         end
+    55|         def key_accessor
+    56|           case type
+    57|           when :has_many, :has_and_belongs_to_many
+    58|             :"#{name.to_s.singularize}_ids"
+    59|           when :has_one
+    60|             :"#{name}_id"
+    61|           else
+    62|             foreign_key
+    63|           end
+    64|         end
+    65|         def as
+    66|           options[:as].try :to_sym
+    67|         end
+    68|         def polymorphic?
+    69|           options[:polymorphic] || false
+    70|         end
+    71|         def inverse_of
+    72|           options[:inverse_of].try :to_sym
+    73|         end
+    74|         def read_only?
+    75|           (klass.all.instance_exec(&scope).readonly_value if scope.is_a?(Proc) && scope.arity == 0) ||
+    76|             association.nested? ||
+    77|             false
+    78|         end
+    79|         def nested_options
+    80|           model.nested_attributes_options.try { |o| o[name.to_sym] }
+    81|         end
+    82|         def association?
+    83|           true
+    84|         end
+    85|         delegate :options, :scope, to: :association, prefix: false
+    86|         delegate :polymorphic_parents, to: RailsAdmin::AbstractModel
+    87|       end
+    88|     end
+    89|   end
+    90| end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/adapters/mongoid.rb
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 7-68 ---
+     7| module RailsAdmin
+     8|   module Adapters
+     9|     module Mongoid
+    10|       DISABLED_COLUMN_TYPES = %w[Range Moped::BSON::Binary BSON::Binary Mongoid::Geospatial::Point].freeze
+    11|       def parse_object_id(value)
+    12|         Bson.parse_object_id(value)
+    13|       end
+    14|       def new(params = {})
+    15|         model.new(params).extend(ObjectExtension)
+    16|       end
+    17|       def get(id, scope = scoped)
+    18|         object = scope.find(id)
+    19|         return nil unless object
+    20|         object.extend(ObjectExtension)
+    21|       rescue StandardError => e
+    22|         raise e if %w[
+    23|           Mongoid::Errors::DocumentNotFound
+    24|           Mongoid::Errors::InvalidFind
+    25|           Moped::Errors::InvalidObjectId
+    26|           BSON::InvalidObjectId
+    27|           BSON::Error::InvalidObjectId
+    28|         ].exclude?(e.class.to_s)
+    29|       end
+    30|       def scoped
+    31|         model.scoped
+    32|       end
+    33|       def first(options = {}, scope = nil)
+    34|         all(options, scope).first
+    35|       end
+    36|       def all(options = {}, scope = nil)
+    37|         scope ||= scoped
+    38|         scope = scope.includes(*options[:include]) if options[:include]
+    39|         scope = scope.limit(options[:limit]) if options[:limit]
+    40|         scope = scope.any_in(_id: options[:bulk_ids]) if options[:bulk_ids]
+    41|         scope = query_scope(scope, options[:query]) if options[:query]
+    42|         scope = filter_scope(scope, options[:filters]) if options[:filters]
+    43|         scope = scope.send(Kaminari.config.page_method_name, options[:page]).per(options[:per]) if options[:page] && options[:per]
+    44|         scope = sort_by(options, scope) if options[:sort]
+    45|         scope
+    46|       rescue NoMethodError => e
+    47|         if /page/.match?(e.message)
+    48|           e = e.exception <<~ERROR
+    49|             If you don't have kaminari-mongoid installed, add `gem 'kaminari-mongoid'` to your Gemfile.
+    50|           ERROR
+    51|         end
+    52|         raise e
+    53|       end
+    54|       def count(options = {}, scope = nil)
+    55|         all(options.merge(limit: false, page: false), scope).count
+    56|       end
+    57|       def destroy(objects)
+    58|         Array.wrap(objects).each(&:destroy)
+    59|       end
+    60|       def primary_key
+    61|         '_id'
+    62|       end
+    63|       def associations
+    64|         model.relations.values.collect do |association|
+    65|           Association.new(association, model)
+    66|         end
+    67|       end
+    68|       def properties
+
+# --- HUNK 2: Lines 103-184 ---
+   103|           conditions_per_collection[collection_name] << statement
+   104|         end
+   105|         conditions_per_collection
+   106|       end
+   107|       def query_scope(scope, query, fields = config.list.fields.select(&:queryable?))
+   108|         if config.list.search_by
+   109|           scope.send(config.list.search_by, query)
+   110|         else
+   111|           statements = []
+   112|           fields.each do |field|
+   113|             value = parse_field_value(field, query)
+   114|             conditions_per_collection = make_field_conditions(field, value, field.search_operator)
+   115|             statements.concat make_condition_for_current_collection(field, conditions_per_collection)
+   116|           end
+   117|           scope.where(statements.any? ? {'$or' => statements} : {})
+   118|         end
+   119|       end
+   120|       def filter_scope(scope, filters, fields = config.list.fields.select(&:filterable?))
+   121|         statements = []
+   122|         filters.each_pair do |field_name, filters_dump|
+   123|           filters_dump.each_value do |filter_dump|
+   124|             field = fields.detect { |f| f.name.to_s == field_name }
+   125|             next unless field
+   126|             value = parse_field_value(field, filter_dump[:v])
+   127|             conditions_per_collection = make_field_conditions(field, value, (filter_dump[:o] || 'default'))
+   128|             field_statements = make_condition_for_current_collection(field, conditions_per_collection)
+   129|             if field_statements.many?
+   130|               statements << {'$or' => field_statements}
+   131|             elsif field_statements.any?
+   132|               statements << field_statements.first
+   133|             end
+   134|           end
+   135|         end
+   136|         scope.where(statements.any? ? {'$and' => statements} : {})
+   137|       end
+   138|       def parse_collection_name(column)
+   139|         collection_name, column_name = column.split('.')
+   140|         if associations.detect { |a| a.name == collection_name.to_sym }.try(:embeds?)
+   141|           [table_name, column]
+   142|         else
+   143|           [collection_name, column_name]
+   144|         end
+   145|       end
+   146|       def make_condition_for_current_collection(target_field, conditions_per_collection)
+   147|         result = []
+   148|         conditions_per_collection.each do |collection_name, conditions|
+   149|           if collection_name == table_name
+   150|             result.concat conditions
+   151|           else
+   152|             result.concat perform_search_on_associated_collection(target_field.name, conditions)
+   153|           end
+   154|         end
+   155|         result
+   156|       end
+   157|       def perform_search_on_associated_collection(field_name, conditions)
+   158|         target_association = associations.detect { |a| a.name == field_name }
+   159|         return [] unless target_association
+   160|         model = target_association.klass
+   161|         case target_association.type
+   162|         when :belongs_to, :has_and_belongs_to_many
+   163|           [{target_association.foreign_key.to_s => {'$in' => model.where('$or' => conditions).all.collect { |r| r.send(target_association.primary_key) }}}]
+   164|         when :has_many, :has_one
+   165|           [{target_association.primary_key.to_s => {'$in' => model.where('$or' => conditions).all.collect { |r| r.send(target_association.foreign_key) }}}]
+   166|         end
+   167|       end
+   168|       def sort_by(options, scope)
+   169|         return scope unless options[:sort]
+   170|         case options[:sort]
+   171|         when String
+   172|           field_name, collection_name = options[:sort].split('.').reverse
+   173|           raise 'sorting by associated model column is not supported in Non-Relational databases' if collection_name && collection_name != table_name
+   174|         when Symbol
+   175|           field_name = options[:sort].to_s
+   176|         end
+   177|         if options[:sort_reverse]
+   178|           scope.asc field_name
+   179|         else
+   180|           scope.desc field_name
+   181|         end
+   182|       end
+   183|       class StatementBuilder < RailsAdmin::AbstractModel::StatementBuilder
+   184|       protected
+
+# --- HUNK 3: Lines 187-227 ---
+   187|             '_blank' => {@column => {'$in' => [nil, '']}},
+   188|             '_present' => {@column => {'$nin' => [nil, '']}},
+   189|             '_null' => {@column => nil},
+   190|             '_not_null' => {@column => {'$ne' => nil}},
+   191|             '_empty' => {@column => ''},
+   192|             '_not_empty' => {@column => {'$ne' => ''}},
+   193|           }
+   194|         end
+   195|       private
+   196|         def build_statement_for_type
+   197|           case @type
+   198|           when :boolean                   then build_statement_for_boolean
+   199|           when :integer, :decimal, :float then build_statement_for_integer_decimal_or_float
+   200|           when :string, :text             then build_statement_for_string_or_text
+   201|           when :enum                      then build_statement_for_enum
+   202|           when :belongs_to_association, :bson_object_id then build_statement_for_belongs_to_association_or_bson_object_id
+   203|           end
+   204|         end
+   205|         def build_statement_for_boolean
+   206|           return {@column => false} if %w[false f 0].include?(@value)
+   207|           {@column => true} if %w[true t 1].include?(@value)
+   208|         end
+   209|         def column_for_value(value)
+   210|           {@column => value}
+   211|         end
+   212|         def build_statement_for_string_or_text
+   213|           return if @value.blank?
+   214|           @value =
+   215|             case @operator
+   216|             when 'not_like'
+   217|               Regexp.compile("^((?!#{Regexp.escape(@value)}).)*$", Regexp::IGNORECASE)
+   218|             when 'default', 'like'
+   219|               Regexp.compile(Regexp.escape(@value), Regexp::IGNORECASE)
+   220|             when 'starts_with'
+   221|               Regexp.compile("^#{Regexp.escape(@value)}", Regexp::IGNORECASE)
+   222|             when 'ends_with'
+   223|               Regexp.compile("#{Regexp.escape(@value)}$", Regexp::IGNORECASE)
+   224|             when 'is', '='
+   225|               @value.to_s
+   226|             else
+   227|               return
+
+
+# ====================================================================
+# FILE: lib/rails_admin/adapters/mongoid/association.rb
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 9-123 ---
+     9|           @model = model
+    10|         end
+    11|         def name
+    12|           association.name.to_sym
+    13|         end
+    14|         def pretty_name
+    15|           name.to_s.tr('_', ' ').capitalize
+    16|         end
+    17|         def type
+    18|           case macro.to_sym
+    19|           when :belongs_to, :referenced_in, :embedded_in
+    20|             :belongs_to
+    21|           when :has_one, :references_one, :embeds_one
+    22|             :has_one
+    23|           when :has_many, :references_many, :embeds_many
+    24|             :has_many
+    25|           when :has_and_belongs_to_many, :references_and_referenced_in_many
+    26|             :has_and_belongs_to_many
+    27|           else
+    28|             raise "Unknown association type: #{macro.inspect}"
+    29|           end
+    30|         end
+    31|         def field_type
+    32|           if polymorphic?
+    33|             :polymorphic_association
+    34|           else
+    35|             :"#{type}_association"
+    36|           end
+    37|         end
+    38|         def klass
+    39|           if polymorphic? && %i[referenced_in belongs_to].include?(macro)
+    40|             polymorphic_parents(:mongoid, model.name, name) || []
+    41|           else
+    42|             association.klass
+    43|           end
+    44|         end
+    45|         def primary_key
+    46|           case type
+    47|           when :belongs_to, :has_and_belongs_to_many
+    48|             association.primary_key.to_sym
+    49|           else
+    50|             :_id
+    51|           end
+    52|         end
+    53|         def foreign_key
+    54|           return if embeds?
+    55|           begin
+    56|             association.foreign_key.to_sym
+    57|           rescue StandardError
+    58|             nil
+    59|           end
+    60|         end
+    61|         def foreign_key_nullable?
+    62|           return if foreign_key.nil?
+    63|           true
+    64|         end
+    65|         def foreign_type
+    66|           return unless polymorphic? && %i[referenced_in belongs_to].include?(macro)
+    67|           association.inverse_type.try(:to_sym) || :"#{name}_type"
+    68|         end
+    69|         def foreign_inverse_of
+    70|           return unless polymorphic? && %i[referenced_in belongs_to].include?(macro)
+    71|           inverse_of_field.try(:to_sym)
+    72|         end
+    73|         def key_accessor
+    74|           case macro.to_sym
+    75|           when :has_many
+    76|             :"#{name.to_s.singularize}_ids"
+    77|           when :has_one
+    78|             :"#{name}_id"
+    79|           when :embedded_in, :embeds_one, :embeds_many
+    80|             nil
+    81|           else
+    82|             foreign_key
+    83|           end
+    84|         end
+    85|         def as
+    86|           association.as.try :to_sym
+    87|         end
+    88|         def polymorphic?
+    89|           association.polymorphic? && %i[referenced_in belongs_to].include?(macro)
+    90|         end
+    91|         def inverse_of
+    92|           association.inverse_of.try :to_sym
+    93|         end
+    94|         def read_only?
+    95|           false
+    96|         end
+    97|         def nested_options
+    98|           nested = nested_attributes_options.try { |o| o[name] }
+    99|           if !nested && %i[embeds_one embeds_many].include?(macro.to_sym) && !cyclic?
+   100|             raise <<~MSG
+   101|               Embedded association without accepts_nested_attributes_for can't be handled by RailsAdmin,
+   102|               because embedded model doesn't have top-level access.
+   103|               Please add `accepts_nested_attributes_for :#{association.name}' line to `#{model}' model.
+   104|             MSG
+   105|           end
+   106|           nested
+   107|         end
+   108|         def association?
+   109|           true
+   110|         end
+   111|         def macro
+   112|           association.try(:macro) || association.class.name.split('::').last.underscore.to_sym
+   113|         end
+   114|         def embeds?
+   115|           %i[embeds_one embeds_many].include?(macro)
+   116|         end
+   117|       private
+   118|         def inverse_of_field
+   119|           association.respond_to?(:inverse_of_field) && association.inverse_of_field
+   120|         end
+   121|         def cyclic?
+   122|           association.respond_to?(:cyclic?) ? association.cyclic? : association.cyclic
+   123|         end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/adapters/mongoid/bson.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-27 ---
+     1| require 'mongoid'
+     2| module RailsAdmin
+     3|   module Adapters
+     4|     module Mongoid
+     5|       class Bson
+     6|         OBJECT_ID =
+     7|           if defined?(Moped::BSON)
+     8|             Moped::BSON::ObjectId
+     9|           elsif defined?(BSON::ObjectId)
+    10|             BSON::ObjectId
+    11|           end
+    12|         class << self
+    13|           def parse_object_id(value)
+    14|             OBJECT_ID.from_string(value)
+    15|           rescue StandardError => e
+    16|             raise e if %w[
+    17|               Moped::Errors::InvalidObjectId
+    18|               BSON::ObjectId::Invalid
+    19|               BSON::InvalidObjectId
+    20|               BSON::Error::InvalidObjectId
+    21|             ].exclude?(e.class.to_s)
+    22|           end
+    23|         end
+    24|       end
+    25|     end
+    26|   end
+    27| end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/config/fields/base.rb
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 29-107 ---
+    29|           @section = parent
+    30|         end
+    31|         register_instance_option :css_class do
+    32|           "#{name}_field"
+    33|         end
+    34|         def type_css_class
+    35|           "#{type}_type"
+    36|         end
+    37|         def virtual?
+    38|           properties.blank?
+    39|         end
+    40|         register_instance_option :column_width do
+    41|           nil
+    42|         end
+    43|         register_instance_option :sticky? do
+    44|           false
+    45|         end
+    46|         register_instance_option :sortable do
+    47|           !virtual? || children_fields.first || false
+    48|         end
+    49|         def sort_column
+    50|           if sortable == true
+    51|             "#{abstract_model.table_name}.#{name}"
+    52|           elsif (sortable.is_a?(String) || sortable.is_a?(Symbol)) && sortable.to_s.include?('.') # just provide sortable, don't do anything smart
+    53|             sortable
+    54|           elsif sortable.is_a?(Hash) # just join sortable hash, don't do anything smart
+    55|             "#{sortable.keys.first}.#{sortable.values.first}"
+    56|           elsif association # use column on target table
+    57|             "#{associated_model_config.abstract_model.table_name}.#{sortable}"
+    58|           else # use described column in the field conf.
+    59|             "#{abstract_model.table_name}.#{sortable}"
+    60|           end
+    61|         end
+    62|         register_instance_option :searchable do
+    63|           !virtual? || children_fields.first || false
+    64|         end
+    65|         register_instance_option :search_operator do
+    66|           RailsAdmin::Config.default_search_operator
+    67|         end
+    68|         register_instance_option :queryable? do
+    69|           !virtual?
+    70|         end
+    71|         register_instance_option :filterable? do
+    72|           !!searchable
+    73|         end
+    74|         register_instance_option :filter_operators do
+    75|           []
+    76|         end
+    77|         register_instance_option :default_filter_operator do
+    78|           nil
+    79|         end
+    80|         def filter_options
+    81|           {
+    82|             label: label,
+    83|             name: name,
+    84|             operator: default_filter_operator,
+    85|             operators: filter_operators,
+    86|             type: type,
+    87|           }
+    88|         end
+    89|         register_instance_option :sort_reverse? do
+    90|           false
+    91|         end
+    92|         register_instance_option :searchable_columns do
+    93|           @searchable_columns ||=
+    94|             case searchable
+    95|             when true
+    96|               [{column: "#{abstract_model.table_name}.#{name}", type: type}]
+    97|             when false
+    98|               []
+    99|             when :all # valid only for associations
+   100|               table_name = associated_model_config.abstract_model.table_name
+   101|               associated_model_config.list.fields.collect { |f| {column: "#{table_name}.#{f.name}", type: f.type} }
+   102|             else
+   103|               [searchable].flatten.collect do |f|
+   104|                 if f.is_a?(String) && f.include?('.')                            #  table_name.column
+   105|                   table_name, column = f.split '.'
+   106|                   type = nil
+   107|                 elsif f.is_a?(Hash)                                              #  <Model|table_name> => <attribute|column>
+
+# --- HUNK 2: Lines 178-217 ---
+   178|         register_instance_option :view_helper do
+   179|           :text_field
+   180|         end
+   181|         register_instance_option :read_only? do
+   182|           !editable?
+   183|         end
+   184|         register_instance_option :active? do
+   185|           false
+   186|         end
+   187|         register_instance_option :visible? do
+   188|           returned = true
+   189|           (RailsAdmin.config.default_hidden_fields || {}).each do |section, fields|
+   190|             next unless self.section.is_a?("RailsAdmin::Config::Sections::#{section.to_s.camelize}".constantize)
+   191|             returned = false if fields.include?(name)
+   192|           end
+   193|           returned
+   194|         end
+   195|         register_instance_option :children_fields do
+   196|           []
+   197|         end
+   198|         register_instance_option :eager_load do
+   199|           false
+   200|         end
+   201|         register_deprecated_instance_option :eager_load?, :eager_load
+   202|         def eager_load_values
+   203|           case eager_load
+   204|           when true
+   205|             [name]
+   206|           when false, nil
+   207|             []
+   208|           else
+   209|             Array.wrap(eager_load)
+   210|           end
+   211|         end
+   212|         register_instance_option :render do
+   213|           bindings[:view].render partial: "rails_admin/main/#{partial}", locals: {field: self, form: bindings[:form]}
+   214|         end
+   215|         def editable?
+   216|           !((@properties && @properties.read_only?) || (bindings[:object] && bindings[:object].readonly?))
+   217|         end
+
+# --- HUNK 3: Lines 225-284 ---
+   225|         end
+   226|         def optional?
+   227|           !required?
+   228|         end
+   229|         def optional(state = nil, &block)
+   230|           if !state.nil? || block
+   231|             required state.nil? ? proc { instance_eval(&block) == false } : state == false
+   232|           else
+   233|             optional?
+   234|           end
+   235|         end
+   236|         def optional=(state)
+   237|           optional(state)
+   238|         end
+   239|         def type
+   240|           @type ||= self.class.name.to_s.demodulize.underscore.to_sym
+   241|         end
+   242|         def value
+   243|           bindings[:object].safe_send(name)
+   244|         rescue NoMethodError => e
+   245|           raise e.exception <<~ERROR
+   246|             If you want to use a RailsAdmin virtual field(= a field without corresponding instance method),
+   247|             you should declare 'formatted_value' in the field definition.
+   248|               field :#{name} do
+   249|                 formatted_value{ bindings[:object].call_some_method }
+   250|               end
+   251|           ERROR
+   252|         end
+   253|         register_instance_option :nested_form do
+   254|           false
+   255|         end
+   256|         register_instance_option :allowed_methods do
+   257|           [method_name]
+   258|         end
+   259|         def generic_help
+   260|           "#{required? ? I18n.translate('admin.form.required') : I18n.translate('admin.form.optional')}. "
+   261|         end
+   262|         def generic_field_help
+   263|           model = abstract_model.model_name.underscore
+   264|           model_lookup = :"admin.help.#{model}.#{name}"
+   265|           translated = I18n.translate(model_lookup, help: generic_help, default: [generic_help])
+   266|           (translated.is_a?(Hash) ? translated.to_a.first[1] : translated).html_safe
+   267|         end
+   268|         def parse_value(value)
+   269|           value
+   270|         end
+   271|         def parse_input(_params)
+   272|         end
+   273|         def inverse_of
+   274|           nil
+   275|         end
+   276|         def method_name
+   277|           name
+   278|         end
+   279|         def form_default_value
+   280|           (default_value if bindings[:object].new_record? && value.nil?)
+   281|         end
+   282|         def form_value
+   283|           form_default_value.nil? ? formatted_value : form_default_value
+   284|         end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/config/fields/factories/active_storage.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-30 ---
+     1| require 'rails_admin/config/fields'
+     2| require 'rails_admin/config/fields/types'
+     3| require 'rails_admin/config/fields/types/file_upload'
+     4| RailsAdmin::Config::Fields.register_factory do |parent, properties, fields|
+     5|   if defined?(::ActiveStorage) && properties.try(:association?) && (match = /\A(.+)_attachments?\Z/.match properties.name) && properties.klass.to_s == 'ActiveStorage::Attachment'
+     6|     name = match[1]
+     7|     field = RailsAdmin::Config::Fields::Types.load(
+     8|       properties.type == :has_many ? :multiple_active_storage : :active_storage,
+     9|     ).new(parent, name, properties)
+    10|     fields << field
+    11|     associations =
+    12|       if properties.type == :has_many
+    13|         [:"#{name}_attachments", :"#{name}_blobs"]
+    14|       else
+    15|         [:"#{name}_attachment", :"#{name}_blob"]
+    16|       end
+    17|     children_fields = associations.map do |child_name|
+    18|       child_association = parent.abstract_model.associations.detect { |p| p.name.to_sym == child_name }
+    19|       next unless child_association
+    20|       child_field = fields.detect { |f| f.name == child_name } || RailsAdmin::Config::Fields.default_factory.call(parent, child_association, fields)
+    21|       child_field.hide unless field == child_field
+    22|       child_field.filterable(false) unless field == child_field
+    23|       child_field.name
+    24|     end.flatten.compact
+    25|     field.children_fields(children_fields)
+    26|     true
+    27|   else
+    28|     false
+    29|   end
+    30| end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/config/fields/factories/carrierwave.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-26 ---
+     1| require 'rails_admin/config/fields'
+     2| require 'rails_admin/config/fields/types'
+     3| require 'rails_admin/config/fields/types/file_upload'
+     4| RailsAdmin::Config::Fields.register_factory do |parent, properties, fields|
+     5|   model = parent.abstract_model.model
+     6|   if defined?(::CarrierWave) && model.is_a?(CarrierWave::Mount) && model.uploaders.include?(attachment_name = properties.name.to_s.chomp('_file_name').to_sym)
+     7|     columns = [model.uploader_options[attachment_name][:mount_on] || attachment_name, :"#{attachment_name}_content_type", :"#{attachment_name}_file_size"]
+     8|     field = RailsAdmin::Config::Fields::Types.load(
+     9|       %i[serialized json].include?(properties.type) ? :multiple_carrierwave : :carrierwave,
+    10|     ).new(parent, attachment_name, properties)
+    11|     fields << field
+    12|     children_fields = []
+    13|     columns.each do |children_column_name|
+    14|       child_properties = parent.abstract_model.properties.detect { |p| p.name.to_s == children_column_name.to_s }
+    15|       next unless child_properties
+    16|       children_field = fields.detect { |f| f.name == children_column_name } || RailsAdmin::Config::Fields.default_factory.call(parent, child_properties, fields)
+    17|       children_field.hide unless field == children_field
+    18|       children_field.filterable(false) unless field == children_field
+    19|       children_fields << children_field.name
+    20|     end
+    21|     field.children_fields(children_fields)
+    22|     true
+    23|   else
+    24|     false
+    25|   end
+    26| end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/config/fields/factories/dragonfly.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-24 ---
+     1| require 'rails_admin/config/fields'
+     2| require 'rails_admin/config/fields/types'
+     3| require 'rails_admin/config/fields/types/file_upload'
+     4| RailsAdmin::Config::Fields.register_factory do |parent, properties, fields|
+     5|   extensions = %i[name uid]
+     6|   if (properties.name.to_s =~ /^(.+)_uid$/) && defined?(::Dragonfly) && parent.abstract_model.model.respond_to?(:dragonfly_attachment_classes) && parent.abstract_model.model.dragonfly_attachment_classes.collect(&:attribute).include?(attachment_name = Regexp.last_match[1].to_sym)
+     7|     field = RailsAdmin::Config::Fields::Types.load(:dragonfly).new(parent, attachment_name, properties)
+     8|     children_fields = []
+     9|     extensions.each do |ext|
+    10|       children_column_name = :"#{attachment_name}_#{ext}"
+    11|       child_properties = parent.abstract_model.properties.detect { |p| p.name.to_s == children_column_name.to_s }
+    12|       next unless child_properties
+    13|       children_field = fields.detect { |f| f.name == children_column_name } || RailsAdmin::Config::Fields.default_factory.call(parent, child_properties, fields)
+    14|       children_field.hide
+    15|       children_field.filterable(false)
+    16|       children_fields << children_field.name
+    17|     end
+    18|     field.children_fields(children_fields)
+    19|     fields << field
+    20|     true
+    21|   else
+    22|     false
+    23|   end
+    24| end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/config/fields/factories/paperclip.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-25 ---
+     1| require 'rails_admin/config/fields'
+     2| require 'rails_admin/config/fields/types'
+     3| require 'rails_admin/config/fields/types/file_upload'
+     4| RailsAdmin::Config::Fields.register_factory do |parent, properties, fields|
+     5|   extensions = %i[file_name content_type file_size updated_at fingerprint]
+     6|   model = parent.abstract_model.model
+     7|   if (properties.name.to_s =~ /^(.+)_file_name$/) && defined?(::Paperclip) && model.try(:attachment_definitions) && model.attachment_definitions.key?(attachment_name = Regexp.last_match[1].to_sym)
+     8|     field = RailsAdmin::Config::Fields::Types.load(:paperclip).new(parent, attachment_name, properties)
+     9|     children_fields = []
+    10|     extensions.each do |ext|
+    11|       children_column_name = :"#{attachment_name}_#{ext}"
+    12|       child_properties = parent.abstract_model.properties.detect { |p| p.name.to_s == children_column_name.to_s }
+    13|       next unless child_properties
+    14|       children_field = fields.detect { |f| f.name == children_column_name } || RailsAdmin::Config::Fields.default_factory.call(parent, child_properties, fields)
+    15|       children_field.hide
+    16|       children_field.filterable(false)
+    17|       children_fields << children_field.name
+    18|     end
+    19|     field.children_fields(children_fields)
+    20|     fields << field
+    21|     true
+    22|   else
+    23|     false
+    24|   end
+    25| end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/config/fields/factories/shrine.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-20 ---
+     1| require 'rails_admin/config/fields'
+     2| require 'rails_admin/config/fields/types'
+     3| require 'rails_admin/config/fields/types/file_upload'
+     4| RailsAdmin::Config::Fields.register_factory do |parent, properties, fields|
+     5|   next false unless defined?(::Shrine)
+     6|   attachment_names = parent.abstract_model.model.ancestors.select { |m| m.is_a?(Shrine::Attachment) }.map { |a| a.instance_variable_get('@name') }
+     7|   next false if attachment_names.blank?
+     8|   attachment_name = attachment_names.detect { |a| a == properties.name.to_s.chomp('_data').to_sym }
+     9|   next false unless attachment_name
+    10|   field = RailsAdmin::Config::Fields::Types.load(:shrine).new(parent, attachment_name, properties)
+    11|   fields << field
+    12|   data_field_name = :"#{attachment_name}_data"
+    13|   child_properties = parent.abstract_model.properties.detect { |p| p.name == data_field_name }
+    14|   next true unless child_properties
+    15|   children_field = fields.detect { |f| f.name == data_field_name } || RailsAdmin::Config::Fields.default_factory.call(parent, child_properties, fields)
+    16|   children_field.hide unless field == children_field
+    17|   children_field.filterable(false) unless field == children_field
+    18|   field.children_fields([data_field_name])
+    19|   true
+    20| end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/config/fields/types/belongs_to_association.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-39 ---
+     1| require 'rails_admin/config/fields/association'
+     2| module RailsAdmin
+     3|   module Config
+     4|     module Fields
+     5|       module Types
+     6|         class BelongsToAssociation < RailsAdmin::Config::Fields::Association
+     7|           RailsAdmin::Config::Fields::Types.register(self)
+     8|           register_instance_option :filter_operators do
+     9|             %w[_discard like not_like is starts_with ends_with] + (required? ? [] : %w[_separator _present _blank])
+    10|           end
+    11|           register_instance_option :formatted_value do
+    12|             (o = value) && o.send(associated_model_config.object_label_method)
+    13|           end
+    14|           register_instance_option :sortable do
+    15|             @sortable ||= abstract_model.adapter_supports_joins? && associated_model_config.abstract_model.properties.collect(&:name).include?(associated_model_config.object_label_method) ? associated_model_config.object_label_method : {abstract_model.table_name => method_name}
+    16|           end
+    17|           register_instance_option :searchable do
+    18|             @searchable ||= associated_model_config.abstract_model.properties.collect(&:name).include?(associated_model_config.object_label_method) ? [associated_model_config.object_label_method, {abstract_model.model => method_name}] : {abstract_model.model => method_name}
+    19|           end
+    20|           register_instance_option :partial do
+    21|             nested_form ? :form_nested_one : :form_filtering_select
+    22|           end
+    23|           register_instance_option :eager_load do
+    24|             true
+    25|           end
+    26|           def selected_id
+    27|             bindings[:object].safe_send(association.key_accessor)
+    28|           end
+    29|           def method_name
+    30|             nested_form ? :"#{name}_attributes" : super
+    31|           end
+    32|           def multiple?
+    33|             false
+    34|           end
+    35|         end
+    36|       end
+    37|     end
+    38|   end
+    39| end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/config/fields/types/has_many_association.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-27 ---
+     1| require 'rails_admin/config/fields/association'
+     2| module RailsAdmin
+     3|   module Config
+     4|     module Fields
+     5|       module Types
+     6|         class HasManyAssociation < RailsAdmin::Config::Fields::Association
+     7|           RailsAdmin::Config::Fields::Types.register(self)
+     8|           register_instance_option :partial do
+     9|             nested_form ? :form_nested_many : :form_filtering_multiselect
+    10|           end
+    11|           register_instance_option :orderable do
+    12|             false
+    13|           end
+    14|           def method_name
+    15|             nested_form ? :"#{name}_attributes" : super
+    16|           end
+    17|           def errors
+    18|             bindings[:object].errors[name]
+    19|           end
+    20|           def associated_prepopulate_params
+    21|             {associated_model_config.abstract_model.param_key => {association.foreign_key => bindings[:object].try(:id)}}
+    22|           end
+    23|         end
+    24|       end
+    25|     end
+    26|   end
+    27| end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/config/fields/types/has_one_association.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-33 ---
+     1| require 'rails_admin/config/fields/association'
+     2| module RailsAdmin
+     3|   module Config
+     4|     module Fields
+     5|       module Types
+     6|         class HasOneAssociation < RailsAdmin::Config::Fields::Association
+     7|           RailsAdmin::Config::Fields::Types.register(self)
+     8|           register_instance_option :filter_operators do
+     9|             %w[_discard like not_like is starts_with ends_with] + (required? ? [] : %w[_separator _present _blank])
+    10|           end
+    11|           register_instance_option :partial do
+    12|             nested_form ? :form_nested_one : :form_filtering_select
+    13|           end
+    14|           register_instance_option :formatted_value do
+    15|             (o = value) && o.send(associated_model_config.object_label_method)
+    16|           end
+    17|           def selected_id
+    18|             value.try(:id).try(:to_s)
+    19|           end
+    20|           def method_name
+    21|             nested_form ? :"#{name}_attributes" : super
+    22|           end
+    23|           def multiple?
+    24|             false
+    25|           end
+    26|           def associated_prepopulate_params
+    27|             {associated_model_config.abstract_model.param_key => {association.foreign_key => bindings[:object].try(:id)}}
+    28|           end
+    29|         end
+    30|       end
+    31|     end
+    32|   end
+    33| end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/extensions/paper_trail/auditing_adapter.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 24-141 ---
+    24|             nil
+    25|           end || @version.whodunnit
+    26|         end
+    27|         def item
+    28|           @version.item_id
+    29|         end
+    30|       end
+    31|       module ControllerExtension
+    32|         def user_for_paper_trail
+    33|           _current_user.try(:id) || _current_user
+    34|         end
+    35|       end
+    36|       class AuditingAdapter
+    37|         COLUMN_MAPPING = {
+    38|           table: :item_type,
+    39|           username: :whodunnit,
+    40|           item: :item_id,
+    41|           created_at: :created_at,
+    42|           message: :event,
+    43|         }.freeze
+    44|         E_USER_CLASS_NOT_SET = <<~ERROR
+    45|           Please set up PaperTrail's user class explicitly.
+    46|               config.audit_with :paper_trail do
+    47|                 user_class { User }
+    48|               end
+    49|         ERROR
+    50|         E_VERSION_MODEL_NOT_SET = <<~ERROR
+    51|           Please set up PaperTrail's version model explicitly.
+    52|               config.audit_with :paper_trail do
+    53|                 version_class { PaperTrail::Version }
+    54|               end
+    55|           If you have configured a model to use a custom version class
+    56|           (https://github.com/paper-trail-gem/paper_trail#6a-custom-version-classes)
+    57|           that configuration will take precedence over what you specify in `audit_with`.
+    58|         ERROR
+    59|         include RailsAdmin::Config::Configurable
+    60|         def self.setup
+    61|           raise 'PaperTrail not found' unless defined?(::PaperTrail)
+    62|           RailsAdmin::Extensions::ControllerExtension.include ControllerExtension
+    63|         end
+    64|         def initialize(controller, user_class_name = nil, version_class_name = nil, &block)
+    65|           @controller = controller
+    66|           @controller&.send(:set_paper_trail_whodunnit)
+    67|           user_class { user_class_name.to_s.constantize } if user_class_name
+    68|           version_class { version_class_name.to_s.constantize } if version_class_name
+    69|           instance_eval(&block) if block
+    70|         end
+    71|         register_instance_option :user_class do
+    72|           User
+    73|         rescue NameError
+    74|           raise E_USER_CLASS_NOT_SET
+    75|         end
+    76|         register_instance_option :version_class do
+    77|           PaperTrail::Version
+    78|         rescue NameError
+    79|           raise E_VERSION_MODEL_NOT_SET
+    80|         end
+    81|         register_instance_option :sort_by do
+    82|           {id: :desc}
+    83|         end
+    84|         def latest(count = 100)
+    85|           version_class.
+    86|             order(sort_by).includes(:item).limit(count).
+    87|             collect { |version| VersionProxy.new(version, user_class) }
+    88|         end
+    89|         def delete_object(_object, _model, _user)
+    90|         end
+    91|         def update_object(_object, _model, _user, _changes)
+    92|         end
+    93|         def create_object(_object, _abstract_model, _user)
+    94|         end
+    95|         def listing_for_model(model, query, sort, sort_reverse, all, page, per_page = (RailsAdmin::Config.default_items_per_page || 20))
+    96|           listing_for_model_or_object(model, nil, query, sort, sort_reverse, all, page, per_page)
+    97|         end
+    98|         def listing_for_object(model, object, query, sort, sort_reverse, all, page, per_page = (RailsAdmin::Config.default_items_per_page || 20))
+    99|           listing_for_model_or_object(model, object, query, sort, sort_reverse, all, page, per_page)
+   100|         end
+   101|       protected
+   102|         def listing_for_model_or_object(model, object, query, sort, sort_reverse, all, page, per_page)
+   103|           sort =
+   104|             if sort.present?
+   105|               {COLUMN_MAPPING[sort.to_sym] => sort_reverse ? :desc : :asc}
+   106|             else
+   107|               sort_by
+   108|             end
+   109|           current_page = page.presence || '1'
+   110|           versions = object.nil? ? versions_for_model(model) : object.public_send(model.model.versions_association_name)
+   111|           versions = versions.where('event LIKE ?', "%#{query}%") if query.present?
+   112|           versions = versions.order(sort)
+   113|           versions = versions.send(Kaminari.config.page_method_name, current_page).per(per_page) unless all
+   114|           paginated_proxies = Kaminari.paginate_array([], total_count: versions.try(:total_count) || versions.count)
+   115|           paginated_proxies = paginated_proxies.send(
+   116|             paginated_proxies.respond_to?(Kaminari.config.page_method_name) ? Kaminari.config.page_method_name : :page,
+   117|             current_page,
+   118|           ).per(per_page)
+   119|           versions.each do |version|
+   120|             paginated_proxies << VersionProxy.new(version, user_class)
+   121|           end
+   122|           paginated_proxies
+   123|         end
+   124|         def versions_for_model(model)
+   125|           model_name = model.model.name
+   126|           base_class_name = model.model.base_class.name
+   127|           options =
+   128|             if base_class_name == model_name
+   129|               {item_type: model_name}
+   130|             else
+   131|               {item_type: base_class_name, item_id: model.model.all}
+   132|             end
+   133|           version_class_for(model.model).where(options)
+   134|         end
+   135|         def version_class_for(model)
+   136|           model.paper_trail.version_class
+   137|         end
+   138|       end
+   139|     end
+   140|   end
+   141| end
+
+
+# ====================================================================
+# FILE: lib/rails_admin/version.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-25 ---
+     1| module RailsAdmin
+     2|   class Version
+     3|     MAJOR = 3
+     4|     MINOR = 1
+     5|     PATCH = 3
+     6|     PRE = nil
+     7|     class << self
+     8|       def to_s
+     9|         [MAJOR, MINOR, PATCH, PRE].compact.join('.')
+    10|       end
+    11|       def js
+    12|         JSON.parse(File.read("#{__dir__}/../../package.json"))['version']
+    13|       end
+    14|       def actual_js_version
+    15|         case RailsAdmin.config.asset_source
+    16|         when :webpacker, :webpack
+    17|           js_version_from_node_modules
+    18|         else
+    19|           js
+    20|         end
+    21|       end
+    22|       def warn_with_js_version
+    23|         return unless Rails.env.development? || Rails.env.test?
+    24|         case actual_js_version
+    25|         when js
+
+
+# ====================================================================
+# FILE: spec/integration/actions/index_spec.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-1110 ---
+     1| require 'spec_helper'
+     2| RSpec.describe 'Index action', type: :request do
+     3|   subject { page }
+     4|   describe 'page' do
+     5|     it 'shows "List of Models", should show filters and should show column headers' do
+     6|       RailsAdmin.config.default_items_per_page = 1
+     7|       2.times { FactoryBot.create :player } # two pages of players
+     8|       visit index_path(model_name: 'player')
+     9|       is_expected.to have_content('List of Players')
+    10|       is_expected.to have_content('Created at')
+    11|       is_expected.to have_content('Updated at')
+    12|       is_expected.to have_selector("li[title='Show'] a")
+    13|       is_expected.to have_selector("li[title='Edit'] a")
+    14|       is_expected.to have_selector("li[title='Delete'] a")
+    15|       is_expected.to have_selector("input[placeholder='Filter']")
+    16|       is_expected.to have_selector("a[href*='all=true']") # make sure we're fully testing pagination
+    17|       is_expected.to have_no_selector("a[href^='/rails_admin/main/list']")
+    18|     end
+    19|   end
+    20|   describe 'css hooks' do
+    21|     it 'is present' do
+    22|       RailsAdmin.config Team do
+    23|         list do
+    24|           field :name
+    25|         end
+    26|       end
+    27|       FactoryBot.create :team
+    28|       visit index_path(model_name: 'team')
+    29|       is_expected.to have_selector('th.header.string_type.name_field')
+    30|       is_expected.to have_selector('td.string_type.name_field')
+    31|     end
+    32|   end
+    33|   describe 'with querying and filtering' do
+    34|     before do
+    35|       @teams = Array.new(2) do
+    36|         FactoryBot.create(:team)
+    37|       end
+    38|       @players = [
+    39|         FactoryBot.create(:player, retired: true, injured: true, team: @teams[0]),
+    40|         FactoryBot.create(:player, retired: true, injured: false, team: @teams[0]),
+    41|         FactoryBot.create(:player, retired: false, injured: true, team: @teams[1]),
+    42|         FactoryBot.create(:player, retired: false, injured: false, team: @teams[1]),
+    43|       ]
+    44|       @comment = FactoryBot.create(:comment, commentable: @players[2])
+    45|     end
+    46|     it 'allows to query on any attribute' do
+    47|       RailsAdmin.config Player do
+    48|         list do
+    49|           field :name
+    50|           field :team
+    51|           field :injured
+    52|           field :retired
+    53|         end
+    54|       end
+    55|       visit index_path(model_name: 'player', query: @players[0].name)
+    56|       is_expected.to have_content(@players[0].name)
+    57|       (1..3).each do |i|
+    58|         is_expected.to have_no_content(@players[i].name)
+    59|       end
+    60|     end
+    61|     it 'allows to clear the search query box', js: true do
+    62|       visit index_path(model_name: 'player', query: @players[0].name)
+    63|       is_expected.not_to have_content(@players[1].name)
+    64|       find_button('Reset filters').click
+    65|       is_expected.to have_content(@players[1].name)
+    66|     end
+    67|     it 'allows to filter on one attribute' do
+    68|       RailsAdmin.config Player do
+    69|         list do
+    70|           field :name
+    71|           field :team
+    72|           field :injured
+    73|           field :retired
+    74|         end
+    75|       end
+    76|       visit index_path(model_name: 'player', f: {injured: {'1' => {v: 'true'}}})
+    77|       is_expected.to have_content(@players[0].name)
+    78|       is_expected.to have_no_content(@players[1].name)
+    79|       is_expected.to have_content(@players[2].name)
+    80|       is_expected.to have_no_content(@players[3].name)
+    81|     end
+    82|     it 'allows to combine filters on two different attributes' do
+    83|       RailsAdmin.config Player do
+    84|         list do
+    85|           field :name
+    86|           field :team
+    87|           field :injured
+    88|           field :retired
+    89|         end
+    90|       end
+    91|       visit index_path(model_name: 'player', f: {retired: {'1' => {v: 'true'}}, injured: {'1' => {v: 'true'}}})
+    92|       is_expected.to have_content(@players[0].name)
+    93|       (1..3).each do |i|
+    94|         is_expected.to have_no_content(@players[i].name)
+    95|       end
+    96|     end
+    97|     it 'allows to filter on belongs_to relationships' do
+    98|       RailsAdmin.config Player do
+    99|         list do
+   100|           field :name
+   101|           field :team
+   102|           field :injured
+   103|           field :retired
+   104|         end
+   105|       end
+   106|       visit index_path(model_name: 'player', f: {team: {'1' => {v: @teams[0].name}}})
+   107|       is_expected.to have_content(@players[0].name)
+   108|       is_expected.to have_content(@players[1].name)
+   109|       is_expected.to have_no_content(@players[2].name)
+   110|       is_expected.to have_no_content(@players[3].name)
+   111|     end
+   112|     it 'allows to filter on has_one relationships' do
+   113|       @draft = FactoryBot.create(:draft, player: @players[1], college: 'University of Alabama')
+   114|       RailsAdmin.config Player do
+   115|         list do
+   116|           field :name
+   117|           field :draft do
+   118|             searchable :college
+   119|           end
+   120|         end
+   121|       end
+   122|       visit index_path(model_name: 'player', f: {draft: {'1' => {v: 'Alabama'}}})
+   123|       is_expected.to have_content(@players[1].name)
+   124|       is_expected.to have_css('tbody .name_field', count: 1)
+   125|     end
+   126|     it 'allows to disable search on attributes' do
+   127|       RailsAdmin.config Player do
+   128|         list do
+   129|           field :position
+   130|           field :name do
+   131|             searchable false
+   132|           end
+   133|         end
+   134|       end
+   135|       visit index_path(model_name: 'player', query: @players[0].name)
+   136|       is_expected.to have_no_content(@players[0].name)
+   137|     end
+   138|     it 'allows to search a belongs_to attribute over the base table' do
+   139|       RailsAdmin.config Player do
+   140|         list do
+   141|           field PK_COLUMN
+   142|           field :name
+   143|           field :team do
+   144|             searchable Player => :team_id
+   145|           end
+   146|         end
+   147|       end
+   148|       visit index_path(model_name: 'player', f: {team: {'1' => {v: @teams.first.id}}})
+   149|       is_expected.to have_content(@players[0].name)
+   150|       is_expected.to have_content(@players[1].name)
+   151|       is_expected.to have_no_content(@players[2].name)
+   152|       is_expected.to have_no_content(@players[3].name)
+   153|     end
+   154|     it 'allows to search a belongs_to attribute over the target table' do
+   155|       RailsAdmin.config Player do
+   156|         list do
+   157|           field PK_COLUMN
+   158|           field :name
+   159|           field :team do
+   160|             searchable Team => :name
+   161|           end
+   162|         end
+   163|       end
+   164|       visit index_path(model_name: 'player', f: {team: {'1' => {v: @teams.first.name}}})
+   165|       is_expected.to have_content(@players[0].name)
+   166|       is_expected.to have_content(@players[1].name)
+   167|       is_expected.to have_no_content(@players[2].name)
+   168|       is_expected.to have_no_content(@players[3].name)
+   169|     end
+   170|     it 'allows to search a belongs_to attribute over the target table with a table name specified as a hash' do
+   171|       RailsAdmin.config Player do
+   172|         list do
+   173|           field PK_COLUMN
+   174|           field :name
+   175|           field :team do
+   176|             searchable teams: :name
+   177|           end
+   178|         end
+   179|       end
+   180|       visit index_path(model_name: 'player', f: {team: {'1' => {v: @teams.first.name}}})
+   181|       is_expected.to have_content(@players[0].name)
+   182|       is_expected.to have_content(@players[1].name)
+   183|       is_expected.to have_no_content(@players[2].name)
+   184|       is_expected.to have_no_content(@players[3].name)
+   185|     end
+   186|     it 'allows to search a belongs_to attribute over the target table with a table name specified as a string' do
+   187|       RailsAdmin.config Player do
+   188|         list do
+   189|           field PK_COLUMN
+   190|           field :name
+   191|           field :team do
+   192|             searchable 'teams.name'
+   193|           end
+   194|         end
+   195|       end
+   196|       visit index_path(model_name: 'player', f: {team: {'1' => {v: @teams.first.name}}})
+   197|       is_expected.to have_content(@players[0].name)
+   198|       is_expected.to have_content(@players[1].name)
+   199|       is_expected.to have_no_content(@players[2].name)
+   200|       is_expected.to have_no_content(@players[3].name)
+   201|     end
+   202|     it 'allows to search a belongs_to attribute over the label method by default' do
+   203|       RailsAdmin.config Player do
+   204|         list do
+   205|           field PK_COLUMN
+   206|           field :name
+   207|           field :team
+   208|         end
+   209|       end
+   210|       visit index_path(model_name: 'player', f: {team: {'1' => {v: @teams.first.name}}})
+   211|       is_expected.to have_content(@players[0].name)
+   212|       is_expected.to have_content(@players[1].name)
+   213|       is_expected.to have_no_content(@players[2].name)
+   214|       is_expected.to have_no_content(@players[3].name)
+   215|     end
+   216|     it 'allows to search a belongs_to attribute over the target table when an attribute is specified' do
+   217|       RailsAdmin.config Player do
+   218|         list do
+   219|           field PK_COLUMN
+   220|           field :name
+   221|           field :team do
+   222|             searchable :name
+   223|           end
+   224|         end
+   225|       end
+   226|       visit index_path(model_name: 'player', f: {team: {'1' => {v: @teams.first.name}}})
+   227|       is_expected.to have_content(@players[0].name)
+   228|       is_expected.to have_content(@players[1].name)
+   229|       is_expected.to have_no_content(@players[2].name)
+   230|       is_expected.to have_no_content(@players[3].name)
+   231|     end
+   232|     it 'allows to search over more than one attribute' do
+   233|       RailsAdmin.config Player do
+   234|         list do
+   235|           field PK_COLUMN
+   236|           field :name
+   237|           field :team do
+   238|             searchable [:name, {Player => :team_id}]
+   239|           end
+   240|         end
+   241|       end
+   242|       visit index_path(model_name: 'player', f: {team: {'1' => {v: @teams.first.name}, '2' => {v: @teams.first.id, o: 'is'}}})
+   243|       is_expected.to have_content(@players[0].name)
+   244|       is_expected.to have_content(@players[1].name)
+   245|       is_expected.to have_no_content(@players[2].name)
+   246|       is_expected.to have_no_content(@players[3].name)
+   247|       visit index_path(model_name: 'player', f: {team: {'1' => {v: @teams.first.name}, '2' => {v: @teams.last.id, o: 'is'}}})
+   248|       is_expected.to have_no_content(@players[0].name)
+   249|       is_expected.to have_no_content(@players[1].name)
+   250|       is_expected.to have_no_content(@players[2].name)
+   251|       is_expected.to have_no_content(@players[3].name)
+   252|     end
+   253|     it 'allows to search a has_many attribute over the target table' do
+   254|       RailsAdmin.config Player do
+   255|         list do
+   256|           field PK_COLUMN
+   257|           field :name
+   258|           field :comments do
+   259|             searchable :content
+   260|           end
+   261|         end
+   262|       end
+   263|       visit index_path(model_name: 'player', f: {comments: {'1' => {v: @comment.content}}})
+   264|       is_expected.to have_no_content(@players[0].name)
+   265|       is_expected.to have_no_content(@players[1].name)
+   266|       is_expected.to have_content(@players[2].name)
+   267|       is_expected.to have_no_content(@players[3].name)
+   268|     end
+   269|     it 'displays base filters when no filters are present in the params' do
+   270|       RailsAdmin.config Player do
+   271|         list { filters(%i[name team]) }
+   272|         field :name do
+   273|           default_filter_operator 'is'
+   274|         end
+   275|         field :team do
+   276|           filterable true
+   277|         end
+   278|       end
+   279|       visit index_path(model_name: 'player')
+   280|       expect(JSON.parse(find('#filters_box')['data-options']).map(&:symbolize_keys)).to match_array [
+   281|         {
+   282|           index: 1,
+   283|           label: 'Name',
+   284|           name: 'name',
+   285|           type: 'string',
+   286|           value: '',
+   287|           operator: 'is',
+   288|           operators: %w[_discard like not_like is starts_with ends_with],
+   289|         },
+   290|         {
+   291|           index: 2,
+   292|           label: 'Team',
+   293|           name: 'team',
+   294|           type: 'belongs_to_association',
+   295|           value: '',
+   296|           operator: nil,
+   297|           operators: %w[_discard like not_like is starts_with ends_with _separator _present _blank],
+   298|         },
+   299|       ]
+   300|     end
+   301|     it 'shows the help text below the search box' do
+   302|       RailsAdmin.config Player do
+   303|         list do
+   304|           search_help 'Use this box to search!'
+   305|         end
+   306|       end
+   307|       visit index_path(model_name: 'player')
+   308|       is_expected.to have_css('.form-text', text: /Use this box/)
+   309|     end
+   310|   end
+   311|   describe 'fields' do
+   312|     before do
+   313|       if defined?(CompositePrimaryKeys)
+   314|         RailsAdmin.config Fan do
+   315|           configure(:fanships) { hide }
+   316|           configure(:fanship) { hide }
+   317|         end
+   318|       end
+   319|     end
+   320|     it 'shows all by default' do
+   321|       visit index_path(model_name: 'fan')
+   322|       expect(all('th').collect(&:text).delete_if { |t| /^\n*$/ =~ t }).
+   323|         to match_array ['Id', 'Created at', 'Updated at', 'Their Name', 'Teams']
+   324|     end
+   325|     it 'hides some fields on demand with a block' do
+   326|       RailsAdmin.config Fan do
+   327|         list do
+   328|           exclude_fields_if do
+   329|             type == :datetime
+   330|           end
+   331|         end
+   332|       end
+   333|       visit index_path(model_name: 'fan')
+   334|       expect(all('th').collect(&:text).delete_if { |t| /^\n*$/ =~ t }).
+   335|         to match_array ['Id', 'Their Name', 'Teams']
+   336|     end
+   337|     it 'hides some fields on demand with fields list' do
+   338|       RailsAdmin.config Fan do
+   339|         list do
+   340|           exclude_fields :created_at, :updated_at
+   341|         end
+   342|       end
+   343|       visit index_path(model_name: 'fan')
+   344|       expect(all('th').collect(&:text).delete_if { |t| /^\n*$/ =~ t }).
+   345|         to match_array ['Id', 'Their Name', 'Teams']
+   346|     end
+   347|     it 'adds some fields on demand with a block' do
+   348|       RailsAdmin.config Fan do
+   349|         list do
+   350|           include_fields_if do
+   351|             type != :datetime
+   352|           end
+   353|         end
+   354|       end
+   355|       visit index_path(model_name: 'fan')
+   356|       expect(all('th').collect(&:text).delete_if { |t| /^\n*$/ =~ t }).
+   357|         to match_array ['Id', 'Their Name', 'Teams']
+   358|     end
+   359|     it 'shows some fields on demand with fields list, respect ordering and configure them' do
+   360|       RailsAdmin.config Fan do
+   361|         list do
+   362|           fields :name, PK_COLUMN do
+   363|             label do
+   364|               "Modified #{label}"
+   365|             end
+   366|           end
+   367|         end
+   368|       end
+   369|       visit index_path(model_name: 'fan')
+   370|       expect(all('th').collect(&:text).delete_if { |t| /^\n*$/ =~ t }).
+   371|         to match_array ['Modified Id', 'Modified Their Name']
+   372|     end
+   373|     it 'shows all fields if asked' do
+   374|       RailsAdmin.config Fan do
+   375|         list do
+   376|           include_all_fields
+   377|           field PK_COLUMN
+   378|           field :name
+   379|         end
+   380|       end
+   381|       visit index_path(model_name: 'fan')
+   382|       expect(all('th').collect(&:text).delete_if { |t| /^\n*$/ =~ t }).
+   383|         to match_array ['Id', 'Created at', 'Updated at', 'Their Name', 'Teams']
+   384|     end
+   385|     it 'appears in order defined' do
+   386|       RailsAdmin.config Fan do
+   387|         list do
+   388|           field :updated_at
+   389|           field :name
+   390|           field PK_COLUMN
+   391|           field :created_at
+   392|         end
+   393|       end
+   394|       visit index_path(model_name: 'fan')
+   395|       expect(all('th').collect(&:text).delete_if { |t| /^\n*$/ =~ t }).
+   396|         to eq(['Updated at', 'Their Name', 'Id', 'Created at'])
+   397|     end
+   398|     it 'only lists the defined fields if some fields are defined' do
+   399|       RailsAdmin.config Fan do
+   400|         list do
+   401|           field PK_COLUMN
+   402|           field :name
+   403|         end
+   404|       end
+   405|       visit index_path(model_name: 'fan')
+   406|       expect(all('th').collect(&:text).delete_if { |t| /^\n*$/ =~ t }).
+   407|         to eq(['Id', 'Their Name'])
+   408|       is_expected.to have_no_selector('th:nth-child(4).header')
+   409|     end
+   410|     it 'delegates the label option to the ActiveModel API' do
+   411|       RailsAdmin.config Fan do
+   412|         list do
+   413|           field :name
+   414|         end
+   415|       end
+   416|       visit index_path(model_name: 'fan')
+   417|       expect(find('th:nth-child(2)')).to have_content('Their Name')
+   418|     end
+   419|     it 'is renameable' do
+   420|       RailsAdmin.config Fan do
+   421|         list do
+   422|           field PK_COLUMN do
+   423|             label 'Identifier'
+   424|           end
+   425|           field :name
+   426|         end
+   427|       end
+   428|       visit index_path(model_name: 'fan')
+   429|       expect(find('th:nth-child(2)')).to have_content('Identifier')
+   430|       expect(find('th:nth-child(3)')).to have_content('Their Name')
+   431|     end
+   432|     it 'is renameable by type' do
+   433|       RailsAdmin.config Fan do
+   434|         list do
+   435|           fields_of_type :datetime do
+   436|             label { "#{label} (datetime)" }
+   437|           end
+   438|         end
+   439|       end
+   440|       visit index_path(model_name: 'fan')
+   441|       expect(all('th').collect(&:text).delete_if { |t| /^\n*$/ =~ t }).
+   442|         to match_array ['Id', 'Created at (datetime)', 'Updated at (datetime)', 'Their Name', 'Teams']
+   443|     end
+   444|     it 'is globally renameable by type' do
+   445|       RailsAdmin.config Fan do
+   446|         list do
+   447|           fields_of_type :datetime do
+   448|             label { "#{label} (datetime)" }
+   449|           end
+   450|         end
+   451|       end
+   452|       visit index_path(model_name: 'fan')
+   453|       expect(all('th').collect(&:text).delete_if { |t| /^\n*$/ =~ t }).
+   454|         to match_array ['Id', 'Created at (datetime)', 'Updated at (datetime)', 'Their Name', 'Teams']
+   455|     end
+   456|     it 'is sortable by default' do
+   457|       visit index_path(model_name: 'fan')
+   458|       is_expected.to have_selector('th:nth-child(2).header')
+   459|       is_expected.to have_selector('th:nth-child(3).header')
+   460|       is_expected.to have_selector('th:nth-child(4).header')
+   461|       is_expected.to have_selector('th:nth-child(5).header')
+   462|     end
+   463|     it 'has option to disable sortability' do
+   464|       RailsAdmin.config Fan do
+   465|         list do
+   466|           field PK_COLUMN do
+   467|             sortable false
+   468|           end
+   469|           field :name
+   470|         end
+   471|       end
+   472|       visit index_path(model_name: 'fan')
+   473|       is_expected.to have_no_selector('th:nth-child(2).header')
+   474|       is_expected.to have_selector('th:nth-child(3).header')
+   475|     end
+   476|     it 'has option to disable sortability by type' do
+   477|       RailsAdmin.config Fan do
+   478|         list do
+   479|           fields_of_type :datetime do
+   480|             sortable false
+   481|           end
+   482|           field PK_COLUMN
+   483|           field :name
+   484|           field :created_at
+   485|           field :updated_at
+   486|         end
+   487|       end
+   488|       visit index_path(model_name: 'fan')
+   489|       is_expected.to have_selector('th:nth-child(2).header')
+   490|       is_expected.to have_selector('th:nth-child(3).header')
+   491|       is_expected.to have_no_selector('th:nth-child(4).header')
+   492|       is_expected.to have_no_selector('th:nth-child(5).header')
+   493|     end
+   494|     it 'has option to disable sortability by type globally' do
+   495|       RailsAdmin.config Fan do
+   496|         list do
+   497|           fields_of_type :datetime do
+   498|             sortable false
+   499|           end
+   500|           field PK_COLUMN
+   501|           field :name
+   502|           field :created_at
+   503|           field :updated_at
+   504|         end
+   505|       end
+   506|       visit index_path(model_name: 'fan')
+   507|       is_expected.to have_selector('th:nth-child(2).header')
+   508|       is_expected.to have_selector('th:nth-child(3).header')
+   509|       is_expected.to have_no_selector('th:nth-child(4).header')
+   510|       is_expected.to have_no_selector('th:nth-child(5).header')
+   511|     end
+   512|     it 'has option to hide fields by type' do
+   513|       RailsAdmin.config Fan do
+   514|         list do
+   515|           fields_of_type :datetime do
+   516|             hide
+   517|           end
+   518|         end
+   519|       end
+   520|       visit index_path(model_name: 'fan')
+   521|       expect(all('th').collect(&:text).delete_if { |t| /^\n*$/ =~ t }).
+   522|         to match_array ['Id', 'Their Name', 'Teams']
+   523|     end
+   524|     it 'has option to hide fields by type globally' do
+   525|       RailsAdmin.config Fan do
+   526|         list do
+   527|           fields_of_type :datetime do
+   528|             hide
+   529|           end
+   530|         end
+   531|       end
+   532|       visit index_path(model_name: 'fan')
+   533|       expect(all('th').collect(&:text).delete_if { |t| /^\n*$/ =~ t }).
+   534|         to match_array ['Id', 'Their Name', 'Teams']
+   535|     end
+   536|     it 'has option to customize column width' do
+   537|       RailsAdmin.config Fan do
+   538|         list do
+   539|           field PK_COLUMN do
+   540|             column_width 200
+   541|           end
+   542|           field :name
+   543|           field :created_at
+   544|           field :updated_at
+   545|         end
+   546|       end
+   547|       @fans = FactoryBot.create_list(:fan, 2)
+   548|       visit index_path(model_name: 'fan')
+   549|       expect(find('style').native.text).to include("#list th.#{PK_COLUMN}_field")
+   550|       expect(find('style').native.text).to include("#list td.#{PK_COLUMN}_field")
+   551|     end
+   552|     it 'has option to customize output formatting' do
+   553|       RailsAdmin.config Fan do
+   554|         list do
+   555|           field PK_COLUMN
+   556|           field :name do
+   557|             formatted_value do
+   558|               value.to_s.upcase
+   559|             end
+   560|           end
+   561|           field :created_at
+   562|           field :updated_at
+   563|         end
+   564|       end
+   565|       @fans = FactoryBot.create_list(:fan, 2).sort_by(&:id)
+   566|       visit index_path(model_name: 'fan')
+   567|       expect(find('tbody tr:nth-child(1) td:nth-child(3)')).to have_content(@fans[1].name.upcase)
+   568|       expect(find('tbody tr:nth-child(2) td:nth-child(3)')).to have_content(@fans[0].name.upcase)
+   569|     end
+   570|     it 'has a simple option to customize output formatting of date fields' do
+   571|       RailsAdmin.config Fan do
+   572|         list do
+   573|           field PK_COLUMN
+   574|           field :name
+   575|           field :created_at do
+   576|             date_format :short
+   577|           end
+   578|           field :updated_at
+   579|         end
+   580|       end
+   581|       @fans = FactoryBot.create_list(:fan, 2)
+   582|       visit index_path(model_name: 'fan')
+   583|       is_expected.to have_selector('tbody tr:nth-child(1) td:nth-child(4)', text: /\d{2} \w{3} \d{1,2}:\d{1,2}/)
+   584|     end
+   585|     it 'has option to customize output formatting of date fields' do
+   586|       RailsAdmin.config Fan do
+   587|         list do
+   588|           field PK_COLUMN
+   589|           field :name
+   590|           field :created_at do
+   591|             strftime_format '%Y-%m-%d'
+   592|           end
+   593|           field :updated_at
+   594|         end
+   595|       end
+   596|       @fans = FactoryBot.create_list(:fan, 2)
+   597|       visit index_path(model_name: 'fan')
+   598|       is_expected.to have_selector('tbody tr:nth-child(1) td:nth-child(4)', text: /\d{4}-\d{2}-\d{2}/)
+   599|     end
+   600|     it 'allows addition of virtual fields (object methods)' do
+   601|       RailsAdmin.config Team do
+   602|         list do
+   603|           field PK_COLUMN
+   604|           field :name
+   605|           field :player_names_truncated
+   606|         end
+   607|       end
+   608|       @team = FactoryBot.create :team
+   609|       @players = FactoryBot.create_list :player, 2, team: @team
+   610|       visit index_path(model_name: 'team')
+   611|       expect(find('tbody tr:nth-child(1) td:nth-child(4)')).to have_content(@players.sort_by(&:id).collect(&:name).join(', '))
+   612|     end
+   613|     it 'does not allow XSS for title attribute' do
+   614|       RailsAdmin.config Team do
+   615|         list do
+   616|           field :name
+   617|         end
+   618|       end
+   619|       @team = FactoryBot.create :team, name: '" onclick="alert()" "'
+   620|       visit index_path(model_name: 'team')
+   621|       expect(find('tbody tr:nth-child(1) td:nth-child(2)')['onclick']).to be_nil
+   622|       expect(find('tbody tr:nth-child(1) td:nth-child(2)')['title']).to eq '" onclick="alert()" "'
+   623|     end
+   624|   end
+   625|   context 'when no record exists' do
+   626|     before do
+   627|       visit index_path(model_name: 'player')
+   628|     end
+   629|     it 'shows "No records found" message' do
+   630|       is_expected.to have_content('No records found')
+   631|     end
+   632|   end
+   633|   context 'without pagination' do
+   634|     before do
+   635|       @players = FactoryBot.create_list(:player, 2)
+   636|       visit index_path(model_name: 'player')
+   637|     end
+   638|     it 'shows "2 results"' do
+   639|       is_expected.to have_content('2 players')
+   640|     end
+   641|   end
+   642|   context 'with pagination' do
+   643|     def visit_page(page)
+   644|       visit index_path(model_name: 'player', page: page)
+   645|     end
+   646|     before do
+   647|       FactoryBot.create_list :player, 3
+   648|     end
+   649|     describe 'with limited_pagination=false' do
+   650|       before { RailsAdmin.config.default_items_per_page = 1 }
+   651|       it 'page 1' do
+   652|         visit_page(1)
+   653|         within('ul.pagination') do
+   654|           expect(find('li:first')).to have_content('« Prev')
+   655|           expect(find('li:last')).to have_content('Next »')
+   656|           expect(find('li.active')).to have_content('1')
+   657|         end
+   658|       end
+   659|       it 'page 2' do
+   660|         visit_page(2)
+   661|         within('ul.pagination') do
+   662|           expect(find('li:first')).to have_content('« Prev')
+   663|           expect(find('li:last')).to have_content('Next »')
+   664|           expect(find('li.active')).to have_content('2')
+   665|         end
+   666|       end
+   667|       it 'page 3' do
+   668|         visit_page(3)
+   669|         within('ul.pagination') do
+   670|           expect(find('li:first')).to have_content('« Prev')
+   671|           expect(find('li:last')).to have_content('Next »')
+   672|           expect(find('li.active')).to have_content('3')
+   673|         end
+   674|       end
+   675|     end
+   676|     context 'with limited_pagination=true' do
+   677|       before do
+   678|         RailsAdmin.config.default_items_per_page = 1
+   679|         allow(RailsAdmin::AbstractModel.new(Player).config.list).
+   680|           to receive(:limited_pagination).
+   681|           and_return(true)
+   682|       end
+   683|       it 'page 1' do
+   684|         visit_page(1)
+   685|         within('ul.pagination') do
+   686|           expect(find('li:first')).not_to have_content('« Prev')
+   687|           expect(find('li:last')).to have_content('Next »')
+   688|         end
+   689|       end
+   690|       it 'page 2' do
+   691|         visit_page(2)
+   692|         within('ul.pagination') do
+   693|           expect(find('li:first')).to have_content('« Prev')
+   694|           expect(find('li:last')).to have_content('Next »')
+   695|         end
+   696|       end
+   697|       it 'page 3' do
+   698|         visit_page(3)
+   699|         within('ul.pagination') do
+   700|           expect(find('li:first')).to have_content('« Prev')
+   701|           expect(find('li:last')).to have_content('Next »')
+   702|         end
+   703|       end
+   704|     end
+   705|     describe 'number of items per page' do
+   706|       before do
+   707|         FactoryBot.create_list :league, 2
+   708|       end
+   709|       it 'is configurable per model' do
+   710|         RailsAdmin.config League do
+   711|           list do
+   712|             items_per_page 1
+   713|           end
+   714|         end
+   715|         visit index_path(model_name: 'league')
+   716|         is_expected.to have_selector('tbody tr', count: 1)
+   717|         visit index_path(model_name: 'player')
+   718|         is_expected.to have_selector('tbody tr', count: 3)
+   719|       end
+   720|     end
+   721|   end
+   722|   context 'on showing all' do
+   723|     it 'responds successfully with a single model' do
+   724|       FactoryBot.create :player
+   725|       visit index_path(model_name: 'player', all: true)
+   726|       expect(find('div.total-count')).to have_content('1 player')
+   727|       expect(find('div.total-count')).not_to have_content('1 players')
+   728|     end
+   729|     it 'responds successfully with multiple models' do
+   730|       FactoryBot.create_list(:player, 2)
+   731|       visit index_path(model_name: 'player', all: true)
+   732|       expect(find('div.total-count')).to have_content('2 players')
+   733|     end
+   734|   end
+   735|   context 'with pagination disabled by :associated_collection' do
+   736|     it 'responds successfully' do
+   737|       @team = FactoryBot.create :team
+   738|       Array.new(2) { FactoryBot.create :player, team: @team }
+   739|       visit index_path(model_name: 'player', associated_collection: 'players', compact: true, current_action: 'update', source_abstract_model: 'team', source_object_id: @team.id)
+   740|       expect(find('div.total-count')).to have_content('2 players')
+   741|     end
+   742|   end
+   743|   describe 'sorting' do
+   744|     let(:today) { Date.today }
+   745|     let(:players) do
+   746|       [{name: 'Jackie Robinson',  created_at: today,            team_id: rand(99_999), number: 42},
+   747|        {name: 'Deibinson Romero', created_at: (today - 2.days), team_id: rand(99_999), number: 13},
+   748|        {name: 'Sandy Koufax',     created_at: (today - 1.days), team_id: rand(99_999), number: 32}]
+   749|     end
+   750|     let(:leagues) do
+   751|       [{name: 'American',      created_at: (today - 1.day)},
+   752|        {name: 'Florida State', created_at: (today - 2.days)},
+   753|        {name: 'National',      created_at: today}]
+   754|     end
+   755|     let(:player_names_by_date) { players.sort_by { |p| p[:created_at] }.collect { |p| p[:name] } }
+   756|     let(:league_names_by_date) { leagues.sort_by { |l| l[:created_at] }.collect { |l| l[:name] } }
+   757|     before { @players = players.collect { |h| Player.create(h) } }
+   758|     it 'has reverse direction by default' do
+   759|       RailsAdmin.config Player do
+   760|         list do
+   761|           sort_by :created_at
+   762|           field :name
+   763|         end
+   764|       end
+   765|       visit index_path(model_name: 'player')
+   766|       player_names_by_date.reverse.each_with_index do |name, i|
+   767|         expect(find("tbody tr:nth-child(#{i + 1})")).to have_content(name)
+   768|       end
+   769|     end
+   770|     it 'allows change direction by using field configuration' do
+   771|       RailsAdmin.config Player do
+   772|         list do
+   773|           sort_by :created_at
+   774|           configure :created_at do
+   775|             sort_reverse false
+   776|           end
+   777|           field :name
+   778|         end
+   779|       end
+   780|       visit index_path(model_name: 'player')
+   781|       player_names_by_date.each_with_index do |name, i|
+   782|         expect(find("tbody tr:nth-child(#{i + 1})")).to have_content(name)
+   783|       end
+   784|     end
+   785|     it 'can be activated by clicking the table header', js: true do
+   786|       visit index_path(model_name: 'player')
+   787|       find('th.header', text: 'Name').trigger('click')
+   788|       is_expected.to have_css('th.name_field.headerSortDown')
+   789|       expect(all('tbody td.name_field').map(&:text)).to eq @players.map(&:name).sort
+   790|     end
+   791|   end
+   792|   context 'on listing as compact json' do
+   793|     it 'has_content an array with 2 elements and contain an array of elements with keys id and label' do
+   794|       FactoryBot.create_list(:player, 2)
+   795|       get index_path(model_name: 'player', compact: true, format: :json)
+   796|       expect(ActiveSupport::JSON.decode(response.body).length).to eq(2)
+   797|       ActiveSupport::JSON.decode(response.body).each do |object|
+   798|         expect(object).to have_key('id')
+   799|         expect(object).to have_key('label')
+   800|       end
+   801|     end
+   802|   end
+   803|   describe 'with search operator' do
+   804|     let(:player) { FactoryBot.create :player }
+   805|     before do
+   806|       expect(Player.count).to eq(0)
+   807|     end
+   808|     it 'finds the player if the query matches the default search operator' do
+   809|       RailsAdmin.config do |config|
+   810|         config.default_search_operator = 'ends_with'
+   811|         config.model Player do
+   812|           list { field :name }
+   813|         end
+   814|       end
+   815|       visit index_path(model_name: 'player', query: player.name[2, -1])
+   816|       is_expected.to have_content(player.name)
+   817|     end
+   818|     it 'does not find the player if the query does not match the default search operator' do
+   819|       RailsAdmin.config do |config|
+   820|         config.default_search_operator = 'ends_with'
+   821|         config.model Player do
+   822|           list { field :name }
+   823|         end
+   824|       end
+   825|       visit index_path(model_name: 'player', query: player.name[0, 2])
+   826|       is_expected.to have_no_content(player.name)
+   827|     end
+   828|     it 'finds the player if the query matches the specified search operator' do
+   829|       RailsAdmin.config Player do
+   830|         list do
+   831|           field :name do
+   832|             search_operator 'starts_with'
+   833|           end
+   834|         end
+   835|       end
+   836|       visit index_path(model_name: 'player', query: player.name[0, 2])
+   837|       is_expected.to have_content(player.name)
+   838|     end
+   839|     it 'does not find the player if the query does not match the specified search operator' do
+   840|       RailsAdmin.config Player do
+   841|         list do
+   842|           field :name do
+   843|             search_operator 'starts_with'
+   844|           end
+   845|         end
+   846|       end
+   847|       visit index_path(model_name: 'player', query: player.name[1..])
+   848|       is_expected.to have_no_content(player.name)
+   849|     end
+   850|   end
+   851|   describe 'with custom search' do
+   852|     before do
+   853|       RailsAdmin.config do |config|
+   854|         config.model Player do
+   855|           list do
+   856|             search_by :rails_admin_search
+   857|           end
+   858|         end
+   859|       end
+   860|     end
+   861|     let!(:players) do
+   862|       [FactoryBot.create(:player, name: 'Joe'),
+   863|        FactoryBot.create(:player, name: 'George')]
+   864|     end
+   865|     it 'performs search using given scope' do
+   866|       visit index_path(model_name: 'player', query: 'eoJ')
+   867|       is_expected.to have_content(players[0].name)
+   868|       is_expected.to have_no_content(players[1].name)
+   869|     end
+   870|   end
+   871|   context 'with overridden to_param' do
+   872|     before do
+   873|       @ball = FactoryBot.create :ball
+   874|       visit index_path(model_name: 'ball')
+   875|     end
+   876|     it 'shows the show, edit and delete links with valid url' do
+   877|       is_expected.to have_selector("td a[href$='/admin/ball/#{@ball.id}']")
+   878|       is_expected.to have_selector("td a[href$='/admin/ball/#{@ball.id}/edit']")
+   879|       is_expected.to have_selector("td a[href$='/admin/ball/#{@ball.id}/delete']")
+   880|     end
+   881|   end
+   882|   describe 'with model scope' do
+   883|     context 'without default scope' do
+   884|       let!(:teams) { %w[red yellow blue].map { |color| FactoryBot.create :team, color: color } }
+   885|       it 'works', active_record: true do
+   886|         RailsAdmin.config do |config|
+   887|           config.model Team do
+   888|             scope { Team.where(color: %w[red blue]) }
+   889|           end
+   890|         end
+   891|         visit index_path(model_name: 'team')
+   892|         expect(all(:css, 'td.color_field').map(&:text)).to match_array %w[red blue]
+   893|       end
+   894|       it 'works', mongoid: true do
+   895|         RailsAdmin.config do |config|
+   896|           config.model Team do
+   897|             scope { Team.any_in(color: %w[red blue]) }
+   898|           end
+   899|         end
+   900|         visit index_path(model_name: 'team')
+   901|         expect(all(:css, 'td.color_field').map(&:text)).to match_array %w[red blue]
+   902|       end
+   903|     end
+   904|     context 'with default_scope' do
+   905|       let!(:comments) { %w[something anything].map { |content| FactoryBot.create :comment_confirmed, content: content } }
+   906|       before do
+   907|         RailsAdmin.config do |config|
+   908|           config.model Comment::Confirmed do
+   909|             scope { Comment::Confirmed.unscoped }
+   910|           end
+   911|         end
+   912|       end
+   913|       it 'can be overriden' do
+   914|         visit index_path(model_name: 'comment~confirmed')
+   915|         expect(all(:css, 'td.content_field').map(&:text)).to match_array %w[something anything]
+   916|       end
+   917|     end
+   918|   end
+   919|   describe 'with scopes' do
+   920|     before do
+   921|       RailsAdmin.config do |config|
+   922|         config.model Team do
+   923|           list do
+   924|             scopes [nil, :red, :white]
+   925|           end
+   926|         end
+   927|       end
+   928|       @teams = [
+   929|         FactoryBot.create(:team, color: 'red'),
+   930|         FactoryBot.create(:team, color: 'red'),
+   931|         FactoryBot.create(:team, color: 'white'),
+   932|         FactoryBot.create(:team, color: 'black'),
+   933|       ]
+   934|     end
+   935|     it 'displays configured scopes' do
+   936|       visit index_path(model_name: 'team')
+   937|       expect(find('#scope_selector li:first')).to have_content('All')
+   938|       expect(find('#scope_selector li:nth-child(2)')).to have_content('Red')
+   939|       expect(find('#scope_selector li:nth-child(3)')).to have_content('White')
+   940|       expect(find('#scope_selector li:last')).to have_content('White')
+   941|       expect(find('#scope_selector li a.active')).to have_content('All')
+   942|     end
+   943|     it 'shows only scoped records' do
+   944|       visit index_path(model_name: 'team')
+   945|       is_expected.to have_content(@teams[0].name)
+   946|       is_expected.to have_content(@teams[1].name)
+   947|       is_expected.to have_content(@teams[2].name)
+   948|       is_expected.to have_content(@teams[3].name)
+   949|       visit index_path(model_name: 'team', scope: 'red')
+   950|       expect(find('#scope_selector li a.active')).to have_content('Red')
+   951|       is_expected.to have_content(@teams[0].name)
+   952|       is_expected.to have_content(@teams[1].name)
+   953|       is_expected.to have_no_content(@teams[2].name)
+   954|       is_expected.to have_no_content(@teams[3].name)
+   955|       visit index_path(model_name: 'team', scope: 'white')
+   956|       expect(find('#scope_selector li a.active')).to have_content('White')
+   957|       is_expected.to have_no_content(@teams[0].name)
+   958|       is_expected.to have_no_content(@teams[1].name)
+   959|       is_expected.to have_content(@teams[2].name)
+   960|       is_expected.to have_no_content(@teams[3].name)
+   961|     end
+   962|     it 'shows all records instead when scope not in list' do
+   963|       visit index_path(model_name: 'team', scope: 'green')
+   964|       is_expected.to have_content(@teams[0].name)
+   965|       is_expected.to have_content(@teams[1].name)
+   966|       is_expected.to have_content(@teams[2].name)
+   967|       is_expected.to have_content(@teams[3].name)
+   968|     end
+   969|     describe 'i18n' do
+   970|       before :each do
+   971|         en = {admin: {scopes: {
+   972|           _all: 'every',
+   973|           red: 'krasnyj',
+   974|         }}}
+   975|         I18n.backend.store_translations(:en, en)
+   976|       end
+   977|       after { I18n.reload! }
+   978|       context 'global' do
+   979|         it 'displays configured scopes' do
+   980|           visit index_path(model_name: 'team')
+   981|           expect(find('#scope_selector li:first')).to have_content('every')
+   982|           expect(find('#scope_selector li:nth-child(2)')).to have_content('krasnyj')
+   983|           expect(find('#scope_selector li:nth-child(3)')).to have_content('White')
+   984|           expect(find('#scope_selector li:last')).to have_content('White')
+   985|           expect(find('#scope_selector li a.active')).to have_content('every')
+   986|         end
+   987|       end
+   988|       context 'per model' do
+   989|         before :each do
+   990|           en = {admin: {scopes: {team: {
+   991|             _all: 'any',
+   992|             red: 'kr',
+   993|           }}}}
+   994|           I18n.backend.store_translations(:en, en)
+   995|         end
+   996|         after { I18n.reload! }
+   997|         it 'displays configured scopes' do
+   998|           visit index_path(model_name: 'team')
+   999|           expect(find('#scope_selector li:first')).to have_content('any')
+  1000|           expect(find('#scope_selector li:nth-child(2)')).to have_content('kr')
+  1001|           expect(find('#scope_selector li:nth-child(3)')).to have_content('White')
+  1002|           expect(find('#scope_selector li:last')).to have_content('White')
+  1003|           expect(find('#scope_selector li a.active')).to have_content('any')
+  1004|         end
+  1005|       end
+  1006|     end
+  1007|   end
+  1008|   describe 'row CSS class' do
+  1009|     before do
+  1010|       RailsAdmin.config do |config|
+  1011|         config.model Team do
+  1012|           list do
+  1013|             row_css_class { 'my_class' }
+  1014|           end
+  1015|         end
+  1016|       end
+  1017|       @teams = [
+  1018|         FactoryBot.create(:team, color: 'red'),
+  1019|         FactoryBot.create(:team, color: 'red'),
+  1020|         FactoryBot.create(:team, color: 'white'),
+  1021|         FactoryBot.create(:team, color: 'black'),
+  1022|       ]
+  1023|     end
+  1024|     it 'appends the CSS class to the model row class' do
+  1025|       visit index_path(model_name: 'team')
+  1026|       expect(page).to have_css('tr.team_row.my_class')
+  1027|     end
+  1028|   end
+  1029|   describe 'checkboxes?' do
+  1030|     describe 'default is enabled' do
+  1031|       before do
+  1032|         RailsAdmin.config FieldTest do
+  1033|           list
+  1034|         end
+  1035|       end
+  1036|       it 'displays checkboxes on index' do
+  1037|         @records = FactoryBot.create_list :field_test, 3
+  1038|         visit index_path(model_name: 'field_test')
+  1039|         checkboxes = all(:xpath, './/form[@id="bulk_form"]//input[@type="checkbox"]')
+  1040|         expect(checkboxes.length).to be > 0
+  1041|         expect(page).to have_content('Selected items')
+  1042|       end
+  1043|     end
+  1044|     describe 'false' do
+  1045|       before do
+  1046|         RailsAdmin.config FieldTest do
+  1047|           list do
+  1048|             checkboxes false
+  1049|           end
+  1050|         end
+  1051|       end
+  1052|       it 'does not display any checkboxes on index' do
+  1053|         @records = FactoryBot.create_list :field_test, 3
+  1054|         visit index_path(model_name: 'field_test')
+  1055|         checkboxes = all(:xpath, './/form[@id="bulk_form"]//input[@type="checkbox"]')
+  1056|         expect(checkboxes.length).to eq 0
+  1057|         expect(page).not_to have_content('Selected items')
+  1058|       end
+  1059|     end
+  1060|   end
+  1061|   describe 'sidescroll' do
+  1062|     all_team_columns = ['', 'Id', 'Created at', 'Updated at', 'Division', 'Name', 'Logo url', 'Team Manager', 'Ballpark', 'Mascot', 'Founded', 'Wins', 'Losses', 'Win percentage', 'Revenue', 'Color', 'Custom field', 'Main Sponsor', 'Players', 'Some Fans', 'Comments', '']
+  1063|     it 'displays all fields on one page' do
+  1064|       FactoryBot.create_list :team, 3
+  1065|       visit index_path(model_name: 'team')
+  1066|       cols = all('th').collect(&:text)
+  1067|       expect(cols[0..4]).to eq(all_team_columns[0..4])
+  1068|       expect(cols).to contain_exactly(*all_team_columns)
+  1069|     end
+  1070|     it 'allows fields to be sticky' do
+  1071|       RailsAdmin.config Team do
+  1072|         list do
+  1073|           configure(:division) { sticky true }
+  1074|           configure(:name) { sticky true }
+  1075|         end
+  1076|       end
+  1077|       FactoryBot.create_list :team, 3
+  1078|       visit index_path(model_name: 'team')
+  1079|       cols = all('th').collect(&:text)
+  1080|       expect(cols[0..4]).to eq(['', 'Division', 'Name', 'Id', 'Created at'])
+  1081|       expect(cols).to contain_exactly(*all_team_columns)
+  1082|       expect(page).to have_selector('.name_field.sticky')
+  1083|       expect(page).to have_selector('.division_field.sticky')
+  1084|     end
+  1085|     it 'displays all fields with no checkboxes' do
+  1086|       RailsAdmin.config Team do
+  1087|         list do
+  1088|           checkboxes false
+  1089|         end
+  1090|       end
+  1091|       FactoryBot.create_list :team, 3
+  1092|       visit index_path(model_name: 'team')
+  1093|       cols = all('th').collect(&:text)
+  1094|       expect(cols[0..3]).to eq(all_team_columns[1..4])
+  1095|       expect(cols).to contain_exactly(*all_team_columns[1..])
+  1096|     end
+  1097|   end
+  1098|   context 'with composite_primary_keys', composite_primary_keys: true do
+  1099|     let!(:fanships) { FactoryBot.create_list(:fanship, 3) }
+  1100|     it 'shows the list' do
+  1101|       visit index_path(model_name: 'fanship')
+  1102|       expect(all('th').collect(&:text)[0..3]).to eq(['', 'Fan', 'Team', 'Since'])
+  1103|       fanships.each do |fanship|
+  1104|         is_expected.to have_content fanship.fan.name
+  1105|         is_expected.to have_content fanship.team.name
+  1106|       end
+  1107|       is_expected.to have_content '3 fanships'
+  1108|     end
+  1109|   end
+  1110| end
+
+
+# ====================================================================
+# FILE: spec/integration/fields/multiple_file_upload_spec.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-32 ---
+     1| require 'spec_helper'
+     2| RSpec.describe 'MultipleFileUpload field', type: :request do
+     3|   subject { page }
+     4|   before do
+     5|     RailsAdmin.config FieldTest do
+     6|       field :string_field, :multiple_file_upload do
+     7|         attachment do
+     8|           delete_value { value }
+     9|           def resource_url(_thumb = false)
+    10|             value
+    11|           end
+    12|         end
+    13|         delete_method 'boolean_field'
+    14|         reorderable true
+    15|         def value
+    16|           bindings[:object].safe_send(name)&.split
+    17|         end
+    18|       end
+    19|     end
+    20|   end
+    21|   let(:field_test) { FactoryBot.create :field_test, string_field: 'http://localhost/1.jpg http://localhost/2.jpg' }
+    22|   it 'supports deletion', js: true do
+    23|     visit edit_path(model_name: 'field_test', id: field_test.id)
+    24|     click_link "Delete 'String field' #1"
+    25|     expect(page.all(:css, '[name="field_test[boolean_field][]"]:checked', visible: false).map(&:value)).to eq %w[http://localhost/1.jpg]
+    26|   end
+    27|   it 'shows a inline preview', js: true do
+    28|     visit new_path(model_name: 'field_test')
+    29|     attach_file 'String field', file_path('test.jpg')
+    30|     is_expected.to have_selector('#field_test_string_field_field img.preview')
+    31|   end
+    32| end
+
+
+# ====================================================================
+# FILE: spec/rails_admin/config/fields/types/multiple_carrierwave_spec.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-48 ---
+     1| require 'spec_helper'
+     2| require 'base64'
+     3| RSpec.describe RailsAdmin::Config::Fields::Types::MultipleCarrierwave do
+     4|   it_behaves_like 'a generic field type', :string_field, :multiple_carrierwave
+     5|   describe '#thumb_method' do
+     6|     before do
+     7|       RailsAdmin.config FieldTest do
+     8|         field :carrierwave_assets, :multiple_carrierwave
+     9|       end
+    10|     end
+    11|     let :rails_admin_field do
+    12|       RailsAdmin.config('FieldTest').fields.detect do |f|
+    13|         f.name == :carrierwave_assets
+    14|       end.with(
+    15|         object: FieldTest.new(carrierwave_assets: [File.open(file_path('test.jpg'))]),
+    16|         view: ApplicationController.new.view_context,
+    17|       )
+    18|     end
+    19|     it 'auto-detects thumb-like version name' do
+    20|       expect(rails_admin_field.attachments.map(&:thumb_method)).to eq [:thumb]
+    21|     end
+    22|   end
+    23|   describe '#delete_value', active_record: true do
+    24|     before do
+    25|       RailsAdmin.config FieldTest do
+    26|         field :carrierwave_assets, :multiple_carrierwave
+    27|       end
+    28|     end
+    29|     let :file do
+    30|       CarrierWave::SanitizedFile.new(
+    31|         tempfile: StringIO.new(Base64.decode64('R0lGODlhAQABAIAAAAUEBAAAACwAAAAAAQABAAACAkQBADs=')),
+    32|         filename: 'dummy.gif',
+    33|       )
+    34|     end
+    35|     let :rails_admin_field do
+    36|       RailsAdmin.config('FieldTest').fields.detect do |f|
+    37|         f.name == :carrierwave_assets
+    38|       end.with(
+    39|         object: FieldTest.create(carrierwave_assets: [file]),
+    40|         view: ApplicationController.new.view_context,
+    41|       )
+    42|     end
+    43|     it 'does not use file.identifier, which is not available for Fog files' do
+    44|       expect_any_instance_of(CarrierWave::SanitizedFile).not_to receive :identifier
+    45|       expect(rails_admin_field.attachments.map(&:delete_value)).to eq ['dummy.gif']
+    46|     end
+    47|   end
+    48| end
+
+
+# ====================================================================
+# FILE: spec/spec_helper.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-84 ---
+     1| ENV['RAILS_ENV'] = 'test'
+     2| CI_ORM = (ENV['CI_ORM'] || :active_record).to_sym
+     3| CI_TARGET_ORMS = %i[active_record mongoid].freeze
+     4| PK_COLUMN = {active_record: :id, mongoid: :_id}[CI_ORM]
+     5| if RUBY_ENGINE == 'jruby'
+     6|   require 'i18n/backend'
+     7|   require 'i18n/backend/simple'
+     8| end
+     9| require 'simplecov'
+    10| require 'simplecov-lcov'
+    11| SimpleCov.formatters = [SimpleCov::Formatter::HTMLFormatter, SimpleCov::Formatter::LcovFormatter]
+    12| SimpleCov.start do
+    13|   add_filter '/spec/'
+    14|   add_filter '/vendor/bundle/'
+    15| end
+    16| SimpleCov::Formatter::LcovFormatter.config do |c|
+    17|   c.report_with_single_file = true
+    18|   c.single_report_path = 'coverage/lcov.info'
+    19| end
+    20| require File.expand_path('dummy_app/config/environment', __dir__)
+    21| require 'rspec/rails'
+    22| require 'factory_bot'
+    23| require 'factories'
+    24| require 'policies'
+    25| require "database_cleaner/#{CI_ORM}"
+    26| require "orm/#{CI_ORM}"
+    27| require 'paper_trail/frameworks/rspec' if defined?(PaperTrail)
+    28| Dir[File.expand_path('support/**/*.rb', __dir__),
+    29|     File.expand_path('shared_examples/**/*.rb', __dir__)].sort.each { |f| require f }
+    30| ActionMailer::Base.delivery_method = :test
+    31| ActionMailer::Base.perform_deliveries = true
+    32| ActionMailer::Base.default_url_options[:host] = 'example.com'
+    33| Rails.backtrace_cleaner.remove_silencers!
+    34| require 'capybara/cuprite'
+    35| Capybara.javascript_driver = :cuprite
+    36| Capybara.register_driver(:cuprite) do |app|
+    37|   Capybara::Cuprite::Driver.new(app, js_errors: true, logger: ConsoleLogger)
+    38| end
+    39| Capybara.server = :webrick
+    40| RailsAdmin.setup_all_extensions
+    41| RSpec.configure do |config|
+    42|   config.expect_with :rspec do |c|
+    43|     c.syntax = :expect
+    44|   end
+    45|   config.disable_monkey_patching!
+    46|   config.include RSpec::Matchers
+    47|   config.include RailsAdmin::Engine.routes.url_helpers
+    48|   config.include Warden::Test::Helpers
+    49|   config.include Capybara::DSL, type: :request
+    50|   config.verbose_retry = true
+    51|   config.display_try_failure_messages = true
+    52|   config.around :each, :js do |example|
+    53|     example.run_with_retry retry: (ENV['CI'] && RUBY_ENGINE == 'jruby' ? 3 : 2)
+    54|   end
+    55|   config.retry_callback = proc do |example|
+    56|     Capybara.reset! if example.metadata[:js]
+    57|   end
+    58|   config.before(:all) do
+    59|     Webpacker.instance.compiler.compile if CI_ASSET == :webpacker
+    60|   end
+    61|   config.before do |example|
+    62|     DatabaseCleaner.strategy =
+    63|       if CI_ORM == :mongoid || example.metadata[:js]
+    64|         :deletion
+    65|       else
+    66|         :transaction
+    67|       end
+    68|     DatabaseCleaner.start
+    69|     RailsAdmin::Config.reset
+    70|     RailsAdmin::Config.asset_source = CI_ASSET
+    71|   end
+    72|   config.after(:each) do
+    73|     Warden.test_reset!
+    74|     DatabaseCleaner.clean
+    75|   end
+    76|   CI_TARGET_ORMS.each do |orm|
+    77|     if orm == CI_ORM
+    78|       config.filter_run_excluding "skip_#{orm}": true
+    79|     else
+    80|       config.filter_run_excluding orm => true
+    81|     end
+    82|   end
+    83|   config.filter_run_excluding composite_primary_keys: true unless defined?(CompositePrimaryKeys)
+    84| end
+

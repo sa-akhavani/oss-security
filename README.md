@@ -85,7 +85,21 @@ Analysis notebooks for data exploration and visualization:
 LLM-based vulnerability detection analysis using code diffs:
 
 - `llm_analysis/main.py`: Main pipeline for diff-based vulnerability analysis using LLMs
-- `llm_analysis/diff_dataset/`: Code diffs organized by ecosystem (vulnerable vs patched code)
 - `llm_analysis/diff_analysis_results/`: Results from LLM vulnerability detection experiments
 - `llm_analysis/results_analysis.ipynb`: Analysis of LLM detection results
 - `llm_analysis/cwe_classification_analysis.ipynb`: CWE classification analysis
+
+### Diff Dataset
+
+Code diffs between vulnerable and patched versions, organized by ecosystem. Each vulnerability folder contains:
+- `diff.txt`: Unified diff between vulnerable and patched code
+- `vulnerable.txt`: The vulnerable version of the code
+- `patched.txt`: The patched version of the code
+
+**Sample Dataset** (100 vulnerabilities): `llm_analysis/diff_dataset_sample/`
+
+A representative sample of 100 vulnerabilities distributed across ecosystems:
+
+**Full Dataset**: [Download from Zenodo](https://zenodo.org/TODO)
+
+<!-- TODO: Upload diff_dataset.zip to Zenodo and update the link above -->

@@ -1,0 +1,730 @@
+# ====================================================================
+# FILE: docker/build/finalize.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-21 ---
+     1| set -xe
+     2| if [ "$(uname -m)" = "aarch64" ]; then
+     3|   export arch='arm64'
+     4|   export checksum='73244a858f5514a927a0f2510d533b4b57169b64d2aa3f9d98d92a7a7df80cea'
+     5| elif [ "$(uname -m)" = "armv7l" ]; then
+     6|   export arch='armhf'
+     7|   export checksum='abb1489357358b443789571d52b5410258ddaca525ee7ac3ba0dd91d34484589'
+     8| else
+     9|   export arch='amd64'
+    10|   export checksum='bd8be776e97ec2b911190a82d9ab3fa6c013ae6d3121eea3d0bfd5c82a0eaf8c'
+    11| fi
+    12| wget --quiet https://github.com/tianon/gosu/releases/download/1.14/gosu-${arch} -O /usr/sbin/gosu
+    13| echo "${checksum}  /usr/sbin/gosu" | sha256sum -cs
+    14| chmod +x /usr/sbin/gosu
+    15| addgroup -S git
+    16| adduser -G git -H -D -g 'Gogs Git User' git -h /data/git -s /bin/bash && usermod -p '*' git && passwd -u git
+    17| echo "export GOGS_CUSTOM=${GOGS_CUSTOM}" >> /etc/profile
+    18| rm -rf /app/gogs/build
+    19| rm -rf /app/gogs/docker/build
+    20| rm /app/gogs/docker/nsswitch.conf
+    21| rm /app/gogs/docker/README.md
+
+
+# ====================================================================
+# FILE: docker/build/install-task.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-15 ---
+     1| set -xe
+     2| if [ "$(uname -m)" = "aarch64" ]; then
+     3|   export arch='arm64'
+     4|   export checksum='44fad3d61ad39d0abff33f90fdbb99a666524dbeab08dc9d138d5d3a532ff68a'
+     5| elif [ "$(uname -m)" = "armv7l" ]; then
+     6|   export arch='arm'
+     7|   export checksum='b10ae7d85749025740097b0c349b946fbabd417c7ee4d2df8ccc5604750accd9'
+     8| else
+     9|   export arch='amd64'
+    10|   export checksum='b9c5986f33a53094751b5e22ccc33e050b4a0a485658442121331cbb724e631e'
+    11| fi
+    12| wget --quiet https://github.com/go-task/task/releases/download/v3.12.1/task_linux_${arch}.tar.gz -O task_linux_${arch}.tar.gz
+    13| echo "${checksum}  task_linux_${arch}.tar.gz" | sha256sum -cs
+    14| tar -xzf task_linux_${arch}.tar.gz
+    15| mv task /usr/local/bin/task
+
+
+# ====================================================================
+# FILE: gogs.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-30 ---
+     1| package main
+     2| import (
+     3| 	"os"
+     4| 	"github.com/urfave/cli"
+     5| 	log "unknwon.dev/clog/v2"
+     6| 	"gogs.io/gogs/internal/cmd"
+     7| 	"gogs.io/gogs/internal/conf"
+     8| )
+     9| func init() {
+    10| 	conf.App.Version = "0.13.0"
+    11| }
+    12| func main() {
+    13| 	app := cli.NewApp()
+    14| 	app.Name = "Gogs"
+    15| 	app.Usage = "A painless self-hosted Git service"
+    16| 	app.Version = conf.App.Version
+    17| 	app.Commands = []cli.Command{
+    18| 		cmd.Web,
+    19| 		cmd.Serv,
+    20| 		cmd.Hook,
+    21| 		cmd.Cert,
+    22| 		cmd.Admin,
+    23| 		cmd.Import,
+    24| 		cmd.Backup,
+    25| 		cmd.Restore,
+    26| 	}
+    27| 	if err := app.Run(os.Args); err != nil {
+    28| 		log.Fatal("Failed to start application: %v", err)
+    29| 	}
+    30| }
+
+
+# ====================================================================
+# FILE: internal/db/issue.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 273-313 ---
+   273| 		}
+   274| 	}
+   275| 	return nil
+   276| }
+   277| func (issue *Issue) ClearLabels(doer *User) (err error) {
+   278| 	sess := x.NewSession()
+   279| 	defer sess.Close()
+   280| 	if err = sess.Begin(); err != nil {
+   281| 		return err
+   282| 	}
+   283| 	if err = issue.clearLabels(sess); err != nil {
+   284| 		return err
+   285| 	}
+   286| 	if err = sess.Commit(); err != nil {
+   287| 		return fmt.Errorf("Commit: %v", err)
+   288| 	}
+   289| 	if issue.IsPull {
+   290| 		err = issue.PullRequest.LoadIssue()
+   291| 		if err != nil {
+   292| 			log.Error("LoadIssue: %v", err)
+   293| 			return
+   294| 		}
+   295| 		err = PrepareWebhooks(issue.Repo, HOOK_EVENT_PULL_REQUEST, &api.PullRequestPayload{
+   296| 			Action:      api.HOOK_ISSUE_LABEL_CLEARED,
+   297| 			Index:       issue.Index,
+   298| 			PullRequest: issue.PullRequest.APIFormat(),
+   299| 			Repository:  issue.Repo.APIFormatLegacy(nil),
+   300| 			Sender:      doer.APIFormat(),
+   301| 		})
+   302| 	} else {
+   303| 		err = PrepareWebhooks(issue.Repo, HOOK_EVENT_ISSUES, &api.IssuesPayload{
+   304| 			Action:     api.HOOK_ISSUE_LABEL_CLEARED,
+   305| 			Index:      issue.Index,
+   306| 			Issue:      issue.APIFormat(),
+   307| 			Repository: issue.Repo.APIFormatLegacy(nil),
+   308| 			Sender:     doer.APIFormat(),
+   309| 		})
+   310| 	}
+   311| 	if err != nil {
+   312| 		log.Error("PrepareWebhooks [is_pull: %v]: %v", issue.IsPull, err)
+   313| 	}
+
+
+# ====================================================================
+# FILE: internal/db/milestone.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 259-299 ---
+   259| 	defer sess.Close()
+   260| 	if err = sess.Begin(); err != nil {
+   261| 		return err
+   262| 	}
+   263| 	if err = changeMilestoneAssign(sess, issue, oldMilestoneID); err != nil {
+   264| 		return err
+   265| 	}
+   266| 	if err = sess.Commit(); err != nil {
+   267| 		return fmt.Errorf("Commit: %v", err)
+   268| 	}
+   269| 	var hookAction api.HookIssueAction
+   270| 	if issue.MilestoneID > 0 {
+   271| 		hookAction = api.HOOK_ISSUE_MILESTONED
+   272| 	} else {
+   273| 		hookAction = api.HOOK_ISSUE_DEMILESTONED
+   274| 	}
+   275| 	if issue.IsPull {
+   276| 		err = issue.PullRequest.LoadIssue()
+   277| 		if err != nil {
+   278| 			log.Error("LoadIssue: %v", err)
+   279| 			return
+   280| 		}
+   281| 		err = PrepareWebhooks(issue.Repo, HOOK_EVENT_PULL_REQUEST, &api.PullRequestPayload{
+   282| 			Action:      hookAction,
+   283| 			Index:       issue.Index,
+   284| 			PullRequest: issue.PullRequest.APIFormat(),
+   285| 			Repository:  issue.Repo.APIFormatLegacy(nil),
+   286| 			Sender:      doer.APIFormat(),
+   287| 		})
+   288| 	} else {
+   289| 		err = PrepareWebhooks(issue.Repo, HOOK_EVENT_ISSUES, &api.IssuesPayload{
+   290| 			Action:     hookAction,
+   291| 			Index:      issue.Index,
+   292| 			Issue:      issue.APIFormat(),
+   293| 			Repository: issue.Repo.APIFormatLegacy(nil),
+   294| 			Sender:     doer.APIFormat(),
+   295| 		})
+   296| 	}
+   297| 	if err != nil {
+   298| 		log.Error("PrepareWebhooks [is_pull: %v]: %v", issue.IsPull, err)
+   299| 	}
+
+
+# ====================================================================
+# FILE: internal/db/release.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 80-120 ---
+    80| 		Body:            r.Note,
+    81| 		Draft:           r.IsDraft,
+    82| 		Prerelease:      r.IsPrerelease,
+    83| 		Author:          r.Publisher.APIFormat(),
+    84| 		Created:         r.Created,
+    85| 	}
+    86| }
+    87| func IsReleaseExist(repoID int64, tagName string) (bool, error) {
+    88| 	if tagName == "" {
+    89| 		return false, nil
+    90| 	}
+    91| 	return x.Get(&Release{RepoID: repoID, LowerTagName: strings.ToLower(tagName)})
+    92| }
+    93| func createTag(gitRepo *git.Repository, r *Release) error {
+    94| 	if !r.IsDraft {
+    95| 		if !gitRepo.HasTag(r.TagName) {
+    96| 			commit, err := gitRepo.BranchCommit(r.Target)
+    97| 			if err != nil {
+    98| 				return fmt.Errorf("get branch commit: %v", err)
+    99| 			}
+   100| 			r.TagName = strings.TrimPrefix(r.TagName, "--")
+   101| 			if err = gitRepo.CreateTag(r.TagName, commit.ID.String()); err != nil {
+   102| 				if strings.Contains(err.Error(), "is not a valid tag name") {
+   103| 					return ErrInvalidTagName{r.TagName}
+   104| 				}
+   105| 				return err
+   106| 			}
+   107| 		} else {
+   108| 			commit, err := gitRepo.TagCommit(r.TagName)
+   109| 			if err != nil {
+   110| 				return fmt.Errorf("get tag commit: %v", err)
+   111| 			}
+   112| 			r.Sha1 = commit.ID.String()
+   113| 			r.NumCommits, err = commit.CommitsCount()
+   114| 			if err != nil {
+   115| 				return fmt.Errorf("count commits: %v", err)
+   116| 			}
+   117| 		}
+   118| 	}
+   119| 	return nil
+   120| }
+
+
+# ====================================================================
+# FILE: internal/db/repo_editor.go
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 152-235 ---
+   152| 	err = git.Push(localPath, "origin", opts.NewBranch,
+   153| 		git.PushOptions{
+   154| 			CommandOptions: git.CommandOptions{
+   155| 				Envs: ComposeHookEnvs(ComposeHookEnvsOptions{
+   156| 					AuthUser:  doer,
+   157| 					OwnerName: repo.MustOwner().Name,
+   158| 					OwnerSalt: repo.MustOwner().Salt,
+   159| 					RepoID:    repo.ID,
+   160| 					RepoName:  repo.Name,
+   161| 					RepoPath:  repo.RepoPath(),
+   162| 				}),
+   163| 			},
+   164| 		},
+   165| 	)
+   166| 	if err != nil {
+   167| 		return fmt.Errorf("git push origin %s: %v", opts.NewBranch, err)
+   168| 	}
+   169| 	return nil
+   170| }
+   171| func (repo *Repository) GetDiffPreview(branch, treePath, content string) (diff *gitutil.Diff, err error) {
+   172| 	repoWorkingPool.CheckIn(com.ToStr(repo.ID))
+   173| 	defer repoWorkingPool.CheckOut(com.ToStr(repo.ID))
+   174| 	if err = repo.DiscardLocalRepoBranchChanges(branch); err != nil {
+   175| 		return nil, fmt.Errorf("discard local repo branch[%s] changes: %v", branch, err)
+   176| 	} else if err = repo.UpdateLocalCopyBranch(branch); err != nil {
+   177| 		return nil, fmt.Errorf("update local copy branch[%s]: %v", branch, err)
+   178| 	}
+   179| 	localPath := repo.LocalCopyPath()
+   180| 	filePath := path.Join(localPath, treePath)
+   181| 	if err = os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
+   182| 		return nil, err
+   183| 	}
+   184| 	if err = os.WriteFile(filePath, []byte(content), 0600); err != nil {
+   185| 		return nil, fmt.Errorf("write file: %v", err)
+   186| 	}
+   187| 	cmd := exec.Command("git", "diff", treePath)
+   188| 	cmd.Dir = localPath
+   189| 	cmd.Stderr = os.Stderr
+   190| 	stdout, err := cmd.StdoutPipe()
+   191| 	if err != nil {
+   192| 		return nil, fmt.Errorf("get stdout pipe: %v", err)
+   193| 	}
+   194| 	if err = cmd.Start(); err != nil {
+   195| 		return nil, fmt.Errorf("start: %v", err)
+   196| 	}
+   197| 	pid := process.Add(fmt.Sprintf("GetDiffPreview [repo_path: %s]", repo.RepoPath()), cmd)
+   198| 	defer process.Remove(pid)
+   199| 	diff, err = gitutil.ParseDiff(stdout, conf.Git.MaxDiffFiles, conf.Git.MaxDiffLines, conf.Git.MaxDiffLineChars)
+   200| 	if err != nil {
+   201| 		return nil, fmt.Errorf("parse diff: %v", err)
+   202| 	}
+   203| 	if err = cmd.Wait(); err != nil {
+   204| 		return nil, fmt.Errorf("wait: %v", err)
+   205| 	}
+   206| 	return diff, nil
+   207| }
+   208| type DeleteRepoFileOptions struct {
+   209| 	LastCommitID string
+   210| 	OldBranch    string
+   211| 	NewBranch    string
+   212| 	TreePath     string
+   213| 	Message      string
+   214| }
+   215| func (repo *Repository) DeleteRepoFile(doer *User, opts DeleteRepoFileOptions) (err error) {
+   216| 	repoWorkingPool.CheckIn(com.ToStr(repo.ID))
+   217| 	defer repoWorkingPool.CheckOut(com.ToStr(repo.ID))
+   218| 	if err = repo.DiscardLocalRepoBranchChanges(opts.OldBranch); err != nil {
+   219| 		return fmt.Errorf("discard local repo branch[%s] changes: %v", opts.OldBranch, err)
+   220| 	} else if err = repo.UpdateLocalCopyBranch(opts.OldBranch); err != nil {
+   221| 		return fmt.Errorf("update local copy branch[%s]: %v", opts.OldBranch, err)
+   222| 	}
+   223| 	if opts.OldBranch != opts.NewBranch {
+   224| 		if err := repo.CheckoutNewBranch(opts.OldBranch, opts.NewBranch); err != nil {
+   225| 			return fmt.Errorf("checkout new branch[%s] from old branch[%s]: %v", opts.NewBranch, opts.OldBranch, err)
+   226| 		}
+   227| 	}
+   228| 	localPath := repo.LocalCopyPath()
+   229| 	if err = os.Remove(path.Join(localPath, opts.TreePath)); err != nil {
+   230| 		return fmt.Errorf("remove file %q: %v", opts.TreePath, err)
+   231| 	}
+   232| 	if err = git.Add(localPath, git.AddOptions{All: true}); err != nil {
+   233| 		return fmt.Errorf("git add --all: %v", err)
+   234| 	}
+   235| 	err = git.CreateCommit(
+
+
+# ====================================================================
+# FILE: internal/route/api/v1/repo/contents.go
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-31 ---
+     1| package repo
+     2| import (
+     3| 	"encoding/base64"
+     4| 	"fmt"
+     5| 	"net/http"
+     6| 	"path"
+     7| 	"github.com/gogs/git-module"
+     8| 	"github.com/pkg/errors"
+     9| 	"gogs.io/gogs/internal/context"
+    10| 	"gogs.io/gogs/internal/db"
+    11| 	"gogs.io/gogs/internal/gitutil"
+    12| 	"gogs.io/gogs/internal/repoutil"
+    13| )
+    14| type links struct {
+    15| 	Git  string `json:"git"`
+    16| 	Self string `json:"self"`
+    17| 	HTML string `json:"html"`
+    18| }
+    19| type repoContent struct {
+    20| 	Type            string `json:"type"`
+    21| 	Target          string `json:"target,omitempty"`
+    22| 	SubmoduleGitURL string `json:"submodule_git_url,omitempty"`
+    23| 	Encoding        string `json:"encoding,omitempty"`
+    24| 	Size            int64  `json:"size"`
+    25| 	Name            string `json:"name"`
+    26| 	Path            string `json:"path"`
+    27| 	Content         string `json:"content,omitempty"`
+    28| 	Sha             string `json:"sha"`
+    29| 	URL             string `json:"url"`
+    30| 	GitURL          string `json:"git_url"`
+    31| 	HTMLURL         string `json:"html_url"`
+
+# --- HUNK 2: Lines 82-122 ---
+    82| 	}
+    83| 	content.Links.Git = content.GitURL
+    84| 	return content, nil
+    85| }
+    86| func GetContents(c *context.APIContext) {
+    87| 	repoPath := repoutil.RepositoryPath(c.Params(":username"), c.Params(":reponame"))
+    88| 	gitRepo, err := git.Open(repoPath)
+    89| 	if err != nil {
+    90| 		c.Error(err, "open repository")
+    91| 		return
+    92| 	}
+    93| 	ref := c.Query("ref")
+    94| 	if ref == "" {
+    95| 		ref = c.Repo.Repository.DefaultBranch
+    96| 	}
+    97| 	commit, err := gitRepo.CatFileCommit(ref)
+    98| 	if err != nil {
+    99| 		c.NotFoundOrError(gitutil.NewError(err), "get commit")
+   100| 		return
+   101| 	}
+   102| 	treePath := c.Params("*")
+   103| 	entry, err := commit.TreeEntry(treePath)
+   104| 	if err != nil {
+   105| 		c.NotFoundOrError(gitutil.NewError(err), "get tree entry")
+   106| 		return
+   107| 	}
+   108| 	if !entry.IsTree() {
+   109| 		content, err := toRepoContent(c, ref, treePath, commit, entry)
+   110| 		if err != nil {
+   111| 			c.Errorf(err, "convert %q to repoContent", treePath)
+   112| 			return
+   113| 		}
+   114| 		c.JSONSuccess(content)
+   115| 		return
+   116| 	}
+   117| 	dir, err := gitRepo.LsTree(entry.ID().String())
+   118| 	if err != nil {
+   119| 		c.NotFoundOrError(gitutil.NewError(err), "get tree")
+   120| 		return
+   121| 	}
+   122| 	entries, err := dir.Entries()
+
+# --- HUNK 3: Lines 137-177 ---
+   137| 			return
+   138| 		}
+   139| 		contents = append(contents, content)
+   140| 	}
+   141| 	c.JSONSuccess(contents)
+   142| }
+   143| type PutContentsRequest struct {
+   144| 	Message string `json:"message" binding:"Required"`
+   145| 	Content string `json:"content" binding:"Required"`
+   146| 	Branch  string `json:"branch"`
+   147| }
+   148| func PutContents(c *context.APIContext, r PutContentsRequest) {
+   149| 	content, err := base64.StdEncoding.DecodeString(r.Content)
+   150| 	if err != nil {
+   151| 		c.Error(err, "decoding base64")
+   152| 		return
+   153| 	}
+   154| 	if r.Branch == "" {
+   155| 		r.Branch = c.Repo.Repository.DefaultBranch
+   156| 	}
+   157| 	treePath := c.Params("*")
+   158| 	err = c.Repo.Repository.UpdateRepoFile(
+   159| 		c.User,
+   160| 		db.UpdateRepoFileOptions{
+   161| 			OldBranch:   c.Repo.Repository.DefaultBranch,
+   162| 			NewBranch:   r.Branch,
+   163| 			OldTreeName: treePath,
+   164| 			NewTreeName: treePath,
+   165| 			Message:     r.Message,
+   166| 			Content:     string(content),
+   167| 		},
+   168| 	)
+   169| 	if err != nil {
+   170| 		c.Error(err, "updating repository file")
+   171| 		return
+   172| 	}
+   173| 	repoPath := repoutil.RepositoryPath(c.Params(":username"), c.Params(":reponame"))
+   174| 	gitRepo, err := git.Open(repoPath)
+   175| 	if err != nil {
+   176| 		c.Error(err, "open repository")
+   177| 		return
+
+
+# ====================================================================
+# FILE: internal/route/install.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 251-297 ---
+   251| 	cfg.Section("database").Key("SCHEMA").SetValue(conf.Database.Schema)
+   252| 	cfg.Section("database").Key("USER").SetValue(conf.Database.User)
+   253| 	cfg.Section("database").Key("PASSWORD").SetValue(conf.Database.Password)
+   254| 	cfg.Section("database").Key("SSL_MODE").SetValue(conf.Database.SSLMode)
+   255| 	cfg.Section("database").Key("PATH").SetValue(conf.Database.Path)
+   256| 	cfg.Section("").Key("BRAND_NAME").SetValue(f.AppName)
+   257| 	cfg.Section("repository").Key("ROOT").SetValue(f.RepoRootPath)
+   258| 	cfg.Section("repository").Key("DEFAULT_BRANCH").SetValue(f.DefaultBranch)
+   259| 	cfg.Section("").Key("RUN_USER").SetValue(f.RunUser)
+   260| 	cfg.Section("server").Key("DOMAIN").SetValue(f.Domain)
+   261| 	cfg.Section("server").Key("HTTP_PORT").SetValue(f.HTTPPort)
+   262| 	cfg.Section("server").Key("EXTERNAL_URL").SetValue(f.AppUrl)
+   263| 	if f.SSHPort == 0 {
+   264| 		cfg.Section("server").Key("DISABLE_SSH").SetValue("true")
+   265| 	} else {
+   266| 		cfg.Section("server").Key("DISABLE_SSH").SetValue("false")
+   267| 		cfg.Section("server").Key("SSH_PORT").SetValue(com.ToStr(f.SSHPort))
+   268| 		cfg.Section("server").Key("START_SSH_SERVER").SetValue(com.ToStr(f.UseBuiltinSSHServer))
+   269| 	}
+   270| 	if len(strings.TrimSpace(f.SMTPHost)) > 0 {
+   271| 		cfg.Section("mailer").Key("ENABLED").SetValue("true")
+   272| 		cfg.Section("mailer").Key("HOST").SetValue(f.SMTPHost)
+   273| 		cfg.Section("mailer").Key("FROM").SetValue(f.SMTPFrom)
+   274| 		cfg.Section("mailer").Key("USER").SetValue(f.SMTPUser)
+   275| 		cfg.Section("mailer").Key("PASSWD").SetValue(f.SMTPPasswd)
+   276| 	} else {
+   277| 		cfg.Section("mailer").Key("ENABLED").SetValue("false")
+   278| 	}
+   279| 	cfg.Section("server").Key("OFFLINE_MODE").SetValue(com.ToStr(f.OfflineMode))
+   280| 	cfg.Section("auth").Key("REQUIRE_EMAIL_CONFIRMATION").SetValue(com.ToStr(f.RegisterConfirm))
+   281| 	cfg.Section("auth").Key("DISABLE_REGISTRATION").SetValue(com.ToStr(f.DisableRegistration))
+   282| 	cfg.Section("auth").Key("ENABLE_REGISTRATION_CAPTCHA").SetValue(com.ToStr(f.EnableCaptcha))
+   283| 	cfg.Section("auth").Key("REQUIRE_SIGNIN_VIEW").SetValue(com.ToStr(f.RequireSignInView))
+   284| 	cfg.Section("user").Key("ENABLE_EMAIL_NOTIFICATION").SetValue(com.ToStr(f.MailNotify))
+   285| 	cfg.Section("picture").Key("DISABLE_GRAVATAR").SetValue(com.ToStr(f.DisableGravatar))
+   286| 	cfg.Section("picture").Key("ENABLE_FEDERATED_AVATAR").SetValue(com.ToStr(f.EnableFederatedAvatar))
+   287| 	cfg.Section("").Key("RUN_MODE").SetValue("prod")
+   288| 	cfg.Section("session").Key("PROVIDER").SetValue("file")
+   289| 	mode := "file"
+   290| 	if f.EnableConsoleMode {
+   291| 		mode = "console, file"
+   292| 	}
+   293| 	cfg.Section("log").Key("MODE").SetValue(mode)
+   294| 	cfg.Section("log").Key("LEVEL").SetValue("Info")
+   295| 	cfg.Section("log").Key("ROOT_PATH").SetValue(f.LogRootPath)
+   296| 	cfg.Section("security").Key("INSTALL_LOCK").SetValue("true")
+   297| 	secretKey, err := strutil.RandomChars(15)
+
+
+# ====================================================================
+# FILE: internal/route/repo/editor.go
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 150-197 ---
+   150| 		}
+   151| 		if index != len(treeNames)-1 {
+   152| 			if !entry.IsTree() {
+   153| 				c.FormErr("TreePath")
+   154| 				c.RenderWithErr(c.Tr("repo.editor.directory_is_a_file", part), tmplEditorEdit, &f)
+   155| 				return
+   156| 			}
+   157| 		} else {
+   158| 			if entry.IsSymlink() {
+   159| 				c.FormErr("TreePath")
+   160| 				c.RenderWithErr(c.Tr("repo.editor.file_is_a_symlink", part), tmplEditorEdit, &f)
+   161| 				return
+   162| 			} else if entry.IsTree() {
+   163| 				c.FormErr("TreePath")
+   164| 				c.RenderWithErr(c.Tr("repo.editor.filename_is_a_directory", part), tmplEditorEdit, &f)
+   165| 				return
+   166| 			}
+   167| 		}
+   168| 	}
+   169| 	if !isNewFile {
+   170| 		_, err := c.Repo.Commit.TreeEntry(oldTreePath)
+   171| 		if err != nil {
+   172| 			if gitutil.IsErrRevisionNotExist(err) {
+   173| 				c.FormErr("TreePath")
+   174| 				c.RenderWithErr(c.Tr("repo.editor.file_editing_no_longer_exists", oldTreePath), tmplEditorEdit, &f)
+   175| 			} else {
+   176| 				c.Error(err, "get tree entry")
+   177| 			}
+   178| 			return
+   179| 		}
+   180| 		if lastCommit != c.Repo.CommitID {
+   181| 			files, err := c.Repo.Commit.FilesChangedAfter(lastCommit)
+   182| 			if err != nil {
+   183| 				c.Error(err, "get changed files")
+   184| 				return
+   185| 			}
+   186| 			for _, file := range files {
+   187| 				if file == f.TreePath {
+   188| 					c.RenderWithErr(c.Tr("repo.editor.file_changed_while_editing", c.Repo.RepoLink+"/compare/"+lastCommit+"..."+c.Repo.CommitID), tmplEditorEdit, &f)
+   189| 					return
+   190| 				}
+   191| 			}
+   192| 		}
+   193| 	}
+   194| 	if oldTreePath != f.TreePath {
+   195| 		entry, err := c.Repo.Commit.TreeEntry(f.TreePath)
+   196| 		if err != nil {
+   197| 			if !gitutil.IsErrRevisionNotExist(err) {
+
+# --- HUNK 2: Lines 227-267 ---
+   227| 		IsNewFile:   isNewFile,
+   228| 	}); err != nil {
+   229| 		log.Error("Failed to update repo file: %v", err)
+   230| 		c.FormErr("TreePath")
+   231| 		c.RenderWithErr(c.Tr("repo.editor.fail_to_update_file", f.TreePath, errors.InternalServerError), tmplEditorEdit, &f)
+   232| 		return
+   233| 	}
+   234| 	if f.IsNewBrnach() && c.Repo.PullRequest.Allowed {
+   235| 		c.Redirect(c.Repo.PullRequestURL(oldBranchName, f.NewBranchName))
+   236| 	} else {
+   237| 		c.Redirect(c.Repo.RepoLink + "/src/" + branchName + "/" + f.TreePath)
+   238| 	}
+   239| }
+   240| func EditFilePost(c *context.Context, f form.EditRepoFile) {
+   241| 	editFilePost(c, f, false)
+   242| }
+   243| func NewFilePost(c *context.Context, f form.EditRepoFile) {
+   244| 	editFilePost(c, f, true)
+   245| }
+   246| func DiffPreviewPost(c *context.Context, f form.EditPreviewDiff) {
+   247| 	treePath := c.Repo.TreePath
+   248| 	entry, err := c.Repo.Commit.TreeEntry(treePath)
+   249| 	if err != nil {
+   250| 		c.Error(err, "get tree entry")
+   251| 		return
+   252| 	} else if entry.IsTree() {
+   253| 		c.Status(http.StatusUnprocessableEntity)
+   254| 		return
+   255| 	}
+   256| 	diff, err := c.Repo.Repository.GetDiffPreview(c.Repo.BranchName, treePath, f.Content)
+   257| 	if err != nil {
+   258| 		c.Error(err, "get diff preview")
+   259| 		return
+   260| 	}
+   261| 	if diff.NumFiles() == 0 {
+   262| 		c.PlainText(http.StatusOK, c.Tr("repo.editor.no_changes_to_show"))
+   263| 		return
+   264| 	}
+   265| 	c.Data["File"] = diff.Files[0]
+   266| 	c.Success(tmplEditorDiffPreview)
+   267| }
+
+
+# ====================================================================
+# FILE: internal/ssh/ssh.go
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-24 ---
+     1| package ssh
+     2| import (
+     3| 	"context"
+     4| 	"fmt"
+     5| 	"io"
+     6| 	"net"
+     7| 	"os"
+     8| 	"os/exec"
+     9| 	"path/filepath"
+    10| 	"strings"
+    11| 	"syscall"
+    12| 	"github.com/pkg/errors"
+    13| 	"github.com/sourcegraph/run"
+    14| 	"github.com/unknwon/com"
+    15| 	"golang.org/x/crypto/ssh"
+    16| 	log "unknwon.dev/clog/v2"
+    17| 	"gogs.io/gogs/internal/conf"
+    18| 	"gogs.io/gogs/internal/db"
+    19| 	"gogs.io/gogs/internal/osutil"
+    20| )
+    21| func cleanCommand(cmd string) string {
+    22| 	i := strings.Index(cmd, "git")
+    23| 	if i == -1 {
+    24| 		return cmd
+
+# --- HUNK 2: Lines 27-83 ---
+    27| }
+    28| func handleServerConn(keyID string, chans <-chan ssh.NewChannel) {
+    29| 	for newChan := range chans {
+    30| 		if newChan.ChannelType() != "session" {
+    31| 			_ = newChan.Reject(ssh.UnknownChannelType, "unknown channel type")
+    32| 			continue
+    33| 		}
+    34| 		ch, reqs, err := newChan.Accept()
+    35| 		if err != nil {
+    36| 			log.Error("Error accepting channel: %v", err)
+    37| 			continue
+    38| 		}
+    39| 		go func(in <-chan *ssh.Request) {
+    40| 			defer func() {
+    41| 				_ = ch.Close()
+    42| 			}()
+    43| 			for req := range in {
+    44| 				payload := cleanCommand(string(req.Payload))
+    45| 				switch req.Type {
+    46| 				case "env":
+    47| 					var env struct {
+    48| 						Name  string
+    49| 						Value string
+    50| 					}
+    51| 					if err := ssh.Unmarshal(req.Payload, &env); err != nil {
+    52| 						log.Warn("SSH: Invalid env payload %q: %v", req.Payload, err)
+    53| 						continue
+    54| 					}
+    55| 					if env.Name == "" || env.Value == "" {
+    56| 						log.Warn("SSH: Invalid env arguments: %+v", env)
+    57| 						continue
+    58| 					}
+    59| 					_, stderr, err := com.ExecCmd("env", fmt.Sprintf("%s=%s", env.Name, env.Value))
+    60| 					if err != nil {
+    61| 						log.Error("env: %v - %s", err, stderr)
+    62| 						return
+    63| 					}
+    64| 				case "exec":
+    65| 					cmdName := strings.TrimLeft(payload, "'()")
+    66| 					log.Trace("SSH: Payload: %v", cmdName)
+    67| 					args := []string{"serv", "key-" + keyID, "--config=" + conf.CustomConf}
+    68| 					log.Trace("SSH: Arguments: %v", args)
+    69| 					cmd := exec.Command(conf.AppPath(), args...)
+    70| 					cmd.Env = append(os.Environ(), "SSH_ORIGINAL_COMMAND="+cmdName)
+    71| 					stdout, err := cmd.StdoutPipe()
+    72| 					if err != nil {
+    73| 						log.Error("SSH: StdoutPipe: %v", err)
+    74| 						return
+    75| 					}
+    76| 					stderr, err := cmd.StderrPipe()
+    77| 					if err != nil {
+    78| 						log.Error("SSH: StderrPipe: %v", err)
+    79| 						return
+    80| 					}
+    81| 					input, err := cmd.StdinPipe()
+    82| 					if err != nil {
+    83| 						log.Error("SSH: StdinPipe: %v", err)
+
+# --- HUNK 3: Lines 125-165 ---
+   125| 				} else {
+   126| 					log.Error("SSH: Error on handshaking: %v", err)
+   127| 				}
+   128| 				return
+   129| 			}
+   130| 			log.Trace("SSH: Connection from %s (%s)", sConn.RemoteAddr(), sConn.ClientVersion())
+   131| 			go ssh.DiscardRequests(reqs)
+   132| 			go handleServerConn(sConn.Permissions.Extensions["key-id"], chans)
+   133| 		}()
+   134| 	}
+   135| }
+   136| func Listen(opts conf.SSHOpts, appDataPath string) {
+   137| 	config := &ssh.ServerConfig{
+   138| 		Config: ssh.Config{
+   139| 			Ciphers: opts.ServerCiphers,
+   140| 			MACs:    opts.ServerMACs,
+   141| 		},
+   142| 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+   143| 			pkey, err := db.SearchPublicKeyByContent(strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key))))
+   144| 			if err != nil {
+   145| 				log.Error("SearchPublicKeyByContent: %v", err)
+   146| 				return nil, err
+   147| 			}
+   148| 			return &ssh.Permissions{Extensions: map[string]string{"key-id": com.ToStr(pkey.ID)}}, nil
+   149| 		},
+   150| 	}
+   151| 	keys, err := setupHostKeys(appDataPath, opts.ServerAlgorithms)
+   152| 	if err != nil {
+   153| 		log.Fatal("SSH: Failed to setup host keys: %v", err)
+   154| 	}
+   155| 	for _, key := range keys {
+   156| 		config.AddHostKey(key)
+   157| 	}
+   158| 	go listen(config, opts.ListenHost, opts.ListenPort)
+   159| }
+   160| func setupHostKeys(appDataPath string, algorithms []string) ([]ssh.Signer, error) {
+   161| 	dir := filepath.Join(appDataPath, "ssh")
+   162| 	err := os.MkdirAll(dir, os.ModePerm)
+   163| 	if err != nil {
+   164| 		return nil, errors.Wrapf(err, "create host key directory")
+   165| 	}
+

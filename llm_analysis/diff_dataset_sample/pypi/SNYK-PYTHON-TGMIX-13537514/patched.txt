@@ -1,0 +1,1094 @@
+# ====================================================================
+# FILE: tgmix/main.py
+# Total hunks: 5
+# ====================================================================
+# --- HUNK 1: Lines 1-27 ---
+     1| import argparse
+     2| import re
+     3| import shutil
+     4| from pathlib import Path
+     5| from ujson import JSONDecodeError, dump, loads
+     6| from tgmix import __version__
+     7| from tgmix.message_processor import MessageProcessor
+     8| from tgmix.stats_processor import compute_chat_stats, print_stats
+     9| PACKAGE_DIR = Path(__file__).parent.resolve()
+    10| def load_config(target_dir: Path) -> dict:
+    11|     """
+    12|     Loads the configuration.
+    13|     Priority:
+    14|     1. tgmix_config.json in the target directory.
+    15|     2. Built-in config.json from the package (default).
+    16|     """
+    17|     local_config_path = target_dir / "tgmix_config.json"
+    18|     default_config_path = PACKAGE_DIR / "config.json"
+    19|     if local_config_path.exists():
+    20|         try:
+    21|             print("[*] Local tgmix_config.json found. Using its settings.")
+    22|             return loads(open(local_config_path, encoding='utf-8').read())
+    23|         except JSONDecodeError as e:
+    24|             print(f"[!] Error: Invalid JSON format in {local_config_path}'.")
+    25|             raise e
+    26|     try:
+    27|         return loads(open(default_config_path, encoding='utf-8').read())
+
+# --- HUNK 2: Lines 32-277 ---
+    32| def create_summary_block(is_transcribed: bool = False,
+    33|                          has_large_files: bool = False) -> dict:
+    34|     """Creates an informational block for the AI model."""
+    35|     if is_transcribed:
+    36|         special_media_handling = ("Voice messages (.ogg) and video messages "
+    37|                                   "are transcribed to text")
+    38|     else:
+    39|         special_media_handling = (
+    40|             "Voice messages (.ogg) and video messages "
+    41|             "are wrapped in .mp4 files. The frame shows the original filename;"
+    42|             " the original audio is kept"
+    43|         )
+    44|     summary_block = {
+    45|         "tgmix_summary": {
+    46|             "purpose":
+    47|                 "This file contains a structured representation of a "
+    48|                 "Telegram chat export, prepared for AI analysis by TGMix",
+    49|             "format_description":
+    50|                 "JSON object containing chat metadata and a list of messages. "
+    51|                 "Each message uses an `author_id` to "
+    52|                 "reference an author in the map, timestamp, "
+    53|                 "and media data. Text is formated in Markdown. "
+    54|                 "special cases: __underline__, ||spoiler||,",
+    55|             "usage_guidelines": {
+    56|                 "main_principle":
+    57|                     "Process this JSON together with any attached media "
+    58|                     "when such media exists.",
+    59|                 "author_references":
+    60|                     "Authors are listed in the top-level `author_map`. Each "
+    61|                     "message refers to an author using a compact `author_id` "
+    62|                     "(e.g. 'U1'). Use this map to resolve the author's full "
+    63|                     "name. In your responses, always use the full name",
+    64|                 "special_media_handling": special_media_handling,
+    65|                 "paid_reactions": "⭐️ cost around $0.02",
+    66|             }
+    67|         }
+    68|     }
+    69|     if has_large_files:
+    70|         summary_block["tgmix_summary"]["usage_guidelines"][
+    71|             "large_media_handling"] = (
+    72|             "Large files are skipped, and their `source_file` "
+    73|             "is marked as 'B'. The size limit is user-configurable."
+    74|         )
+    75|     return summary_block
+    76| def parse_cli_dict(rules_list: list[str] | None) -> dict:
+    77|     """Parses 'key:value' strings from CLI into a single dictionary."""
+    78|     if not rules_list:
+    79|         return {}
+    80|     parsed = {}
+    81|     for item in rules_list:
+    82|         if ':' not in item:
+    83|             print(f"[!] Warning: Skipping invalid rule '{item}'. "
+    84|                   f"Format must be 'key:value'.")
+    85|             continue
+    86|         key, value = item.split(':', 1)
+    87|         parsed[key] = value
+    88|     return parsed
+    89| def run_processing(target_dir: Path, config: dict,
+    90|                    masking_rules: dict | None, do_anonymise: bool,
+    91|                    do_confirm_deletion: bool) -> tuple[dict, dict]:
+    92|     """Main processing logic for the export."""
+    93|     export_json_path = target_dir / config['export_json_file']
+    94|     if not export_json_path.exists():
+    95|         print(f"[!] Error: '{config['export_json_file']}' not found"
+    96|               f" in {target_dir}")
+    97|         return {}, {}
+    98|     media_dir = target_dir / config['media_output_dir']
+    99|     if media_dir.exists():
+   100|         if do_confirm_deletion and input(
+   101|                 f"\nMedia directory '{media_dir}' already exists.\n"
+   102|                 "Delete and continue? [Y/N]: ").lower() != "y":
+   103|             return {}, {}
+   104|         print(f"[*] Cleaning up '{config['media_output_dir']}'...")
+   105|         shutil.rmtree(media_dir)
+   106|     media_dir.mkdir(exist_ok=True)
+   107|     raw_chat = loads(open(export_json_path, encoding="utf-8").read())
+   108|     if not raw_chat.get("messages"):
+   109|         print("[!] Error: No messages found in the export.")
+   110|         return {}, raw_chat
+   111|     message_processor = MessageProcessor(
+   112|         target_dir, media_dir, config["mark_media"], masking_rules,
+   113|         do_anonymise)
+   114|     stitched_messages, author_map, is_anonymised = (
+   115|         message_processor.stitch_messages(raw_chat["messages"]))
+   116|     message_processor.fix_reply_ids(stitched_messages)
+   117|     chat_name = raw_chat.get("name")
+   118|     if is_anonymised and ("authors" in masking_rules.get("presets", {})):
+   119|         template = masking_rules["presets"]["authors"]
+   120|         print("[*] Anonymizing author names...")
+   121|         for compact_id in author_map.keys():
+   122|             numeric_id_match = re.search(r'\d+', compact_id)
+   123|             if not numeric_id_match:
+   124|                 continue
+   125|             unique_placeholder = template.replace(
+   126|                 ']', f'_{numeric_id_match.group(0)}]'
+   127|             )
+   128|             author_map[compact_id] = unique_placeholder
+   129|         chat_name = "[ANONYMIZED CHAT]"
+   130|     processed_chat = create_summary_block(
+   131|         False,
+   132|         "(File not included. "
+   133|         "Change data exporting settings to download.)" in str(raw_chat)
+   134|     )
+   135|     processed_chat["chat_name"] = chat_name
+   136|     processed_chat["author_map"] = author_map
+   137|     processed_chat["messages"] = stitched_messages
+   138|     return processed_chat, raw_chat
+   139| def handle_init(package_dir: Path) -> None:
+   140|     """Creates tgmix_config.json in the current directory from a template."""
+   141|     config_template_path = package_dir / "config.json"
+   142|     target_config_path = Path.cwd() / "tgmix_config.json"
+   143|     if not config_template_path.exists():
+   144|         print(
+   145|             "[!] Critical Error: config.json template not found in package.")
+   146|         return
+   147|     if target_config_path.exists():
+   148|         print(f"[!] File 'tgmix_config.json' already exists here.")
+   149|         return
+   150|     shutil.copy(config_template_path, target_config_path)
+   151|     print(
+   152|         f"[+] Configuration file 'tgmix_config.json' created successfully.")
+   153| def main():
+   154|     """Main entry point for the CLI application."""
+   155|     parser = argparse.ArgumentParser(
+   156|         description="Process a Telegram chat export for AI analysis.",
+   157|         formatter_class=argparse.RawTextHelpFormatter
+   158|     )
+   159|     parser.add_argument(
+   160|         "path",
+   161|         nargs="?",
+   162|         default=None,
+   163|         help="Path to the directory with the Telegram export.\n"
+   164|              "If not provided, processes the current directory."
+   165|     )
+   166|     parser.add_argument(
+   167|         "--init",
+   168|         action="store_true",
+   169|         help="Create a default 'tgmix_config.json' in the current directory."
+   170|     )
+   171|     parser.add_argument(
+   172|         "--version",
+   173|         "-v",
+   174|         "-V",
+   175|         action="version",
+   176|         version=f"%(prog)s {__version__}",
+   177|         help="Show the version number and exit."
+   178|     )
+   179|     parser.add_argument(
+   180|         "-a",
+   181|         "--anonymize",
+   182|         action="store_true",
+   183|         help="Enable anonymization of message content. "
+   184|              "Rules are taken from config or overridden by CLI flags."
+   185|     )
+   186|     parser.add_argument(
+   187|         "--no-stats",
+   188|         action="store_true",
+   189|         help="Disable statistics computation and printing."
+   190|     )
+   191|     parser.add_argument(
+   192|         "--no-mark-media",
+   193|         action="store_true",
+   194|         help="Do not mark media files in the output."
+   195|     )
+   196|     parser.add_argument(
+   197|         '--mask-preset',
+   198|         nargs='+',
+   199|         metavar='PRESET',
+   200|         help='A list of built-in presets to use (e.g., phone email authors). '
+   201|              'Overrides presets in config.'
+   202|     )
+   203|     parser.add_argument(
+   204|         '--mask-literal',
+   205|         nargs='+',
+   206|         metavar='"LITERAL:REPLACEMENT"',
+   207|         help="A list of exact phrases to mask, with their replacements. "
+   208|              "Overrides literals in config."
+   209|     )
+   210|     parser.add_argument(
+   211|         '--mask-regex',
+   212|         nargs='+',
+   213|         metavar='"REGEX:REPLACEMENT"',
+   214|         help="A list of regex patterns to mask, with their replacements. "
+   215|              "Overrides regex rules in config."
+   216|     )
+   217|     parser.add_argument(
+   218|         "--no-confirm-deletion",
+   219|         action="store_false",
+   220|         dest="do_confirm_deletion",
+   221|         help=argparse.SUPPRESS
+   222|     )
+   223|     args = parser.parse_args()
+   224|     if args.init:
+   225|         handle_init(PACKAGE_DIR)
+   226|         return
+   227|     target_directory = Path(args.path).resolve() if args.path else Path.cwd()
+   228|     if target_directory.is_file():
+   229|         if target_directory.suffix != ".json":
+   230|             print("[!] Error: Path must be a directory, not a file.")
+   231|             return
+   232|         target_directory = target_directory.parent
+   233|     config = load_config(target_directory)
+   234|     masking_rules: dict | None = dict()
+   235|     if args.no_mark_media:
+   236|         config["mark_media"] = False
+   237|     if args.anonymize or config.get("anonymize", False):
+   238|         print("[*] Anonymization enabled.")
+   239|         masking_rules = {
+   240|             "default_phone_region": config.get("default_phone_region", "RU")
+   241|         }
+   242|         default_presets = config.get("mask_presets", {})
+   243|         active_presets = (
+   244|             args.mask_preset if args.mask_preset else
+   245|             default_presets.keys()
+   246|         )
+   247|         masking_rules["presets"] = {
+   248|             preset: default_presets.get(
+   249|                 preset, f"[{preset.upper()}]") for preset in active_presets
+   250|         }
+   251|         masking_rules["literals"] = (
+   252|             parse_cli_dict(args.mask_literal) if args.mask_literal else
+   253|             config.get("mask_literals", {})
+   254|         )
+   255|         masking_rules["regex"] = (
+   256|             parse_cli_dict(args.mask_regex) if args.mask_regex else
+   257|             config.get("mask_regex", {})
+   258|         )
+   259|     print(f"--- Starting TGMix on directory: {target_directory} ---")
+   260|     processed_chat, raw_chat = run_processing(
+   261|         target_directory, config, masking_rules, args.anonymize,
+   262|         args.do_confirm_deletion)
+   263|     if not processed_chat:
+   264|         return
+   265|     output_path = target_directory / config['final_output_json']
+   266|     with open(output_path, "w", encoding="utf-8") as file:
+   267|         dump(processed_chat, file, ensure_ascii=False, indent=2)
+   268|     if args.no_stats:
+   269|         return
+   270|     if not config.get("enable_stats", True):
+   271|         return
+   272|     if not (stats := compute_chat_stats(processed_chat, raw_chat)):
+   273|         print("[!] Error: Failed to compute statistics.")
+   274|         return
+   275|     print_stats(stats, config, args.anonymize)
+   276| if __name__ == "__main__":
+   277|     main()
+
+
+# ====================================================================
+# FILE: tgmix/media_processor.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-96 ---
+     1| from pathlib import Path
+     2| from shutil import copyfile
+     3| from markmymedia import mark_audio, mark_image, mark_video
+     4| from markmymedia.errors import (
+     5|     AudioMarkingError, FFmpegProcessError, ImageMarkingError,
+     6|     InvalidMediaError, VideoMarkingError)
+     7| from tgmix.consts import MEDIA_KEYS
+     8| class Media:
+     9|     def __init__(self, base_dir: Path, media_dir: Path, mark_media: bool):
+    10|         self.base_dir = base_dir
+    11|         self.media_dir = media_dir
+    12|         self.do_mark_media = mark_media
+    13|     @staticmethod
+    14|     def detect(message: dict) -> str:
+    15|         for key in MEDIA_KEYS:
+    16|             if key in message:
+    17|                 return key
+    18|         return ""
+    19|     def check_path(self, filename: str):
+    20|         try:
+    21|             source_path = self.base_dir / filename
+    22|             resolved_source = source_path.resolve(strict=True)
+    23|             resolved_base = self.base_dir.resolve()
+    24|         except FileNotFoundError:
+    25|             print(f"[!] Skipped: File not found: {filename}")
+    26|             return "NF", ""  # Not found
+    27|         except Exception as e:
+    28|             print(f"[!] Skipped (error resolving path for '{filename}'):\n"
+    29|                   f"{e}")
+    30|             return "NF", ""
+    31|         if not resolved_source.is_relative_to(resolved_base):
+    32|             print("[!] Security Warning: Blocked attempt to access a file "
+    33|                   f"outside the base directory: {filename}")
+    34|             return "OOB", resolved_source  # Out Of Bounds
+    35|         if resolved_source.is_dir():
+    36|             print(f"[!] Skipped: Path points to a directory: {filename}")
+    37|             return "isdir", resolved_source
+    38|         return "", resolved_source
+    39|     def process(self, message: dict) -> str | None:
+    40|         """
+    41|         Detects media in a message, processes it, and returns
+    42|         structured information.
+    43|         """
+    44|         if not (media_type := self.detect(message)):
+    45|             return
+    46|         filename = message.get(media_type)
+    47|         if not isinstance(filename, str) or not filename:
+    48|             return
+    49|         if filename in ("(File not included. "
+    50|                         "Change data exporting settings to download.)",
+    51|                         "(File exceeds maximum size. "
+    52|                         "Change data exporting settings to download.)",
+    53|                         "(File unavailable, please try again later)"):
+    54|             return "B"
+    55|         output_code, resolved_source = self.check_path(filename)
+    56|         if output_code:
+    57|             return output_code
+    58|         prepared_path = self.media_dir / resolved_source.name
+    59|         if not self.do_mark_media:
+    60|             self.copy_media_file(resolved_source, prepared_path)
+    61|             return filename
+    62|         self.mark_media(resolved_source, prepared_path)
+    63|         return filename
+    64|     def _mark_media(self, func, source_path: Path,
+    65|                     prepared_path: Path) -> None:
+    66|         try:
+    67|             func(source_path, prepared_path)
+    68|         except (AudioMarkingError, VideoMarkingError, ImageMarkingError):
+    69|             print(f"[!] Failed to mark media: {source_path.name}")
+    70|             self.copy_media_file(source_path, prepared_path)
+    71|         except InvalidMediaError:
+    72|             print(f"[!] Invalid media: {source_path.name}")
+    73|             self.copy_media_file(source_path, prepared_path)
+    74|         except FFmpegProcessError:
+    75|             print("[!] Ffmpeg not found, disabling media marking.")
+    76|             self.do_mark_media = False
+    77|             self.copy_media_file(source_path, prepared_path)
+    78|     def mark_media(self, source_path: Path,
+    79|                    prepared_path: Path) -> None:
+    80|         file_type = source_path.parent.name
+    81|         if file_type == "voice_messages":
+    82|             self._mark_media(mark_audio, source_path,
+    83|                              prepared_path.with_suffix(".mp4"))
+    84|         elif file_type in ("round_video_messages", "video_files"):
+    85|             self._mark_media(mark_video, source_path, prepared_path)
+    86|         elif file_type == "photos":
+    87|             self._mark_media(mark_image, source_path, prepared_path)
+    88|         else:
+    89|             self.copy_media_file(source_path, prepared_path)
+    90|     @staticmethod
+    91|     def copy_media_file(source_path: Path, output_path: Path) -> None:
+    92|         """Simply copies a file if it exists."""
+    93|         if not source_path.exists():
+    94|             print(f"[!] Skipped (not found): {source_path}")
+    95|             return
+    96|         copyfile(source_path, output_path)
+
+
+# ====================================================================
+# FILE: tgmix/message_processor.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-44 ---
+     1| import re
+     2| from pathlib import Path
+     3| import phonenumbers
+     4| from tqdm import tqdm
+     5| from tgmix.media_processor import Media
+     6| from tgmix.utils import b64decode_forgiving
+     7| class Masking:
+     8|     def __init__(self, rules: dict | None, enabled: bool):
+     9|         self.rules = rules
+    10|         self.email_re = re.compile(
+    11|             r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}'
+    12|             r'[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}'
+    13|             r'[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}\b')
+    14|         self.name_to_authors_map: dict[str, list] = {}
+    15|         self.enabled = enabled
+    16|         if not rules.get("regex"):
+    17|             return
+    18|         rules_regex = {}
+    19|         for rule, placeholder in rules["regex"].items():
+    20|             try:
+    21|                 rules_regex.update({re.compile(rule): placeholder})
+    22|             except re.error as e:
+    23|                 print(f"[!] Warning: Invalid regex '{rule}'. {e}")
+    24|         self.rules["regex"] = rules_regex
+    25|     @staticmethod
+    26|     def _replace_phone_numbers(text: str, placeholder: str,
+    27|                                region: str | None) -> str:
+    28|         """
+    29|         Finds, filters, and replaces phone numbers for a single pass.
+    30|         :param text: The text to process.
+    31|         :param placeholder: The string to replace numbers with.
+    32|         :param region: The region to search for. If None, searches for
+    33|                        international numbers only.
+    34|         :return: Text with numbers replaced.
+    35|         """
+    36|         unique_matches = {}
+    37|         matcher = phonenumbers.PhoneNumberMatcher(text, region)
+    38|         for match in matcher:
+    39|             unique_matches[(match.start, match.end)] = match
+    40|         if not unique_matches:
+    41|             return text
+    42|         all_found = list(unique_matches.values())
+    43|         non_nested_matches = []
+    44|         for current_match in all_found:
+
+# --- HUNK 2: Lines 48-635 ---
+    48|                     continue
+    49|                 if (other_match.start > current_match.start
+    50|                         or other_match.end < current_match.end):
+    51|                     continue
+    52|                 is_nested = True
+    53|                 break
+    54|             if not is_nested:
+    55|                 non_nested_matches.append(current_match)
+    56|         sorted_matches = sorted(
+    57|             non_nested_matches,
+    58|             key=lambda m: m.start,
+    59|             reverse=True
+    60|         )
+    61|         for match in sorted_matches:
+    62|             text = f"{text[:match.start]}{placeholder}{text[match.end:]}"
+    63|         return text
+    64|     def apply(self, text: str) -> str:
+    65|         """Applies a set of masking rules to the given text."""
+    66|         if (not self.enabled) or (not self.rules) or (not text):
+    67|             return text
+    68|         if not isinstance(text, str):
+    69|             return text
+    70|         for literal, placeholder in self.rules.get("literals", {}).items():
+    71|             text = re.sub(
+    72|                 re.escape(literal), placeholder, text, flags=re.IGNORECASE
+    73|             )
+    74|         preset_rules = self.rules.get("presets", {})
+    75|         if "email" in preset_rules:
+    76|             text = self.email_re.sub(preset_rules["email"], text)
+    77|         if "phone" in preset_rules:
+    78|             placeholder = preset_rules["phone"]
+    79|             region = self.rules.get("default_phone_region", "RU")
+    80|             text = self._replace_phone_numbers(text, placeholder, region)
+    81|             text = self._replace_phone_numbers(text, placeholder, None)
+    82|         for pattern_re, placeholder in self.rules.get("regex", {}).items():
+    83|             try:
+    84|                 text = pattern_re.sub(placeholder, text)
+    85|             except re.error as e:
+    86|                 print(f"[!] Warning: Invalid regex '{pattern_re.pattern}'. "
+    87|                       f"{e}")
+    88|         return text
+    89|     def author(self, text: str):
+    90|         if not self.enabled:
+    91|             return text
+    92|         author = self.name_to_authors_map.get(text, text)
+    93|         if not author:
+    94|             return text
+    95|         if len(author) == 1:
+    96|             return author[0]
+    97|         return author
+    98| class MessageProcessor:
+    99|     def __init__(self, target_dir: Path, media_dir: Path, mark_media: bool,
+   100|                  masking_rules: dict, do_anonymise: bool) -> None:
+   101|         self.media = Media(target_dir, media_dir, mark_media)
+   102|         self.pbar = None
+   103|         self.id_to_author_map = {}
+   104|         self.masking = Masking(masking_rules, do_anonymise)
+   105|         self.id_alias_map = {}
+   106|     def format_text_entities_to_markdown(self, entities: list) -> str:
+   107|         """
+   108|         Converts text_entities to Markdown.
+   109|         """
+   110|         if not entities:
+   111|             return ""
+   112|         if isinstance(entities, str):
+   113|             return entities
+   114|         masking_presets = self.masking.rules.get("presets")
+   115|         markdown_parts = []
+   116|         for entity in entities:
+   117|             if isinstance(entity, str):
+   118|                 markdown_parts.append(entity)
+   119|                 continue
+   120|             text = entity.get("text", "")
+   121|             entity_type = entity.get("type", "plain")
+   122|             if not text:
+   123|                 continue
+   124|             match entity_type:
+   125|                 case "bold":
+   126|                     markdown_parts.append(f"**{text}**")
+   127|                 case "italic":
+   128|                     markdown_parts.append(f"*{text}*")
+   129|                 case "strikethrough":
+   130|                     markdown_parts.append(f"~~{text}~~")
+   131|                 case "code":
+   132|                     markdown_parts.append(f"`{text}`")
+   133|                 case "pre":
+   134|                     markdown_parts.append(f"```{entity.get('language', '')}\n"
+   135|                                           f"{text}\n```")
+   136|                 case "email":
+   137|                     if self.masking.enabled and (
+   138|                             mask := masking_presets.get("email")):
+   139|                         markdown_parts.append(mask)
+   140|                         continue
+   141|                     markdown_parts.append(text)
+   142|                 case "phone":
+   143|                     if self.masking.enabled and (
+   144|                             mask := masking_presets.get("phone")):
+   145|                         markdown_parts.append(mask)
+   146|                         continue
+   147|                     markdown_parts.append(text)
+   148|                 case "mention" | "mention_name":
+   149|                     if self.masking.enabled and (
+   150|                             mask := masking_presets.get("authors")):
+   151|                         if author_id := self.id_to_author_map.get(
+   152|                                 f"user{text}"):
+   153|                             markdown_parts.append(f"[{author_id}]")
+   154|                             continue
+   155|                         markdown_parts.append(mask)
+   156|                         continue
+   157|                     markdown_parts.append(text)
+   158|                 case "underline":
+   159|                     markdown_parts.append(f"<u>{text}</u>")
+   160|                 case "spoiler":
+   161|                     markdown_parts.append(f"||{text}||")
+   162|                 case "custom_emoji":
+   163|                     markdown_parts.append(f"[emoji_{entity['document_id']}]")
+   164|                 case "bank_card":
+   165|                     if self.masking.enabled and (
+   166|                             mask := masking_presets.get("bank_card")):
+   167|                         markdown_parts.append(mask)
+   168|                         continue
+   169|                     markdown_parts.append(text)
+   170|                 case "blockquote":
+   171|                     markdown_parts.append(f"> {text}")
+   172|                 case "link":
+   173|                     if self.masking.enabled and (
+   174|                             mask := masking_presets.get("link")):
+   175|                         markdown_parts.append(mask)
+   176|                         continue
+   177|                     markdown_parts.append(text)
+   178|                 case "text_link":
+   179|                     if self.masking.enabled and (
+   180|                             mask := masking_presets.get("link")):
+   181|                         markdown_parts.append(f"[{entity.get('text')}]"
+   182|                                               f"({mask})")
+   183|                         continue
+   184|                     markdown_parts.append(f"[{entity.get('text')}]"
+   185|                                           f"({entity.get('href', '#')})")
+   186|                 case "bot_command" | "hashtag" | "cashtag":
+   187|                     markdown_parts.append(text)
+   188|                 case _:  # plain and others
+   189|                     print(f"[!] Warning: Unknown entity type '{entity_type}'")
+   190|                     markdown_parts.append(text)
+   191|         return "".join(markdown_parts)
+   192|     def stitch_messages(
+   193|             self, source_messages: list) -> tuple[list, dict, bool]:
+   194|         """
+   195|         Step 1: Iterates through messages, gathers "raw" parts,
+   196|         and then parses them at once. Returns processed messages and maps.
+   197|         """
+   198|         author_map = {}
+   199|         author_counter = 1
+   200|         for next_message in source_messages:
+   201|             author_id = next_message.get("from_id")
+   202|             if not author_id or author_id in self.id_to_author_map:
+   203|                 continue
+   204|             compact_id = f"U{author_counter}"
+   205|             self.id_to_author_map[author_id] = compact_id
+   206|             author_map[compact_id] = {
+   207|                 "name": next_message.get("from"),
+   208|                 "id": author_id
+   209|             }
+   210|             self.masking.name_to_authors_map.setdefault(
+   211|                 next_message.get("from"), []).append(compact_id)
+   212|             author_counter += 1
+   213|         stitched_messages = []
+   214|         next_id = 0
+   215|         self.pbar = tqdm(total=len(source_messages),
+   216|                     desc="Step 1/2: Stitching messages")
+   217|         while next_id < len(source_messages):
+   218|             next_message = source_messages[next_id]
+   219|             self.pbar.update()
+   220|             if next_message.get("type") != "message":
+   221|                 if next_message.get("type") != "service":
+   222|                     next_id += 1
+   223|                     continue
+   224|                 stitched_messages.append(
+   225|                     self.parse_service_message(next_message))
+   226|                 next_id += 1
+   227|                 continue
+   228|             parsed_msg = self.parse_message_data(next_message)
+   229|             next_id = self.combine_messages(
+   230|                 next_message, next_id, parsed_msg,
+   231|                 source_messages
+   232|             )
+   233|             stitched_messages.append(parsed_msg)
+   234|         self.pbar.close()
+   235|         return stitched_messages, author_map, self.masking.enabled
+   236|     @staticmethod
+   237|     def check_attributes(message1: dict, message2: dict,
+   238|                          same: tuple = None, has: tuple = None) -> bool:
+   239|         if not same:
+   240|             same = ()
+   241|         if not has:
+   242|             has = ()
+   243|         for attribute in same:
+   244|             if message1.get(attribute) != message2.get(attribute):
+   245|                 return False
+   246|         for attribute in has:
+   247|             if (attribute not in message1) or (attribute not in message2):
+   248|                 return False
+   249|         return True
+   250|     def combine_messages(self, message: dict,
+   251|                          message_id: int, parsed_message: dict,
+   252|                          source_messages: list) -> int:
+   253|         next_id = message_id + 1
+   254|         if not len(source_messages) > next_id:
+   255|             return next_id
+   256|         next_message = source_messages[next_id]
+   257|         while self.check_attributes(
+   258|                 message, next_message,
+   259|                 ("from_id", "forwarded_from", "date_unixtime")):
+   260|             self.pbar.update()
+   261|             next_text = self.masking.apply(
+   262|                 self.format_text_entities_to_markdown(
+   263|                     next_message.get("text")))
+   264|             if next_text:
+   265|                 if not parsed_message.get("text"):
+   266|                     parsed_message["text"] = next_text
+   267|                 else:
+   268|                     parsed_message["text"] += f"\n\n{next_text}"
+   269|             if file_name := self.media.process(next_message):
+   270|                 if isinstance(parsed_message.get("media"), str):
+   271|                     parsed_message["media"] = [
+   272|                         parsed_message["media"]]
+   273|                 elif not parsed_message.get("media"):
+   274|                     parsed_message["media"] = []
+   275|                 parsed_message["media"].append(file_name)
+   276|             self.combine_reactions(next_message, parsed_message)
+   277|             self.id_alias_map[next_message["id"]] = message["id"]
+   278|             next_id += 1
+   279|             if not len(source_messages) > next_id:
+   280|                 return next_id
+   281|             next_message = source_messages[next_id]
+   282|         return next_id
+   283|     def combine_reactions(self, next_message: dict,
+   284|                           parsed_message: dict) -> None:
+   285|         """
+   286|         Merges raw reactions from next_msg_data with already processed
+   287|         reactions in parsed_message, applying minimization.
+   288|         """
+   289|         if "reactions" not in next_message:
+   290|             return
+   291|         if "reactions" not in parsed_message:
+   292|             parsed_message["reactions"] = []
+   293|         for next_reaction in next_message["reactions"]:
+   294|             next_shape, next_count = (
+   295|                 next_reaction.get("emoji") or next_reaction.get("document_id")
+   296|                 or "⭐️", next_reaction["count"])
+   297|             if next_reaction["type"] == "paid":
+   298|                 next_shape = "⭐️"
+   299|             found = False
+   300|             for reaction_id in range(len(parsed_message["reactions"])):
+   301|                 reaction = parsed_message["reactions"][reaction_id]
+   302|                 if reaction.get(next_shape) is not None:
+   303|                     parsed_message["reactions"][reaction_id][
+   304|                         next_shape] += next_count
+   305|                     found = True
+   306|                     break
+   307|             if not found:
+   308|                 parsed_message["reactions"].append({
+   309|                     next_shape: next_count
+   310|                 })
+   311|             if not next_reaction.get("recent"):
+   312|                 continue
+   313|             for reaction_id in range(len(parsed_message["reactions"])):
+   314|                 if not parsed_message["reactions"][reaction_id].get(
+   315|                         next_shape):
+   316|                     continue
+   317|                 parsed_message["reactions"][reaction_id].setdefault(
+   318|                     "recent", []).extend(self.minimise_recent_reactions(
+   319|                     next_reaction))
+   320|     def minimise_recent_reactions(self, reactions: dict) -> list[dict]:
+   321|         recent = []
+   322|         for reaction in reactions["recent"]:
+   323|             if author_id := self.id_to_author_map.get(reaction["from_id"]):
+   324|                 recent.append({
+   325|                     "author_id": author_id,
+   326|                     "date": reaction["date"]
+   327|                 })
+   328|                 continue
+   329|             recent.append({
+   330|                 "from": reaction["from"],
+   331|                 "from_id": reaction["from_id"],
+   332|                 "date": reaction["date"]
+   333|             })
+   334|         return recent
+   335|     def parse_message_data(self, message: dict) -> dict:
+   336|         """Parses a single message using the author map."""
+   337|         parsed_message = {
+   338|             "id": message["id"],
+   339|             "time": message["date"],
+   340|             "author_id": self.id_to_author_map.get(message.get("from_id"))
+   341|         }
+   342|         if message.get("text"):
+   343|             parsed_message["text"] = self.masking.apply(
+   344|                 self.format_text_entities_to_markdown(message["text"]))
+   345|         if "reply_to_message_id" in message:
+   346|             parsed_message["reply_to_message_id"] = message[
+   347|                 "reply_to_message_id"]
+   348|         if file_name := self.media.process(message):
+   349|             parsed_message["media"] = file_name
+   350|         if "forwarded_from" in message:
+   351|             parsed_message["forwarded_from"] = self.masking.author(
+   352|                 message["forwarded_from"])
+   353|         if "edited" in message:
+   354|             parsed_message["edited_time"] = message["edited"]
+   355|         if "author" in message:
+   356|             parsed_message["post_author"] = self.masking.author(
+   357|                 message["author"])
+   358|         if "paid_stars_amount" in message:
+   359|             parsed_message["media_unlock_stars"] = message[
+   360|                 "paid_stars_amount"]
+   361|         if "poll" in message:
+   362|             parsed_message["poll"] = {
+   363|                 "question": self.masking.apply(
+   364|                     self.format_text_entities_to_markdown(
+   365|                         message["poll"]["question"])),
+   366|                 "closed": message["poll"]["closed"],
+   367|                 "answers": [
+   368|                     self.masking.apply(
+   369|                         self.format_text_entities_to_markdown(answer["text"]))
+   370|                     for answer in message["poll"]["answers"]],
+   371|             }
+   372|         if "contact_information" in message:
+   373|             if self.masking.enabled and (
+   374|                     self.masking.rules["presets"].get("phone")):
+   375|                 parsed_message["contact_information"] = "[CONTACT]"
+   376|             else:
+   377|                 parsed_message["contact_information"] = message[
+   378|                     "contact_information"]
+   379|         if "via_bot" in message:
+   380|             parsed_message["via_bot"] = message["via_bot"]
+   381|         if "inline_bot_buttons" in message:
+   382|             parsed_message["inline_buttons"] = []
+   383|             for button_group in message["inline_bot_buttons"]:
+   384|                 for button in button_group:
+   385|                     parsed_message["inline_buttons"].append(
+   386|                         self.parse_inline_button(button))
+   387|         if "reactions" in message:
+   388|             parsed_message["reactions"] = []
+   389|             for reaction in message["reactions"]:
+   390|                 shape_value = reaction.get("emoji") or reaction.get(
+   391|                     "document_id") or "⭐️"
+   392|                 parsed_message["reactions"].append({
+   393|                     shape_value: reaction["count"]
+   394|                 })
+   395|                 if reaction.get("recent"):
+   396|                     parsed_message["reactions"][-1][
+   397|                         "recent"] = self.minimise_recent_reactions(reaction)
+   398|         return parsed_message
+   399|     def parse_inline_button(self, button) -> dict:
+   400|         text = self.masking.apply(button["text"] or "")
+   401|         has_encoded_data = "dataBase64" in button
+   402|         has_data = "data" in button
+   403|         if has_data or has_encoded_data:
+   404|             if has_encoded_data and not has_data:
+   405|                 button_data = b64decode_forgiving(button["dataBase64"])
+   406|             elif has_encoded_data and has_data:
+   407|                 button_data = [
+   408|                     b64decode_forgiving(button["dataBase64"]),
+   409|                     button["data"]]
+   410|             else:
+   411|                 button_data = button["data"]
+   412|         else:
+   413|             button_data = ""
+   414|         if button["type"] == "callback":
+   415|             return {
+   416|                 "type": button["type"],
+   417|                 "text": text,
+   418|                 "callback": button_data,
+   419|             }
+   420|         elif button["type"] == "auth":
+   421|             return {
+   422|                     "text": text,
+   423|                     "data": button_data,
+   424|                 }
+   425|         elif button["type"] == "url":
+   426|                 return {
+   427|                     "text": text,
+   428|                     "url": button_data,
+   429|                 }
+   430|         elif button["type"] == "switch_inline_same":
+   431|             return {
+   432|                 "type": button["type"],
+   433|                 "text": text,
+   434|             }
+   435|         elif button["type"] == "switch_inline":
+   436|             data = {
+   437|                 "type": button["type"],
+   438|                 "text": text,
+   439|             }
+   440|             if button_data:
+   441|                 data["data"] = button_data
+   442|             return data
+   443|         elif button["type"] == "game":
+   444|             return {
+   445|                 "type": button["type"],
+   446|                 "text": text,
+   447|             }
+   448|         else:
+   449|             button["text"] = text
+   450|             print("[!] Warning: Unknown inline button type "
+   451|                   f"'{button['type']}'")
+   452|             return button
+   453|     def parse_service_message(self, message: dict) -> dict:
+   454|         action_from = self.id_to_author_map.get(message.get("actor_id"))
+   455|         if members := message.get("members", []):
+   456|             members = [
+   457|                 self.masking.author(member) for member in message["members"]]
+   458|         match message.get("action"):
+   459|             case "phone_call":
+   460|                 data = {
+   461|                     "id": message["id"],
+   462|                     "type": "phone_call",
+   463|                     "time": message["date"],
+   464|                     "from": action_from,
+   465|                     "discard_reason": message["discard_reason"],
+   466|                 }
+   467|                 if "duration_seconds" in message:
+   468|                     data["duration"] = message["duration_seconds"]
+   469|                 return data
+   470|             case "group_call":
+   471|                 data = {
+   472|                     "id": message["id"],
+   473|                     "type": "group_call",
+   474|                     "time": message["date"],
+   475|                     "from": action_from,
+   476|                 }
+   477|                 if "duration" in message:
+   478|                     data["duration"] = message["duration"]
+   479|                 return data
+   480|             case "invite_to_group_call":
+   481|                 return {
+   482|                     "id": message["id"],
+   483|                     "type": "invite_to_group_call",
+   484|                     "time": message["date"],
+   485|                     "from": action_from,
+   486|                     "members": members,
+   487|                 }
+   488|             case "pin_message":
+   489|                 return {
+   490|                     "id": message["id"],
+   491|                     "type": "pin_message",
+   492|                     "time": message["date"],
+   493|                     "from": action_from,
+   494|                     "message_id": message["message_id"],
+   495|                 }
+   496|             case "send_star_gift":
+   497|                 data = {
+   498|                     "id": message["id"],
+   499|                     "type": "send_star_gift",
+   500|                     "time": message["date"],
+   501|                     "from": action_from,
+   502|                     "gift_id": message["gift_id"],
+   503|                     "stars": message["stars"],
+   504|                     "is_limited": message["is_limited"],
+   505|                     "is_anonymous": message["is_anonymous"],
+   506|                 }
+   507|                 if message.get("gift_text"):
+   508|                     data["text"] = message["gift_text"]
+   509|                 return data
+   510|             case "paid_messages_price_change":
+   511|                 return {
+   512|                     "id": message["id"],
+   513|                     "type": "paid_pm_price_change",
+   514|                     "time": message["date"],
+   515|                     "from": action_from,
+   516|                     "price_stars": message["price_stars"],
+   517|                     "is_broadcast_messages_allowed":
+   518|                         message["is_broadcast_messages_allowed"],
+   519|                 }
+   520|             case "join_group_by_request":
+   521|                 return {
+   522|                     "id": message["id"],
+   523|                     "type": "join_group_by_request",
+   524|                     "time": message["date"],
+   525|                     "from": action_from
+   526|                 }
+   527|             case "join_group_by_link":
+   528|                 return {
+   529|                     "id": message["id"],
+   530|                     "type": "join_group_by_link",
+   531|                     "time": message["date"],
+   532|                     "from": action_from,
+   533|                     "inviter": self.masking.author(message["inviter"])
+   534|                 }
+   535|             case "invite_members":
+   536|                 return {
+   537|                     "id": message["id"],
+   538|                     "type": "invite_members",
+   539|                     "time": message["date"],
+   540|                     "from": action_from,
+   541|                     "members": members,
+   542|                 }
+   543|             case "remove_members":
+   544|                 return {
+   545|                     "id": message["id"],
+   546|                     "type": "remove_members",
+   547|                     "time": message["date"],
+   548|                     "from": action_from,
+   549|                     "members": members,
+   550|                 }
+   551|             case "create_channel":
+   552|                 return {
+   553|                     "id": message["id"],
+   554|                     "type": "create_channel",
+   555|                     "time": message["date"],
+   556|                     "from": action_from,
+   557|                     "title": message["title"],
+   558|                 }
+   559|             case "edit_group_title":
+   560|                 return {
+   561|                     "id": message["id"],
+   562|                     "type": "edit_group_title",
+   563|                     "time": message["date"],
+   564|                     "from": action_from,
+   565|                     "title": message["title"],
+   566|                 }
+   567|             case "edit_group_photo":
+   568|                 return {
+   569|                     "id": message["id"],
+   570|                     "type": "edit_group_photo",
+   571|                     "time": message["date"],
+   572|                     "from": action_from,
+   573|                     "photo": message["photo"],
+   574|                 }
+   575|             case "score_in_game":
+   576|                 return {
+   577|                     "id": message["id"],
+   578|                     "type": "score_in_game",
+   579|                     "time": message["date"],
+   580|                     "from": action_from,
+   581|                     "score": message["score"],
+   582|                 }
+   583|             case "topic_created":
+   584|                 return {
+   585|                     "id": message["id"],
+   586|                     "type": "topic_created",
+   587|                     "time": message["date"],
+   588|                     "from": action_from,
+   589|                     "title": message["title"]
+   590|                 }
+   591|             case "topic_edit":
+   592|                 return {
+   593|                     "id": message["id"],
+   594|                     "type": "topic_edit",
+   595|                     "time": message["date"],
+   596|                     "from": action_from,
+   597|                     "title": message["new_title"],
+   598|                     "icon_emoji_id": message["new_icon_emoji_id"],
+   599|                 }
+   600|             case "boost_apply":
+   601|                 return {
+   602|                     "id": message["id"],
+   603|                     "type": "boost_apply",
+   604|                     "time": message["date"],
+   605|                     "from": action_from,
+   606|                     "boosts": message["boosts"],
+   607|                 }
+   608|         print(f"[!] Unhandled service message({message['id']}): "
+   609|               f"{message['action']}")
+   610|         if self.masking.enabled:
+   611|             data = {
+   612|                 "id": message["id"],
+   613|                 "type": message.get("action"),
+   614|                 "time": message["date"],
+   615|                 "from": action_from,
+   616|                 "notice":
+   617|                     "Not included due to unknown action "
+   618|                     "and anonymization enabled."
+   619|             }
+   620|             if "members" in message:
+   621|                 data["members"] = members
+   622|             return data
+   623|         return message
+   624|     def fix_reply_ids(self, messages: list) -> None:
+   625|         """
+   626|         Goes through the stitched messages and fixes reply IDs
+   627|         using the alias map.
+   628|         """
+   629|         for message in tqdm(messages, desc="Step 2/2: Fixing replies"):
+   630|             if "reply_to_message_id" not in message:
+   631|                 continue
+   632|             reply_id = message["reply_to_message_id"]
+   633|             if reply_id not in self.id_alias_map:
+   634|                 continue
+   635|             message["reply_to_message_id"] = self.id_alias_map[reply_id]
+
+
+# ====================================================================
+# FILE: tgmix/stats_processor.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-52 ---
+     1| from rs_bpe.bpe import openai
+     2| from tqdm import tqdm
+     3| from ujson import dumps
+     4| def compute_chat_stats(chat: dict, raw_chat: dict) -> dict:
+     5|     """Computes token, char, and other stats for the chat."""
+     6|     messages = chat.get("messages", [])
+     7|     stats: dict[str, int] = {
+     8|         "raw_total_messages": len(raw_chat.get("messages", [])),
+     9|         "total_messages": len(messages),
+    10|         "raw_total_tokens": 0,
+    11|         "total_tokens": 0,
+    12|         "raw_total_chars": 0,
+    13|         "total_chars": 0,
+    14|         "media_count": 0,
+    15|     }
+    16|     encoding = openai.o200k_base()
+    17|     for message in tqdm(messages, desc="Counting media in messages"):
+    18|         if "media" not in message:
+    19|             continue
+    20|         if isinstance(message["media"], str):
+    21|             stats["media_count"] += 1
+    22|         else:
+    23|             stats["media_count"] += len(message["media"])
+    24|     pbar = tqdm(total=2, desc="Dumping chats for stats")
+    25|     chat_json = dumps(chat)
+    26|     raw_chat_json = dumps(raw_chat)
+    27|     pbar.update()
+    28|     pbar.set_description("Counting tokens for files")
+    29|     stats["raw_total_tokens"] = encoding.count(raw_chat_json)
+    30|     stats["total_tokens"] = encoding.count(chat_json)
+    31|     pbar.update()
+    32|     pbar.set_description("Counting chars for files")
+    33|     stats["raw_total_chars"] = len(raw_chat_json)
+    34|     stats["total_chars"] = len(chat_json)
+    35|     pbar.close()
+    36|     return stats
+    37| def print_stats(stats: dict, config: dict, anonymised: bool) -> None:
+    38|     """Prints a formatted summary of the processing stats."""
+    39|     print("\n📊 Process Summary:\n"
+    40|           "─────────────────────\n"
+    41|           f"Total messages: {stats['raw_total_messages']:,} "
+    42|           f"-> {stats['total_messages']:,}\n"
+    43|           f"Output file tokens: {stats['raw_total_tokens']:,} "
+    44|           f"-> {stats['total_tokens']:,}\n"
+    45|           f"Total chars: {stats['raw_total_chars']:,} "
+    46|           f"-> {stats['total_chars']:,}\n"
+    47|           f"Media tokens: unaccounted\n"
+    48|           f"Output file: {config['final_output_json']}\n"
+    49|           f"Anonymization: {'ON' if anonymised else 'OFF'}\n"
+    50|           "\n"
+    51|           "🎉 All Done!\n"
+    52|           "Your chat has been successfully packed.")
+
+
+# ====================================================================
+# FILE: tgmix/utils.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-3 ---
+     1| from base64 import b64decode
+     2| def b64decode_forgiving(data_str: str) -> str:
+     3|     return b64decode(f"{data_str}{'=' * (4 - len(data_str) % 4)}").decode()
+

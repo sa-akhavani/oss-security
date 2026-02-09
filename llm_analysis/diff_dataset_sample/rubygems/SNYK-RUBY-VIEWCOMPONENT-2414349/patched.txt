@@ -1,0 +1,119 @@
+# ====================================================================
+# FILE: lib/view_component/translatable.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-97 ---
+     1| require "erb"
+     2| require "set"
+     3| require "i18n"
+     4| require "action_view/helpers/translation_helper"
+     5| require "active_support/concern"
+     6| module ViewComponent
+     7|   module Translatable
+     8|     extend ActiveSupport::Concern
+     9|     HTML_SAFE_TRANSLATION_KEY = /(?:_|\b)html\z/.freeze
+    10|     included do
+    11|       class_attribute :i18n_backend, instance_writer: false, instance_predicate: false
+    12|     end
+    13|     class_methods do
+    14|       def i18n_scope
+    15|         @i18n_scope ||= virtual_path.sub(%r{^/}, "").gsub(%r{/_?}, ".")
+    16|       end
+    17|       def _after_compile
+    18|         super
+    19|         return if CompileCache.compiled? self
+    20|         if (translation_files = _sidecar_files(%w[yml yaml])).any?
+    21|           self.i18n_backend = I18nBackend.new(
+    22|             i18n_scope: i18n_scope,
+    23|             load_paths: translation_files,
+    24|           )
+    25|         else
+    26|           self.i18n_backend = nil
+    27|         end
+    28|       end
+    29|     end
+    30|     class I18nBackend < ::I18n::Backend::Simple
+    31|       EMPTY_HASH = {}.freeze
+    32|       def initialize(i18n_scope:, load_paths:)
+    33|         @i18n_scope = i18n_scope.split(".").map(&:to_sym)
+    34|         @load_paths = load_paths
+    35|       end
+    36|       def load_translations
+    37|         super(@load_paths)
+    38|       end
+    39|       def scope_data(data)
+    40|         @i18n_scope.reverse_each do |part|
+    41|           data = { part => data }
+    42|         end
+    43|         data
+    44|       end
+    45|       def store_translations(locale, data, options = EMPTY_HASH)
+    46|         super(locale, scope_data(data), options)
+    47|       end
+    48|     end
+    49|     def translate(key = nil, **options)
+    50|       return super unless i18n_backend
+    51|       return key.map { |k| translate(k, **options) } if key.is_a?(Array)
+    52|       locale = options.delete(:locale) || ::I18n.locale
+    53|       key = key&.to_s unless key.is_a?(String)
+    54|       key = "#{i18n_scope}#{key}" if key.start_with?(".")
+    55|       if HTML_SAFE_TRANSLATION_KEY.match?(key)
+    56|         html_escape_translation_options!(options)
+    57|       end
+    58|       if key.start_with?(i18n_scope + ".")
+    59|         translated =
+    60|           catch(:exception) do
+    61|             i18n_backend.translate(locale, key, options)
+    62|           end
+    63|         if translated.is_a? ::I18n::MissingTranslation
+    64|           return super(key, locale: locale, **options)
+    65|         end
+    66|         if HTML_SAFE_TRANSLATION_KEY.match?(key)
+    67|           translated = translated.html_safe # rubocop:disable Rails/OutputSafety
+    68|         end
+    69|         translated
+    70|       else
+    71|         super(key, locale: locale, **options)
+    72|       end
+    73|     end
+    74|     alias :t :translate
+    75|     def i18n_scope
+    76|       self.class.i18n_scope
+    77|     end
+    78|     def html_safe_translation(translation)
+    79|       if translation.respond_to?(:map)
+    80|         translation.map { |element| html_safe_translation(element) }
+    81|       else
+    82|         translation.html_safe # rubocop:disable Rails/OutputSafety
+    83|       end
+    84|     end
+    85|     private
+    86|     def html_escape_translation_options!(options)
+    87|       options.each do |name, value|
+    88|         unless i18n_option?(name) || (name == :count && value.is_a?(Numeric))
+    89|           options[name] = ERB::Util.html_escape(value.to_s)
+    90|         end
+    91|       end
+    92|     end
+    93|     def i18n_option?(name)
+    94|       (@i18n_option_names ||= I18n::RESERVED_KEYS.to_set).include?(name)
+    95|     end
+    96|   end
+    97| end
+
+
+# ====================================================================
+# FILE: lib/view_component/version.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-9 ---
+     1| module ViewComponent
+     2|   module VERSION
+     3|     MAJOR = 2
+     4|     MINOR = 49
+     5|     PATCH = 1
+     6|     STRING = [MAJOR, MINOR, PATCH].join(".")
+     7|   end
+     8| end
+     9| puts ViewComponent::VERSION::STRING if __FILE__ == $PROGRAM_NAME
+

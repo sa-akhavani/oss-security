@@ -1,0 +1,138 @@
+--- a/src/packet/many.rs
++++ b/src/packet/many.rs
+@@ -94,23 +94,20 @@
+                             return Some(Err(err.into()));
+                         }
+                     };
+                     if body.len() < len {
+                         return Some(Err(format_err!("invalid length encountered")));
+                     }
+                     let res = single::body_parser(version, tag, &body[..len]);
+                     self.reader.consume(len);
+                     res
+                 } else {
+-                    if len > MAX_CAPACITY {
+-                        return Some(Err(format_err!("Fixed packet too large")));
+-                    }
+                     let mut buffer = vec![0u8; len];
+                     if let Err(err) = self.reader.read_exact(&mut buffer) {
+                         self.done = true;
+                         return Some(Err(err.into()));
+                     };
+                     single::body_parser(version, tag, &buffer)
+                 };
+                 match res {
+                     Ok(p) => Some(Ok(p)),
+                     Err(Error::Incomplete(_)) => {
+@@ -133,23 +130,20 @@
+                         tag
+                     )));
+                 }
+                 if len < 512 {
+                     self.done = true;
+                     return Some(Err(format_err!(
+                         "Illegal first partial body length {} (shorter than 512 bytes)",
+                         len,
+                     )));
+                 }
+-                if len >= MAX_CAPACITY {
+-                    return Some(Err(format_err!("First partial of packet is too large")));
+-                }
+                 let mut body = vec![0u8; len];
+                 if let Err(err) = self.reader.read_exact(&mut body) {
+                     self.done = true;
+                     return Some(Err(err.into()));
+                 };
+                 loop {
+                     self.reader.make_room();
+                     let buf = match self.reader.fill_buf() {
+                         Ok(buf) => buf,
+                         Err(err) => {
+@@ -198,23 +192,20 @@
+             }
+         }
+     }
+ }
+ fn read_fixed<R: Read>(
+     reader: &mut BufReader<R, MinBuffered>,
+     len: usize,
+     out: &mut Vec<u8>,
+ ) -> Result<()> {
+     let out_len = out.len();
+-    if out_len + len > MAX_CAPACITY {
+-        return Err(format_err!("Packet too large"));
+-    }
+     out.resize(out_len + len, 0u8);
+     reader.read_exact(&mut out[out_len..])?;
+     Ok(())
+ }
+ #[cfg(test)]
+ mod tests {
+     #![allow(clippy::unwrap_used)]
+     use std::fs::File;
+     use std::io::{BufReader, Seek, SeekFrom};
+     use std::path::Path;
+
+--- a/src/types/s2k.rs
++++ b/src/types/s2k.rs
+@@ -5,21 +5,20 @@
+ use nom::number::streaming::be_u8;
+ use rand::{CryptoRng, Rng};
+ use crate::crypto::aead::AeadAlgorithm;
+ use crate::crypto::hash::HashAlgorithm;
+ use crate::crypto::sym::SymmetricKeyAlgorithm;
+ use crate::errors::{Error, IResult, Result};
+ use crate::ser::Serialize;
+ use crate::types::KeyVersion;
+ const EXPBIAS: u32 = 6;
+ const DEFAULT_ITER_SALTED_COUNT: u8 = 224;
+-const ARGON2_MEMORY_LIMIT_KIB: u32 = 2 * 1024 * 1024; // 2 ~mio KiB (== 2 GiB)
+ #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+ pub enum S2kUsage {
+     Unprotected,
+     LegacyCfb(SymmetricKeyAlgorithm),
+     Aead,
+     Cfb,
+     MalleableCfb,
+ }
+ #[derive(derive_more::Debug, PartialEq, Eq, Clone)]
+ pub enum S2kParams {
+@@ -250,38 +249,27 @@
+                     let end = if round == rounds - 1 {
+                         key_size
+                     } else {
+                         (round + 1) * digest_size
+                     };
+                     hasher.finish_reset_into(&mut key[start..end]);
+                 }
+                 key
+             }
+             Self::Argon2 { salt, t, p, m_enc } => {
+-                ensure!(
+-                    *t <= 32 && *p <= 32,
+-                    "unsupported settings t={}, p={} in argon s2k",
+-                    t,
+-                    p,
+-                );
+                 let min_m = (*p as f32).log2().ceil() as u8;
+                 ensure!(
+                     *m_enc >= min_m && *m_enc <= 31,
+                     "unsupported value {} for m in argon s2k",
+                     m_enc
+                 );
+                 let m = 2u32.pow(*m_enc as u32);
+-                ensure!(
+-                    m <= ARGON2_MEMORY_LIMIT_KIB,
+-                    "unsupported memory usage setting ({} KiB) for m in argon s2k",
+-                    m
+-                );
+                 use argon2::{Algorithm, Argon2, Params, Version};
+                 let a2 = Argon2::new(
+                     Algorithm::Argon2id,
+                     Version::V0x13,
+                     Params::new(m, *t as u32, *p as u32, Some(key_size))
+                         .map_err(|e| Error::Message(format!("{:?}", e)))?,
+                 );
+                 let mut output_key_material = vec![0; key_size];
+                 a2.hash_password_into(passphrase.as_bytes(), salt, &mut output_key_material)
+                     .map_err(|e| Error::Message(format!("{:?}", e)))?;

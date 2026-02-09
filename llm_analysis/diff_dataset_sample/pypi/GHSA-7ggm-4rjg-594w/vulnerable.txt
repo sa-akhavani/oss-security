@@ -1,0 +1,912 @@
+# ====================================================================
+# FILE: litellm/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 501-540 ---
+   501| from .llms.cohere import CohereConfig
+   502| from .llms.ai21 import AI21Config
+   503| from .llms.together_ai import TogetherAIConfig
+   504| from .llms.cloudflare import CloudflareConfig
+   505| from .llms.palm import PalmConfig
+   506| from .llms.gemini import GeminiConfig
+   507| from .llms.nlp_cloud import NLPCloudConfig
+   508| from .llms.aleph_alpha import AlephAlphaConfig
+   509| from .llms.petals import PetalsConfig
+   510| from .llms.vertex_ai import VertexAIConfig
+   511| from .llms.sagemaker import SagemakerConfig
+   512| from .llms.ollama import OllamaConfig
+   513| from .llms.maritalk import MaritTalkConfig
+   514| from .llms.bedrock import (
+   515|     AmazonTitanConfig,
+   516|     AmazonAI21Config,
+   517|     AmazonAnthropicConfig,
+   518|     AmazonCohereConfig,
+   519|     AmazonLlamaConfig,
+   520|     AmazonStabilityConfig,
+   521| )
+   522| from .llms.openai import OpenAIConfig, OpenAITextCompletionConfig
+   523| from .llms.azure import AzureOpenAIConfig, AzureOpenAIError
+   524| from .main import *  # type: ignore
+   525| from .integrations import *
+   526| from .exceptions import (
+   527|     AuthenticationError,
+   528|     InvalidRequestError,
+   529|     BadRequestError,
+   530|     NotFoundError,
+   531|     RateLimitError,
+   532|     ServiceUnavailableError,
+   533|     OpenAIError,
+   534|     ContextWindowExceededError,
+   535|     ContentPolicyViolationError,
+   536|     BudgetExceededError,
+   537|     APIError,
+   538|     Timeout,
+   539|     APIConnectionError,
+   540|     APIResponseValidationError,
+
+
+# ====================================================================
+# FILE: litellm/llms/anthropic.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-60 ---
+     1| import os, types
+     2| import json
+     3| from enum import Enum
+     4| import requests
+     5| import time
+     6| from typing import Callable, Optional
+     7| from litellm.utils import ModelResponse, Usage
+     8| import litellm
+     9| from .prompt_templates.factory import prompt_factory, custom_prompt
+    10| import httpx
+    11| class AnthropicConstants(Enum):
+    12|     HUMAN_PROMPT = "\n\nHuman: "
+    13|     AI_PROMPT = "\n\nAssistant: "
+    14| class AnthropicError(Exception):
+    15|     def __init__(self, status_code, message):
+    16|         self.status_code = status_code
+    17|         self.message = message
+    18|         self.request = httpx.Request(
+    19|             method="POST", url="https://api.anthropic.com/v1/complete"
+    20|         )
+    21|         self.response = httpx.Response(status_code=status_code, request=self.request)
+    22|         super().__init__(
+    23|             self.message
+    24|         )  # Call the base class constructor with the parameters it needs
+    25| class AnthropicConfig:
+    26|     """
+    27|     Reference: https://docs.anthropic.com/claude/reference/complete_post
+    28|     to pass metadata to anthropic, it's {"user_id": "any-relevant-information"}
+    29|     """
+    30|     max_tokens_to_sample: Optional[
+    31|         int
+    32|     ] = litellm.max_tokens  # anthropic requires a default
+    33|     stop_sequences: Optional[list] = None
+    34|     temperature: Optional[int] = None
+    35|     top_p: Optional[int] = None
+    36|     top_k: Optional[int] = None
+    37|     metadata: Optional[dict] = None
+    38|     def __init__(
+    39|         self,
+    40|         max_tokens_to_sample: Optional[int] = 256,  # anthropic requires a default
+    41|         stop_sequences: Optional[list] = None,
+    42|         temperature: Optional[int] = None,
+    43|         top_p: Optional[int] = None,
+    44|         top_k: Optional[int] = None,
+    45|         metadata: Optional[dict] = None,
+    46|     ) -> None:
+    47|         locals_ = locals()
+    48|         for key, value in locals_.items():
+    49|             if key != "self" and value is not None:
+    50|                 setattr(self.__class__, key, value)
+    51|     @classmethod
+    52|     def get_config(cls):
+    53|         return {
+    54|             k: v
+    55|             for k, v in cls.__dict__.items()
+    56|             if not k.startswith("__")
+    57|             and not isinstance(
+    58|                 v,
+    59|                 (
+    60|                     types.FunctionType,
+
+# --- HUNK 2: Lines 90-188 ---
+    90|     api_key,
+    91|     logging_obj,
+    92|     optional_params=None,
+    93|     litellm_params=None,
+    94|     logger_fn=None,
+    95|     headers={},
+    96| ):
+    97|     headers = validate_environment(api_key, headers)
+    98|     if model in custom_prompt_dict:
+    99|         model_prompt_details = custom_prompt_dict[model]
+   100|         prompt = custom_prompt(
+   101|             role_dict=model_prompt_details["roles"],
+   102|             initial_prompt_value=model_prompt_details["initial_prompt_value"],
+   103|             final_prompt_value=model_prompt_details["final_prompt_value"],
+   104|             messages=messages,
+   105|         )
+   106|     else:
+   107|         prompt = prompt_factory(
+   108|             model=model, messages=messages, custom_llm_provider="anthropic"
+   109|         )
+   110|     config = litellm.AnthropicConfig.get_config()
+   111|     for k, v in config.items():
+   112|         if (
+   113|             k not in optional_params
+   114|         ):  # completion(top_k=3) > anthropic_config(top_k=3) <- allows for dynamic variables to be passed in
+   115|             optional_params[k] = v
+   116|     data = {
+   117|         "model": model,
+   118|         "prompt": prompt,
+   119|         **optional_params,
+   120|     }
+   121|     logging_obj.pre_call(
+   122|         input=prompt,
+   123|         api_key=api_key,
+   124|         additional_args={
+   125|             "complete_input_dict": data,
+   126|             "api_base": api_base,
+   127|             "headers": headers,
+   128|         },
+   129|     )
+   130|     if "stream" in optional_params and optional_params["stream"] == True:
+   131|         response = requests.post(
+   132|             api_base,
+   133|             headers=headers,
+   134|             data=json.dumps(data),
+   135|             stream=optional_params["stream"],
+   136|         )
+   137|         if response.status_code != 200:
+   138|             raise AnthropicError(
+   139|                 status_code=response.status_code, message=response.text
+   140|             )
+   141|         return response.iter_lines()
+   142|     else:
+   143|         response = requests.post(api_base, headers=headers, data=json.dumps(data))
+   144|         if response.status_code != 200:
+   145|             raise AnthropicError(
+   146|                 status_code=response.status_code, message=response.text
+   147|             )
+   148|         logging_obj.post_call(
+   149|             input=prompt,
+   150|             api_key=api_key,
+   151|             original_response=response.text,
+   152|             additional_args={"complete_input_dict": data},
+   153|         )
+   154|         print_verbose(f"raw model_response: {response.text}")
+   155|         try:
+   156|             completion_response = response.json()
+   157|         except:
+   158|             raise AnthropicError(
+   159|                 message=response.text, status_code=response.status_code
+   160|             )
+   161|         if "error" in completion_response:
+   162|             raise AnthropicError(
+   163|                 message=str(completion_response["error"]),
+   164|                 status_code=response.status_code,
+   165|             )
+   166|         else:
+   167|             if len(completion_response["completion"]) > 0:
+   168|                 model_response["choices"][0]["message"][
+   169|                     "content"
+   170|                 ] = completion_response["completion"]
+   171|             model_response.choices[0].finish_reason = completion_response["stop_reason"]
+   172|         prompt_tokens = len(
+   173|             encoding.encode(prompt)
+   174|         )  ##[TODO] use the anthropic tokenizer here
+   175|         completion_tokens = len(
+   176|             encoding.encode(model_response["choices"][0]["message"].get("content", ""))
+   177|         )  ##[TODO] use the anthropic tokenizer here
+   178|         model_response["created"] = int(time.time())
+   179|         model_response["model"] = model
+   180|         usage = Usage(
+   181|             prompt_tokens=prompt_tokens,
+   182|             completion_tokens=completion_tokens,
+   183|             total_tokens=prompt_tokens + completion_tokens,
+   184|         )
+   185|         model_response.usage = usage
+   186|         return model_response
+   187| def embedding():
+   188|     pass
+
+
+# ====================================================================
+# FILE: litellm/llms/bedrock.py
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 196-235 ---
+   196|         }
+   197| class AnthropicConstants(Enum):
+   198|     HUMAN_PROMPT = "\n\nHuman: "
+   199|     AI_PROMPT = "\n\nAssistant: "
+   200| class AmazonLlamaConfig:
+   201|     """
+   202|     Reference: https://us-west-2.console.aws.amazon.com/bedrock/home?region=us-west-2#/providers?model=meta.llama2-13b-chat-v1
+   203|     Supported Params for the Amazon / Meta Llama models:
+   204|     - `max_gen_len` (integer) max tokens,
+   205|     - `temperature` (float) temperature for model,
+   206|     - `top_p` (float) top p for model
+   207|     """
+   208|     max_gen_len: Optional[int] = None
+   209|     temperature: Optional[float] = None
+   210|     topP: Optional[float] = None
+   211|     def __init__(
+   212|         self,
+   213|         maxTokenCount: Optional[int] = None,
+   214|         temperature: Optional[float] = None,
+   215|         topP: Optional[int] = None,
+   216|     ) -> None:
+   217|         locals_ = locals()
+   218|         for key, value in locals_.items():
+   219|             if key != "self" and value is not None:
+   220|                 setattr(self.__class__, key, value)
+   221|     @classmethod
+   222|     def get_config(cls):
+   223|         return {
+   224|             k: v
+   225|             for k, v in cls.__dict__.items()
+   226|             if not k.startswith("__")
+   227|             and not isinstance(
+   228|                 v,
+   229|                 (
+   230|                     types.FunctionType,
+   231|                     types.BuiltinFunctionType,
+   232|                     classmethod,
+   233|                     staticmethod,
+   234|                 ),
+   235|             )
+
+# --- HUNK 2: Lines 384-423 ---
+   384|             service_name="bedrock-runtime",
+   385|             region_name=region_name,
+   386|             endpoint_url=endpoint_url,
+   387|             config=config,
+   388|         )
+   389|     return client
+   390| def convert_messages_to_prompt(model, messages, provider, custom_prompt_dict):
+   391|     if provider == "anthropic" or provider == "amazon":
+   392|         if model in custom_prompt_dict:
+   393|             model_prompt_details = custom_prompt_dict[model]
+   394|             prompt = custom_prompt(
+   395|                 role_dict=model_prompt_details["roles"],
+   396|                 initial_prompt_value=model_prompt_details["initial_prompt_value"],
+   397|                 final_prompt_value=model_prompt_details["final_prompt_value"],
+   398|                 messages=messages,
+   399|             )
+   400|         else:
+   401|             prompt = prompt_factory(
+   402|                 model=model, messages=messages, custom_llm_provider="bedrock"
+   403|             )
+   404|     else:
+   405|         prompt = ""
+   406|         for message in messages:
+   407|             if "role" in message:
+   408|                 if message["role"] == "user":
+   409|                     prompt += f"{message['content']}"
+   410|                 else:
+   411|                     prompt += f"{message['content']}"
+   412|             else:
+   413|                 prompt += f"{message['content']}"
+   414|     return prompt
+   415| """
+   416| BEDROCK AUTH Keys/Vars
+   417| os.environ['AWS_ACCESS_KEY_ID'] = ""
+   418| os.environ['AWS_SECRET_ACCESS_KEY'] = ""
+   419| """
+   420| def completion(
+   421|     model: str,
+   422|     messages: list,
+   423|     custom_prompt_dict: dict,
+
+# --- HUNK 3: Lines 495-534 ---
+   495|             config = litellm.AmazonLlamaConfig.get_config()
+   496|             for k, v in config.items():
+   497|                 if (
+   498|                     k not in inference_params
+   499|                 ):  # completion(top_k=3) > anthropic_config(top_k=3) <- allows for dynamic variables to be passed in
+   500|                     inference_params[k] = v
+   501|             data = json.dumps({"prompt": prompt, **inference_params})
+   502|         elif provider == "amazon":  # amazon titan
+   503|             config = litellm.AmazonTitanConfig.get_config()
+   504|             for k, v in config.items():
+   505|                 if (
+   506|                     k not in inference_params
+   507|                 ):  # completion(top_k=3) > amazon_config(top_k=3) <- allows for dynamic variables to be passed in
+   508|                     inference_params[k] = v
+   509|             data = json.dumps(
+   510|                 {
+   511|                     "inputText": prompt,
+   512|                     "textGenerationConfig": inference_params,
+   513|                 }
+   514|             )
+   515|         else:
+   516|             data = json.dumps({})
+   517|         accept = "application/json"
+   518|         contentType = "application/json"
+   519|         if stream == True:
+   520|             if provider == "ai21":
+   521|                 request_str = f"""
+   522|                 response = client.invoke_model(
+   523|                     body={data},
+   524|                     modelId={modelId},
+   525|                     accept=accept,
+   526|                     contentType=contentType
+   527|                 )
+   528|                 """
+   529|                 logging_obj.pre_call(
+   530|                     input=prompt,
+   531|                     api_key="",
+   532|                     additional_args={
+   533|                         "complete_input_dict": data,
+   534|                         "request_str": request_str,
+
+# --- HUNK 4: Lines 588-627 ---
+   588|         except Exception as e:
+   589|             raise BedrockError(status_code=500, message=str(e))
+   590|         response_body = json.loads(response.get("body").read())
+   591|         logging_obj.post_call(
+   592|             input=prompt,
+   593|             api_key="",
+   594|             original_response=json.dumps(response_body),
+   595|             additional_args={"complete_input_dict": data},
+   596|         )
+   597|         print_verbose(f"raw model_response: {response}")
+   598|         outputText = "default"
+   599|         if provider == "ai21":
+   600|             outputText = response_body.get("completions")[0].get("data").get("text")
+   601|         elif provider == "anthropic":
+   602|             outputText = response_body["completion"]
+   603|             model_response["finish_reason"] = response_body["stop_reason"]
+   604|         elif provider == "cohere":
+   605|             outputText = response_body["generations"][0]["text"]
+   606|         elif provider == "meta":
+   607|             outputText = response_body["generation"]
+   608|         else:  # amazon titan
+   609|             outputText = response_body.get("results")[0].get("outputText")
+   610|         response_metadata = response.get("ResponseMetadata", {})
+   611|         if response_metadata.get("HTTPStatusCode", 500) >= 400:
+   612|             raise BedrockError(
+   613|                 message=outputText,
+   614|                 status_code=response_metadata.get("HTTPStatusCode", 500),
+   615|             )
+   616|         else:
+   617|             try:
+   618|                 if len(outputText) > 0:
+   619|                     model_response["choices"][0]["message"]["content"] = outputText
+   620|                 else:
+   621|                     raise Exception()
+   622|             except:
+   623|                 raise BedrockError(
+   624|                     message=json.dumps(outputText),
+   625|                     status_code=response_metadata.get("HTTPStatusCode", 500),
+   626|                 )
+   627|         prompt_tokens = response_metadata.get(
+
+
+# ====================================================================
+# FILE: litellm/llms/huggingface_restapi.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 548-595 ---
+   548|         self,
+   549|         logging_obj,
+   550|         api_base: str,
+   551|         data: dict,
+   552|         headers: dict,
+   553|         model_response: ModelResponse,
+   554|         model: str,
+   555|         timeout: float,
+   556|     ):
+   557|         async with httpx.AsyncClient(timeout=timeout) as client:
+   558|             response = client.stream(
+   559|                 "POST", url=f"{api_base}", json=data, headers=headers
+   560|             )
+   561|             async with response as r:
+   562|                 if r.status_code != 200:
+   563|                     text = await r.aread()
+   564|                     raise HuggingfaceError(
+   565|                         status_code=r.status_code,
+   566|                         message=str(text),
+   567|                     )
+   568|                 streamwrapper = CustomStreamWrapper(
+   569|                     completion_stream=r.aiter_lines(),
+   570|                     model=model,
+   571|                     custom_llm_provider="huggingface",
+   572|                     logging_obj=logging_obj,
+   573|                 )
+   574|                 async for transformed_chunk in streamwrapper:
+   575|                     yield transformed_chunk
+   576|     def embedding(
+   577|         self,
+   578|         model: str,
+   579|         input: list,
+   580|         api_key: Optional[str] = None,
+   581|         api_base: Optional[str] = None,
+   582|         logging_obj=None,
+   583|         model_response=None,
+   584|         encoding=None,
+   585|     ):
+   586|         super().embedding()
+   587|         headers = self.validate_environment(api_key, headers=None)
+   588|         embed_url = ""
+   589|         if "https" in model:
+   590|             embed_url = model
+   591|         elif api_base:
+   592|             embed_url = api_base
+   593|         elif "HF_API_BASE" in os.environ:
+   594|             embed_url = os.getenv("HF_API_BASE", "")
+   595|         elif "HUGGINGFACE_API_BASE" in os.environ:
+
+
+# ====================================================================
+# FILE: litellm/llms/prompt_templates/factory.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 79-121 ---
+    79|         return {"prompt": prompt, "images": images}
+    80|     else:
+    81|         prompt = "".join(
+    82|             (
+    83|                 m["content"]
+    84|                 if isinstance(m["content"], str) is str
+    85|                 else "".join(m["content"])
+    86|             )
+    87|             for m in messages
+    88|         )
+    89|     return prompt
+    90| def mistral_instruct_pt(messages):
+    91|     prompt = custom_prompt(
+    92|         initial_prompt_value="<s>",
+    93|         role_dict={
+    94|             "system": {
+    95|                 "pre_message": "[INST] \n",
+    96|                 "post_message": " [/INST]\n",
+    97|             },
+    98|             "user": {"pre_message": "[INST] ", "post_message": " [/INST]\n"},
+    99|             "assistant": {"pre_message": " ", "post_message": " "},
+   100|         },
+   101|         final_prompt_value="</s>",
+   102|         messages=messages,
+   103|     )
+   104|     return prompt
+   105| def mistral_api_pt(messages):
+   106|     """
+   107|     - handles scenario where content is list and not string
+   108|     - content list is just text, and no images
+   109|     - if image passed in, then just return as is (user-intended)
+   110|     Motivation: mistral api doesn't support content as a list
+   111|     """
+   112|     new_messages = []
+   113|     for m in messages:
+   114|         texts = ""
+   115|         if isinstance(m["content"], list):
+   116|             for c in m["content"]:
+   117|                 if c["type"] == "image_url":
+   118|                     return messages
+   119|                 elif c["type"] == "text" and isinstance(c["text"], str):
+   120|                     texts += c["text"]
+   121|         new_m = {"role": m["role"], "content": texts}
+
+# --- HUNK 2: Lines 536-575 ---
+   536|     elif custom_llm_provider == "together_ai":
+   537|         prompt_format, chat_template = get_model_info(token=api_key, model=model)
+   538|         return format_prompt_togetherai(
+   539|             messages=messages, prompt_format=prompt_format, chat_template=chat_template
+   540|         )
+   541|     elif custom_llm_provider == "gemini":
+   542|         if model == "gemini-pro-vision":
+   543|             return _gemini_vision_convert_messages(messages=messages)
+   544|         else:
+   545|             return gemini_text_image_pt(messages=messages)
+   546|     elif custom_llm_provider == "mistral":
+   547|         return mistral_api_pt(messages=messages)
+   548|     elif custom_llm_provider == "bedrock":
+   549|         if "amazon.titan-text" in model:
+   550|             return amazon_titan_pt(messages=messages)
+   551|         elif "anthropic." in model:
+   552|             if any(_ in model for _ in ["claude-2.1", "claude-v2:1"]):
+   553|                 return claude_2_1_pt(messages=messages)
+   554|             else:
+   555|                 return anthropic_pt(messages=messages)
+   556|     try:
+   557|         if "meta-llama/llama-2" in model and "chat" in model:
+   558|             return llama_2_chat_pt(messages=messages)
+   559|         elif (
+   560|             "tiiuae/falcon" in model
+   561|         ):  # Note: for the instruct models, it's best to use a User: .., Assistant:.. approach in your prompt template.
+   562|             if model == "tiiuae/falcon-180B-chat":
+   563|                 return falcon_chat_pt(messages=messages)
+   564|             elif "instruct" in model:
+   565|                 return falcon_instruct_pt(messages=messages)
+   566|         elif "mosaicml/mpt" in model:
+   567|             if "chat" in model:
+   568|                 return mpt_chat_pt(messages=messages)
+   569|         elif "codellama/codellama" in model or "togethercomputer/codellama" in model:
+   570|             if "instruct" in model:
+   571|                 return llama_2_chat_pt(
+   572|                     messages=messages
+   573|                 )  # https://huggingface.co/blog/codellama#conversational-instructions
+   574|         elif "wizardlm/wizardcoder" in model:
+   575|             return wizardcoder_pt(messages=messages)
+
+
+# ====================================================================
+# FILE: litellm/main.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 884-924 ---
+   884|             if "stream" in optional_params and optional_params["stream"] == True:
+   885|                 model_response = CustomStreamWrapper(model_response, model, logging_obj=logging, custom_llm_provider="replicate")  # type: ignore
+   886|             if optional_params.get("stream", False) or acompletion == True:
+   887|                 logging.post_call(
+   888|                     input=messages,
+   889|                     api_key=replicate_key,
+   890|                     original_response=model_response,
+   891|                 )
+   892|             response = model_response
+   893|         elif custom_llm_provider == "anthropic":
+   894|             api_key = (
+   895|                 api_key
+   896|                 or litellm.anthropic_key
+   897|                 or litellm.api_key
+   898|                 or os.environ.get("ANTHROPIC_API_KEY")
+   899|             )
+   900|             api_base = (
+   901|                 api_base
+   902|                 or litellm.api_base
+   903|                 or get_secret("ANTHROPIC_API_BASE")
+   904|                 or "https://api.anthropic.com/v1/complete"
+   905|             )
+   906|             custom_prompt_dict = custom_prompt_dict or litellm.custom_prompt_dict
+   907|             response = anthropic.completion(
+   908|                 model=model,
+   909|                 messages=messages,
+   910|                 api_base=api_base,
+   911|                 custom_prompt_dict=litellm.custom_prompt_dict,
+   912|                 model_response=model_response,
+   913|                 print_verbose=print_verbose,
+   914|                 optional_params=optional_params,
+   915|                 litellm_params=litellm_params,
+   916|                 logger_fn=logger_fn,
+   917|                 encoding=encoding,  # for calculating input/output tokens
+   918|                 api_key=api_key,
+   919|                 logging_obj=logging,
+   920|                 headers=headers,
+   921|             )
+   922|             if "stream" in optional_params and optional_params["stream"] == True:
+   923|                 response = CustomStreamWrapper(
+   924|                     response,
+
+
+# ====================================================================
+# FILE: litellm/proxy/proxy_server.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 125-164 ---
+   125|     docs_url="/",
+   126|     title="LiteLLM API",
+   127|     description=f"Proxy Server to call 100+ LLMs in the OpenAI format\n\n{ui_message}",
+   128|     version=version,
+   129|     root_path=os.environ.get(
+   130|         "SERVER_ROOT_PATH", ""
+   131|     ),  # check if user passed root path, FastAPI defaults this value to ""
+   132| )
+   133| class ProxyException(Exception):
+   134|     def __init__(
+   135|         self,
+   136|         message: str,
+   137|         type: str,
+   138|         param: Optional[str],
+   139|         code: Optional[int],
+   140|     ):
+   141|         self.message = message
+   142|         self.type = type
+   143|         self.param = param
+   144|         self.code = code
+   145| @app.exception_handler(ProxyException)
+   146| async def openai_exception_handler(request: Request, exc: ProxyException):
+   147|     return JSONResponse(
+   148|         status_code=(
+   149|             int(exc.code) if exc.code else status.HTTP_500_INTERNAL_SERVER_ERROR
+   150|         ),
+   151|         content={
+   152|             "error": {
+   153|                 "message": exc.message,
+   154|                 "type": exc.type,
+   155|                 "param": exc.param,
+   156|                 "code": exc.code,
+   157|             }
+   158|         },
+   159|     )
+   160| router = APIRouter()
+   161| origins = ["*"]
+   162| try:
+   163|     current_dir = os.path.dirname(os.path.abspath(__file__))
+   164|     ui_path = os.path.join(current_dir, "_experimental", "out")
+
+# --- HUNK 2: Lines 1842-1887 ---
+  1842|     except Exception as e:
+  1843|         traceback.print_exc()
+  1844|         await proxy_logging_obj.post_call_failure_hook(
+  1845|             user_api_key_dict=user_api_key_dict, original_exception=e
+  1846|         )
+  1847|         verbose_proxy_logger.debug(
+  1848|             f"\033[1;31mAn error occurred: {e}\n\n Debug this by setting `--debug`, e.g. `litellm --model gpt-3.5-turbo --debug`"
+  1849|         )
+  1850|         router_model_names = (
+  1851|             [m["model_name"] for m in llm_model_list]
+  1852|             if llm_model_list is not None
+  1853|             else []
+  1854|         )
+  1855|         if user_debug:
+  1856|             traceback.print_exc()
+  1857|         if isinstance(e, HTTPException):
+  1858|             raise e
+  1859|         else:
+  1860|             error_traceback = traceback.format_exc()
+  1861|             error_msg = f"{str(e)}\n\n{error_traceback}"
+  1862|         raise ProxyException(
+  1863|             message=getattr(e, "message", error_msg),
+  1864|             type=getattr(e, "type", "None"),
+  1865|             param=getattr(e, "param", "None"),
+  1866|             code=getattr(e, "status_code", 500),
+  1867|         )
+  1868| def select_data_generator(response, user_api_key_dict):
+  1869|     return async_data_generator(response=response, user_api_key_dict=user_api_key_dict)
+  1870| def get_litellm_model_info(model: dict = {}):
+  1871|     model_info = model.get("model_info", {})
+  1872|     model_to_lookup = model.get("litellm_params", {}).get("model", None)
+  1873|     try:
+  1874|         if "azure" in model_to_lookup:
+  1875|             model_to_lookup = model_info.get("base_model", None)
+  1876|         litellm_model_info = litellm.get_model_info(model_to_lookup)
+  1877|         return litellm_model_info
+  1878|     except:
+  1879|         return {}
+  1880| def parse_cache_control(cache_control):
+  1881|     cache_dict = {}
+  1882|     directives = cache_control.split(", ")
+  1883|     for directive in directives:
+  1884|         if "=" in directive:
+  1885|             key, value = directive.split("=")
+  1886|             cache_dict[key] = value
+  1887|         else:
+
+
+# ====================================================================
+# FILE: litellm/utils.py
+# Total hunks: 5
+# ====================================================================
+# --- HUNK 1: Lines 2207-2247 ---
+  2207|             result._response_ms = (
+  2208|                 end_time - start_time
+  2209|             ).total_seconds() * 1000  # return response latency in ms like openai
+  2210|             return result
+  2211|         except Exception as e:
+  2212|             call_type = original_function.__name__
+  2213|             if call_type == CallTypes.completion.value:
+  2214|                 num_retries = (
+  2215|                     kwargs.get("num_retries", None) or litellm.num_retries or None
+  2216|                 )
+  2217|                 litellm.num_retries = (
+  2218|                     None  # set retries to None to prevent infinite loops
+  2219|                 )
+  2220|                 context_window_fallback_dict = kwargs.get(
+  2221|                     "context_window_fallback_dict", {}
+  2222|                 )
+  2223|                 if num_retries:
+  2224|                     if (
+  2225|                         isinstance(e, openai.APIError)
+  2226|                         or isinstance(e, openai.Timeout)
+  2227|                         or isinstance(openai.APIConnectionError)
+  2228|                     ):
+  2229|                         print_verbose(f"RETRY TRIGGERED!")
+  2230|                         kwargs["num_retries"] = num_retries
+  2231|                         return litellm.completion_with_retries(*args, **kwargs)
+  2232|                 elif (
+  2233|                     isinstance(e, litellm.exceptions.ContextWindowExceededError)
+  2234|                     and context_window_fallback_dict
+  2235|                     and model in context_window_fallback_dict
+  2236|                 ):
+  2237|                     if len(args) > 0:
+  2238|                         args[0] = context_window_fallback_dict[model]
+  2239|                     else:
+  2240|                         kwargs["model"] = context_window_fallback_dict[model]
+  2241|                     return original_function(*args, **kwargs)
+  2242|             traceback_exception = traceback.format_exc()
+  2243|             crash_reporting(*args, **kwargs, exception=traceback_exception)
+  2244|             end_time = datetime.datetime.now()
+  2245|             if logging_obj:
+  2246|                 logging_obj.failure_handler(
+  2247|                     e, traceback_exception, start_time, end_time
+
+# --- HUNK 2: Lines 3630-3670 ---
+  3630|                     for s in stop:
+  3631|                         if re.match(r"^(\|+|User:)$", s):
+  3632|                             filtered_stop.append(s)
+  3633|         if filtered_stop is not None:
+  3634|             supported_params["stop"] = filtered_stop
+  3635|         return supported_params
+  3636|     if custom_llm_provider == "anthropic":
+  3637|         supported_params = ["stream", "stop", "temperature", "top_p", "max_tokens"]
+  3638|         _check_valid_arg(supported_params=supported_params)
+  3639|         if stream:
+  3640|             optional_params["stream"] = stream
+  3641|         if stop is not None:
+  3642|             if type(stop) == str:
+  3643|                 stop = [stop]  # openai can accept str/list for stop
+  3644|             optional_params["stop_sequences"] = stop
+  3645|         if temperature is not None:
+  3646|             optional_params["temperature"] = temperature
+  3647|         if top_p is not None:
+  3648|             optional_params["top_p"] = top_p
+  3649|         if max_tokens is not None:
+  3650|             optional_params["max_tokens_to_sample"] = max_tokens
+  3651|     elif custom_llm_provider == "cohere":
+  3652|         supported_params = [
+  3653|             "stream",
+  3654|             "temperature",
+  3655|             "max_tokens",
+  3656|             "logit_bias",
+  3657|             "top_p",
+  3658|             "frequency_penalty",
+  3659|             "presence_penalty",
+  3660|             "stop",
+  3661|             "n",
+  3662|         ]
+  3663|         _check_valid_arg(supported_params=supported_params)
+  3664|         if stream:
+  3665|             optional_params["stream"] = stream
+  3666|         if temperature is not None:
+  3667|             optional_params["temperature"] = temperature
+  3668|         if max_tokens is not None:
+  3669|             optional_params["max_tokens"] = max_tokens
+  3670|         if n is not None:
+
+# --- HUNK 3: Lines 3945-3984 ---
+  3945|         elif "meta" in model:  # amazon / meta llms
+  3946|             supported_params = ["max_tokens", "temperature", "top_p", "stream"]
+  3947|             _check_valid_arg(supported_params=supported_params)
+  3948|             if max_tokens is not None:
+  3949|                 optional_params["max_gen_len"] = max_tokens
+  3950|             if temperature is not None:
+  3951|                 optional_params["temperature"] = temperature
+  3952|             if top_p is not None:
+  3953|                 optional_params["top_p"] = top_p
+  3954|             if stream:
+  3955|                 optional_params["stream"] = stream
+  3956|         elif "cohere" in model:  # cohere models on bedrock
+  3957|             supported_params = ["stream", "temperature", "max_tokens"]
+  3958|             _check_valid_arg(supported_params=supported_params)
+  3959|             if stream:
+  3960|                 optional_params["stream"] = stream
+  3961|             if temperature is not None:
+  3962|                 optional_params["temperature"] = temperature
+  3963|             if max_tokens is not None:
+  3964|                 optional_params["max_tokens"] = max_tokens
+  3965|     elif custom_llm_provider == "aleph_alpha":
+  3966|         supported_params = [
+  3967|             "max_tokens",
+  3968|             "stream",
+  3969|             "top_p",
+  3970|             "temperature",
+  3971|             "presence_penalty",
+  3972|             "frequency_penalty",
+  3973|             "n",
+  3974|             "stop",
+  3975|         ]
+  3976|         _check_valid_arg(supported_params=supported_params)
+  3977|         if max_tokens is not None:
+  3978|             optional_params["maximum_tokens"] = max_tokens
+  3979|         if stream:
+  3980|             optional_params["stream"] = stream
+  3981|         if temperature is not None:
+  3982|             optional_params["temperature"] = temperature
+  3983|         if top_p is not None:
+  3984|             optional_params["top_p"] = top_p
+
+# --- HUNK 4: Lines 7078-7121 ---
+  7078|         curr_chunk = curr_chunk.strip()
+  7079|         for token in self.special_tokens:
+  7080|             if len(curr_chunk) < len(token) and curr_chunk in token:
+  7081|                 hold = True
+  7082|             elif len(curr_chunk) >= len(token):
+  7083|                 if token in curr_chunk:
+  7084|                     self.holding_chunk = curr_chunk.replace(token, "")
+  7085|                     hold = True
+  7086|             else:
+  7087|                 pass
+  7088|         if hold is False:  # reset
+  7089|             self.holding_chunk = ""
+  7090|         return hold, curr_chunk
+  7091|     def handle_anthropic_chunk(self, chunk):
+  7092|         str_line = chunk.decode("utf-8")  # Convert bytes to string
+  7093|         text = ""
+  7094|         is_finished = False
+  7095|         finish_reason = None
+  7096|         if str_line.startswith("data:"):
+  7097|             data_json = json.loads(str_line[5:])
+  7098|             text = data_json.get("completion", "")
+  7099|             if data_json.get("stop_reason", None):
+  7100|                 is_finished = True
+  7101|                 finish_reason = data_json["stop_reason"]
+  7102|             return {
+  7103|                 "text": text,
+  7104|                 "is_finished": is_finished,
+  7105|                 "finish_reason": finish_reason,
+  7106|             }
+  7107|         elif "error" in str_line:
+  7108|             raise ValueError(f"Unable to parse response. Original response: {str_line}")
+  7109|         else:
+  7110|             return {
+  7111|                 "text": text,
+  7112|                 "is_finished": is_finished,
+  7113|                 "finish_reason": finish_reason,
+  7114|             }
+  7115|     def handle_together_ai_chunk(self, chunk):
+  7116|         chunk = chunk.decode("utf-8")
+  7117|         text = ""
+  7118|         is_finished = False
+  7119|         finish_reason = None
+  7120|         if "text" in chunk:
+  7121|             text_index = chunk.find('"text":"')  # this checks if text: exists
+
+# --- HUNK 5: Lines 7150-7203 ---
+  7150|             text = ""
+  7151|             is_finished = False
+  7152|             finish_reason = ""
+  7153|             print_verbose(f"chunk: {chunk}")
+  7154|             if chunk.startswith("data:"):
+  7155|                 data_json = json.loads(chunk[5:])
+  7156|                 print_verbose(f"data json: {data_json}")
+  7157|                 if "token" in data_json and "text" in data_json["token"]:
+  7158|                     text = data_json["token"]["text"]
+  7159|                 if data_json.get("details", False) and data_json["details"].get(
+  7160|                     "finish_reason", False
+  7161|                 ):
+  7162|                     is_finished = True
+  7163|                     finish_reason = data_json["details"]["finish_reason"]
+  7164|                 elif data_json.get(
+  7165|                     "generated_text", False
+  7166|                 ):  # if full generated text exists, then stream is complete
+  7167|                     text = ""  # don't return the final bos token
+  7168|                     is_finished = True
+  7169|                     finish_reason = "stop"
+  7170|                 return {
+  7171|                     "text": text,
+  7172|                     "is_finished": is_finished,
+  7173|                     "finish_reason": finish_reason,
+  7174|                 }
+  7175|             elif "error" in chunk:
+  7176|                 raise ValueError(chunk)
+  7177|             return {
+  7178|                 "text": text,
+  7179|                 "is_finished": is_finished,
+  7180|                 "finish_reason": finish_reason,
+  7181|             }
+  7182|         except Exception as e:
+  7183|             traceback.print_exc()
+  7184|     def handle_ai21_chunk(self, chunk):  # fake streaming
+  7185|         chunk = chunk.decode("utf-8")
+  7186|         data_json = json.loads(chunk)
+  7187|         try:
+  7188|             text = data_json["completions"][0]["data"]["text"]
+  7189|             is_finished = True
+  7190|             finish_reason = "stop"
+  7191|             return {
+  7192|                 "text": text,
+  7193|                 "is_finished": is_finished,
+  7194|                 "finish_reason": finish_reason,
+  7195|             }
+  7196|         except:
+  7197|             raise ValueError(f"Unable to parse response. Original response: {chunk}")
+  7198|     def handle_maritalk_chunk(self, chunk):  # fake streaming
+  7199|         chunk = chunk.decode("utf-8")
+  7200|         data_json = json.loads(chunk)
+  7201|         try:
+  7202|             text = data_json["answer"]
+  7203|             is_finished = True
+

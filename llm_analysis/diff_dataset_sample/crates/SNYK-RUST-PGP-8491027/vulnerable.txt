@@ -1,0 +1,214 @@
+# ====================================================================
+# FILE: src/packet/many.rs
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 84-159 ---
+    84|                     }
+    85|                 }
+    86|             }
+    87|             PacketLength::Fixed(len) => {
+    88|                 let res = if len <= self.reader.policy().0 {
+    89|                     self.reader.make_room();
+    90|                     let body = match self.reader.fill_buf() {
+    91|                         Ok(body) => body,
+    92|                         Err(err) => {
+    93|                             self.done = true;
+    94|                             return Some(Err(err.into()));
+    95|                         }
+    96|                     };
+    97|                     if body.len() < len {
+    98|                         return Some(Err(format_err!("invalid length encountered")));
+    99|                     }
+   100|                     let res = single::body_parser(version, tag, &body[..len]);
+   101|                     self.reader.consume(len);
+   102|                     res
+   103|                 } else {
+   104|                     let mut buffer = vec![0u8; len];
+   105|                     if let Err(err) = self.reader.read_exact(&mut buffer) {
+   106|                         self.done = true;
+   107|                         return Some(Err(err.into()));
+   108|                     };
+   109|                     single::body_parser(version, tag, &buffer)
+   110|                 };
+   111|                 match res {
+   112|                     Ok(p) => Some(Ok(p)),
+   113|                     Err(Error::Incomplete(_)) => {
+   114|                         Some(Err(Error::PacketIncomplete))
+   115|                     }
+   116|                     Err(err) => Some(Err(err)),
+   117|                 }
+   118|             }
+   119|             PacketLength::Partial(len) => {
+   120|                 if !matches!(
+   121|                     tag,
+   122|                     Tag::LiteralData
+   123|                         | Tag::CompressedData
+   124|                         | Tag::SymEncryptedData
+   125|                         | Tag::SymEncryptedProtectedData
+   126|                 ) {
+   127|                     self.done = true;
+   128|                     return Some(Err(format_err!(
+   129|                         "Partial body length is not allowed for packet type {:?}",
+   130|                         tag
+   131|                     )));
+   132|                 }
+   133|                 if len < 512 {
+   134|                     self.done = true;
+   135|                     return Some(Err(format_err!(
+   136|                         "Illegal first partial body length {} (shorter than 512 bytes)",
+   137|                         len,
+   138|                     )));
+   139|                 }
+   140|                 let mut body = vec![0u8; len];
+   141|                 if let Err(err) = self.reader.read_exact(&mut body) {
+   142|                     self.done = true;
+   143|                     return Some(Err(err.into()));
+   144|                 };
+   145|                 loop {
+   146|                     self.reader.make_room();
+   147|                     let buf = match self.reader.fill_buf() {
+   148|                         Ok(buf) => buf,
+   149|                         Err(err) => {
+   150|                             self.done = true;
+   151|                             return Some(Err(err.into()));
+   152|                         }
+   153|                     };
+   154|                     match single::read_packet_len(buf) {
+   155|                         Ok((rest, PacketLength::Partial(len))) => {
+   156|                             let read = buf.len() - rest.len();
+   157|                             self.reader.consume(read);
+   158|                             if let Err(err) = read_fixed(&mut self.reader, len, &mut body) {
+   159|                                 self.done = true;
+
+# --- HUNK 2: Lines 182-221 ---
+   182|                 match single::body_parser(version, tag, &body) {
+   183|                     Ok(res) => Some(Ok(res)),
+   184|                     Err(Error::Incomplete(_)) => {
+   185|                         Some(Err(Error::PacketIncomplete))
+   186|                     }
+   187|                     Err(err) => {
+   188|                         self.done = true;
+   189|                         Some(Err(err))
+   190|                     }
+   191|                 }
+   192|             }
+   193|         }
+   194|     }
+   195| }
+   196| fn read_fixed<R: Read>(
+   197|     reader: &mut BufReader<R, MinBuffered>,
+   198|     len: usize,
+   199|     out: &mut Vec<u8>,
+   200| ) -> Result<()> {
+   201|     let out_len = out.len();
+   202|     out.resize(out_len + len, 0u8);
+   203|     reader.read_exact(&mut out[out_len..])?;
+   204|     Ok(())
+   205| }
+   206| #[cfg(test)]
+   207| mod tests {
+   208|     #![allow(clippy::unwrap_used)]
+   209|     use std::fs::File;
+   210|     use std::io::{BufReader, Seek, SeekFrom};
+   211|     use std::path::Path;
+   212|     use regex::Regex;
+   213|     use super::*;
+   214|     use crate::ser::Serialize;
+   215|     #[test]
+   216|     #[ignore]
+   217|     fn test_packet_roundtrip_0001() {
+   218|         packet_roundtrip(
+   219|             "0001",
+   220|             vec![
+   221|                 (556, 6 + 2224),
+
+
+# ====================================================================
+# FILE: src/types/s2k.rs
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-34 ---
+     1| use std::io;
+     2| use byteorder::WriteBytesExt;
+     3| use nom::bytes::streaming::take;
+     4| use nom::combinator::{map, rest};
+     5| use nom::number::streaming::be_u8;
+     6| use rand::{CryptoRng, Rng};
+     7| use crate::crypto::aead::AeadAlgorithm;
+     8| use crate::crypto::hash::HashAlgorithm;
+     9| use crate::crypto::sym::SymmetricKeyAlgorithm;
+    10| use crate::errors::{Error, IResult, Result};
+    11| use crate::ser::Serialize;
+    12| use crate::types::KeyVersion;
+    13| const EXPBIAS: u32 = 6;
+    14| const DEFAULT_ITER_SALTED_COUNT: u8 = 224;
+    15| #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    16| pub enum S2kUsage {
+    17|     Unprotected,
+    18|     LegacyCfb(SymmetricKeyAlgorithm),
+    19|     Aead,
+    20|     Cfb,
+    21|     MalleableCfb,
+    22| }
+    23| #[derive(derive_more::Debug, PartialEq, Eq, Clone)]
+    24| pub enum S2kParams {
+    25|     Unprotected,
+    26|     LegacyCfb {
+    27|         sym_alg: SymmetricKeyAlgorithm,
+    28|         #[debug("{}", hex::encode(iv))]
+    29|         iv: Vec<u8>,
+    30|     },
+    31|     Aead {
+    32|         sym_alg: SymmetricKeyAlgorithm,
+    33|         aead_mode: AeadAlgorithm,
+    34|         s2k: StringToKey,
+
+# --- HUNK 2: Lines 239-285 ---
+   239|                                 hasher.update(&salt[..count]);
+   240|                             } else {
+   241|                                 hasher.update(salt);
+   242|                                 count -= salt.len();
+   243|                                 hasher.update(&pw[..count]);
+   244|                             }
+   245|                         }
+   246|                         _ => unimplemented_err!("S2K {:?} is not available", self),
+   247|                     }
+   248|                     let start = round * digest_size;
+   249|                     let end = if round == rounds - 1 {
+   250|                         key_size
+   251|                     } else {
+   252|                         (round + 1) * digest_size
+   253|                     };
+   254|                     hasher.finish_reset_into(&mut key[start..end]);
+   255|                 }
+   256|                 key
+   257|             }
+   258|             Self::Argon2 { salt, t, p, m_enc } => {
+   259|                 let min_m = (*p as f32).log2().ceil() as u8;
+   260|                 ensure!(
+   261|                     *m_enc >= min_m && *m_enc <= 31,
+   262|                     "unsupported value {} for m in argon s2k",
+   263|                     m_enc
+   264|                 );
+   265|                 let m = 2u32.pow(*m_enc as u32);
+   266|                 use argon2::{Algorithm, Argon2, Params, Version};
+   267|                 let a2 = Argon2::new(
+   268|                     Algorithm::Argon2id,
+   269|                     Version::V0x13,
+   270|                     Params::new(m, *t as u32, *p as u32, Some(key_size))
+   271|                         .map_err(|e| Error::Message(format!("{:?}", e)))?,
+   272|                 );
+   273|                 let mut output_key_material = vec![0; key_size];
+   274|                 a2.hash_password_into(passphrase.as_bytes(), salt, &mut output_key_material)
+   275|                     .map_err(|e| Error::Message(format!("{:?}", e)))?;
+   276|                 output_key_material
+   277|             }
+   278|             _ => unimplemented_err!("S2K {:?} is not available", self),
+   279|         };
+   280|         Ok(key)
+   281|     }
+   282|     #[allow(clippy::len_without_is_empty)]
+   283|     pub(crate) fn len(&self) -> Result<u8> {
+   284|         let len = match self {
+   285|             Self::Simple { .. } => 2,
+

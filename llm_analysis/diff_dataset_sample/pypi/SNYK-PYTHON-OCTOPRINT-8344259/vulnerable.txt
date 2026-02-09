@@ -1,0 +1,1936 @@
+# ====================================================================
+# FILE: setup.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-32 ---
+     1| import os
+     2| import sys
+     3| sys.path.insert(0, os.path.dirname(__file__))
+     4| import setuptools  # noqa: F401,E402
+     5| try:
+     6|     import octoprint_setuptools  # noqa: F401,E402
+     7| except ImportError:
+     8|     octoprint_setuptools = None
+     9| PYTHON_REQUIRES = ">=3.7, <3.13"
+    10| SETUP_REQUIRES = []
+    11| bundled_plugins = [
+    12|     "OctoPrint-FileCheck>=2021.2.23",
+    13|     "OctoPrint-FirmwareCheck>=2021.10.11",
+    14|     "OctoPrint-PiSupport>=2023.10.10",
+    15| ]
+    16| core_deps = [
+    17|     "argon2-cffi>=23.1.0",
+    18|     "Babel>=2.12.1,<2.13",  # breaking changes can happen on minor version increases
+    19|     "cachelib>=0.10.2,<0.11",
+    20|     "Click>=8.1.7,<9",
+    21|     "colorlog>=6.7.0,<7",
+    22|     "emoji>=2.10.1,<3",
+    23|     "feedparser>=6.0.11,<7",
+    24|     "filetype>=1.2.0,<2",
+    25|     "Flask-Assets>=2.1.0,<3",
+    26|     "Flask-Babel>=3.1.0,<4",
+    27|     "Flask-Login>=0.6.3,<0.7",  # breaking changes can happen on minor version increases
+    28|     "Flask-Limiter>=3.5.0,<4",
+    29|     "flask>=2.2.3,<2.3",  # breaking changes can happen on minor version increases (with deprecation warnings)
+    30|     "frozendict>=2.4.0,<3",
+    31|     "future>=0.18.3,<1",  # not really needed anymore, but leaving in for py2/3 compat plugins
+    32|     "markdown>=3.4.4,<3.5",  # later versions require Python 3.8+
+
+
+# ====================================================================
+# FILE: src/octoprint/_version.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 11-52 ---
+    11| version is calculated as `<tag>.dev<distance>+g<short>` where `<tag>` is the
+    12| virtual tag associated with the current branch, `<distance>` is the distance of
+    13| the current HEAD from the reference commit of the branch and `<short>` is the
+    14| short SHA1 of the current HEAD. If the current branch does not match any of the
+    15| rules, the version is the closest tag reachable from the current HEAD.
+    16| If the current HEAD is dirty, the version as calculated from a matching branch
+    17| rule is appended with `.dirty`. Versions from a closest tag instead get
+    18| `.post<distance>.dev0` appended.
+    19| If no tag can be determined but a commit hash, the version is `0+unknown.g<short>`.
+    20| If no commit hash can be determined either, the version is `0+unknown`.
+    21| """
+    22| import errno
+    23| import os
+    24| import re
+    25| import subprocess
+    26| import sys
+    27| BRANCH_VERSIONS = """
+    28| maintenance 1.10.0 cd955e9a46782119b36cc22b8dea5652ebbf9774
+    29| fix/.* 1.10.0 cd955e9a46782119b36cc22b8dea5652ebbf9774
+    30| improve/.* 1.10.0 cd955e9a46782119b36cc22b8dea5652ebbf9774
+    31| staging/bugfix 1.10.2 e18547582a7dcd381b600eb32822799c8bb238f9
+    32| bug/.* 1.10.2 e18547582a7dcd381b600eb32822799c8bb238f9
+    33| staging/maintenance 1.10.0rc5 https://data.octoprint.org/#achievements
+    34| regressionfix/.* 1.10.0rc5 https://data.octoprint.org/#achievements
+    35| staging/devel 1.4.1rc4 650d54d1885409fa1d411eb54b9e8c7ff428910f
+    36| devel 2.0.0 2da7aa358d950b4567aaab8f18d6b5779193e077
+    37| dev/* 2.0.0 2da7aa358d950b4567aaab8f18d6b5779193e077
+    38| feature/* 2.0.0 2da7aa358d950b4567aaab8f18d6b5779193e077
+    39| """
+    40| package_root = os.path.dirname(os.path.realpath(__file__))
+    41| package_name = os.path.basename(package_root)
+    42| STATIC_FILE = "_static_version.py"
+    43| STATIC_FILE_TEMPLATE = """
+    44| version = "{version}"
+    45| branch = "{branch}"
+    46| revision = "{revision}"
+    47| """.strip()
+    48| FALLBACK = "0+unknown"
+    49| FALLBACK_WITH_SHA = "0+unknown.g{short}"
+    50| FALLBACK_DICT = {
+    51|     "version": FALLBACK,
+    52|     "branch": None,
+
+
+# ====================================================================
+# FILE: src/octoprint/access/users.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-28 ---
+     1| __license__ = "GNU Affero General Public License http://www.gnu.org/licenses/agpl.html"
+     2| __copyright__ = "Copyright (C) 2014 The OctoPrint Project - Released under terms of the AGPLv3 License"
+     3| import hashlib
+     4| import logging
+     5| import os
+     6| import shutil
+     7| import time
+     8| import uuid
+     9| import wrapt
+    10| from flask_login import AnonymousUserMixin, UserMixin
+    11| from passlib.hash import pbkdf2_sha256
+    12| from werkzeug.local import LocalProxy
+    13| from octoprint.access.groups import Group, GroupChangeListener
+    14| from octoprint.access.permissions import OctoPrintPermission, Permissions
+    15| from octoprint.settings import settings as s
+    16| from octoprint.util import atomic_write, deprecated, generate_api_key
+    17| from octoprint.util import get_fully_qualified_classname as fqcn
+    18| from octoprint.util import to_bytes, yaml
+    19| password_hashers = []
+    20| try:
+    21|     from passlib.hash import argon2
+    22|     hash = argon2.hash("test")
+    23|     assert argon2.verify("test", hash)
+    24|     password_hashers.append(argon2)
+    25| except Exception:
+    26|     logging.getLogger(__name__).warning(
+    27|         "Argon2 passlib backend is not available, not using it for password hashing"
+    28|     )
+
+# --- HUNK 2: Lines 1093-1133 ---
+  1093|     @property
+  1094|     def is_authenticated(self):
+  1095|         return FlaskLoginMethodReplacedByBooleanProperty(
+  1096|             "is_authenticated", lambda: False
+  1097|         )
+  1098|     @property
+  1099|     def is_active(self):
+  1100|         return FlaskLoginMethodReplacedByBooleanProperty(
+  1101|             "is_active", lambda: self._active
+  1102|         )
+  1103|     def check_password(self, passwordHash):
+  1104|         return True
+  1105|     def as_dict(self):
+  1106|         from octoprint.access.permissions import OctoPrintPermission
+  1107|         return {"needs": OctoPrintPermission.convert_needs_to_dict(self.needs)}
+  1108|     def __repr__(self):
+  1109|         return "AnonymousUser(groups=%s)" % self._groups
+  1110| class SessionUser(wrapt.ObjectProxy):
+  1111|     def __init__(self, user):
+  1112|         wrapt.ObjectProxy.__init__(self, user)
+  1113|         self._self_session = "".join("%02X" % z for z in bytes(uuid.uuid4().bytes))
+  1114|         self._self_created = self._self_touched = time.monotonic()
+  1115|     @property
+  1116|     def session(self):
+  1117|         return self._self_session
+  1118|     @property
+  1119|     def created(self):
+  1120|         return self._self_created
+  1121|     @property
+  1122|     def touched(self):
+  1123|         return self._self_touched
+  1124|     def touch(self):
+  1125|         self._self_touched = time.monotonic()
+  1126|     @deprecated(
+  1127|         "SessionUser.get_session() has been deprecated, use SessionUser.session instead",
+  1128|         since="1.3.5",
+  1129|     )
+  1130|     def get_session(self):
+  1131|         return self.session
+  1132|     def update_user(self, user):
+  1133|         self.__wrapped__ = user
+
+
+# ====================================================================
+# FILE: src/octoprint/filemanager/storage.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 419-459 ---
+   419|         self._filelist_cache_mutex = threading.RLock()
+   420|         self._old_metadata = None
+   421|         self._initialize_metadata()
+   422|     def _initialize_metadata(self):
+   423|         self._logger.info(f"Initializing the file metadata for {self.basefolder}...")
+   424|         old_metadata_path = os.path.join(self.basefolder, "metadata.yaml")
+   425|         backup_path = os.path.join(self.basefolder, "metadata.yaml.backup")
+   426|         if os.path.exists(old_metadata_path):
+   427|             try:
+   428|                 self._old_metadata = yaml.load_from_file(path=old_metadata_path)
+   429|             except Exception:
+   430|                 self._logger.exception("Error while loading old metadata file")
+   431|             self._list_folder(self.basefolder)
+   432|             self._old_metadata = None
+   433|             try:
+   434|                 import shutil
+   435|                 shutil.move(old_metadata_path, backup_path)
+   436|             except Exception:
+   437|                 self._logger.exception("Could not rename old metadata.yaml file")
+   438|         else:
+   439|             self._list_folder(self.basefolder)
+   440|         self._logger.info(
+   441|             f"... file metadata for {self.basefolder} initialized successfully."
+   442|         )
+   443|     @property
+   444|     def analysis_backlog(self):
+   445|         return self.analysis_backlog_for_path()
+   446|     def analysis_backlog_for_path(self, path=None):
+   447|         if path:
+   448|             path = self.sanitize_path(path)
+   449|         yield from self._analysis_backlog_generator(path)
+   450|     def _analysis_backlog_generator(self, path=None):
+   451|         if path is None:
+   452|             path = self.basefolder
+   453|         metadata = self._get_metadata(path)
+   454|         if not metadata:
+   455|             metadata = {}
+   456|         for entry in scandir(path):
+   457|             if is_hidden_path(entry.name):
+   458|                 continue
+   459|             if entry.is_file() and octoprint.filemanager.valid_file_type(entry.name):
+
+# --- HUNK 2: Lines 1225-1265 ---
+  1225|                 for link in metadata[name]["links"]:
+  1226|                     if not link["rel"] == rel:
+  1227|                         continue
+  1228|                     matches = True
+  1229|                     for k, v in data.items():
+  1230|                         if k not in link or not link[k] == v:
+  1231|                             matches = False
+  1232|                             break
+  1233|                     if not matches:
+  1234|                         continue
+  1235|                     metadata[name]["links"].remove(link)
+  1236|                     metadata_dirty = True
+  1237|         if metadata_dirty:
+  1238|             self._save_metadata(path, metadata)
+  1239|     @time_this(
+  1240|         logtarget=__name__ + ".timings",
+  1241|         message="{func}({func_args},{func_kwargs}) took {timing:.2f}ms",
+  1242|         incl_func_args=True,
+  1243|         log_enter=True,
+  1244|     )
+  1245|     def _list_folder(self, path, base="", force_refresh=False, **kwargs):
+  1246|         def get_size(nodes):
+  1247|             total_size = 0
+  1248|             for node in nodes.values():
+  1249|                 if "size" in node:
+  1250|                     total_size += node["size"]
+  1251|             return total_size
+  1252|         def enrich_folders(nodes):
+  1253|             nodes = copy.copy(nodes)
+  1254|             for key, value in nodes.items():
+  1255|                 if value["type"] == "folder":
+  1256|                     value = copy.copy(value)
+  1257|                     value["children"] = self._list_folder(
+  1258|                         os.path.join(path, key),
+  1259|                         base=value["path"] + "/",
+  1260|                         force_refresh=force_refresh,
+  1261|                     )
+  1262|                     value["size"] = get_size(value["children"])
+  1263|                     nodes[key] = value
+  1264|             return nodes
+  1265|         metadata_dirty = False
+
+# --- HUNK 3: Lines 1370-1413 ---
+  1370|                                     metadata=metadata,
+  1371|                                 )
+  1372|                                 metadata_dirty = True
+  1373|                             else:
+  1374|                                 entry_metadata = {}
+  1375|                             entry_data = {
+  1376|                                 "name": entry_name,
+  1377|                                 "display": entry_metadata.get("display", entry_name),
+  1378|                                 "path": path_in_location,
+  1379|                                 "type": "folder",
+  1380|                                 "typePath": ["folder"],
+  1381|                             }
+  1382|                             if entry_stat:
+  1383|                                 entry_data["date"] = int(entry_stat.st_mtime)
+  1384|                             result[entry_name] = entry_data
+  1385|                     except Exception:
+  1386|                         self._logger.exception(
+  1387|                             f"Error while processing entry {entry_path}"
+  1388|                         )
+  1389|                         continue
+  1390|                 self._filelist_cache[path] = (
+  1391|                     lm,
+  1392|                     result,
+  1393|                 )
+  1394|                 return enrich_folders(result)
+  1395|         finally:
+  1396|             if metadata_dirty:
+  1397|                 self._save_metadata(path, metadata)
+  1398|     def _add_basic_metadata(
+  1399|         self,
+  1400|         path,
+  1401|         entry,
+  1402|         display_name=None,
+  1403|         additional_metadata=None,
+  1404|         save=True,
+  1405|         metadata=None,
+  1406|     ):
+  1407|         if additional_metadata is None:
+  1408|             additional_metadata = {}
+  1409|         if metadata is None:
+  1410|             metadata = self._get_metadata(path)
+  1411|         entry_path = os.path.join(path, entry)
+  1412|         if os.path.isfile(entry_path):
+  1413|             entry_data = {
+
+
+# ====================================================================
+# FILE: src/octoprint/plugins/appkeys/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 189-229 ---
+   189|         pending = None
+   190|         for p in pendings:
+   191|             if p.user_id == required_user or (not required_user and p.user_id == user_id):
+   192|                 pending = p
+   193|                 break
+   194|         else:
+   195|             return flask.abort(404)
+   196|         app_id = pending.app_id
+   197|         user_token = pending.user_token
+   198|         redirect_url = flask.request.args.get("redirect", "")
+   199|         response = flask.make_response(
+   200|             flask.render_template(
+   201|                 "plugin_appkeys/appkeys_authdialog.jinja2",
+   202|                 app=app_id,
+   203|                 user=user_id,
+   204|                 user_token=user_token,
+   205|                 redirect_url=redirect_url,
+   206|                 theming=[],
+   207|                 request_text=gettext(
+   208|                     '"<strong>%(app)s</strong>" has requested access to control OctoPrint through the API.'
+   209|                 ).replace("%(app)s", app_id),
+   210|             )
+   211|         )
+   212|         return add_csrf_cookie(add_non_caching_response_headers(response))
+   213|     @octoprint.plugin.BlueprintPlugin.route("/decision/<user_token>", methods=["POST"])
+   214|     @restricted_access
+   215|     def handle_decision(self, user_token):
+   216|         data = flask.request.json
+   217|         if "decision" not in data:
+   218|             flask.abort(400, description="No decision provided")
+   219|         if not Permissions.PLUGIN_APPKEYS_GRANT.can():
+   220|             flask.abort(403, description="No permission to grant app access")
+   221|         ensure_credentials_checked_recently()
+   222|         decision = data["decision"] in valid_boolean_trues
+   223|         user_id = current_user.get_name()
+   224|         result = self._set_decision(user_token, decision, user_id)
+   225|         if not result:
+   226|             return flask.abort(404)
+   227|         self._plugin_manager.send_plugin_message(
+   228|             self._identifier, {"type": "end_request", "user_token": user_token}
+   229|         )
+
+
+# ====================================================================
+# FILE: src/octoprint/plugins/discovery/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 56-111 ---
+    56|             "httpPassword": None,
+    57|             "upnpUuid": None,
+    58|             "zeroConf": [],
+    59|             "model": {
+    60|                 "name": None,
+    61|                 "description": None,
+    62|                 "number": None,
+    63|                 "url": None,
+    64|                 "serial": None,
+    65|                 "vendor": None,
+    66|                 "vendorUrl": None,
+    67|             },
+    68|             "addresses": None,
+    69|             "ignoredAddresses": None,
+    70|             "interfaces": None,
+    71|             "ignoredInterfaces": None,
+    72|         }
+    73|     @octoprint.plugin.BlueprintPlugin.route("/discovery.xml", methods=["GET"])
+    74|     def discovery(self):
+    75|         self._logger.debug("Rendering discovery.xml")
+    76|         modelName = self._settings.get(["model", "name"])
+    77|         if not modelName:
+    78|             import octoprint.server
+    79|             modelName = octoprint.server.DISPLAY_VERSION
+    80|         vendor = self._settings.get(["model", "vendor"])
+    81|         vendorUrl = self._settings.get(["model", "vendorUrl"])
+    82|         if not vendor:
+    83|             vendor = "The OctoPrint Project"
+    84|             vendorUrl = "http://www.octoprint.org/"
+    85|         response = flask.make_response(
+    86|             flask.render_template(
+    87|                 "discovery.xml.jinja2",
+    88|                 friendlyName=self.get_instance_name(),
+    89|                 manufacturer=vendor,
+    90|                 manufacturerUrl=vendorUrl,
+    91|                 modelName=modelName,
+    92|                 modelDescription=self._settings.get(["model", "description"]),
+    93|                 modelNumber=self._settings.get(["model", "number"]),
+    94|                 modelUrl=self._settings.get(["model", "url"]),
+    95|                 serialNumber=self._settings.get(["model", "serial"]),
+    96|                 uuid=self.get_uuid(),
+    97|                 presentationUrl=flask.url_for("index", _external=True),
+    98|             )
+    99|         )
+   100|         response.headers["Content-Type"] = "application/xml"
+   101|         return response
+   102|     def is_blueprint_protected(self):
+   103|         return False
+   104|     def is_blueprint_csrf_protected(self):
+   105|         return True
+   106|     def on_startup(self, host, port):
+   107|         public_host = self._settings.get(["publicHost"])
+   108|         if public_host:
+   109|             host = public_host
+   110|         public_port = self._settings.get(["publicPort"])
+   111|         if public_port:
+
+
+# ====================================================================
+# FILE: src/octoprint/plugins/errortracking/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-40 ---
+     1| __license__ = "GNU Affero General Public License http://www.gnu.org/licenses/agpl.html"
+     2| __copyright__ = "Copyright (C) 2019 The OctoPrint Project - Released under terms of the AGPLv3 License"
+     3| import errno
+     4| import logging
+     5| import requests.exceptions
+     6| import serial
+     7| import tornado.websocket
+     8| from flask import jsonify
+     9| from flask_babel import gettext
+    10| import octoprint.plugin
+    11| from octoprint.util import get_fully_qualified_classname as fqcn  # noqa: F401
+    12| from octoprint.util.version import (
+    13|     get_octoprint_version_string,
+    14|     is_released_octoprint_version,
+    15| )
+    16| SENTRY_URL_SERVER = (
+    17|     "https://fc0e29027267843275a25ccb977fd622@o118517.ingest.us.sentry.io/1373987"
+    18| )
+    19| SENTRY_URL_COREUI = (
+    20|     "https://abc2a1365195f4eac742746eff1236de@o118517.ingest.us.sentry.io/1374096"
+    21| )
+    22| SETTINGS_DEFAULTS = {
+    23|     "enabled": False,
+    24|     "enabled_unreleased": False,
+    25|     "unique_id": None,
+    26|     "url_server": SENTRY_URL_SERVER,
+    27|     "url_coreui": SENTRY_URL_COREUI,
+    28| }
+    29| IGNORED_EXCEPTIONS = [
+    30|     (
+    31|         serial.SerialException,
+    32|         lambda exc, logger, plugin, cb: logger == "octoprint.util.comm",
+    33|     ),
+    34|     KeyboardInterrupt,
+    35|     (
+    36|         IOError,
+    37|         lambda exc, logger, plugin, cb: exc.errorgetattr(exc, "errno")  # noqa: B009
+    38|         and exc.errno in (getattr(errno, "ENOSPC"),),  # noqa: B009
+    39|     ),
+    40|     requests.exceptions.RequestException,
+
+
+# ====================================================================
+# FILE: src/octoprint/plugins/gcodeviewer/__init__.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-26 ---
+     1| __license__ = "GNU Affero General Public License http://www.gnu.org/licenses/agpl.html"
+     2| __copyright__ = "Copyright (C) 2020 The OctoPrint Project - Released under terms of the AGPLv3 License"
+     3| import os
+     4| import flask
+     5| from flask_babel import gettext
+     6| import octoprint.plugin
+     7| from octoprint.util.files import search_through_file
+     8| class GcodeviewerPlugin(
+     9|     octoprint.plugin.AssetPlugin,
+    10|     octoprint.plugin.TemplatePlugin,
+    11|     octoprint.plugin.SettingsPlugin,
+    12|     octoprint.plugin.BlueprintPlugin,
+    13| ):
+    14|     def get_assets(self):
+    15|         js = [
+    16|             "js/gcodeviewer.js",
+    17|             "js/viewer/ui.js",
+    18|             "js/viewer/reader.js",
+    19|             "js/viewer/renderer.js",
+    20|             "js/lib/pako.js",
+    21|         ]
+    22|         return {
+    23|             "js": js,
+    24|             "less": ["less/gcodeviewer.less"],
+    25|             "css": ["css/gcodeviewer.css"],
+    26|         }
+
+# --- HUNK 2: Lines 51-90 ---
+    51|         }
+    52|     def get_settings_version(self):
+    53|         return 1
+    54|     def on_settings_migrate(self, target, current):
+    55|         if current is None:
+    56|             config = self._settings.global_get(["gcodeViewer"])
+    57|             if config:
+    58|                 self._logger.info(
+    59|                     "Migrating settings from gcodeViewer to plugins.gcodeviewer..."
+    60|                 )
+    61|                 if "mobileSizeThreshold" in config:
+    62|                     self._settings.set_int(
+    63|                         ["mobileSizeThreshold"], config["mobileSizeThreshold"]
+    64|                     )
+    65|                 if "sizeThreshold" in config:
+    66|                     self._settings.set_int(["sizeThreshold"], config["sizeThreshold"])
+    67|                 self._settings.global_remove(["gcodeViewer"])
+    68|     @octoprint.plugin.BlueprintPlugin.route(
+    69|         "/skipuntilcheck/<string:origin>/<path:filename>", methods=["GET"]
+    70|     )
+    71|     def check_skip_until_presence(self, origin, filename):
+    72|         try:
+    73|             path = self._file_manager.path_on_disk(origin, filename)
+    74|         except NotImplementedError:
+    75|             flask.abort(404)
+    76|         if not os.path.exists(path):
+    77|             flask.abort(404)
+    78|         skipUntilThis = self._settings.get(["skipUntilThis"])
+    79|         if not skipUntilThis:
+    80|             return flask.jsonify(present=False)
+    81|         return flask.jsonify(present=search_through_file(path, skipUntilThis))
+    82|     def is_blueprint_csrf_protected(self):
+    83|         return True
+    84| __plugin_name__ = gettext("GCode Viewer")
+    85| __plugin_author__ = "Gina Häußge"
+    86| __plugin_description__ = "Provides a GCODE viewer in OctoPrint's UI."
+    87| __plugin_disabling_discouraged__ = gettext(
+    88|     "Without this plugin the GCode Viewer in OctoPrint will no longer be " "available."
+    89| )
+    90| __plugin_license__ = "AGPLv3"
+
+
+# ====================================================================
+# FILE: src/octoprint/plugins/pluginmanager/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 591-632 ---
+   591|                 for plugin in self._queued_installs:
+   592|                     plugin.pop("command")
+   593|                     self.command_install(**plugin)
+   594|                 self._queued_installs = []
+   595|     def get_api_commands(self):
+   596|         return {
+   597|             "install": ["url"],
+   598|             "uninstall": ["plugin"],
+   599|             "enable": ["plugin"],
+   600|             "disable": ["plugin"],
+   601|             "cleanup": ["plugin"],
+   602|             "cleanup_all": [],
+   603|             "refresh_repository": [],
+   604|             "clear_queued_plugin": ["plugin"],
+   605|             "clear_queued_installs": [],
+   606|         }
+   607|     def on_api_command(self, command, data):
+   608|         if not Permissions.PLUGIN_PLUGINMANAGER_MANAGE.can():
+   609|             abort(403)
+   610|         if command == "clear_queued_plugin":
+   611|             if data["plugin"] and data["plugin"] in self._queued_installs:
+   612|                 self._queued_installs.remove(data["plugin"])
+   613|             return (
+   614|                 jsonify({"queued_installs": self._queued_installs}),
+   615|                 202,
+   616|             )
+   617|         elif command == "clear_queued_installs":
+   618|             self._queued_installs.clear()
+   619|             return (
+   620|                 jsonify({"queued_installs": self._queued_installs}),
+   621|                 202,
+   622|             )
+   623|         elif self._printer.is_printing() or self._printer.is_paused():
+   624|             if command == "install" and data not in self._queued_installs:
+   625|                 if not Permissions.PLUGIN_PLUGINMANAGER_INSTALL.can():
+   626|                     abort(403)
+   627|                 ensure_credentials_checked_recently()
+   628|                 self._logger.debug(f"Queuing install of {data}")
+   629|                 self._queued_installs.append(data)
+   630|             if len(self._queued_installs) > 0:
+   631|                 self._logger.debug(f"Queued installs: {self._queued_installs}")
+   632|                 return (
+
+
+# ====================================================================
+# FILE: src/octoprint/plugins/pluginmanager/static/js/pluginmanager.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1031-1073 ---
+  1031|                     show: true
+  1032|                 });
+  1033|             });
+  1034|         };
+  1035|         self.pluginDetails = function (data) {
+  1036|             window.open(data.page);
+  1037|         };
+  1038|         self.installFromRepository = function (data) {
+  1039|             self.installPlugin(
+  1040|                 data.archive,
+  1041|                 data.title,
+  1042|                 self.installed(data) ? data.id : undefined,
+  1043|                 data.follow_dependency_links || self.followDependencyLinks(),
+  1044|                 true
+  1045|             );
+  1046|         };
+  1047|         self.removeFromQueue = function (plugin) {
+  1048|             var data = {
+  1049|                 plugin: {
+  1050|                     command: self.installed(plugin) ? "reinstall" : "install",
+  1051|                     url: plugin.archive,
+  1052|                     dependency_links:
+  1053|                         plugin.follow_dependency_links || self.followDependencyLinks()
+  1054|                 }
+  1055|             };
+  1056|             OctoPrint.simpleApiCommand("pluginmanager", "clear_queued_plugin", data).done(
+  1057|                 function (response) {
+  1058|                     self.queuedInstalls(response.queued_installs);
+  1059|                 }
+  1060|             );
+  1061|         };
+  1062|         self.installPlugin = function (
+  1063|             url,
+  1064|             name,
+  1065|             reinstall,
+  1066|             followDependencyLinks,
+  1067|             fromRepo
+  1068|         ) {
+  1069|             if (
+  1070|                 !self.loginState.hasPermission(
+  1071|                     self.access.permissions.PLUGIN_PLUGINMANAGER_INSTALL
+  1072|                 )
+  1073|             ) {
+
+
+# ====================================================================
+# FILE: src/octoprint/server/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1170-1213 ---
+  1170|     def _setup_app(self, app):
+  1171|         global limiter
+  1172|         from octoprint.server.util.flask import (
+  1173|             OctoPrintFlaskRequest,
+  1174|             OctoPrintFlaskResponse,
+  1175|             OctoPrintJsonProvider,
+  1176|             OctoPrintSessionInterface,
+  1177|             PrefixAwareJinjaEnvironment,
+  1178|             ReverseProxiedEnvironment,
+  1179|         )
+  1180|         app.jinja_environment = PrefixAwareJinjaEnvironment
+  1181|         app.config["TEMPLATES_AUTO_RELOAD"] = True
+  1182|         app.config["REMEMBER_COOKIE_DURATION"] = 90 * 24 * 60 * 60  # 90 days
+  1183|         app.config["REMEMBER_COOKIE_HTTPONLY"] = True
+  1184|         app.debug = self._debug
+  1185|         app.json = OctoPrintJsonProvider(app)
+  1186|         app.json.compact = False
+  1187|         s = settings()
+  1188|         secret_key = s.get(["server", "secretKey"])
+  1189|         if not secret_key:
+  1190|             import string
+  1191|             from random import choice
+  1192|             chars = string.ascii_lowercase + string.ascii_uppercase + string.digits
+  1193|             secret_key = "".join(choice(chars) for _ in range(32))
+  1194|             s.set(["server", "secretKey"], secret_key)
+  1195|             s.save()
+  1196|         app.secret_key = secret_key
+  1197|         reverse_proxied = ReverseProxiedEnvironment(
+  1198|             header_prefix=s.get(["server", "reverseProxy", "prefixHeader"]),
+  1199|             header_scheme=s.get(["server", "reverseProxy", "schemeHeader"]),
+  1200|             header_host=s.get(["server", "reverseProxy", "hostHeader"]),
+  1201|             header_server=s.get(["server", "reverseProxy", "serverHeader"]),
+  1202|             header_port=s.get(["server", "reverseProxy", "portHeader"]),
+  1203|             prefix=s.get(["server", "reverseProxy", "prefixFallback"]),
+  1204|             scheme=s.get(["server", "reverseProxy", "schemeFallback"]),
+  1205|             host=s.get(["server", "reverseProxy", "hostFallback"]),
+  1206|             server=s.get(["server", "reverseProxy", "serverFallback"]),
+  1207|             port=s.get(["server", "reverseProxy", "portFallback"]),
+  1208|         )
+  1209|         OctoPrintFlaskRequest.environment_wrapper = reverse_proxied
+  1210|         app.request_class = OctoPrintFlaskRequest
+  1211|         app.response_class = OctoPrintFlaskResponse
+  1212|         app.session_interface = OctoPrintSessionInterface()
+  1213|         @app.before_request
+
+
+# ====================================================================
+# FILE: src/octoprint/server/api/access.py
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-31 ---
+     1| __author__ = "Marc Hannappel <salandora@gmail.com>"
+     2| __license__ = "GNU Affero General Public License http://www.gnu.org/licenses/agpl.html"
+     3| __copyright__ = "Copyright (C) 2017 The OctoPrint Project - Released under terms of the AGPLv3 License"
+     4| from flask import abort, jsonify, request
+     5| from flask_login import current_user
+     6| import octoprint.access.groups as groups
+     7| import octoprint.access.users as users
+     8| from octoprint.access.permissions import Permissions
+     9| from octoprint.server import SUCCESS, groupManager, userManager
+    10| from octoprint.server.api import api, valid_boolean_trues
+    11| from octoprint.server.util.flask import (
+    12|     ensure_credentials_checked_recently,
+    13|     no_firstrun_access,
+    14|     require_credentials_checked_recently,
+    15| )
+    16| @api.route("/access/permissions", methods=["GET"])
+    17| def get_permissions():
+    18|     return jsonify(permissions=[permission.as_dict() for permission in Permissions.all()])
+    19| @api.route("/access/groups", methods=["GET"])
+    20| @no_firstrun_access
+    21| @Permissions.ADMIN.require(403)
+    22| def get_groups():
+    23|     return jsonify(groups=list(map(lambda g: g.as_dict(), groupManager.groups)))
+    24| @api.route("/access/groups", methods=["POST"])
+    25| @no_firstrun_access
+    26| @require_credentials_checked_recently
+    27| @Permissions.ADMIN.require(403)
+    28| def add_group():
+    29|     data = request.get_json()
+    30|     if "key" not in data:
+    31|         abort(400, description="key is missing")
+
+# --- HUNK 2: Lines 81-159 ---
+    81|     except groups.GroupCantBeChanged:
+    82|         abort(403)
+    83|     except groups.UnknownGroup:
+    84|         abort(404)
+    85| @api.route("/access/groups/<key>", methods=["DELETE"])
+    86| @no_firstrun_access
+    87| @require_credentials_checked_recently
+    88| @Permissions.ADMIN.require(403)
+    89| def remove_group(key):
+    90|     try:
+    91|         groupManager.remove_group(key)
+    92|         return get_groups()
+    93|     except groups.UnknownGroup:
+    94|         abort(404)
+    95|     except groups.GroupUnremovable:
+    96|         abort(403)
+    97| @api.route("/access/users", methods=["GET"])
+    98| @no_firstrun_access
+    99| @Permissions.ADMIN.require(403)
+   100| def get_users():
+   101|     return jsonify(users=list(map(lambda u: u.as_dict(), userManager.get_all_users())))
+   102| @api.route("/access/users", methods=["POST"])
+   103| @no_firstrun_access
+   104| @require_credentials_checked_recently
+   105| @Permissions.ADMIN.require(403)
+   106| def add_user():
+   107|     data = request.get_json()
+   108|     if "name" not in data:
+   109|         abort(400, description="name is missing")
+   110|     if "password" not in data:
+   111|         abort(400, description="password is missing")
+   112|     if "active" not in data:
+   113|         abort(400, description="active is missing")
+   114|     name = data["name"]
+   115|     password = data["password"]
+   116|     active = data["active"] in valid_boolean_trues
+   117|     groups = data.get("groups", None)
+   118|     permissions = data.get("permissions", None)
+   119|     try:
+   120|         userManager.add_user(name, password, active, permissions, groups)
+   121|     except users.UserAlreadyExists:
+   122|         abort(409)
+   123|     except users.InvalidUsername:
+   124|         abort(400, "Username invalid")
+   125|     return get_users()
+   126| @api.route("/access/users/<username>", methods=["GET"])
+   127| @no_firstrun_access
+   128| def get_user(username):
+   129|     if (
+   130|         current_user is not None
+   131|         and not current_user.is_anonymous
+   132|         and (
+   133|             current_user.get_name() == username
+   134|             or current_user.has_permission(Permissions.ADMIN)
+   135|         )
+   136|     ):
+   137|         user = userManager.find_user(username)
+   138|         if user is not None:
+   139|             return jsonify(user)
+   140|         else:
+   141|             abort(404)
+   142|     else:
+   143|         abort(403)
+   144| @api.route("/access/users/<username>", methods=["PUT"])
+   145| @no_firstrun_access
+   146| @require_credentials_checked_recently
+   147| @Permissions.ADMIN.require(403)
+   148| def update_user(username):
+   149|     user = userManager.find_user(username)
+   150|     if user is not None:
+   151|         data = request.get_json()
+   152|         if "groups" in data:
+   153|             groups = data["groups"]
+   154|             userManager.change_user_groups(username, groups)
+   155|         if "permissions" in data:
+   156|             permissions = data["permissions"]
+   157|             userManager.change_user_permissions(username, permissions)
+   158|         if "active" in data:
+   159|             userManager.change_user_activation(
+
+# --- HUNK 3: Lines 229-288 ---
+   229| def change_settings_for_user(username):
+   230|     if (
+   231|         current_user is None
+   232|         or current_user.is_anonymous
+   233|         or (
+   234|             current_user.get_name() != username
+   235|             and not current_user.has_permission(Permissions.ADMIN)
+   236|         )
+   237|     ):
+   238|         abort(403)
+   239|     if current_user.get_name() != username:
+   240|         ensure_credentials_checked_recently()
+   241|     data = request.get_json()
+   242|     try:
+   243|         userManager.change_user_settings(username, data)
+   244|         return jsonify(SUCCESS)
+   245|     except users.UnknownUser:
+   246|         abort(404)
+   247| @api.route("/access/users/<username>/apikey", methods=["DELETE"])
+   248| @no_firstrun_access
+   249| def delete_apikey_for_user(username):
+   250|     if (
+   251|         current_user is not None
+   252|         and not current_user.is_anonymous
+   253|         and (
+   254|             current_user.get_name() == username
+   255|             or current_user.has_permission(Permissions.ADMIN)
+   256|         )
+   257|     ):
+   258|         if current_user.get_name() != username:
+   259|             ensure_credentials_checked_recently()
+   260|         try:
+   261|             userManager.delete_api_key(username)
+   262|         except users.UnknownUser:
+   263|             abort(404)
+   264|         return jsonify(SUCCESS)
+   265|     else:
+   266|         abort(403)
+   267| @api.route("/access/users/<username>/apikey", methods=["POST"])
+   268| @no_firstrun_access
+   269| def generate_apikey_for_user(username):
+   270|     if not userManager.enabled:
+   271|         return jsonify(SUCCESS)
+   272|     if (
+   273|         current_user is not None
+   274|         and not current_user.is_anonymous
+   275|         and (
+   276|             current_user.get_name() == username
+   277|             or current_user.has_permission(Permissions.ADMIN)
+   278|         )
+   279|     ):
+   280|         if current_user.get_name() != username:
+   281|             ensure_credentials_checked_recently()
+   282|         try:
+   283|             apikey = userManager.generate_api_key(username)
+   284|         except users.UnknownUser:
+   285|             abort(404)
+   286|         return jsonify({"apikey": apikey})
+   287|     else:
+   288|         abort(403)
+
+
+# ====================================================================
+# FILE: src/octoprint/server/api/settings.py
+# Total hunks: 7
+# ====================================================================
+# --- HUNK 1: Lines 1-35 ---
+     1| __author__ = "Gina Häußge <osd@foosel.net>"
+     2| __license__ = "GNU Affero General Public License http://www.gnu.org/licenses/agpl.html"
+     3| __copyright__ = "Copyright (C) 2014 The OctoPrint Project - Released under terms of the AGPLv3 License"
+     4| import logging
+     5| import re
+     6| from flask import abort, jsonify, request
+     7| from flask_login import current_user
+     8| import octoprint.plugin
+     9| import octoprint.util
+    10| from octoprint.access.permissions import Permissions
+    11| from octoprint.server import pluginManager, printer, userManager
+    12| from octoprint.server.api import NO_CONTENT, api
+    13| from octoprint.server.util.flask import (
+    14|     credentials_checked_recently,
+    15|     no_firstrun_access,
+    16|     with_revalidation_checking,
+    17| )
+    18| from octoprint.settings import settings, valid_boolean_trues
+    19| from octoprint.timelapse import configure_timelapse
+    20| from octoprint.webcams import (
+    21|     get_default_webcam,
+    22|     get_snapshot_webcam,
+    23|     get_webcams_as_dicts,
+    24| )
+    25| FOLDER_TYPES = ("uploads", "timelapse", "watched")
+    26| TIMELAPSE_BITRATE_PATTERN = re.compile(r"\d+[KMGTPEZY]?i?B?", flags=re.IGNORECASE)
+    27| DEPRECATED_WEBCAM_KEYS = (
+    28|     "streamUrl",
+    29|     "streamRatio",
+    30|     "streamTimeout",
+    31|     "streamWebrtcIceServers",
+    32|     "snapshotUrl",
+    33|     "snapshotTimeout",
+    34|     "snapshotSslValidation",
+    35|     "cacheBuster",
+
+# --- HUNK 2: Lines 399-444 ---
+   399|                 "Could not load settings for plugin {name} ({version})".format(
+   400|                     version=plugin._plugin_version, name=plugin._plugin_name
+   401|                 ),
+   402|                 extra={"plugin": plugin._identifier},
+   403|             )
+   404|     return data
+   405| @api.route("/settings", methods=["POST"])
+   406| @no_firstrun_access
+   407| @Permissions.SETTINGS.require(403)
+   408| def setSettings():
+   409|     data = request.get_json()
+   410|     if not isinstance(data, dict):
+   411|         abort(400, description="Malformed JSON body in request")
+   412|     response = _saveSettings(data)
+   413|     if response:
+   414|         return response
+   415|     return getSettings()
+   416| @api.route("/settings/apikey", methods=["POST"])
+   417| @no_firstrun_access
+   418| @Permissions.ADMIN.require(403)
+   419| def generateApiKey():
+   420|     apikey = settings().generateApiKey()
+   421|     return jsonify(apikey=apikey)
+   422| @api.route("/settings/apikey", methods=["DELETE"])
+   423| @no_firstrun_access
+   424| @Permissions.ADMIN.require(403)
+   425| def deleteApiKey():
+   426|     settings().deleteApiKey()
+   427|     return NO_CONTENT
+   428| @api.route("/settings/templates", methods=["GET"])
+   429| @no_firstrun_access
+   430| @Permissions.SETTINGS.require(403)
+   431| def fetchTemplateData():
+   432|     from octoprint.server.views import fetch_template_data
+   433|     refresh = request.values.get("refresh", "false") in valid_boolean_trues
+   434|     templates, _, _ = fetch_template_data(refresh=refresh)
+   435|     result = {}
+   436|     for tt in templates:
+   437|         result[tt] = []
+   438|         for key in templates[tt]["order"]:
+   439|             entry = templates[tt]["entries"].get(key)
+   440|             if not entry:
+   441|                 continue
+   442|             if isinstance(entry, dict):
+   443|                 name = key
+   444|             else:
+
+# --- HUNK 3: Lines 478-518 ---
+   478|                 s.setBaseFolder(folder, future[folder])
+   479|         except Exception:
+   480|             logger.exception("Something went wrong while saving a folder path")
+   481|             abort(400, description="At least one of the configured folders is invalid")
+   482|     if "api" in data:
+   483|         if "allowCrossOrigin" in data["api"]:
+   484|             s.setBoolean(["api", "allowCrossOrigin"], data["api"]["allowCrossOrigin"])
+   485|     if "accessControl" in data:
+   486|         if "autologinHeadsupAcknowledged" in data["accessControl"]:
+   487|             s.setBoolean(
+   488|                 ["accessControl", "autologinHeadsupAcknowledged"],
+   489|                 data["accessControl"]["autologinHeadsupAcknowledged"],
+   490|             )
+   491|     if "appearance" in data:
+   492|         if "name" in data["appearance"]:
+   493|             s.set(["appearance", "name"], data["appearance"]["name"])
+   494|         if "color" in data["appearance"]:
+   495|             s.set(["appearance", "color"], data["appearance"]["color"])
+   496|         if "colorTransparent" in data["appearance"]:
+   497|             s.setBoolean(
+   498|                 ["appearance", "colorTransparent"], data["appearance"]["colorTransparent"]
+   499|             )
+   500|         if "colorIcon" in data["appearance"]:
+   501|             s.setBoolean(["appearance", "colorIcon"], data["appearance"]["colorIcon"])
+   502|         if "defaultLanguage" in data["appearance"]:
+   503|             s.set(
+   504|                 ["appearance", "defaultLanguage"], data["appearance"]["defaultLanguage"]
+   505|             )
+   506|         if "showFahrenheitAlso" in data["appearance"]:
+   507|             s.setBoolean(
+   508|                 ["appearance", "showFahrenheitAlso"],
+   509|                 data["appearance"]["showFahrenheitAlso"],
+   510|             )
+   511|         if "fuzzyTimes" in data["appearance"]:
+   512|             s.setBoolean(["appearance", "fuzzyTimes"], data["appearance"]["fuzzyTimes"])
+   513|         if "closeModalsWithClick" in data["appearance"]:
+   514|             s.setBoolean(
+   515|                 ["appearance", "closeModalsWithClick"],
+   516|                 data["appearance"]["closeModalsWithClick"],
+   517|             )
+   518|         if "showInternalFilename" in data["appearance"]:
+
+# --- HUNK 4: Lines 533-573 ---
+   533|                     f"Setting webcam.{key} via the API is no longer supported, please use the individual settings of the default webcam instead."
+   534|                 )
+   535|         if "webcamEnabled" in data["webcam"]:
+   536|             s.setBoolean(["webcam", "webcamEnabled"], data["webcam"]["webcamEnabled"])
+   537|         if "timelapseEnabled" in data["webcam"]:
+   538|             s.setBoolean(
+   539|                 ["webcam", "timelapseEnabled"], data["webcam"]["timelapseEnabled"]
+   540|             )
+   541|         if "snapshotTimeout" in data["webcam"]:
+   542|             s.setInt(["webcam", "snapshotTimeout"], data["webcam"]["snapshotTimeout"])
+   543|         if "snapshotSslValidation" in data["webcam"]:
+   544|             s.setBoolean(
+   545|                 ["webcam", "snapshotSslValidation"],
+   546|                 data["webcam"]["snapshotSslValidation"],
+   547|             )
+   548|         if "ffmpegPath" in data["webcam"]:
+   549|             s.set(["webcam", "ffmpeg"], data["webcam"]["ffmpegPath"])
+   550|         if "ffmpegCommandline" in data["webcam"]:
+   551|             commandline = data["webcam"]["ffmpegCommandline"]
+   552|             if not all(
+   553|                 map(lambda x: "{" + x + "}" in commandline, ("ffmpeg", "input", "output"))
+   554|             ):
+   555|                 abort(
+   556|                     400,
+   557|                     description="Invalid webcam.ffmpegCommandline setting, lacks mandatory {ffmpeg}, {input} or {output}",
+   558|                 )
+   559|             try:
+   560|                 commandline.format(
+   561|                     ffmpeg="ffmpeg",
+   562|                     fps="fps",
+   563|                     bitrate="bitrate",
+   564|                     threads="threads",
+   565|                     input="input",
+   566|                     output="output",
+   567|                     videocodec="videocodec",
+   568|                     containerformat="containerformat",
+   569|                     filters="filters",
+   570|                 )
+   571|             except Exception:
+   572|                 logger.exception("Invalid webcam.ffmpegCommandline setting")
+   573|                 abort(400, description="Invalid webcam.ffmpegCommandline setting")
+
+# --- HUNK 5: Lines 743-783 ---
+   743|                 min=1.0,
+   744|             )
+   745|         if "additionalPorts" in data["serial"] and isinstance(
+   746|             data["serial"]["additionalPorts"], (list, tuple)
+   747|         ):
+   748|             s.set(["serial", "additionalPorts"], data["serial"]["additionalPorts"])
+   749|         if "additionalBaudrates" in data["serial"] and isinstance(
+   750|             data["serial"]["additionalBaudrates"], (list, tuple)
+   751|         ):
+   752|             s.set(
+   753|                 ["serial", "additionalBaudrates"], data["serial"]["additionalBaudrates"]
+   754|             )
+   755|         if "blacklistedPorts" in data["serial"] and isinstance(
+   756|             data["serial"]["blacklistedPorts"], (list, tuple)
+   757|         ):
+   758|             s.set(["serial", "blacklistedPorts"], data["serial"]["blacklistedPorts"])
+   759|         if "blacklistedBaudrates" in data["serial"] and isinstance(
+   760|             data["serial"]["blacklistedBaudrates"], (list, tuple)
+   761|         ):
+   762|             s.set(
+   763|                 ["serial", "blacklistedBaudrates"], data["serial"]["blacklistedBaudrates"]
+   764|             )
+   765|         if "longRunningCommands" in data["serial"] and isinstance(
+   766|             data["serial"]["longRunningCommands"], (list, tuple)
+   767|         ):
+   768|             s.set(
+   769|                 ["serial", "longRunningCommands"], data["serial"]["longRunningCommands"]
+   770|             )
+   771|         if "checksumRequiringCommands" in data["serial"] and isinstance(
+   772|             data["serial"]["checksumRequiringCommands"], (list, tuple)
+   773|         ):
+   774|             s.set(
+   775|                 ["serial", "checksumRequiringCommands"],
+   776|                 data["serial"]["checksumRequiringCommands"],
+   777|             )
+   778|         if "blockedCommands" in data["serial"] and isinstance(
+   779|             data["serial"]["blockedCommands"], (list, tuple)
+   780|         ):
+   781|             s.set(["serial", "blockedCommands"], data["serial"]["blockedCommands"])
+   782|         if "ignoredCommands" in data["serial"] and isinstance(
+   783|             data["serial"]["ignoredCommands"], (list, tuple)
+
+# --- HUNK 6: Lines 830-870 ---
+   830|         if "sendChecksumWithUnknownCommands" in data["serial"]:
+   831|             s.setBoolean(
+   832|                 ["serial", "sendChecksumWithUnknownCommands"],
+   833|                 data["serial"]["sendChecksumWithUnknownCommands"],
+   834|             )
+   835|         if "unknownCommandsNeedAck" in data["serial"]:
+   836|             s.setBoolean(
+   837|                 ["serial", "unknownCommandsNeedAck"],
+   838|                 data["serial"]["unknownCommandsNeedAck"],
+   839|             )
+   840|         if "sdRelativePath" in data["serial"]:
+   841|             s.setBoolean(["serial", "sdRelativePath"], data["serial"]["sdRelativePath"])
+   842|         if "sdAlwaysAvailable" in data["serial"]:
+   843|             s.setBoolean(
+   844|                 ["serial", "sdAlwaysAvailable"], data["serial"]["sdAlwaysAvailable"]
+   845|             )
+   846|         if "sdLowerCase" in data["serial"]:
+   847|             s.setBoolean(["serial", "sdLowerCase"], data["serial"]["sdLowerCase"])
+   848|         if "swallowOkAfterResend" in data["serial"]:
+   849|             s.setBoolean(
+   850|                 ["serial", "swallowOkAfterResend"], data["serial"]["swallowOkAfterResend"]
+   851|             )
+   852|         if "repetierTargetTemp" in data["serial"]:
+   853|             s.setBoolean(
+   854|                 ["serial", "repetierTargetTemp"], data["serial"]["repetierTargetTemp"]
+   855|             )
+   856|         if "externalHeatupDetection" in data["serial"]:
+   857|             s.setBoolean(
+   858|                 ["serial", "externalHeatupDetection"],
+   859|                 data["serial"]["externalHeatupDetection"],
+   860|             )
+   861|         if "ignoreIdenticalResends" in data["serial"]:
+   862|             s.setBoolean(
+   863|                 ["serial", "ignoreIdenticalResends"],
+   864|                 data["serial"]["ignoreIdenticalResends"],
+   865|             )
+   866|         if "firmwareDetection" in data["serial"]:
+   867|             s.setBoolean(
+   868|                 ["serial", "firmwareDetection"], data["serial"]["firmwareDetection"]
+   869|             )
+   870|         if "blockWhileDwelling" in data["serial"]:
+
+# --- HUNK 7: Lines 928-979 ---
+   928|             s.setBoolean(
+   929|                 ["serial", "capabilities", "autoreport_sdstatus"],
+   930|                 data["serial"]["capAutoreportSdStatus"],
+   931|             )
+   932|         if "capAutoreportPos" in data["serial"]:
+   933|             s.setBoolean(
+   934|                 ["serial", "capabilities", "autoreport_pos"],
+   935|                 data["serial"]["capAutoreportPos"],
+   936|             )
+   937|         if "capBusyProtocol" in data["serial"]:
+   938|             s.setBoolean(
+   939|                 ["serial", "capabilities", "busy_protocol"],
+   940|                 data["serial"]["capBusyProtocol"],
+   941|             )
+   942|         if "capEmergencyParser" in data["serial"]:
+   943|             s.setBoolean(
+   944|                 ["serial", "capabilities", "emergency_parser"],
+   945|                 data["serial"]["capEmergencyParser"],
+   946|             )
+   947|         if "capExtendedM20" in data["serial"]:
+   948|             s.setBoolean(
+   949|                 ["serial", "capabilities", "extended_m20"],
+   950|                 data["serial"]["capExtendedM20"],
+   951|             ),
+   952|         if "capLfnWrite" in data["serial"]:
+   953|             s.setBoolean(
+   954|                 ["serial", "capabilities", "lfn_write"],
+   955|                 data["serial"]["capLfnWrite"],
+   956|             )
+   957|         if "resendRatioThreshold" in data["serial"]:
+   958|             s.setInt(
+   959|                 ["serial", "resendRatioThreshold"], data["serial"]["resendRatioThreshold"]
+   960|             )
+   961|         if "resendRatioStart" in data["serial"]:
+   962|             s.setInt(["serial", "resendRatioStart"], data["serial"]["resendRatioStart"])
+   963|         if "ignoreEmptyPorts" in data["serial"]:
+   964|             s.setBoolean(
+   965|                 ["serial", "ignoreEmptyPorts"], data["serial"]["ignoreEmptyPorts"]
+   966|             )
+   967|         if "encoding" in data["serial"]:
+   968|             s.set(["serial", "encoding"], data["serial"]["encoding"])
+   969|         if "enableShutdownActionCommand" in data["serial"]:
+   970|             s.setBoolean(
+   971|                 ["serial", "enableShutdownActionCommand"],
+   972|                 data["serial"]["enableShutdownActionCommand"],
+   973|             )
+   974|         oldLog = s.getBoolean(["serial", "log"])
+   975|         if "log" in data["serial"]:
+   976|             s.setBoolean(["serial", "log"], data["serial"]["log"])
+   977|         if oldLog and not s.getBoolean(["serial", "log"]):
+   978|             logging.getLogger("SERIAL").debug("Disabling serial logging")
+   979|             logging.getLogger("SERIAL").setLevel(logging.CRITICAL)
+
+
+# ====================================================================
+# FILE: src/octoprint/server/util/sockjs.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 131-173 ---
+   131|         self._held_back_current = None
+   132|         self._held_back_mutex = threading.RLock()
+   133|         self._register_hooks = self._pluginManager.get_hooks(
+   134|             "octoprint.server.sockjs.register"
+   135|         )
+   136|         self._authed_hooks = self._pluginManager.get_hooks(
+   137|             "octoprint.server.sockjs.authed"
+   138|         )
+   139|         self._emit_hooks = self._pluginManager.get_hooks("octoprint.server.sockjs.emit")
+   140|         self._registered = False
+   141|         self._authed = False
+   142|         self._initial_data_sent = False
+   143|         self._subscriptions_active = False
+   144|         self._subscriptions = {"state": False, "plugins": [], "events": []}
+   145|         self._keep_alive = RepeatedTimer(
+   146|             60, self._keep_alive_callback, condition=lambda: self._authed
+   147|         )
+   148|     @staticmethod
+   149|     def _get_remote_address(info):
+   150|         from octoprint.util.net import get_http_client_ip
+   151|         trusted_proxies = settings().get(["server", "reverseProxy", "trustedUpstream"])
+   152|         if not isinstance(trusted_proxies, list):
+   153|             trusted_proxies = ["127.0.0.1"]
+   154|         return get_http_client_ip(
+   155|             info.ip, info.headers.get("X-Forwarded-For"), trusted_proxies
+   156|         )
+   157|     def _keep_alive_callback(self):
+   158|         if not self._authed:
+   159|             return
+   160|         if not isinstance(self._user, SessionUser):
+   161|             return
+   162|         self._user.touch()
+   163|     def __str__(self):
+   164|         if self._remoteAddress:
+   165|             return f"{self!r} connected to {self._remoteAddress}"
+   166|         else:
+   167|             return f"Unconnected {self!r}"
+   168|     def on_open(self, info):
+   169|         self._pluginManager.register_message_receiver(self.on_plugin_message)
+   170|         self._remoteAddress = self._get_remote_address(info)
+   171|         self._logger.info("New connection from client: %s" % self._remoteAddress)
+   172|         self._userManager.register_login_status_listener(self)
+   173|         self._groupManager.register_listener(self)
+
+
+# ====================================================================
+# FILE: src/octoprint/static/js/app/viewmodels/access.js
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 14-53 ---
+    14|                             return -1;
+    15|                         if (a["name"].toLocaleLowerCase() > b["name"].toLocaleLowerCase())
+    16|                             return 1;
+    17|                         return 0;
+    18|                     }
+    19|                 },
+    20|                 {},
+    21|                 "name",
+    22|                 [],
+    23|                 [],
+    24|                 CONFIG_USERSPERPAGE
+    25|             );
+    26|             self.emptyUser = {name: "", active: false};
+    27|             self.currentUser = ko.observable(self.emptyUser).extend({notify: "always"});
+    28|             self.isCurrentUser = (user) => {
+    29|                 return user && user.name && user.name == access.loginState.username();
+    30|             };
+    31|             self.isDeleteUserEnabled = (user) => {
+    32|                 return !self.isCurrentUser(user);
+    33|             };
+    34|             self.editor = {
+    35|                 name: ko.observable(undefined),
+    36|                 groups: ko.observableArray([]),
+    37|                 permissions: ko.observableArray([]),
+    38|                 password: ko.observable(undefined),
+    39|                 currentPassword: ko.observable(undefined),
+    40|                 repeatedPassword: ko.observable(undefined),
+    41|                 passwordMismatch: ko.pureComputed(function () {
+    42|                     return self.editor.password() !== self.editor.repeatedPassword();
+    43|                 }),
+    44|                 providedUsername: ko.pureComputed(function () {
+    45|                     return self.editor.name() && self.editor.name().trim();
+    46|                 }),
+    47|                 validUsername: ko.pureComputed(function () {
+    48|                     return (
+    49|                         !self.editor.name() ||
+    50|                         self.editor.name() == self.editor.name().trim()
+    51|                     );
+    52|                 }),
+    53|                 currentPasswordMismatch: ko.observable(false),
+
+# --- HUNK 2: Lines 129-168 ---
+   129|                         _.sprintf(gettext('Edit user "%(name)s"'), {name: newValue.name})
+   130|                     );
+   131|                     self.editor.new(false);
+   132|                     self.editor.confirm = self.confirmEditUser;
+   133|                 }
+   134|                 self.editor.password(undefined);
+   135|                 self.editor.repeatedPassword(undefined);
+   136|                 self.editor.currentPassword(undefined);
+   137|                 self.editor.currentPasswordMismatch(false);
+   138|             });
+   139|             self.editor.currentPassword.subscribe(function () {
+   140|                 self.editor.currentPasswordMismatch(false);
+   141|             });
+   142|             self.requestData = function () {
+   143|                 if (!CONFIG_ACCESS_CONTROL) return;
+   144|                 if (!access.loginState.hasPermissionKo(access.permissions.ADMIN)) return;
+   145|                 return OctoPrint.access.users.list().done(self.fromResponse);
+   146|             };
+   147|             self.fromResponse = function (response) {
+   148|                 self.listHelper.updateItems(response.users);
+   149|             };
+   150|             self.showAddUserDialog = function () {
+   151|                 if (!CONFIG_ACCESS_CONTROL) return;
+   152|                 access.loginState.reauthenticateIfNecessary(() => {
+   153|                     self.currentUser(undefined);
+   154|                     $(
+   155|                         'ul.nav-pills a[data-toggle="tab"]:first',
+   156|                         self.userEditorDialog
+   157|                     ).tab("show");
+   158|                     self.userEditorDialog
+   159|                         .modal({
+   160|                             minHeight: function () {
+   161|                                 return Math.max(
+   162|                                     $.fn.modal.defaults.maxHeight() - 80,
+   163|                                     250
+   164|                                 );
+   165|                             }
+   166|                         })
+   167|                         .css({
+   168|                             "margin-left": function () {
+
+# --- HUNK 3: Lines 292-349 ---
+   292|                                 self.currentPasswordMismatch(true);
+   293|                             }
+   294|                         });
+   295|                 };
+   296|                 if (self.isCurrentUser()) {
+   297|                     proceed();
+   298|                 } else {
+   299|                     access.loginState.reauthenticateIfNecessary(proceed);
+   300|                 }
+   301|             };
+   302|             self.confirmGenerateApikey = function () {
+   303|                 if (!CONFIG_ACCESS_CONTROL) return;
+   304|                 access.loginState.reauthenticateIfNecessary(() => {
+   305|                     self.generateApikey(self.currentUser().name).done(function (
+   306|                         response
+   307|                     ) {
+   308|                         self._updateApikey(response.apikey);
+   309|                     });
+   310|                 });
+   311|             };
+   312|             self.copyApikey = function () {
+   313|                 copyToClipboard(self.editor.apikey());
+   314|             };
+   315|             self._updateApikey = function (apikey) {
+   316|                 self.editor.apikey(apikey);
+   317|                 self.requestData();
+   318|             };
+   319|             self.confirmDeleteApikey = function () {
+   320|                 if (!CONFIG_ACCESS_CONTROL) return;
+   321|                 access.loginState.reauthenticateIfNecessary(() => {
+   322|                     self.deleteApikey(self.currentUser().name).done(function () {
+   323|                         self._updateApikey(undefined);
+   324|                     });
+   325|                 });
+   326|             };
+   327|             self.onStartup = function () {
+   328|                 self.userEditorDialog = $("#settings-usersEditorDialog");
+   329|                 self.changePasswordDialog = $("#settings-usersDialogChangePassword");
+   330|             };
+   331|             self.addUser = function (user) {
+   332|                 if (!user) {
+   333|                     throw OctoPrint.InvalidArgumentError("user must be set");
+   334|                 }
+   335|                 if (!access.loginState.hasPermissionKo(access.permissions.ADMIN)) {
+   336|                     return $.Deferred()
+   337|                         .reject("You are not authorized to perform this action")
+   338|                         .promise();
+   339|                 }
+   340|                 if (!access.loginState.credentialsSeen()) {
+   341|                     return $.Deferred()
+   342|                         .reject("You need to reauthenticate to perform this action")
+   343|                         .promise();
+   344|                 }
+   345|                 return OctoPrint.access.users.add(user).done(self.fromResponse);
+   346|             };
+   347|             self.removeUser = function (user) {
+   348|                 if (!user) {
+   349|                     throw OctoPrint.InvalidArgumentError("user must be set");
+
+# --- HUNK 4: Lines 815-847 ---
+   815|                 }),
+   816|                 function (p) {
+   817|                     return p !== undefined;
+   818|                 }
+   819|             );
+   820|             mappedPermissions.sort(access.permissionComparator);
+   821|             return _.map(mappedPermissions, function (p) {
+   822|                 return p.name;
+   823|             }).join(", ");
+   824|         };
+   825|         access.onStartup = function () {
+   826|             access.groups.onStartup();
+   827|             access.users.onStartup();
+   828|         };
+   829|         access.onServerConnect = function () {
+   830|             access.permissions.initialize();
+   831|         };
+   832|         access.onServerReconnect = function () {
+   833|             access.permissions.initialize();
+   834|         };
+   835|         access.onUserPermissionsChanged =
+   836|             access.onUserLoggedIn =
+   837|             access.onUserLoggedOut =
+   838|                 function (user) {
+   839|                     if (access.loginState.hasPermission(access.permissions.ADMIN)) {
+   840|                         access.groups.requestData().done(function () {
+   841|                             access.users.requestData();
+   842|                         });
+   843|                     }
+   844|                 };
+   845|     }
+   846|     OCTOPRINT_VIEWMODELS.push([AccessViewModel, ["loginStateViewModel"], []]);
+   847| });
+
+
+# ====================================================================
+# FILE: src/octoprint/static/js/app/viewmodels/loginstate.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-39 ---
+     1| $(function () {
+     2|     function LoginStateViewModel(parameters) {
+     3|         var self = this;
+     4|         self.loginUser = ko.observable("");
+     5|         self.loginPass = ko.observable("");
+     6|         self.loginRemember = ko.observable(false);
+     7|         self.reauthenticateDialog = undefined;
+     8|         self.reauthenticatePass = ko.observable("");
+     9|         self.reauthenticateFailed = ko.observable(false);
+    10|         self.loggedIn = ko.observable(undefined);
+    11|         self.username = ko.observable(undefined);
+    12|         self.userneeds = ko.observable(undefined);
+    13|         self.isAdmin = ko.observable(false);
+    14|         self.isUser = ko.observable(false);
+    15|         self.allViewModels = undefined;
+    16|         self.startupDeferred = $.Deferred();
+    17|         self.currentUser = ko.observable(undefined);
+    18|         self.currentLoginMechanism = ko.observable(undefined);
+    19|         self.credentialsSeen = ko.observable(undefined);
+    20|         self.elementUsernameInput = undefined;
+    21|         self.elementPasswordInput = undefined;
+    22|         self.elementLoginButton = undefined;
+    23|         self.externalAddressNotification = undefined;
+    24|         self.userMenuText = ko.pureComputed(function () {
+    25|             if (self.loggedIn()) {
+    26|                 return self.username();
+    27|             } else {
+    28|                 return gettext("Login");
+    29|             }
+    30|         });
+    31|         self.userMenuTitle = ko.pureComputed(function () {
+    32|             if (self.loggedIn()) {
+    33|                 return _.sprintf(gettext("Logged in as %(name)s"), {
+    34|                     name: _.escape(self.username())
+    35|                 });
+    36|             } else {
+    37|                 return gettext("Login");
+    38|             }
+    39|         });
+
+
+# ====================================================================
+# FILE: src/octoprint/static/js/app/viewmodels/settings.js
+# Total hunks: 5
+# ====================================================================
+# --- HUNK 1: Lines 92-131 ---
+    92|                     return color;
+    93|             }
+    94|         };
+    95|         self.webcam_available_videocodecs = ["libx264", "mpeg2video"];
+    96|         var auto_locale = {
+    97|             language: "_default",
+    98|             display: gettext("Autodetect from browser"),
+    99|             english: undefined
+   100|         };
+   101|         self.locales = ko.observableArray(
+   102|             [auto_locale].concat(
+   103|                 _.sortBy(_.values(AVAILABLE_LOCALES), function (n) {
+   104|                     return n.display;
+   105|                 })
+   106|             )
+   107|         );
+   108|         self.locale_languages = _.keys(AVAILABLE_LOCALES);
+   109|         self.api_key = ko.observable(undefined);
+   110|         self.api_allowCrossOrigin = ko.observable(undefined);
+   111|         self.apiKeyVisible = ko.observable(false);
+   112|         self.appearance_name = ko.observable(undefined);
+   113|         self.appearance_color = ko.observable(undefined);
+   114|         self.appearance_colorTransparent = ko.observable();
+   115|         self.appearance_colorIcon = ko.observable();
+   116|         self.appearance_defaultLanguage = ko.observable();
+   117|         self.appearance_showFahrenheitAlso = ko.observable(undefined);
+   118|         self.appearance_fuzzyTimes = ko.observable(undefined);
+   119|         self.appearance_closeModalsWithClick = ko.observable(undefined);
+   120|         self.appearance_showInternalFilename = ko.observable(undefined);
+   121|         self.printer_defaultExtrusionLength = ko.observable(undefined);
+   122|         self.webcam_webcamEnabled = ko.observable(undefined);
+   123|         self.webcam_timelapseEnabled = ko.observable(undefined);
+   124|         self.webcam_snapshotTimeout = ko.observable(undefined);
+   125|         self.webcam_snapshotSslValidation = ko.observable(undefined);
+   126|         self.webcam_ffmpegPath = ko.observable(undefined);
+   127|         self.webcam_ffmpegCommandline = ko.observable(undefined);
+   128|         self.webcam_bitrate = ko.observable(undefined);
+   129|         self.webcam_ffmpegThreads = ko.observable(undefined);
+   130|         self.webcam_ffmpegVideoCodec = ko.observable(undefined);
+   131|         self.webcam_watermark = ko.observable(undefined);
+
+# --- HUNK 2: Lines 595-666 ---
+   595|         };
+   596|         self.show = function (tab) {
+   597|             self.selectTab(tab);
+   598|             self._resetScrollPosition();
+   599|             self.settingsDialog
+   600|                 .modal({
+   601|                     minHeight: function () {
+   602|                         return Math.max($.fn.modal.defaults.maxHeight() - 80, 250);
+   603|                     }
+   604|                 })
+   605|                 .css({
+   606|                     "margin-left": function () {
+   607|                         return -($(this).width() / 2);
+   608|                     }
+   609|                 });
+   610|             return false;
+   611|         };
+   612|         self.hide = function () {
+   613|             self.settingsDialog.modal("hide");
+   614|         };
+   615|         self.generateApiKey = function () {
+   616|             if (!CONFIG_ACCESS_CONTROL) return;
+   617|             showConfirmationDialog(
+   618|                 gettext(
+   619|                     "This will generate a new API Key. The old API Key will cease to function immediately."
+   620|                 ),
+   621|                 function () {
+   622|                     OctoPrint.settings.generateApiKey().done(function (response) {
+   623|                         self.api_key(response.apikey);
+   624|                         self.requestData();
+   625|                     });
+   626|                 }
+   627|             );
+   628|         };
+   629|         self.deleteApiKey = () => {
+   630|             if (!CONFIG_ACCESS_CONTROL) return;
+   631|             if (!self.api_key()) return;
+   632|             showConfirmationDialog(
+   633|                 gettext(
+   634|                     "This will delete the API Key. It will cease to to function immediately."
+   635|                 ),
+   636|                 function () {
+   637|                     OctoPrint.settings.deleteApiKey().done(() => {
+   638|                         self.api_key(undefined);
+   639|                     });
+   640|                 }
+   641|             );
+   642|         };
+   643|         self.copyApiKey = function () {
+   644|             copyToClipboard(self.api_key());
+   645|         };
+   646|         self.revealingApiKey = ko.observable(false);
+   647|         self.revealApiKey = () => {
+   648|             self.loginState.reauthenticateIfNecessary(() => {
+   649|                 self.revealingApiKey(true);
+   650|                 self.requestData().always(() => {
+   651|                     self.revealingApiKey(false);
+   652|                 });
+   653|             });
+   654|         };
+   655|         self.showTranslationManager = function () {
+   656|             self.translationManagerDialog.modal();
+   657|             return false;
+   658|         };
+   659|         self.requestData = function (local) {
+   660|             var callback = undefined;
+   661|             if (arguments.length === 2 || _.isFunction(local)) {
+   662|                 var exc = new Error();
+   663|                 log.warn(
+   664|                     "The callback parameter of SettingsViewModel.requestData is deprecated, the method now returns a promise, please use that instead. Stacktrace:",
+   665|                     exc.stack || exc.stacktrace || "<n/a>"
+   666|                 );
+
+# --- HUNK 3: Lines 936-976 ---
+   936|                         var subresult = mapFromObservables(
+   937|                             value,
+   938|                             mapping && mapping[key] ? mapping[key] : undefined,
+   939|                             observable
+   940|                         );
+   941|                         if (subresult !== undefined) {
+   942|                             result[key] = subresult;
+   943|                             flag = true;
+   944|                         }
+   945|                     } else if (self.hasOwnProperty(observable)) {
+   946|                         result[key] = self[observable]();
+   947|                         flag = true;
+   948|                     }
+   949|                 });
+   950|                 return flag ? result : undefined;
+   951|             };
+   952|             var dataFromObservables = mapFromObservables(data, specialMappings);
+   953|             data = deepMerge(data, dataFromObservables);
+   954|             return data;
+   955|         };
+   956|         self.reauthenticationTimeout = undefined;
+   957|         self.fromResponse = function (response, local) {
+   958|             var serverChangedData;
+   959|             var clientChangedData;
+   960|             if (local) {
+   961|                 serverChangedData = getOnlyChangedData(
+   962|                     response,
+   963|                     self.lastReceivedSettings
+   964|                 );
+   965|                 clientChangedData = getOnlyChangedData(
+   966|                     self.getLocalData(),
+   967|                     self.lastReceivedSettings
+   968|                 );
+   969|             } else {
+   970|                 serverChangedData = response;
+   971|                 clientChangedData = undefined;
+   972|             }
+   973|             self.lastReceivedSettings = response;
+   974|             if (self.settings === undefined) {
+   975|                 self.settings = ko.mapping.fromJS(serverChangedData);
+   976|             } else {
+
+# --- HUNK 4: Lines 1095-1141 ---
+  1095|                         mapping &&
+  1096|                         mapping[key] &&
+  1097|                         _.isFunction(mapping[key]) &&
+  1098|                         !haveLocalVersion
+  1099|                     ) {
+  1100|                         mapping[key](value);
+  1101|                     } else if (_.isPlainObject(value)) {
+  1102|                         mapToObservables(
+  1103|                             value,
+  1104|                             mapping && mapping[key] ? mapping[key] : undefined,
+  1105|                             local && local[key] ? local[key] : undefined,
+  1106|                             observable
+  1107|                         );
+  1108|                     } else if (!haveLocalVersion && self.hasOwnProperty(observable)) {
+  1109|                         self[observable](value);
+  1110|                     }
+  1111|                 });
+  1112|             };
+  1113|             mapToObservables(serverChangedData, specialMappings, clientChangedData);
+  1114|             firstRequest.resolve();
+  1115|             self.apiKeyVisible(self.loginState.checkCredentialsSeen());
+  1116|             if (self.apiKeyVisible()) {
+  1117|                 self.reauthenticationTimeout =
+  1118|                     self.loginState.afterReauthenticationTimeout(() => {
+  1119|                         self.requestData();
+  1120|                     }, self.reauthenticationTimeout);
+  1121|             }
+  1122|             if (
+  1123|                 self.settings.accessControl &&
+  1124|                 self.settings.accessControl.autologinLocal() &&
+  1125|                 !self.settings.accessControl.autologinHeadsupAcknowledged()
+  1126|             ) {
+  1127|                 const text = gettext(
+  1128|                     "<p>You have Autologin enabled. This means that you will be automatically logged in when accessing OctoPrint from a local IP.</p>" +
+  1129|                         "<p>By default, OctoPrint is configured in such a way this should not pose a security risk. However, <strong>if you yourself have " +
+  1130|                         "any additional reverse proxies configured</strong> in front of OctoPrint, make sure those are configured correctly.</p>" +
+  1131|                         "<p><a href='%(url)s' target='_blank' rel='noopener noreferer'>Read more in the FAQ</a>.</p>"
+  1132|                 );
+  1133|                 new PNotify.singleButtonNotify({
+  1134|                     title: gettext("Autologin Heads-up"),
+  1135|                     text: _.sprintf(text, {
+  1136|                         url: "https://faq.octoprint.org/reverse-proxy"
+  1137|                     }),
+  1138|                     hide: false,
+  1139|                     confirm: {
+  1140|                         confirm: true,
+  1141|                         buttons: [
+
+# --- HUNK 5: Lines 1266-1305 ---
+  1266|                 if (!_.startsWith(tab, "#")) {
+  1267|                     tab = "#" + tab;
+  1268|                 }
+  1269|                 $('ul.nav-list a[href="' + tab + '"]', self.settingsDialog).tab("show");
+  1270|             } else {
+  1271|                 $('ul.nav-list a[data-toggle="tab"]:first', self.settingsDialog).tab(
+  1272|                     "show"
+  1273|                 );
+  1274|             }
+  1275|         };
+  1276|         self.onServerReconnect = function () {
+  1277|             self.requestData();
+  1278|         };
+  1279|         self.onUserPermissionsChanged =
+  1280|             self.onUserLoggedIn =
+  1281|             self.onUserLoggedOut =
+  1282|                 function () {
+  1283|                     if (!self._startupComplete) return;
+  1284|                     self.requestData();
+  1285|                 };
+  1286|         self.validURL = function (str) {
+  1287|             var pattern = new RegExp(
+  1288|                 "^(https?:\\/\\/)?" + // protocol
+  1289|                     "((([a-z\\d]([a-z\\d-]*[a-z\\d])*)\\.)+[a-z]{2,}|" + // domain name
+  1290|                     "((\\d{1,3}\\.){3}\\d{1,3}))" + // OR ip (v4) address
+  1291|                     "(\\:\\d+)?(\\/[-a-z\\d%_.~+]*)*" + // port and path
+  1292|                     "(\\?[;&a-z\\d%_.~+=-]*)?" + // query string
+  1293|                     "(\\#[-a-z\\d_]*)?$",
+  1294|                 "i"
+  1295|             ); // fragment locator
+  1296|             return !!pattern.test(str);
+  1297|         };
+  1298|     }
+  1299|     OCTOPRINT_VIEWMODELS.push({
+  1300|         construct: SettingsViewModel,
+  1301|         dependencies: [
+  1302|             "loginStateViewModel",
+  1303|             "accessViewModel",
+  1304|             "printerProfilesViewModel",
+  1305|             "aboutViewModel",
+
+
+# ====================================================================
+# FILE: src/octoprint/static/js/app/viewmodels/usersettings.js
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 7-169 ---
+     7|         self.userSettingsDialog = undefined;
+     8|         var auto_locale = {
+     9|             language: "_default",
+    10|             display: gettext("Site default"),
+    11|             english: undefined
+    12|         };
+    13|         self.locales = ko.observableArray(
+    14|             [auto_locale].concat(
+    15|                 _.sortBy(_.values(AVAILABLE_LOCALES), function (n) {
+    16|                     return n.display;
+    17|                 })
+    18|             )
+    19|         );
+    20|         self.locale_languages = _.keys(AVAILABLE_LOCALES);
+    21|         self.access_password = ko.observable(undefined);
+    22|         self.access_repeatedPassword = ko.observable(undefined);
+    23|         self.access_currentPassword = ko.observable(undefined);
+    24|         self.access_currentPasswordMismatch = ko.observable(false);
+    25|         self.access_apikey = ko.observable(undefined);
+    26|         self.interface_language = ko.observable(undefined);
+    27|         self.currentUser = ko.observable(undefined);
+    28|         self.currentUser.subscribe(function (newUser) {
+    29|             self.access_password(undefined);
+    30|             self.access_repeatedPassword(undefined);
+    31|             self.access_currentPassword(undefined);
+    32|             self.access_currentPasswordMismatch(false);
+    33|             self.access_apikey(undefined);
+    34|             self.interface_language("_default");
+    35|             if (newUser !== undefined) {
+    36|                 self.access_apikey(newUser.apikey);
+    37|                 if (
+    38|                     newUser.settings.hasOwnProperty("interface") &&
+    39|                     newUser.settings.interface.hasOwnProperty("language")
+    40|                 ) {
+    41|                     self.interface_language(newUser.settings.interface.language);
+    42|                 }
+    43|             }
+    44|         });
+    45|         self.access_currentPassword.subscribe(function () {
+    46|             self.access_currentPasswordMismatch(false);
+    47|         });
+    48|         self.passwordMismatch = ko.pureComputed(function () {
+    49|             return self.access_password() !== self.access_repeatedPassword();
+    50|         });
+    51|         self.show = function (user) {
+    52|             if (!CONFIG_ACCESS_CONTROL) return;
+    53|             if (user === undefined) {
+    54|                 user = self.loginState.currentUser();
+    55|             }
+    56|             var process = function (user) {
+    57|                 self.currentUser(user);
+    58|                 self.userSettingsDialog.modal("show");
+    59|             };
+    60|             OctoPrint.access.users
+    61|                 .get(user.name)
+    62|                 .done(function (data) {
+    63|                     process(data);
+    64|                 })
+    65|                 .fail(function () {
+    66|                     log.warn(
+    67|                         "Could not fetch current user data, proceeding with client side data copy"
+    68|                     );
+    69|                     process(user);
+    70|                 });
+    71|         };
+    72|         self.save = function () {
+    73|             if (!CONFIG_ACCESS_CONTROL) return;
+    74|             self.userSettingsDialog.trigger("beforeSave");
+    75|             function saveSettings() {
+    76|                 var settings = {
+    77|                     interface: {
+    78|                         language: self.interface_language()
+    79|                     }
+    80|                 };
+    81|                 self.updateSettings(self.currentUser().name, settings).done(function () {
+    82|                     self.currentUser(undefined);
+    83|                     self.userSettingsDialog.modal("hide");
+    84|                     self.loginState.reloadUser();
+    85|                 });
+    86|             }
+    87|             if (self.access_password() && !self.passwordMismatch()) {
+    88|                 self.users
+    89|                     .updatePassword(
+    90|                         self.currentUser().name,
+    91|                         self.access_password(),
+    92|                         self.access_currentPassword()
+    93|                     )
+    94|                     .done(function () {
+    95|                         saveSettings();
+    96|                     })
+    97|                     .fail(function (xhr) {
+    98|                         if (xhr.status === 403) {
+    99|                             self.access_currentPasswordMismatch(true);
+   100|                         }
+   101|                     });
+   102|             } else {
+   103|                 saveSettings();
+   104|             }
+   105|         };
+   106|         self.copyApikey = function () {
+   107|             copyToClipboard(self.access_apikey());
+   108|         };
+   109|         self.generateApikey = function () {
+   110|             if (!CONFIG_ACCESS_CONTROL) return;
+   111|             var generate = function () {
+   112|                 self.users
+   113|                     .generateApikey(self.currentUser().name)
+   114|                     .done(function (response) {
+   115|                         self.access_apikey(response.apikey);
+   116|                     });
+   117|             };
+   118|             if (self.access_apikey()) {
+   119|                 showConfirmationDialog(
+   120|                     gettext(
+   121|                         "This will generate a new API Key. The old API Key will cease to function immediately."
+   122|                     ),
+   123|                     generate
+   124|                 );
+   125|             } else {
+   126|                 generate();
+   127|             }
+   128|         };
+   129|         self.deleteApikey = function () {
+   130|             if (!CONFIG_ACCESS_CONTROL) return;
+   131|             if (!self.access_apikey()) return;
+   132|             showConfirmationDialog(
+   133|                 gettext(
+   134|                     "This will delete the API Key. It will cease to to function immediately."
+   135|                 ),
+   136|                 function () {
+   137|                     self.users.deleteApikey(self.currentUser().name).done(function () {
+   138|                         self.access_apikey(undefined);
+   139|                     });
+   140|                 }
+   141|             );
+   142|         };
+   143|         self.updateSettings = function (username, settings) {
+   144|             return OctoPrint.access.users.saveSettings(username, settings);
+   145|         };
+   146|         self.saveEnabled = function () {
+   147|             return !self.passwordMismatch();
+   148|         };
+   149|         self.onStartup = function () {
+   150|             self.userSettingsDialog = $("#usersettings_dialog");
+   151|         };
+   152|         self.onAllBound = function (allViewModels) {
+   153|             self.userSettingsDialog.on("show", function () {
+   154|                 callViewModels(allViewModels, "onUserSettingsShown");
+   155|             });
+   156|             self.userSettingsDialog.on("hidden", function () {
+   157|                 callViewModels(allViewModels, "onUserSettingsHidden");
+   158|             });
+   159|             self.userSettingsDialog.on("beforeSave", function () {
+   160|                 callViewModels(allViewModels, "onUserSettingsBeforeSave");
+   161|             });
+   162|         };
+   163|     }
+   164|     OCTOPRINT_VIEWMODELS.push({
+   165|         construct: UserSettingsViewModel,
+   166|         dependencies: ["loginStateViewModel", "accessViewModel"],
+   167|         elements: ["#usersettings_dialog"]
+   168|     });
+   169| });
+
+
+# ====================================================================
+# FILE: src/octoprint/util/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1268-1309 ---
+  1268|             if incl_func_args and logger.isEnabledFor(logging.DEBUG):
+  1269|                 data.update(
+  1270|                     func_args=",".join(map(repr, args)),
+  1271|                     func_kwargs=",".join(
+  1272|                         map(lambda x: f"{x[0]}={x[1]!r}", kwargs.items())
+  1273|                     ),
+  1274|                 )
+  1275|             if log_enter:
+  1276|                 logger.debug(message_enter.format(**data), extra=data)
+  1277|             start = time.time()
+  1278|             try:
+  1279|                 return f(*args, **kwargs)
+  1280|             finally:
+  1281|                 timing = (time.time() - start) * 1000
+  1282|                 if logger.isEnabledFor(logging.DEBUG):
+  1283|                     data.update(timing=timing)
+  1284|                     logger.debug(message.format(**data), extra=data)
+  1285|         return wrapper
+  1286|     return decorator
+  1287| def generate_api_key():
+  1288|     import uuid
+  1289|     return "".join("%02X" % z for z in bytes(uuid.uuid4().bytes))
+  1290| def map_boolean(value, true_text, false_text):
+  1291|     return true_text if value else false_text
+  1292| def serialize(filename, data, encoding="utf-8", compressed=True):
+  1293|     """
+  1294|     Serializes data to a file
+  1295|     In the current implementation this uses json.dumps.
+  1296|     If `compressed` is True (the default), the serialized data put through zlib.compress.
+  1297|     Supported data types are listed at the bottom of
+  1298|     :func:`octoprint.util.comprehensive_json`, and include some data types that are not
+  1299|     supported by json.dumps by default.
+  1300|     This is not thread-safe, if concurrent access is required, the caller needs to ensure
+  1301|     that only one thread is writing to the file at any given time.
+  1302|     Arguments:
+  1303|         filename (str): The file to write to
+  1304|         data (object): The data to serialize
+  1305|         encoding (str): The encoding to use for the file
+  1306|         compressed (bool): Whether to compress the data before writing it to the file
+  1307|     """
+  1308|     from octoprint.util import json
+  1309|     serialized = json.serializing.dumps(data).encode(encoding)
+

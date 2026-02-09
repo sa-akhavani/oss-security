@@ -1,0 +1,240 @@
+# ====================================================================
+# FILE: src/index.ts
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-26 ---
+     1| import {
+     2|   execFile,
+     3|   execFileSync,
+     4|   ExecFileSyncOptions,
+     5|   ExecException,
+     6| } from "child_process";
+     7| import { existsSync } from "fs";
+     8| import createDebugger from "debug";
+     9| const debug = createDebugger("gitlog");
+    10| const delimiter = "\t";
+    11| const fieldMap = {
+    12|   hash: "%H",
+    13|   abbrevHash: "%h",
+    14|   treeHash: "%T",
+    15|   abbrevTreeHash: "%t",
+    16|   parentHashes: "%P",
+    17|   abbrevParentHashes: "%P",
+    18|   authorName: "%an",
+    19|   authorEmail: "%ae",
+    20|   authorDate: "%ai",
+    21|   authorDateRel: "%ar",
+    22|   committerName: "%cn",
+    23|   committerEmail: "%ce",
+    24|   committerDate: "%cd",
+    25|   committerDateRel: "%cr",
+    26|   subject: "%s",
+
+# --- HUNK 2: Lines 94-160 ---
+    94|    * the whole history leading to the current commit).
+    95|    */
+    96|   branch?: string;
+    97|   /** Range of lines for a given file to find the commits for */
+    98|   fileLineRange?: FileLineRange;
+    99|   /** File filter for the git log command */
+   100|   file?: string;
+   101|   /** Limit the commits output to ones with author header lines that match the specified pattern. */
+   102|   author?: string;
+   103|   /** Limit the commits output to ones with committer header lines that match the specified pattern. */
+   104|   committer?: string;
+   105|   /** Show commits more recent than a specific date. */
+   106|   since?: string;
+   107|   /** Show commits more recent than a specific date. */
+   108|   after?: string;
+   109|   /** Show commits older than a specific date */
+   110|   until?: string;
+   111|   /** Show commits older than a specific date */
+   112|   before?: string;
+   113|   /** Specify some options to be passed to the .exec() method */
+   114|   execOptions?: ExecFileSyncOptions;
+   115| }
+   116| const defaultOptions = {
+   117|   number: 10,
+   118|   fields: defaultFields,
+   119|   nameStatus: true,
+   120|   includeMergeCommitFiles: false,
+   121|   findCopiesHarder: false,
+   122|   all: false,
+   123| };
+   124| /** Add optional parameter to command */
+   125| function addOptionalArguments<Field extends string = DefaultField>(
+   126|   command: string[],
+   127|   options: GitlogOptions<Field>
+   128| ) {
+   129|   let commandWithOptions = command;
+   130|   const cmdOptional = [
+   131|     "author",
+   132|     "since",
+   133|     "after",
+   134|     "until",
+   135|     "before",
+   136|     "committer",
+   137|   ] as const;
+   138|   for (let i = cmdOptional.length; i--; ) {
+   139|     if (options[cmdOptional[i]]) {
+   140|       commandWithOptions.push(`--${cmdOptional[i]}=${options[cmdOptional[i]]}`);
+   141|     }
+   142|   }
+   143|   return commandWithOptions;
+   144| }
+   145| /** Parse the output of "git log" for commit information */
+   146| const parseCommits = <T extends string>(
+   147|   commits: string[],
+   148|   fields: readonly T[],
+   149|   nameStatus: boolean
+   150| ) => {
+   151|   type Commit = Record<T | NotOptField, any>;
+   152|   return commits.map((rawCommit) => {
+   153|     const parts = rawCommit.split("@end@");
+   154|     const commit = parts[0].split(delimiter);
+   155|     if (parts[1]) {
+   156|       const parseNameStatus = parts[1].trimLeft().split("\n");
+   157|       if (parseNameStatus[parseNameStatus.length - 1] === "") {
+   158|         parseNameStatus.pop();
+   159|       }
+   160|       const nameAndStatusDelimited = parseNameStatus.map((d) =>
+
+# --- HUNK 3: Lines 184-263 ---
+   184|         parsed[fields[index]] = commitField;
+   185|       } else if (nameStatus) {
+   186|         const pos = (index - fields.length) % notOptFields.length;
+   187|         debug(
+   188|           "nameStatus",
+   189|           index - fields.length,
+   190|           notOptFields.length,
+   191|           pos,
+   192|           commitField
+   193|         );
+   194|         const arr = parsed[notOptFields[pos]];
+   195|         if (Array.isArray(arr)) {
+   196|           arr.push(commitField);
+   197|         }
+   198|       }
+   199|     });
+   200|     return parsed as Commit;
+   201|   });
+   202| };
+   203| /** Run "git log" and return the result as JSON */
+   204| function createCommandArguments<
+   205|   T extends CommitField | DefaultField = DefaultField
+   206| >(options: GitlogOptions<T>) {
+   207|   let command: string[] = ["log", "-l0"];
+   208|   if (options.findCopiesHarder) {
+   209|     command.push("--find-copies-harder");
+   210|   }
+   211|   if (options.all) {
+   212|     command.push("--all");
+   213|   }
+   214|   if (options.includeMergeCommitFiles) {
+   215|     command.push("-m");
+   216|   }
+   217|   command.push(`-n ${options.number}`);
+   218|   command = addOptionalArguments(command, options);
+   219|   let prettyArgument: string = "--pretty=@begin@";
+   220|   if (options.fields) {
+   221|     options.fields.forEach((field) => {
+   222|       if (!fieldMap[field] && !notOptFields.includes(field as any)) {
+   223|         throw new Error(`Unknown field: ${field}`);
+   224|       }
+   225|       prettyArgument += delimiter + fieldMap[field];
+   226|     });
+   227|   }
+   228|   prettyArgument += "@end@";
+   229|   command.push(prettyArgument);
+   230|   if (options.branch) {
+   231|     command.push(options.branch);
+   232|   }
+   233|   if (options.nameStatus && !options.fileLineRange) {
+   234|     command.push("--name-status");
+   235|   }
+   236|   if (options.fileLineRange) {
+   237|     command.push(
+   238|       `-L ${options.fileLineRange.startLine},${options.fileLineRange.endLine}:${options.fileLineRange.file}`
+   239|     );
+   240|   }
+   241|   if (options.file) {
+   242|     command.push("--");
+   243|     command.push(options.file);
+   244|   }
+   245|   debug("command", options.execOptions, command);
+   246|   return command;
+   247| }
+   248| type GitlogError = ExecException | string | null;
+   249| type CommitBase<Field extends string> = Record<Field, string>;
+   250| type CommitBaseWithFiles<Field extends string> = Record<
+   251|   Field | "status",
+   252|   string
+   253| > & { files: string[] };
+   254| function gitlog<Field extends CommitField = DefaultField>(
+   255|   userOptions: GitlogOptions<Field> & { nameStatus: false },
+   256|   cb: (err: GitlogError, commits: CommitBase<Field>[]) => void
+   257| ): void;
+   258| function gitlog<Field extends CommitField = DefaultField>(
+   259|   userOptions: GitlogOptions<Field>,
+   260|   cb: (err: GitlogError, commits: CommitBaseWithFiles<Field>[]) => void
+   261| ): void;
+   262| function gitlog<Field extends CommitField = DefaultField>(
+   263|   userOptions: GitlogOptions<Field> & { nameStatus: false }
+
+# --- HUNK 4: Lines 265-319 ---
+   265| function gitlog<Field extends CommitField = DefaultField>(
+   266|   userOptions: GitlogOptions<Field>
+   267| ): CommitBaseWithFiles<Field>[];
+   268| function gitlog<Field extends CommitField = DefaultField>(
+   269|   userOptions: GitlogOptions<Field>,
+   270|   cb?:
+   271|     | ((err: GitlogError, commits: CommitBase<Field>[]) => void)
+   272|     | ((err: GitlogError, commits: CommitBaseWithFiles<Field>[]) => void)
+   273| ): CommitBase<Field>[] | CommitBaseWithFiles<Field>[] | void {
+   274|   if (!userOptions.repo) {
+   275|     throw new Error("Repo required!");
+   276|   }
+   277|   if (!existsSync(userOptions.repo)) {
+   278|     throw new Error("Repo location does not exist");
+   279|   }
+   280|   const options = {
+   281|     ...(defaultOptions as any),
+   282|     ...userOptions,
+   283|   };
+   284|   const execOptions = { cwd: userOptions.repo, ...userOptions.execOptions };
+   285|   const commandArguments = createCommandArguments(options);
+   286|   if (!cb) {
+   287|     const stdout = execFileSync(
+   288|       "git",
+   289|       commandArguments,
+   290|       execOptions
+   291|     ).toString();
+   292|     const commits = stdout.split("@begin@");
+   293|     if (commits[0] === "") {
+   294|       commits.shift();
+   295|     }
+   296|     debug("commits", commits);
+   297|     return parseCommits(commits, options.fields, options.nameStatus);
+   298|   }
+   299|   execFile("git", commandArguments, execOptions, (err, stdout, stderr) => {
+   300|     debug("stdout", stdout);
+   301|     const commits = stdout.split("@begin@");
+   302|     if (commits[0] === "") {
+   303|       commits.shift();
+   304|     }
+   305|     debug("commits", commits);
+   306|     cb(
+   307|       stderr || err,
+   308|       parseCommits(commits, options.fields, options.nameStatus)
+   309|     );
+   310|   });
+   311| }
+   312| export function gitlogPromise<Field extends CommitField = DefaultField>(
+   313|   options: GitlogOptions<Field> & { nameStatus: false }
+   314| ): Promise<CommitBase<Field>[]>;
+   315| export function gitlogPromise<Field extends CommitField = DefaultField>(
+   316|   options: GitlogOptions<Field>
+   317| ): Promise<CommitBaseWithFiles<Field>[]>;
+   318| export function gitlogPromise<Field extends CommitField = DefaultField>(
+   319|   options: GitlogOptions<Field>
+

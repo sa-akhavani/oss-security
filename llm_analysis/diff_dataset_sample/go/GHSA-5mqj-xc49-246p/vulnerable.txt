@@ -1,0 +1,121 @@
+# ====================================================================
+# FILE: identity_provider.go
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-24 ---
+     1| package saml
+     2| import (
+     3| 	"bytes"
+     4| 	"compress/flate"
+     5| 	"crypto"
+     6| 	"crypto/tls"
+     7| 	"crypto/x509"
+     8| 	"encoding/base64"
+     9| 	"encoding/xml"
+    10| 	"fmt"
+    11| 	"io"
+    12| 	"io/ioutil"
+    13| 	"net/http"
+    14| 	"net/url"
+    15| 	"os"
+    16| 	"regexp"
+    17| 	"strconv"
+    18| 	"text/template"
+    19| 	"time"
+    20| 	"github.com/beevik/etree"
+    21| 	xrv "github.com/mattermost/xml-roundtrip-validator"
+    22| 	dsig "github.com/russellhaering/goxmldsig"
+    23| 	"github.com/crewjam/saml/logger"
+    24| 	"github.com/crewjam/saml/xmlenc"
+
+# --- HUNK 2: Lines 240-280 ---
+   240| 	ServiceProviderMetadata *EntityDescriptor
+   241| 	SPSSODescriptor         *SPSSODescriptor
+   242| 	ACSEndpoint             *IndexedEndpoint
+   243| 	Assertion               *Assertion
+   244| 	AssertionEl             *etree.Element
+   245| 	ResponseEl              *etree.Element
+   246| 	Now                     time.Time
+   247| }
+   248| func NewIdpAuthnRequest(idp *IdentityProvider, r *http.Request) (*IdpAuthnRequest, error) {
+   249| 	req := &IdpAuthnRequest{
+   250| 		IDP:         idp,
+   251| 		HTTPRequest: r,
+   252| 		Now:         TimeNow(),
+   253| 	}
+   254| 	switch r.Method {
+   255| 	case "GET":
+   256| 		compressedRequest, err := base64.StdEncoding.DecodeString(r.URL.Query().Get("SAMLRequest"))
+   257| 		if err != nil {
+   258| 			return nil, fmt.Errorf("cannot decode request: %s", err)
+   259| 		}
+   260| 		req.RequestBuffer, err = ioutil.ReadAll(flate.NewReader(bytes.NewReader(compressedRequest)))
+   261| 		if err != nil {
+   262| 			return nil, fmt.Errorf("cannot decompress request: %s", err)
+   263| 		}
+   264| 		req.RelayState = r.URL.Query().Get("RelayState")
+   265| 	case "POST":
+   266| 		if err := r.ParseForm(); err != nil {
+   267| 			return nil, err
+   268| 		}
+   269| 		var err error
+   270| 		req.RequestBuffer, err = base64.StdEncoding.DecodeString(r.PostForm.Get("SAMLRequest"))
+   271| 		if err != nil {
+   272| 			return nil, err
+   273| 		}
+   274| 		req.RelayState = r.PostForm.Get("RelayState")
+   275| 	default:
+   276| 		return nil, fmt.Errorf("method not allowed")
+   277| 	}
+   278| 	return req, nil
+   279| }
+   280| func (req *IdpAuthnRequest) Validate() error {
+
+
+# ====================================================================
+# FILE: service_provider.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1108-1148 ---
+  1108| 	var resp LogoutResponse
+  1109| 	if err := unmarshalElement(doc.Root(), &resp); err != nil {
+  1110| 		retErr.PrivateErr = err
+  1111| 		return retErr
+  1112| 	}
+  1113| 	if err := sp.validateLogoutResponse(&resp); err != nil {
+  1114| 		return err
+  1115| 	}
+  1116| 	return nil
+  1117| }
+  1118| func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData string) error {
+  1119| 	retErr := &InvalidResponseError{
+  1120| 		Now: TimeNow(),
+  1121| 	}
+  1122| 	rawResponseBuf, err := base64.StdEncoding.DecodeString(queryParameterData)
+  1123| 	if err != nil {
+  1124| 		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
+  1125| 		return retErr
+  1126| 	}
+  1127| 	retErr.Response = string(rawResponseBuf)
+  1128| 	gr, err := ioutil.ReadAll(flate.NewReader(bytes.NewBuffer(rawResponseBuf)))
+  1129| 	if err != nil {
+  1130| 		retErr.PrivateErr = err
+  1131| 		return retErr
+  1132| 	}
+  1133| 	if err := xrv.Validate(bytes.NewReader(gr)); err != nil {
+  1134| 		return err
+  1135| 	}
+  1136| 	doc := etree.NewDocument()
+  1137| 	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+  1138| 		retErr.PrivateErr = err
+  1139| 		return retErr
+  1140| 	}
+  1141| 	if err := sp.validateSignature(doc.Root()); err != nil {
+  1142| 		retErr.PrivateErr = err
+  1143| 		return retErr
+  1144| 	}
+  1145| 	var resp LogoutResponse
+  1146| 	if err := unmarshalElement(doc.Root(), &resp); err != nil {
+  1147| 		retErr.PrivateErr = err
+  1148| 		return retErr
+

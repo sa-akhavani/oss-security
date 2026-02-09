@@ -1,0 +1,286 @@
+# ====================================================================
+# FILE: build/controllers/DevController.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-280 ---
+     1| <?php
+     2| /**
+     3|  * @link http://www.yiiframework.com/
+     4|  * @copyright Copyright (c) 2008 Yii Software LLC
+     5|  * @license http://www.yiiframework.com/license/
+     6|  */
+     7| namespace yii\build\controllers;
+     8| use Yii;
+     9| use yii\base\InvalidParamException;
+    10| use yii\console\Controller;
+    11| use yii\helpers\Console;
+    12| use yii\helpers\FileHelper;
+    13| /**
+    14|  * This command helps to set up a dev environment with all extensions and applications
+    15|  *
+    16|  * It will clone an extension or app repo and link the yii2 dev installation to the containted applications/extensions vendor dirs
+    17|  * to help working on yii using the application to test it.
+    18|  *
+    19|  * @author Carsten Brandt <mail@cebe.cc>
+    20|  * @since 2.0
+    21|  */
+    22| class DevController extends Controller
+    23| {
+    24|     public $defaultAction = 'all';
+    25|     public $apps = [
+    26|         'basic' => 'git@github.com:yiisoft/yii2-app-basic.git',
+    27|         'advanced' => 'git@github.com:yiisoft/yii2-app-advanced.git',
+    28|         'benchmark' => 'git@github.com:yiisoft/yii2-app-benchmark.git',
+    29|     ];
+    30|     public $extensions = [
+    31|         'apidoc' => 'git@github.com:yiisoft/yii2-apidoc.git',
+    32|         'authclient' => 'git@github.com:yiisoft/yii2-authclient.git',
+    33|         'bootstrap' => 'git@github.com:yiisoft/yii2-bootstrap.git',
+    34|         'codeception' => 'git@github.com:yiisoft/yii2-codeception.git',
+    35|         'composer' => 'git@github.com:yiisoft/yii2-composer.git',
+    36|         'debug' => 'git@github.com:yiisoft/yii2-debug.git',
+    37|         'elasticsearch' => 'git@github.com:yiisoft/yii2-elasticsearch.git',
+    38|         'faker' => 'git@github.com:yiisoft/yii2-faker.git',
+    39|         'gii' => 'git@github.com:yiisoft/yii2-gii.git',
+    40|         'imagine' => 'git@github.com:yiisoft/yii2-imagine.git',
+    41|         'jui' => 'git@github.com:yiisoft/yii2-jui.git',
+    42|         'mongodb' => 'git@github.com:yiisoft/yii2-mongodb.git',
+    43|         'redis' => 'git@github.com:yiisoft/yii2-redis.git',
+    44|         'smarty' => 'git@github.com:yiisoft/yii2-smarty.git',
+    45|         'sphinx' => 'git@github.com:yiisoft/yii2-sphinx.git',
+    46|         'swiftmailer' => 'git@github.com:yiisoft/yii2-swiftmailer.git',
+    47|         'twig' => 'git@github.com:yiisoft/yii2-twig.git',
+    48|     ];
+    49|     /**
+    50|      * Install all extensions and advanced + basic app
+    51|      */
+    52|     public function actionAll()
+    53|     {
+    54|         if (!$this->confirm('Install all applications and all extensions now?')) {
+    55|             return 1;
+    56|         }
+    57|         foreach($this->extensions as $ext => $repo) {
+    58|             $ret = $this->actionExt($ext, $repo);
+    59|             if ($ret !== 0) {
+    60|                 return $ret;
+    61|             }
+    62|         }
+    63|         foreach($this->apps as $app => $repo) {
+    64|             $ret = $this->actionApp($app, $repo);
+    65|             if ($ret !== 0) {
+    66|                 return $ret;
+    67|             }
+    68|         }
+    69|         return 0;
+    70|     }
+    71|     /**
+    72|      * Runs a command in all extension and application directories
+    73|      *
+    74|      * Can be used to run e.g. `git pull`.
+    75|      *
+    76|      *     ./build/build dev/run git pull
+    77|      *
+    78|      * @param string $command the command to run
+    79|      */
+    80|     public function actionRun($command)
+    81|     {
+    82|         $command = implode(' ', func_get_args());
+    83|         $base = dirname(dirname(__DIR__));
+    84|         $dirs = $this->listSubDirs("$base/extensions");
+    85|         $dirs = array_merge($dirs, $this->listSubDirs("$base/apps"));
+    86|         asort($dirs);
+    87|         $oldcwd = getcwd();
+    88|         foreach($dirs as $dir) {
+    89|             $displayDir = substr($dir, strlen($base));
+    90|             $this->stdout("Running '$command' in $displayDir...\n", Console::BOLD);
+    91|             chdir($dir);
+    92|             passthru($command);
+    93|             $this->stdout("done.\n", Console::BOLD, Console::FG_GREEN);
+    94|         }
+    95|         chdir($oldcwd);
+    96|     }
+    97|     /**
+    98|      * This command installs a project template in the `apps` directory and links the framework and extensions
+    99|      *
+   100|      * It basically runs the following commands in the dev repo root:
+   101|      *
+   102|      * - Run `composer update`
+   103|      * - `rm -rf apps/basic/vendor/yiisoft/yii2`
+   104|      * - `rm -rf apps/basic/vendor/yiisoft/yii2-*`
+   105|      *
+   106|      * And replaces them with symbolic links to the extensions and framework path in the dev repo.
+   107|      *
+   108|      * Extensions required by the application are automatically installed using the `ext` action.
+   109|      *
+   110|      * @param string $app the application name e.g. `basic` or `advanced`.
+   111|      * @param string $repo url of the git repo to clone if it does not already exist.
+   112|      * @return int return code
+   113|      */
+   114|     public function actionApp($app, $repo = null)
+   115|     {
+   116|         $base = dirname(dirname(__DIR__));
+   117|         $appDir = "$base/apps/$app";
+   118|         if (!file_exists($appDir)) {
+   119|             if (empty($repo)) {
+   120|                 if (isset($this->apps[$app])) {
+   121|                     $repo = $this->apps[$app];
+   122|                 } else {
+   123|                     $this->stderr("Repo argument is required for app '$app'.\n", Console::FG_RED);
+   124|                     return 1;
+   125|                 }
+   126|             }
+   127|             $this->stdout("cloning application repo '$app' from '$repo'...\n", Console::BOLD);
+   128|             passthru('git clone ' . escapeshellarg($repo) . ' ' . $appDir);
+   129|             $this->stdout("done.\n", Console::BOLD, Console::FG_GREEN);
+   130|         }
+   131|         $this->stdout("cleaning up application '$app' vendor directory...\n", Console::BOLD);
+   132|         $this->cleanupVendorDir($appDir);
+   133|         $this->stdout("done.\n", Console::BOLD, Console::FG_GREEN);
+   134|         $this->stdout("updating composer for app '$app'...\n", Console::BOLD);
+   135|         chdir($appDir);
+   136|         passthru('composer update --prefer-dist');
+   137|         $this->stdout("done.\n", Console::BOLD, Console::FG_GREEN);
+   138|         $this->stdout("linking framework and extensions to '$app' app vendor dir...\n", Console::BOLD);
+   139|         $this->linkFrameworkAndExtensions($appDir, $base);
+   140|         $this->stdout("done.\n", Console::BOLD, Console::FG_GREEN);
+   141|         return 0;
+   142|     }
+   143|     /**
+   144|      * This command installs an extension in the `extensions` directory and links the framework and other extensions
+   145|      *
+   146|      * @param string $extension the application name e.g. `basic` or `advanced`.
+   147|      * @param string $repo url of the git repo to clone if it does not already exist.
+   148|      */
+   149|     public function actionExt($extension, $repo = null)
+   150|     {
+   151|         $base = dirname(dirname(__DIR__));
+   152|         $extensionDir = "$base/extensions/$extension";
+   153|         if (!file_exists($extensionDir)) {
+   154|             if (empty($repo)) {
+   155|                 if (isset($this->extensions[$extension])) {
+   156|                     $repo = $this->extensions[$extension];
+   157|                 } else {
+   158|                     $this->stderr("Repo argument is required for extension '$extension'.\n", Console::FG_RED);
+   159|                     return 1;
+   160|                 }
+   161|             }
+   162|             $this->stdout("cloning extension repo '$extension' from '$repo'...\n", Console::BOLD);
+   163|             passthru('git clone ' . escapeshellarg($repo) . ' ' . $extensionDir);
+   164|             $this->stdout("done.\n", Console::BOLD, Console::FG_GREEN);
+   165|         }
+   166|         $this->stdout("cleaning up extension '$extension' vendor directory...\n", Console::BOLD);
+   167|         $this->cleanupVendorDir($extensionDir);
+   168|         $this->stdout("done.\n", Console::BOLD, Console::FG_GREEN);
+   169|         $this->stdout("updating composer for extension '$extension'...\n", Console::BOLD);
+   170|         chdir($extensionDir);
+   171|         passthru('composer update --prefer-dist');
+   172|         $this->stdout("done.\n", Console::BOLD, Console::FG_GREEN);
+   173|         $this->stdout("linking framework and extensions to '$extension' vendor dir...\n", Console::BOLD);
+   174|         $this->linkFrameworkAndExtensions($extensionDir, $base);
+   175|         $this->stdout("done.\n", Console::BOLD, Console::FG_GREEN);
+   176|         return 0;
+   177|     }
+   178|     protected function cleanupVendorDir($dir)
+   179|     {
+   180|         if (is_link($link = "$dir/vendor/yiisoft/yii2")) {
+   181|             $this->stdout("Removing symlink $link.\n");
+   182|             $this->unlink($link);
+   183|         }
+   184|         $extensions = $this->findDirs("$dir/vendor/yiisoft");
+   185|         foreach($extensions as $ext) {
+   186|             if (is_link($link = "$dir/vendor/yiisoft/yii2-$ext")) {
+   187|                 $this->stdout("Removing symlink $link.\n");
+   188|                 $this->unlink($link);
+   189|             }
+   190|         }
+   191|     }
+   192|     protected function linkFrameworkAndExtensions($dir, $base)
+   193|     {
+   194|         if (is_dir($link = "$dir/vendor/yiisoft/yii2")) {
+   195|             $this->stdout("Removing dir $link.\n");
+   196|             FileHelper::removeDirectory($link);
+   197|             $this->stdout("Creating symlink for $link.\n");
+   198|             symlink("$base/framework", $link);
+   199|         }
+   200|         $extensions = $this->findDirs("$dir/vendor/yiisoft");
+   201|         foreach($extensions as $ext) {
+   202|             if (is_dir($link = "$dir/vendor/yiisoft/yii2-$ext")) {
+   203|                 $this->stdout("Removing dir $link.\n");
+   204|                 FileHelper::removeDirectory($link);
+   205|                 $this->stdout("Creating symlink for $link.\n");
+   206|                 if (!file_exists("$base/extensions/$ext")) {
+   207|                     $ret = $this->actionExt($ext);
+   208|                     if ($ret !== 0) {
+   209|                         return $ret;
+   210|                     }
+   211|                 }
+   212|                 symlink("$base/extensions/$ext", $link);
+   213|             }
+   214|         }
+   215|     }
+   216|     /**
+   217|      * Properly removes symlinked directory under Windows, MacOS and Linux
+   218|      *
+   219|      * @param string $file path to symlink
+   220|      */
+   221|     protected function unlink($file)
+   222|     {
+   223|         if (is_dir($file) && DIRECTORY_SEPARATOR === '\\') {
+   224|             rmdir($file);
+   225|         } else {
+   226|             unlink($file);
+   227|         }
+   228|     }
+   229|     protected function listSubDirs($dir)
+   230|     {
+   231|         $list = [];
+   232|         $handle = opendir($dir);
+   233|         if ($handle === false) {
+   234|             throw new InvalidParamException("Unable to open directory: $dir");
+   235|         }
+   236|         while (($file = readdir($handle)) !== false) {
+   237|             if ($file === '.' || $file === '..') {
+   238|                 continue;
+   239|             }
+   240|             if ($file[0] === '.') {
+   241|                 continue;
+   242|             }
+   243|             if (is_dir("$dir/$file")) {
+   244|                 $list[] = "$dir/$file";
+   245|             }
+   246|         }
+   247|         closedir($handle);
+   248|         return $list;
+   249|     }
+   250|     /**
+   251|      * Finds linkable applications
+   252|      *
+   253|      * @param string $dir directory to search in
+   254|      * @return array list of applications command can link
+   255|      */
+   256|     protected function findDirs($dir)
+   257|     {
+   258|         $list = [];
+   259|         $handle = @opendir($dir);
+   260|         if ($handle === false) {
+   261|             return [];
+   262|         }
+   263|         while (($file = readdir($handle)) !== false) {
+   264|             if ($file === '.' || $file === '..') {
+   265|                 continue;
+   266|             }
+   267|             $path = $dir . DIRECTORY_SEPARATOR . $file;
+   268|             if (is_dir($path) && preg_match('/^yii2-(.*)$/', $file, $matches)) {
+   269|                 $list[] = $matches[1];
+   270|             }
+   271|         }
+   272|         closedir($handle);
+   273|         foreach($list as $i => $e) {
+   274|             if ($e == 'composer') { // skip composer to not break composer update
+   275|                 unset($list[$i]);
+   276|             }
+   277|         }
+   278|         return $list;
+   279|     }
+   280| }
+

@@ -1,0 +1,4447 @@
+--- a//dev/null
++++ b/client/src/api/admin.js
+@@ -0,0 +1,20 @@
++import { get } from '../api/client';
++import { ADMIN_API } from '../config/wagtailConfig';
++export const getPage = (id) => {
++  const url = `${ADMIN_API.PAGES}${id}/`;
++  return get(url);
++};
++export const getPageChildren = (id, options = {}) => {
++  let url = `${ADMIN_API.PAGES}?child_of=${id}&for_explorer=1`;
++  if (options.fields) {
++    url += `&fields=${global.encodeURIComponent(options.fields.join(','))}`;
++  }
++  if (options.onlyWithChildren) {
++    url += '&has_children=1';
++  }
++  if (options.offset) {
++    url += `&offset=${options.offset}`;
++  }
++  url += ADMIN_API.EXTRA_CHILDREN_PARAMETERS;
++  return get(url);
++};
+
+--- a//dev/null
++++ b/client/src/components/Draftail/Tooltip/Tooltip.js
+@@ -0,0 +1,50 @@
++import PropTypes from 'prop-types';
++import React from 'react';
++const TOP = 'top';
++const LEFT = 'left';
++const TOP_LEFT = 'top-left';
++const getTooltipStyles = (target, direction) => {
++  const top = window.pageYOffset + target.top;
++  const left = window.pageXOffset + target.left;
++  switch (direction) {
++  case TOP:
++    return {
++      top: top + target.height,
++      left: left + target.width / 2,
++    };
++  case LEFT:
++    return {
++      top: top + target.height / 2,
++      left: left + target.width,
++    };
++  case TOP_LEFT:
++  default:
++    return {
++      top: top + target.height,
++      left: left,
++    };
++  }
++};
++/**
++ * A tooltip, with arbitrary content.
++ */
++const Tooltip = ({ target, children, direction }) => (
++  <div
++    style={getTooltipStyles(target, direction)}
++    className={`Tooltip Tooltip--${direction}`}
++    role="tooltip"
++  >
++    {children}
++  </div>
++);
++Tooltip.propTypes = {
++  target: PropTypes.shape({
++    top: PropTypes.number.isRequired,
++    left: PropTypes.number.isRequired,
++    width: PropTypes.number.isRequired,
++    height: PropTypes.number.isRequired,
++  }).isRequired,
++  direction: PropTypes.oneOf([TOP, LEFT, TOP_LEFT]).isRequired,
++  children: PropTypes.node.isRequired,
++};
++export default Tooltip;
+
+--- a//dev/null
++++ b/client/src/components/Draftail/blocks/EmbedBlock.js
+@@ -0,0 +1,35 @@
++import PropTypes from 'prop-types';
++import React from 'react';
++import { STRINGS } from '../../../config/wagtailConfig';
++import MediaBlock from '../blocks/MediaBlock';
++/**
++ * Editor block to display media and edit content.
++ */
++const EmbedBlock = props => {
++  const { entity, onRemoveEntity } = props.blockProps;
++  const { url, title, thumbnail } = entity.getData();
++  return (
++    <MediaBlock {...props} src={thumbnail} alt="">
++      {url ? (
++        <a
++          className="Tooltip__link EmbedBlock__link"
++          href={url}
++          title={url}
++          target="_blank"
++          rel="noopener noreferrer"
++        >
++          {title}
++        </a>
++      ) : null}
++      <button className="button button-secondary no Tooltip__button" onClick={onRemoveEntity}>
++        {STRINGS.DELETE}
++      </button>
++    </MediaBlock>
++  );
++};
++EmbedBlock.propTypes = {
++  blockProps: PropTypes.shape({
++    entity: PropTypes.object,
++  }).isRequired,
++};
++export default EmbedBlock;
+
+--- a//dev/null
++++ b/client/src/components/Draftail/blocks/ImageBlock.js
+@@ -0,0 +1,45 @@
++import PropTypes from 'prop-types';
++import React, { Component } from 'react';
++import { DraftUtils } from 'draftail';
++import { STRINGS } from '../../../config/wagtailConfig';
++import MediaBlock from '../blocks/MediaBlock';
++/**
++ * Editor block to preview and edit images.
++ */
++class ImageBlock extends Component {
++  constructor(props) {
++    super(props);
++    this.changeAlt = this.changeAlt.bind(this);
++  }
++  changeAlt(e) {
++    const { block, blockProps } = this.props;
++    const { editorState, onChange } = blockProps;
++    const data = {
++      alt: e.target.value,
++    };
++    onChange(DraftUtils.updateBlockEntity(editorState, block, data));
++  }
++  render() {
++    const { blockProps } = this.props;
++    const { entity, onRemoveEntity } = blockProps;
++    const { src, alt } = entity.getData();
++    const altLabel = `${STRINGS.ALT_TEXT}: “${alt || ''}”`;
++    return (
++      <MediaBlock {...this.props} src={src} alt="">
++        <p className="ImageBlock__alt">{altLabel}</p>
++        <button className="button button-secondary no Tooltip__button" onClick={onRemoveEntity}>
++          {STRINGS.DELETE}
++        </button>
++      </MediaBlock>
++    );
++  }
++}
++ImageBlock.propTypes = {
++  block: PropTypes.object.isRequired,
++  blockProps: PropTypes.shape({
++    editorState: PropTypes.object.isRequired,
++    entity: PropTypes.object,
++    onChange: PropTypes.func.isRequired,
++  }).isRequired,
++};
++export default ImageBlock;
+
+--- a//dev/null
++++ b/client/src/components/Draftail/blocks/MediaBlock.js
+@@ -0,0 +1,95 @@
++import PropTypes from 'prop-types';
++import React, { Component } from 'react';
++import { Icon } from 'draftail';
++import Tooltip from '../Tooltip/Tooltip';
++import Portal from '../../Portal/Portal';
++const OPTIONS_MAX_WIDTH = 300;
++const OPTIONS_SPACING = 70;
++const TOOLTIP_MAX_WIDTH = OPTIONS_MAX_WIDTH + OPTIONS_SPACING;
++/**
++ * Editor block to preview and edit images.
++ */
++class MediaBlock extends Component {
++  constructor(props) {
++    super(props);
++    this.state = {
++      showTooltipAt: null,
++    };
++    this.openTooltip = this.openTooltip.bind(this);
++    this.closeTooltip = this.closeTooltip.bind(this);
++    this.renderTooltip = this.renderTooltip.bind(this);
++  }
++  openTooltip(e) {
++    const trigger = e.target.closest('[data-draftail-trigger]');
++    if (!trigger) {
++      return;
++    }
++    const container = trigger.closest('[data-draftail-editor-wrapper]');
++    const containerRect = container.getBoundingClientRect();
++    const rect = trigger.getBoundingClientRect();
++    const maxWidth = trigger.parentNode.offsetWidth - rect.width;
++    this.setState({
++      showTooltipAt: {
++        container: container,
++        top: rect.top - containerRect.top - (document.documentElement.scrollTop || document.body.scrollTop),
++        left: rect.left - containerRect.left - (document.documentElement.scrollLeft || document.body.scrollLeft),
++        width: rect.width,
++        height: rect.height,
++        direction: maxWidth >= TOOLTIP_MAX_WIDTH ? 'left' : 'top-left',
++      },
++    });
++  }
++  closeTooltip() {
++    this.setState({ showTooltipAt: null });
++  }
++  renderTooltip() {
++    const { children } = this.props;
++    const { showTooltipAt } = this.state;
++    return (
++      <Portal
++        node={showTooltipAt.container}
++        onClose={this.closeTooltip}
++        closeOnClick
++        closeOnType
++        closeOnResize
++      >
++        <Tooltip target={showTooltipAt} direction={showTooltipAt.direction}>
++          <div style={{ maxWidth: OPTIONS_MAX_WIDTH }}>{children}</div>
++        </Tooltip>
++      </Portal>
++    );
++  }
++  render() {
++    const { blockProps, src, alt } = this.props;
++    const { showTooltipAt } = this.state;
++    const { entityType } = blockProps;
++    return (
++      <button
++        type="button"
++        tabIndex={-1}
++        className="MediaBlock"
++        onClick={this.openTooltip}
++        data-draftail-trigger
++      >
++        <span className="MediaBlock__icon-wrapper" aria-hidden>
++          <Icon icon={entityType.icon} className="MediaBlock__icon" />
++        </span>
++        <img className="MediaBlock__img" src={src} alt={alt} width="256" />
++        {showTooltipAt && this.renderTooltip()}
++      </button>
++    );
++  }
++}
++MediaBlock.propTypes = {
++  blockProps: PropTypes.shape({
++    entityType: PropTypes.object.isRequired,
++  }).isRequired,
++  src: PropTypes.string,
++  alt: PropTypes.string,
++  children: PropTypes.node.isRequired,
++};
++MediaBlock.defaultProps = {
++  src: null,
++  alt: '',
++};
++export default MediaBlock;
+
+--- a//dev/null
++++ b/client/src/components/Draftail/decorators/Document.js
+@@ -0,0 +1,22 @@
++import PropTypes from 'prop-types';
++import React from 'react';
++import Icon from '../../Icon/Icon';
++import TooltipEntity from '../decorators/TooltipEntity';
++const documentIcon = <Icon name="doc-full" />;
++const Document = props => {
++  const { entityKey, contentState } = props;
++  const data = contentState.getEntity(entityKey).getData();
++  return (
++    <TooltipEntity
++      {...props}
++      icon={documentIcon}
++      label={data.filename || ''}
++      url={data.url || ''}
++    />
++  );
++};
++Document.propTypes = {
++  entityKey: PropTypes.string.isRequired,
++  contentState: PropTypes.object.isRequired,
++};
++export default Document;
+
+--- a//dev/null
++++ b/client/src/components/Draftail/decorators/Link.js
+@@ -0,0 +1,46 @@
++import PropTypes from 'prop-types';
++import React from 'react';
++import Icon from '../../Icon/Icon';
++import TooltipEntity from '../decorators/TooltipEntity';
++const LINK_ICON = <Icon name="link" />;
++const MAIL_ICON = <Icon name="mail" />;
++const getEmailAddress = mailto => mailto.replace('mailto:', '').split('?')[0];
++const getDomainName = url => url.replace(/(^\w+:|^)\/\//, '').split('/')[0];
++export const getLinkAttributes = (data) => {
++  const url = data.url || '';
++  let icon;
++  let label;
++  if (data.id) {
++    icon = LINK_ICON;
++    label = url;
++  } else if (url.startsWith('mailto:')) {
++    icon = MAIL_ICON;
++    label = getEmailAddress(url);
++  } else {
++    icon = LINK_ICON;
++    label = getDomainName(url);
++  }
++  return {
++    url,
++    icon,
++    label,
++  };
++};
++/**
++ * Represents a link within the editor's content.
++ */
++const Link = props => {
++  const { entityKey, contentState } = props;
++  const data = contentState.getEntity(entityKey).getData();
++  return (
++    <TooltipEntity
++      {...props}
++      {...getLinkAttributes(data)}
++    />
++  );
++};
++Link.propTypes = {
++  entityKey: PropTypes.string.isRequired,
++  contentState: PropTypes.object.isRequired,
++};
++export default Link;
+
+--- a//dev/null
++++ b/client/src/components/Draftail/decorators/TooltipEntity.js
+@@ -0,0 +1,126 @@
++import PropTypes from 'prop-types';
++import React, { Component } from 'react';
++import { Icon } from 'draftail';
++import Tooltip from '../Tooltip/Tooltip';
++import Portal from '../../Portal/Portal';
++const shortenLabel = (label) => {
++  let shortened = label;
++  if (shortened.length > 25) {
++    shortened = `${shortened.slice(0, 20)}…`;
++  }
++  return shortened;
++};
++class TooltipEntity extends Component {
++  constructor(props) {
++    super(props);
++    this.state = {
++      showTooltipAt: null,
++    };
++    this.onEdit = this.onEdit.bind(this);
++    this.onRemove = this.onRemove.bind(this);
++    this.openTooltip = this.openTooltip.bind(this);
++    this.closeTooltip = this.closeTooltip.bind(this);
++  }
++  onEdit(e) {
++    const { onEdit, entityKey } = this.props;
++    e.preventDefault();
++    e.stopPropagation();
++    onEdit(entityKey);
++  }
++  onRemove(e) {
++    const { onRemove, entityKey } = this.props;
++    e.preventDefault();
++    e.stopPropagation();
++    onRemove(entityKey);
++  }
++  openTooltip(e) {
++    const trigger = e.target.closest('[data-draftail-trigger]');
++    if (!trigger) {
++      return;
++    }
++    const container = trigger.closest('[data-draftail-editor-wrapper]');
++    const containerRect = container.getBoundingClientRect();
++    const rect = trigger.getBoundingClientRect();
++    this.setState({
++      showTooltipAt: {
++        container: container,
++        top: rect.top - containerRect.top - (document.documentElement.scrollTop || document.body.scrollTop),
++        left: rect.left - containerRect.left - (document.documentElement.scrollLeft || document.body.scrollLeft),
++        width: rect.width,
++        height: rect.height,
++      },
++    });
++  }
++  closeTooltip() {
++    this.setState({ showTooltipAt: null });
++  }
++  render() {
++    const {
++      children,
++      icon,
++      label,
++      url,
++    } = this.props;
++    const { showTooltipAt } = this.state;
++    /* eslint-disable springload/jsx-a11y/interactive-supports-focus */
++    return (
++      <a
++        role="button"
++        onMouseUp={this.openTooltip}
++        className="TooltipEntity"
++        data-draftail-trigger
++      >
++        <Icon icon={icon} className="TooltipEntity__icon" />
++        {children}
++        {showTooltipAt && (
++          <Portal
++            node={showTooltipAt.container}
++            onClose={this.closeTooltip}
++            closeOnClick
++            closeOnType
++            closeOnResize
++          >
++            <Tooltip target={showTooltipAt} direction="top">
++              {(
++                <a
++                  href={url}
++                  title={url}
++                  target="_blank"
++                  rel="noopener noreferrer"
++                  className="Tooltip__link"
++                >
++                  {shortenLabel(label)}
++                </a>
++              )}
++              <button
++                className="button Tooltip__button"
++                onClick={this.onEdit}
++              >
++                Edit
++              </button>
++              <button
++                className="button button-secondary no Tooltip__button"
++                onClick={this.onRemove}
++              >
++                Remove
++              </button>
++            </Tooltip>
++          </Portal>
++        )}
++      </a>
++    );
++  }
++}
++TooltipEntity.propTypes = {
++  entityKey: PropTypes.string.isRequired,
++  children: PropTypes.node.isRequired,
++  onEdit: PropTypes.func.isRequired,
++  onRemove: PropTypes.func.isRequired,
++  icon: PropTypes.oneOfType([
++    PropTypes.string.isRequired,
++    PropTypes.object.isRequired,
++  ]).isRequired,
++  label: PropTypes.string.isRequired,
++  url: PropTypes.string.isRequired,
++};
++export default TooltipEntity;
+
+--- a//dev/null
++++ b/client/src/components/Draftail/index.js
+@@ -0,0 +1,87 @@
++import React from 'react';
++import ReactDOM from 'react-dom';
++import { DraftailEditor } from 'draftail';
++import { IS_IE11, STRINGS } from '../../config/wagtailConfig';
++import Icon from '../Icon/Icon';
++export { default as Link } from './decorators/Link';
++export { default as Document } from './decorators/Document';
++export { default as ImageBlock } from './blocks/ImageBlock';
++export { default as EmbedBlock } from './blocks/EmbedBlock';
++export { default as ModalWorkflowSource } from './sources/ModalWorkflowSource';
++const BR_ICON = 'M.436 633.471l296.897-296.898v241.823h616.586V94.117h109.517v593.796H297.333v242.456z';
++/**
++ * Registry for client-side code of Draftail plugins.
++ */
++const PLUGINS = {};
++const registerPlugin = (plugin) => {
++  PLUGINS[plugin.type] = plugin;
++  return PLUGINS;
++};
++/**
++ * Wraps a style/block/entity type’s icon with an icon font implementation,
++ * so Draftail can use icon fonts in its toolbar.
++ */
++export const wrapWagtailIcon = type => {
++  const isIconFont = type.icon && typeof type.icon === 'string';
++  if (isIconFont) {
++    return Object.assign(type, {
++      icon: <Icon name={type.icon} />,
++    });
++  }
++  return type;
++};
++/**
++ * Initialises the DraftailEditor for a given field.
++ * @param {string} selector
++ * @param {Object} options
++ * @param {Element} currentScript
++ */
++const initEditor = (selector, options, currentScript) => {
++  const context = currentScript ? currentScript.parentNode : document.body;
++  const field = context.querySelector(selector) || document.body.querySelector(selector);
++  const editorWrapper = document.createElement('div');
++  editorWrapper.className = 'Draftail-Editor__wrapper';
++  editorWrapper.setAttribute('data-draftail-editor-wrapper', true);
++  field.parentNode.appendChild(editorWrapper);
++  const serialiseInputValue = rawContentState => {
++    field.value = JSON.stringify(rawContentState);
++  };
++  const blockTypes = options.blockTypes || [];
++  const inlineStyles = options.inlineStyles || [];
++  let entityTypes = options.entityTypes || [];
++  entityTypes = entityTypes.map(wrapWagtailIcon).map((type) => {
++    const plugin = PLUGINS[type.type];
++    return Object.assign({}, plugin, type);
++  });
++  const enableHorizontalRule = options.enableHorizontalRule ? {
++    description: STRINGS.HORIZONTAL_LINE,
++  } : false;
++  const rawContentState = JSON.parse(field.value);
++  const editor = (
++    <DraftailEditor
++      rawContentState={rawContentState}
++      onSave={serialiseInputValue}
++      placeholder={STRINGS.WRITE_HERE}
++      spellCheck={true}
++      enableLineBreak={{
++        description: STRINGS.LINE_BREAK,
++        icon: BR_ICON,
++      }}
++      showUndoControl={{ description: STRINGS.UNDO }}
++      showRedoControl={{ description: STRINGS.REDO }}
++      maxListNesting={4}
++      stripPastedStyles={IS_IE11}
++      {...options}
++      blockTypes={blockTypes.map(wrapWagtailIcon)}
++      inlineStyles={inlineStyles.map(wrapWagtailIcon)}
++      entityTypes={entityTypes}
++      enableHorizontalRule={enableHorizontalRule}
++    />
++  );
++  const draftailEditor = ReactDOM.render(editor, editorWrapper);
++  field.draftailEditor = draftailEditor;
++};
++export default {
++  initEditor,
++  registerPlugin,
++};
+
+--- a//dev/null
++++ b/client/src/components/Draftail/sources/ModalWorkflowSource.js
+@@ -0,0 +1,163 @@
++import PropTypes from 'prop-types';
++import { Component } from 'react';
++import { AtomicBlockUtils, Modifier, RichUtils, EditorState } from 'draft-js';
++import { ENTITY_TYPE } from 'draftail';
++import { STRINGS } from '../../../config/wagtailConfig';
++const $ = global.jQuery;
++const EMBED = 'EMBED';
++const DOCUMENT = 'DOCUMENT';
++const MUTABILITY = {};
++MUTABILITY[ENTITY_TYPE.LINK] = 'MUTABLE';
++MUTABILITY[DOCUMENT] = 'MUTABLE';
++MUTABILITY[ENTITY_TYPE.IMAGE] = 'IMMUTABLE';
++MUTABILITY[EMBED] = 'IMMUTABLE';
++export const getChooserConfig = (entityType, entity) => {
++  const chooserURL = {};
++  chooserURL[ENTITY_TYPE.IMAGE] = `${global.chooserUrls.imageChooser}?select_format=true`;
++  chooserURL[EMBED] = global.chooserUrls.embedsChooser;
++  chooserURL[ENTITY_TYPE.LINK] = global.chooserUrls.pageChooser;
++  chooserURL[DOCUMENT] = global.chooserUrls.documentChooser;
++  let url = chooserURL[entityType.type];
++  let urlParams = {};
++  if (entityType.type === ENTITY_TYPE.LINK) {
++    urlParams = {
++      page_type: 'wagtailcore.page',
++      allow_external_link: true,
++      allow_email_link: true,
++      can_choose_root: 'false',
++      link_text: '',
++    };
++    if (entity) {
++      const data = entity.getData();
++      if (data.id) {
++        url = `${global.chooserUrls.pageChooser}${data.parentId}/`;
++      } else if (data.url.startsWith('mailto:')) {
++        url = global.chooserUrls.emailLinkChooser;
++        urlParams.link_url = data.url.replace('mailto:', '');
++      } else {
++        url = global.chooserUrls.externalLinkChooser;
++        urlParams.link_url = data.url;
++      }
++    }
++  }
++  return {
++    url,
++    urlParams,
++  };
++};
++export const filterEntityData = (entityType, data) => {
++  switch (entityType.type) {
++  case ENTITY_TYPE.IMAGE:
++    return {
++      id: data.id,
++      src: data.preview.url,
++      alt: data.alt,
++      format: data.format,
++    };
++  case EMBED:
++    return {
++      embedType: data.embedType,
++      url: data.url,
++      providerName: data.providerName,
++      authorName: data.authorName,
++      thumbnail: data.thumbnail,
++      title: data.title,
++    };
++  case ENTITY_TYPE.LINK:
++    if (data.id) {
++      return {
++        url: data.url,
++        id: data.id,
++        parentId: data.parentId,
++      };
++    }
++    return {
++      url: data.url,
++    };
++  case DOCUMENT:
++    return {
++      url: data.url,
++      filename: data.filename,
++      id: data.id,
++    };
++  default:
++    return {};
++  }
++};
++/**
++ * Interfaces with Wagtail's ModalWorkflow to open the chooser,
++ * and create new content in Draft.js based on the data.
++ */
++class ModalWorkflowSource extends Component {
++  constructor(props) {
++    super(props);
++    this.onChosen = this.onChosen.bind(this);
++    this.onClose = this.onClose.bind(this);
++  }
++  componentDidMount() {
++    const { onClose, entityType, entity } = this.props;
++    const { url, urlParams } = getChooserConfig(entityType, entity);
++    $(document.body).on('hidden.bs.modal', this.onClose);
++    this.workflow = global.ModalWorkflow({
++      url,
++      urlParams,
++      responses: {
++        imageChosen: this.onChosen,
++        embedChosen: (_, data) => this.onChosen(data),
++        documentChosen: this.onChosen,
++        pageChosen: this.onChosen,
++      },
++      onError: () => {
++        window.alert(STRINGS.SERVER_ERROR);
++        onClose();
++      },
++    });
++  }
++  componentWillUnmount() {
++    this.workflow = null;
++    $(document.body).off('hidden.bs.modal', this.onClose);
++  }
++  onChosen(data) {
++    const { editorState, entityType, onComplete } = this.props;
++    const content = editorState.getCurrentContent();
++    const selection = editorState.getSelection();
++    const entityData = filterEntityData(entityType, data);
++    const mutability = MUTABILITY[entityType.type];
++    const contentWithEntity = content.createEntity(entityType.type, mutability, entityData);
++    const entityKey = contentWithEntity.getLastCreatedEntityKey();
++    let nextState;
++    if (entityType.block) {
++      nextState = AtomicBlockUtils.insertAtomicBlock(editorState, entityKey, ' ');
++    } else {
++      const shouldReplaceText = data.prefer_this_title_as_link_text || selection.isCollapsed();
++      if (shouldReplaceText) {
++        const newText = data.title || data.url;
++        const newContent = Modifier.replaceText(content, selection, newText, null, entityKey);
++        nextState = EditorState.push(editorState, newContent, 'insert-characters');
++      } else {
++        nextState = RichUtils.toggleLink(editorState, selection, entityKey);
++      }
++    }
++    this.workflow.close();
++    onComplete(nextState);
++  }
++  onClose(e) {
++    const { onClose } = this.props;
++    e.preventDefault();
++    onClose();
++  }
++  render() {
++    return null;
++  }
++}
++ModalWorkflowSource.propTypes = {
++  editorState: PropTypes.object.isRequired,
++  entityType: PropTypes.object.isRequired,
++  entity: PropTypes.object,
++  onComplete: PropTypes.func.isRequired,
++  onClose: PropTypes.func.isRequired,
++};
++ModalWorkflowSource.defaultProps = {
++  entity: null,
++};
++export default ModalWorkflowSource;
+
+--- a//dev/null
++++ b/client/src/components/Portal/Portal.js
+@@ -0,0 +1,61 @@
++import PropTypes from 'prop-types';
++import { Component } from 'react';
++import { createPortal } from 'react-dom';
++/**
++ * A Portal component which automatically closes itself
++ * when certain events happen outside.
++ * See https://reactjs.org/docs/portals.html.
++ */
++class Portal extends Component {
++  constructor(props) {
++    super(props);
++    this.portal = document.createElement('div');
++    this.onCloseEvent = this.onCloseEvent.bind(this);
++  }
++  onCloseEvent(e) {
++    const { onClose } = this.props;
++    if (!this.portal.contains(e.target)) {
++      onClose();
++    }
++  }
++  componentDidMount() {
++    const { node, onClose, closeOnClick, closeOnType, closeOnResize } = this.props;
++    node.appendChild(this.portal);
++    if (closeOnClick) {
++      document.addEventListener('mouseup', this.onCloseEvent);
++    }
++    if (closeOnType) {
++      document.addEventListener('keyup', this.onCloseEvent);
++    }
++    if (closeOnResize) {
++      window.addEventListener('resize', onClose);
++    }
++  }
++  componentWillUnmount() {
++    const { node, onClose } = this.props;
++    node.removeChild(this.portal);
++    document.removeEventListener('mouseup', this.onCloseEvent);
++    document.removeEventListener('keyup', this.onCloseEvent);
++    window.removeEventListener('resize', onClose);
++  }
++  render() {
++    const { children } = this.props;
++    return createPortal(children, this.portal);
++  }
++}
++Portal.propTypes = {
++  onClose: PropTypes.func.isRequired,
++  node: PropTypes.instanceOf(Element),
++  children: PropTypes.node,
++  closeOnClick: PropTypes.bool,
++  closeOnType: PropTypes.bool,
++  closeOnResize: PropTypes.bool,
++};
++Portal.defaultProps = {
++  node: document.body,
++  children: null,
++  closeOnClick: false,
++  closeOnType: false,
++  closeOnResize: false,
++};
++export default Portal;
+
+--- a//dev/null
++++ b/client/src/config/wagtailConfig.js
+@@ -0,0 +1,5 @@
++export const ADMIN_API = global.wagtailConfig.ADMIN_API;
++export const STRINGS = global.wagtailConfig.STRINGS;
++export const ADMIN_URLS = global.wagtailConfig.ADMIN_URLS;
++export const MAX_EXPLORER_PAGES = 200;
++export const IS_IE11 = !global.ActiveXObject && 'ActiveXObject' in global;
+
+--- a//dev/null
++++ b/client/src/utils/performance.js
+@@ -0,0 +1,27 @@
++/* eslint-disable import/no-mutable-exports */
++let perfMiddleware;
++if (process.env.NODE_ENV !== 'production') {
++  /**
++   * Performance middleware for use with a Redux store.
++   * Will log the time taken by every action across all
++   * of the reducers of the store.
++   */
++  perfMiddleware = () => {
++    /* eslint-disable no-console */
++    const middleware = (next) => (action) => {
++      let result;
++      if (!!console.time) {
++        console.time(action.type);
++        result = next(action);
++        console.timeEnd(action.type);
++      } else {
++        result = next(action);
++      }
++      return result;
++    };
++    return middleware;
++  };
++}
++export {
++  perfMiddleware,
++};
+
+--- a//dev/null
++++ b/client/src/utils/polyfills.js
+@@ -0,0 +1,6 @@
++/**
++ * Polyfills for Wagtail's admin.
++ */
++import 'core-js/shim';
++import 'whatwg-fetch';
++import 'element-closest';
+
+--- a//dev/null
++++ b/client/webpack/base.config.js
+@@ -0,0 +1,73 @@
++const path = require('path');
++const webpack = require('webpack');
++const getEntryPath = (app, filename) => path.resolve('wagtail', app, 'static_src', `wagtail${app}`, 'app', filename);
++const getOutputPath = (app, filename) => path.join('wagtail', app, 'static', `wagtail${app}`, 'js', filename);
++const exposedDependencies = {
++  'focus-trap-react': 'FocusTrapReact',
++  'react': 'React',
++  'react-dom': 'ReactDOM',
++  'react-transition-group/CSSTransitionGroup': 'CSSTransitionGroup',
++  'draft-js': 'DraftJS',
++};
++module.exports = function exports() {
++  const entry = {
++    vendor: [
++      './client/src/utils/polyfills.js',
++    ],
++  };
++  entry[getOutputPath('admin', 'wagtailadmin')] = getEntryPath('admin', 'wagtailadmin.entry.js');
++  entry[getOutputPath('admin', 'draftail')] = getEntryPath('admin', 'draftail.entry.js');
++  return {
++    entry: entry,
++    output: {
++      path: path.resolve('.'),
++      filename: '[name].js',
++      publicPath: '/static/js/'
++    },
++    plugins: [
++      new webpack.optimize.CommonsChunkPlugin({
++        name: 'vendor',
++        filename: getOutputPath('admin', '[name].js'),
++        minChunks: 2,
++      }),
++    ],
++    resolve: {
++      alias: {
++        'wagtail-client': path.resolve('.', 'client'),
++      },
++    },
++    module: {
++      rules: [
++        {
++          test: /\.js$/,
++          loader: 'babel-loader',
++          exclude: /node_modules/,
++        },
++      ].concat(Object.keys(exposedDependencies).map((name) => {
++        const globalName = exposedDependencies[name];
++        return {
++          test: require.resolve(name),
++          use: [
++            {
++              loader: 'expose-loader',
++              options: globalName,
++            },
++          ],
++        };
++      }))
++    },
++    stats: {
++      chunks: false,
++      hash: false,
++      colors: true,
++      reasons: false,
++      version: false,
++      maxModules: 0,
++    },
++    node: {
++      fs: 'empty',
++      net: 'empty',
++      tls: 'empty',
++    },
++  };
++};
+
+--- a//dev/null
++++ b/docs/conf.py
+@@ -0,0 +1,49 @@
++import sys
++import os
++on_rtd = os.environ.get('READTHEDOCS', None) == 'True'
++if not on_rtd:  # only import and set the theme if we're building docs locally
++    import sphinx_rtd_theme
++    html_theme = 'sphinx_rtd_theme'
++    html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
++sys.path.insert(0, os.path.abspath('..'))
++os.environ['DJANGO_SETTINGS_MODULE'] = 'wagtail.tests.settings'
++import django
++django.setup()
++os.environ['DATABASE_ENGINE'] = 'django.db.backends.sqlite3'
++extensions = [
++    'sphinx.ext.autodoc',
++]
++if not on_rtd:
++    extensions.append('sphinxcontrib.spelling')
++templates_path = ['_templates']
++source_suffix = '.rst'
++master_doc = 'index'
++project = u'Wagtail'
++copyright = u'2015, Torchbox'
++from wagtail import __version__, VERSION
++version = '{}.{}'.format(VERSION[0], VERSION[1])
++release = __version__
++exclude_patterns = ['_build']
++pygments_style = 'sphinx'
++spelling_lang = 'en_GB'
++spelling_word_list_filename='spelling_wordlist.txt'
++html_logo = 'logo.png'
++html_static_path = ['_static']
++htmlhelp_basename = 'Wagtaildoc'
++latex_elements = {
++}
++latex_documents = [
++  ('index', 'Wagtail.tex', u'Wagtail Documentation',
++   u'Torchbox', 'manual'),
++]
++man_pages = [
++    ('index', 'wagtail', u'Wagtail Documentation',
++     [u'Torchbox'], 1)
++]
++texinfo_documents = [
++  ('index', 'Wagtail', u'Wagtail Documentation',
++   u'Torchbox', 'Wagtail', 'One line description of project.',
++   'Miscellaneous'),
++]
++def setup(app):
++    app.add_stylesheet('css/custom.css')
+
+--- a//dev/null
++++ b/gulpfile.js/config.js
+@@ -0,0 +1,33 @@
++var path = require('path');
++var srcDir = 'static_src';
++var destDir = 'static';
++var App = function(dir, options) {
++    this.dir = dir;
++    this.options = options || {};
++    this.appName = this.options.appName || path.basename(dir);
++    this.sourceFiles = path.join('.', this.dir, srcDir);
++};
++App.prototype = Object.create(null);
++App.prototype.scssIncludePaths = function() {
++    return [this.sourceFiles];
++};
++App.prototype.scssSources = function() {
++    return path.join(this.sourceFiles, this.appName, '/scss/**/*.scss')
++};
++var apps = [
++    new App('wagtail/admin', {'appName': 'wagtailadmin'}),
++    new App('wagtail/documents', {'appName': 'wagtaildocs'}),
++    new App('wagtail/embeds', {'appName': 'wagtailembeds'}),
++    new App('wagtail/images', {'appName': 'wagtailimages'}),
++    new App('wagtail/snippets', {'appName': 'wagtailsnippets'}),
++    new App('wagtail/users', {'appName': 'wagtailusers'}),
++    new App('wagtail/contrib/styleguide', {'appName': 'wagtailstyleguide'}),
++    new App('wagtail/contrib/settings', {'appName': 'wagtailsettings'}),
++    new App('wagtail/contrib/modeladmin', {'appName': 'wagtailmodeladmin'}),
++];
++module.exports = {
++    apps: apps,
++    srcDir: srcDir,
++    destDir: destDir,
++    isProduction: process.env.NODE_ENV === 'production',
++};
+
+--- a//dev/null
++++ b/gulpfile.js/tasks/styles.js
+@@ -0,0 +1,74 @@
++var path = require('path');
++var gulp = require('gulp');
++var sass = require('gulp-sass');
++var cssnano = require('gulp-cssnano');
++var sourcemaps = require('gulp-sourcemaps');
++var size = require('gulp-size');
++var config = require('../config');
++var autoprefixer = require('gulp-autoprefixer');
++var simpleCopyTask = require('../lib/simplyCopy');
++var normalizePath = require('../lib/normalize-path');
++var renameSrcToDest = require('../lib/rename-src-to-dest');
++var gutil = require('gulp-util');
++var flatten = function(arrOfArr) {
++    return arrOfArr.reduce(function(flat, more) {
++        return flat.concat(more);
++    }, []);
++};
++var autoprefixerConfig = {
++    browsers: [
++      'Firefox ESR',
++      'ie 11',
++      'last 2 Chrome versions',
++      'last 2 ChromeAndroid versions',
++      'last 2 Edge versions',
++      'last 1 Firefox version',
++      'last 2 iOS versions',
++      'last 2 Safari versions',
++    ],
++    cascade: false,
++};
++var cssnanoConfig = {
++    discardUnused: {
++        fontFace: false,
++    },
++    zindex: false,
++};
++gulp.task('styles', ['styles:sass', 'styles:css', 'styles:assets']);
++gulp.task('styles:assets', simpleCopyTask('css/**/!(*.css)'));
++gulp.task('styles:css', function() {
++    var sources = config.apps.map(function(app) {
++        return path.join(app.sourceFiles, app.appName, 'css/**/*.css');
++    });
++    return gulp.src(sources, {base: '.'})
++        .pipe(cssnano(cssnanoConfig))
++        .pipe(autoprefixer(autoprefixerConfig))
++        .pipe(renameSrcToDest())
++        .pipe(size({ title: 'Vendor CSS' }))
++        .pipe(gulp.dest('.'))
++        .on('error', gutil.log);
++});
++gulp.task('styles:sass', function () {
++    var includePaths = flatten(config.apps.map(function(app) { return app.scssIncludePaths(); }));
++    var sources = flatten(config.apps.map(function(app) { return app.scssSources(); }));
++    return gulp.src(sources)
++        .pipe(config.isProduction ? gutil.noop() : sourcemaps.init())
++        .pipe(sass({
++            errLogToConsole: true,
++            includePaths: includePaths,
++            outputStyle: 'expanded'
++        }).on('error', sass.logError))
++        .pipe(cssnano(cssnanoConfig))
++        .pipe(autoprefixer(autoprefixerConfig))
++        .pipe(size({ title: 'Wagtail CSS' }))
++        .pipe(config.isProduction ? gutil.noop() : sourcemaps.write())
++        .pipe(gulp.dest(function (file) {
++            return normalizePath(file.base)
++                .replace(
++                    '/' + config.srcDir + '/',
++                    '/' + config.destDir + '/'
++                )
++                .replace('/scss/', '/css/');
++        }))
++        .on('error', gutil.log);
++});
+
+--- a//dev/null
++++ b/scripts/get-translator-credits.py
+@@ -0,0 +1,38 @@
++import subprocess
++import re
++from collections import defaultdict
++from io import open
++from babel import Locale
++authors_by_locale = defaultdict(set)
++file_listing = subprocess.Popen('find ../wagtail -iname *.po', shell=True, stdout=subprocess.PIPE)
++for file_listing_line in file_listing.stdout:
++    filename = file_listing_line.strip()
++    locale = re.search(r'locale/(\w+)/LC_MESSAGES', str(filename)).group(1)
++    if locale == 'en':
++        continue
++    with open(filename, 'rt') as f:
++        has_found_translators_heading = False
++        for line in f:
++            line = line.strip()
++            if line.startswith('#'):
++                if has_found_translators_heading:
++                    author = re.match(r'\# (.*), [\d\-]+', line).group(1)
++                    authors_by_locale[locale].add(author)
++                elif line.startswith('# Translators:'):
++                    has_found_translators_heading = True
++            else:
++                if has_found_translators_heading:
++                    break
++                else:
++                    raise Exception("No 'Translators:' heading found in %s" % filename)
++language_names = [
++    (Locale.parse(locale_string).english_name, locale_string)
++    for locale_string in authors_by_locale.keys()
++]
++language_names.sort()
++for (language_name, locale) in language_names:
++    print(("%s - %s" % (language_name, locale)))
++    print("-----")
++    for author in sorted(authors_by_locale[locale]):
++        print(author)
++    print('')
+
+--- a/setup.py
++++ b/setup.py
+@@ -1,114 +1,90 @@
++import sys
+ from wagtail import __version__
+-from wagtail.utils.setup import assets, check_bdist_egg, sdist
++from wagtail.utils.setup import assets, sdist, check_bdist_egg
+ try:
+-    from setuptools import find_packages, setup
++    from setuptools import setup, find_packages
+ except ImportError:
+     from distutils.core import setup
+ try:
+-    import multiprocessing  # noqa: F401
++    import multiprocessing
+ except ImportError:
+     pass
+ install_requires = [
+-    "Django>=3.2,<5.1",
+-    "django-modelcluster>=6.1,<7.0",
+-    "django-permissionedforms>=0.1,<1.0",
+-    "django-taggit>=2.0,<5.0",
+-    "django-treebeard>=4.5.1,<5.0",
+-    "djangorestframework>=3.11.1,<4.0",
+-    "django-filter>=23.3,<24",
+-    "draftjs_exporter>=2.1.5,<3.0",
+-    "Pillow>=9.1.0,<11.0.0",
+-    "beautifulsoup4>=4.8,<4.12",
+-    "html5lib>=0.999,<2",
+-    "Willow[heif]>=1.6.2,<1.7",
++    "Django>=1.11,<2.1",
++    "django-modelcluster>=4.0,<5.0",
++    "django-taggit>=0.22.2,<1.0",
++    "django-treebeard>=4.2.0,<5.0",
++    "djangorestframework>=3.1.3,<4.0",
++    "draftjs_exporter>=2.0,<2.1",
++    "Pillow>=2.6.1,<5.0",
++    "beautifulsoup4>=4.5.1,<5.0",
++    "html5lib>=0.999,<1",
++    "Unidecode>=0.04.14,<1.0",
++    "Willow>=1.1,<1.2",
+     "requests>=2.11.1,<3.0",
+-    "l18n>=2018.5",
+-    "openpyxl>=3.0.10,<4.0",
+-    "anyascii>=0.1.5",
+-    "telepath>=0.3.1,<1",
+ ]
+ testing_extras = [
+-    "python-dateutil>=2.7",
+-    "pytz>=2014.7",
+-    "Jinja2>=3.0,<3.2",
+-    "boto3>=1.28,<2",
+-    "freezegun>=0.3.8",
+-    "azure-mgmt-cdn>=12.0,<13.0",
+-    "azure-mgmt-frontdoor>=1.0,<1.1",
+-    "django-pattern-library>=0.7",
+-    "coverage>=3.7.0",
+-    "black==22.3.0",
+-    "doc8==0.8.1",
+-    "ruff==0.0.290",
+-    "semgrep==1.40.0",
+-    "curlylint==0.13.1",
+-    "djhtml==1.5.2",
+-    "polib>=1.1,<2.0",
+-    "factory-boy>=3.2",
+-    "tblib>=2.0,<3.0",
++    'mock>=1.0.0',
++    'python-dateutil>=2.2',
++    'pytz>=2014.7',
++    'Pillow>=2.7.0',
++    'elasticsearch>=1.0.0,<3.0',
++    'Jinja2>=2.8,<3.0',
++    'boto3>=1.4,<1.5',
++    'freezegun>=0.3.8',
++    'coverage>=3.7.0',
++    'flake8>=2.2.0',
++    'isort==4.2.5',
++    'flake8-blind-except==0.1.1',
++    'flake8-print==2.0.2',
+ ]
+ documentation_extras = [
+-    "pyenchant>=3.1.1,<4",
+-    "sphinxcontrib-spelling>=5.4.0,<6",
+-    "Sphinx>=1.5.2",
+-    "sphinx-autobuild>=0.6.0",
+-    "sphinx-wagtail-theme==6.1.1",
+-    "myst_parser==0.18.1",
+-    "sphinx_copybutton>=0.5,<1.0",
++    'pyenchant==1.6.8',
++    'sphinxcontrib-spelling>=2.3.0',
++    'Sphinx>=1.5.2',
++    'sphinx-autobuild>=0.6.0',
++    'sphinx_rtd_theme>=0.1.9',
+ ]
+ setup(
+-    name="wagtail",
++    name='wagtail',
+     version=__version__,
+-    description="A Django content management system.",
+-    author="Wagtail core team + contributors",
+-    author_email="hello@wagtail.org",  # For support queries, please see https://docs.wagtail.org/en/stable/support.html
+-    url="https://wagtail.org/",
+-    project_urls={
+-        "Changelog": "https://github.com/wagtail/wagtail/blob/main/CHANGELOG.txt",
+-        "Documentation": "https://docs.wagtail.org",
+-        "Source": "https://github.com/wagtail/wagtail",
+-        "Tracker": "https://github.com/wagtail/wagtail/issues",
+-    },
++    description='A Django content management system focused on flexibility and user experience',
++    author='Matthew Westcott',
++    author_email='matthew.westcott@torchbox.com',
++    url='http://wagtail.io/',
+     packages=find_packages(),
+     include_package_data=True,
+-    license="BSD",
+-    long_description="Wagtail is an open source content management \
+-system built on Django, with a strong community and commercial support. \
+-It’s focused on user experience, and offers precise control for \
+-designers and developers.\n\n\
+-For more details, see https://wagtail.org, https://docs.wagtail.org and \
+-https://github.com/wagtail/wagtail/.",
++    license='BSD',
++    long_description=open('README.rst').read(),
+     classifiers=[
+-        "Development Status :: 5 - Production/Stable",
+-        "Environment :: Web Environment",
+-        "Intended Audience :: Developers",
+-        "License :: OSI Approved :: BSD License",
+-        "Operating System :: OS Independent",
+-        "Programming Language :: Python",
+-        "Programming Language :: Python :: 3",
+-        "Programming Language :: Python :: 3.8",
+-        "Programming Language :: Python :: 3.9",
+-        "Programming Language :: Python :: 3.10",
+-        "Programming Language :: Python :: 3.11",
+-        "Framework :: Django",
+-        "Framework :: Django :: 3.2",
+-        "Framework :: Django :: 4.1",
+-        "Framework :: Django :: 4.2",
+-        "Framework :: Django :: 5.0",
+-        "Framework :: Wagtail",
+-        "Topic :: Internet :: WWW/HTTP :: Site Management",
++        'Development Status :: 5 - Production/Stable',
++        'Environment :: Web Environment',
++        'Intended Audience :: Developers',
++        'License :: OSI Approved :: BSD License',
++        'Operating System :: OS Independent',
++        'Programming Language :: Python',
++        'Programming Language :: Python :: 3',
++        'Programming Language :: Python :: 3.4',
++        'Programming Language :: Python :: 3.5',
++        'Programming Language :: Python :: 3.6',
++        'Framework :: Django',
++        'Framework :: Django :: 1.11',
++        'Framework :: Django :: 2.0',
++        'Topic :: Internet :: WWW/HTTP :: Site Management',
+     ],
+-    python_requires=">=3.8",
+     install_requires=install_requires,
+-    extras_require={"testing": testing_extras, "docs": documentation_extras},
++    extras_require={
++        'testing': testing_extras,
++        'docs': documentation_extras
++    },
+     entry_points="""
+             [console_scripts]
+             wagtail=wagtail.bin.wagtail:main
+     """,
+     zip_safe=False,
+     cmdclass={
+-        "sdist": sdist,
+-        "bdist_egg": check_bdist_egg,
+-        "assets": assets,
++        'sdist': sdist,
++        'bdist_egg': check_bdist_egg,
++        'assets': assets,
+     },
+ )
+
+--- a/wagtail/__init__.py
++++ b/wagtail/__init__.py
+@@ -1,9 +1,4 @@
+ from wagtail.utils.version import get_semver_version, get_version
+-VERSION = (5, 2, 6, "final", 1)
++VERSION = (2, 0, 0, 'final', 0)
+ __version__ = get_version(VERSION)
+ __semver__ = get_semver_version(VERSION)
+-def setup():
+-    import warnings
+-    from wagtail.utils.deprecation import removed_in_next_version_warning
+-    warnings.simplefilter("default", removed_in_next_version_warning)
+-setup()
+
+--- a//dev/null
++++ b/wagtail/admin/__init__.py
+@@ -0,0 +1 @@
++default_app_config = 'wagtail.admin.apps.WagtailAdminAppConfig'
+
+--- a//dev/null
++++ b/wagtail/admin/api/endpoints.py
+@@ -0,0 +1,72 @@
++from collections import OrderedDict
++from wagtail.api.v2.endpoints import PagesAPIEndpoint
++from wagtail.api.v2.filters import (
++    ChildOfFilter, DescendantOfFilter, FieldsFilter, ForExplorerFilter, OrderingFilter,
++    SearchFilter)
++from wagtail.api.v2.utils import BadRequestError, filter_page_type, page_models_from_string
++from wagtail.core.models import Page
++from .filters import HasChildrenFilter
++from .serializers import AdminPageSerializer
++class PagesAdminAPIEndpoint(PagesAPIEndpoint):
++    base_serializer_class = AdminPageSerializer
++    filter_backends = [
++        FieldsFilter,
++        ChildOfFilter,
++        DescendantOfFilter,
++        ForExplorerFilter,
++        HasChildrenFilter,
++        OrderingFilter,
++        SearchFilter,
++    ]
++    meta_fields = PagesAPIEndpoint.meta_fields + [
++        'latest_revision_created_at',
++        'status',
++        'children',
++        'descendants',
++        'parent',
++    ]
++    body_fields = PagesAPIEndpoint.body_fields + [
++        'admin_display_title',
++    ]
++    listing_default_fields = PagesAPIEndpoint.listing_default_fields + [
++        'latest_revision_created_at',
++        'status',
++        'children',
++        'admin_display_title',
++    ]
++    detail_only_fields = []
++    known_query_parameters = PagesAPIEndpoint.known_query_parameters.union([
++        'for_explorer',
++        'has_children'
++    ])
++    def get_queryset(self):
++        request = self.request
++        try:
++            models = page_models_from_string(request.GET.get('type', 'wagtailcore.Page'))
++        except (LookupError, ValueError):
++            raise BadRequestError("type doesn't exist")
++        if not models:
++            models = [Page]
++        if len(models) == 1:
++            queryset = models[0].objects.all()
++        else:
++            queryset = Page.objects.all()
++            queryset = filter_page_type(queryset, models)
++        queryset = queryset.exclude(depth=1).specific()
++        return queryset
++    def get_type_info(self):
++        types = OrderedDict()
++        for name, model in self.seen_types.items():
++            types[name] = OrderedDict([
++                ('verbose_name', model._meta.verbose_name),
++                ('verbose_name_plural', model._meta.verbose_name_plural),
++            ])
++        return types
++    def listing_view(self, request):
++        response = super().listing_view(request)
++        response.data['__types'] = self.get_type_info()
++        return response
++    def detail_view(self, request, pk):
++        response = super().detail_view(request, pk)
++        response.data['__types'] = self.get_type_info()
++        return response
+
+--- a//dev/null
++++ b/wagtail/admin/api/filters.py
+@@ -0,0 +1,18 @@
++from rest_framework.filters import BaseFilterBackend
++from wagtail.api.v2.utils import BadRequestError, parse_boolean
++class HasChildrenFilter(BaseFilterBackend):
++    """
++    Filters the queryset by checking if the pages have children or not.
++    This is useful when you want to get just the branches or just the leaves.
++    """
++    def filter_queryset(self, request, queryset, view):
++        if 'has_children' in request.GET:
++            try:
++                has_children_filter = parse_boolean(request.GET['has_children'])
++            except ValueError:
++                raise BadRequestError("has_children must be 'true' or 'false'")
++            if has_children_filter is True:
++                return queryset.filter(numchild__gt=0)
++            else:
++                return queryset.filter(numchild=0)
++        return queryset
+
+--- a//dev/null
++++ b/wagtail/admin/api/serializers.py
+@@ -0,0 +1,64 @@
++from collections import OrderedDict
++from rest_framework.fields import Field, ReadOnlyField
++from wagtail.api.v2.serializers import PageSerializer
++from wagtail.api.v2.utils import get_full_url
++from wagtail.core.models import Page
++def get_model_listing_url(context, model):
++    url_path = context['router'].get_model_listing_urlpath(model)
++    if url_path:
++        return get_full_url(context['request'], url_path)
++class PageStatusField(Field):
++    """
++    Serializes the "status" field.
++    Example:
++    "status": {
++        "status": "live",
++        "live": true,
++        "has_unpublished_changes": false
++    },
++    """
++    def get_attribute(self, instance):
++        return instance
++    def to_representation(self, page):
++        return OrderedDict([
++            ('status', page.status_string),
++            ('live', page.live),
++            ('has_unpublished_changes', page.has_unpublished_changes),
++        ])
++class PageChildrenField(Field):
++    """
++    Serializes the "children" field.
++    Example:
++    "children": {
++        "count": 1,
++        "listing_url": "/api/v1/pages/?child_of=2"
++    }
++    """
++    def get_attribute(self, instance):
++        return instance
++    def to_representation(self, page):
++        return OrderedDict([
++            ('count', page.numchild),
++            ('listing_url', get_model_listing_url(self.context, Page) + '?child_of=' + str(page.id)),
++        ])
++class PageDescendantsField(Field):
++    """
++    Serializes the "descendants" field.
++    Example:
++    "descendants": {
++        "count": 10,
++        "listing_url": "/api/v1/pages/?descendant_of=2"
++    }
++    """
++    def get_attribute(self, instance):
++        return instance
++    def to_representation(self, page):
++        return OrderedDict([
++            ('count', page.get_descendants().count()),
++            ('listing_url', get_model_listing_url(self.context, Page) + '?descendant_of=' + str(page.id)),
++        ])
++class AdminPageSerializer(PageSerializer):
++    status = PageStatusField(read_only=True)
++    children = PageChildrenField(read_only=True)
++    descendants = PageDescendantsField(read_only=True)
++    admin_display_title = ReadOnlyField(source='get_admin_display_title')
+
+--- a//dev/null
++++ b/wagtail/admin/api/urls.py
+@@ -0,0 +1,11 @@
++from django.conf.urls import url
++from wagtail.api.v2.router import WagtailAPIRouter
++from wagtail.core import hooks
++from .endpoints import PagesAdminAPIEndpoint
++admin_api = WagtailAPIRouter('wagtailadmin_api_v1')
++admin_api.register_endpoint('pages', PagesAdminAPIEndpoint)
++for fn in hooks.get_hooks('construct_admin_api'):
++    fn(admin_api)
++urlpatterns = [
++    url(r'^v2beta/', admin_api.urls),
++]
+
+--- a//dev/null
++++ b/wagtail/admin/apps.py
+@@ -0,0 +1,6 @@
++from django.apps import AppConfig
++from . import checks  # NOQA
++class WagtailAdminAppConfig(AppConfig):
++    name = 'wagtail.admin'
++    label = 'wagtailadmin'
++    verbose_name = "Wagtail admin"
+
+--- a//dev/null
++++ b/wagtail/admin/blocks.py
+@@ -0,0 +1,3 @@
++import warnings
++from wagtail.core.blocks import *  # noqa
++warnings.warn("wagtail.admin.blocks has moved to wagtail.core.blocks", UserWarning, stacklevel=2)
+
+--- a//dev/null
++++ b/wagtail/admin/checks.py
+@@ -0,0 +1,55 @@
++import os
++from django.core.checks import Error, Warning, register
++@register()
++def css_install_check(app_configs, **kwargs):
++    errors = []
++    css_path = os.path.join(
++        os.path.dirname(__file__), 'static', 'wagtailadmin', 'css', 'normalize.css'
++    )
++    if not os.path.isfile(css_path):
++        error_hint = """
++            Most likely you are running a development (non-packaged) copy of
++            Wagtail and have not built the static assets -
++            see http://docs.wagtail.io/en/latest/contributing/developing.html
++            File not found: %s
++        """ % css_path
++        errors.append(
++            Warning(
++                "CSS for the Wagtail admin is missing",
++                hint=error_hint,
++                id='wagtailadmin.W001',
++            )
++        )
++    return errors
++@register()
++def base_form_class_check(app_configs, **kwargs):
++    from wagtail.admin.forms import WagtailAdminPageForm
++    from wagtail.core.models import get_page_models
++    errors = []
++    for cls in get_page_models():
++        if not issubclass(cls.base_form_class, WagtailAdminPageForm):
++            errors.append(Error(
++                "{}.base_form_class does not extend WagtailAdminPageForm".format(
++                    cls.__name__),
++                hint="Ensure that {}.{} extends WagtailAdminPageForm".format(
++                    cls.base_form_class.__module__,
++                    cls.base_form_class.__name__),
++                obj=cls,
++                id='wagtailadmin.E001'))
++    return errors
++@register()
++def get_form_class_check(app_configs, **kwargs):
++    from wagtail.admin.forms import WagtailAdminPageForm
++    from wagtail.core.models import get_page_models
++    errors = []
++    for cls in get_page_models():
++        edit_handler = cls.get_edit_handler()
++        if not issubclass(edit_handler.get_form_class(), WagtailAdminPageForm):
++            errors.append(Error(
++                "{cls}.get_edit_handler().get_form_class() does not extend WagtailAdminPageForm".format(
++                    cls=cls.__name__),
++                hint="Ensure that the EditHandler for {cls} creates a subclass of WagtailAdminPageForm".format(
++                    cls=cls.__name__),
++                obj=cls,
++                id='wagtailadmin.E002'))
++    return errors
+
+--- a//dev/null
++++ b/wagtail/admin/compare.py
+@@ -0,0 +1,372 @@
++import difflib
++from bs4 import BeautifulSoup
++from django.utils.encoding import force_text
++from django.utils.html import escape
++from django.utils.safestring import mark_safe
++from django.utils.text import capfirst
++from django.utils.translation import ugettext_lazy as _
++class FieldComparison:
++    is_field = True
++    is_child_relation = False
++    def __init__(self, field, obj_a, obj_b):
++        self.field = field
++        self.val_a = field.value_from_object(obj_a)
++        self.val_b = field.value_from_object(obj_b)
++    def field_label(self):
++        """
++        Returns a label for this field to be displayed to the user
++        """
++        verbose_name = getattr(self.field, 'verbose_name', None)
++        if verbose_name is None:
++            verbose_name = self.field.name.replace('_', ' ')
++        return capfirst(verbose_name)
++    def htmldiff(self):
++        if self.val_a != self.val_b:
++            return TextDiff([('deletion', self.val_a), ('addition', self.val_b)]).to_html()
++        else:
++            return escape(self.val_a)
++    def has_changed(self):
++        """
++        Returns True if the field has changed
++        """
++        return self.val_a != self.val_b
++class TextFieldComparison(FieldComparison):
++    def htmldiff(self):
++        return diff_text(self.val_a, self.val_b).to_html()
++class RichTextFieldComparison(TextFieldComparison):
++    def htmldiff(self):
++        return diff_text(
++            BeautifulSoup(force_text(self.val_a), 'html5lib').getText(),
++            BeautifulSoup(force_text(self.val_b), 'html5lib').getText()
++        ).to_html()
++class StreamFieldComparison(RichTextFieldComparison):
++    pass
++class ChoiceFieldComparison(FieldComparison):
++    def htmldiff(self):
++        val_a = force_text(dict(self.field.flatchoices).get(self.val_a, self.val_a), strings_only=True)
++        val_b = force_text(dict(self.field.flatchoices).get(self.val_b, self.val_b), strings_only=True)
++        if self.val_a != self.val_b:
++            return TextDiff([('deletion', val_a), ('addition', val_b)]).to_html()
++        else:
++            return escape(val_a)
++class M2MFieldComparison(FieldComparison):
++    def get_items(self):
++        return list(self.val_a), list(self.val_b)
++    def get_item_display(self, item):
++        return str(item)
++    def htmldiff(self):
++        items_a, items_b = self.get_items()
++        sm = difflib.SequenceMatcher(0, items_a, items_b)
++        changes = []
++        for op, i1, i2, j1, j2 in sm.get_opcodes():
++            if op == 'replace':
++                for item in items_a[i1:i2]:
++                    changes.append(('deletion', self.get_item_display(item)))
++                for item in items_b[j1:j2]:
++                    changes.append(('addition', self.get_item_display(item)))
++            elif op == 'delete':
++                for item in items_a[i1:i2]:
++                    changes.append(('deletion', self.get_item_display(item)))
++            elif op == 'insert':
++                for item in items_b[j1:j2]:
++                    changes.append(('addition', self.get_item_display(item)))
++            elif op == 'equal':
++                for item in items_a[i1:i2]:
++                    changes.append(('equal', self.get_item_display(item)))
++        return TextDiff(changes, separator=", ").to_html()
++    def has_changed(self):
++        items_a, items_b = self.get_items()
++        return items_a != items_b
++class TagsFieldComparison(M2MFieldComparison):
++    def get_items(self):
++        tags_a = [
++            tag.tag
++            for tag in self.val_a
++        ]
++        tags_b = [
++            tag.tag
++            for tag in self.val_b
++        ]
++        return tags_a, tags_b
++    def get_item_display(self, tag):
++        return tag.slug
++class ForeignObjectComparison(FieldComparison):
++    def get_objects(self):
++        model = self.field.related_model
++        obj_a = model.objects.filter(id=self.val_a).first()
++        obj_b = model.objects.filter(id=self.val_b).first()
++        return obj_a, obj_b
++    def htmldiff(self):
++        obj_a, obj_b = self.get_objects()
++        if obj_a != obj_b:
++            if obj_a and obj_b:
++                return TextDiff([('deletion', force_text(obj_a)), ('addition', force_text(obj_b))]).to_html()
++            elif obj_b:
++                return TextDiff([('addition', force_text(obj_b))]).to_html()
++            elif obj_a:
++                return TextDiff([('deletion', force_text(obj_a))]).to_html()
++        else:
++            if obj_a:
++                return escape(force_text(obj_a))
++            else:
++                return mark_safe(_("None"))
++class ChildRelationComparison:
++    is_field = False
++    is_child_relation = True
++    def __init__(self, field, field_comparisons, obj_a, obj_b):
++        self.field = field
++        self.field_comparisons = field_comparisons
++        self.val_a = getattr(obj_a, field.related_name)
++        self.val_b = getattr(obj_b, field.related_name)
++    def field_label(self):
++        """
++        Returns a label for this field to be displayed to the user
++        """
++        verbose_name = getattr(self.field, 'verbose_name', None)
++        if verbose_name is None:
++            verbose_name = self.field.name.replace('_', ' ')
++        return capfirst(verbose_name)
++    def get_mapping(self, objs_a, objs_b):
++        """
++        This bit of code attempts to match the objects in the A revision with
++        their counterpart in the B revision.
++        A match is firstly attempted by PK (where a matching ID indicates they're the same).
++        We compare remaining the objects by their field data; the objects with the fewest
++        fields changed are matched until there are no more possible matches left.
++        This returns 4 values:
++         - map_forwards => a mapping of object indexes from the B version to the A version
++         - map_backwards => a mapping of object indexes from the A version to the B version
++         - added => a list of indices for objects that didn't exist in the B version
++         - deleted => a list of indices for objects that didn't exist in the A version
++        Note the indices are 0-based array indices indicating the location of the object in either
++        the objs_a or objs_b arrays.
++        For example:
++        objs_a => A, B, C, D
++        objs_b => B, C, D, E
++        Will return the following:
++        map_forwards = {
++            1: 0,  # B (objs_a: objs_b)
++            2: 1,  # C (objs_a: objs_b)
++            3: 2,  # D (objs_a: objs_b)
++        }
++        map_backwards = {
++            0: 1,  # B (objs_b: objs_a)
++            1: 2,  # C (objs_b: objs_a)
++            2: 3,  # D (objs_b: objs_a)
++        }
++        added = [4]  # D in objs_b
++        deleted = [0]  # A in objs_a
++        """
++        map_forwards = {}
++        map_backwards = {}
++        added = []
++        deleted = []
++        for a_idx, a_child in enumerate(objs_a):
++            for b_idx, b_child in enumerate(objs_b):
++                if b_idx in map_backwards:
++                    continue
++                if a_child.pk is not None and b_child.pk is not None and a_child.pk == b_child.pk:
++                    map_forwards[a_idx] = b_idx
++                    map_backwards[b_idx] = a_idx
++        matches = []
++        for a_idx, a_child in enumerate(objs_a):
++            if a_idx not in map_forwards:
++                for b_idx, b_child in enumerate(objs_b):
++                    if b_idx not in map_backwards:
++                        if a_child.pk and b_child.pk and a_child.pk != b_child.pk:
++                            continue
++                        comparison = self.get_child_comparison(objs_a[a_idx], objs_b[b_idx])
++                        num_differences = comparison.get_num_differences()
++                        matches.append((a_idx, b_idx, num_differences))
++        matches.sort(key=lambda match: match[2])
++        for a_idx, b_idx, num_differences in matches:
++            if a_idx in map_forwards or b_idx in map_backwards:
++                continue
++            map_forwards[a_idx] = b_idx
++            map_backwards[b_idx] = a_idx
++        for a_idx, a_child in enumerate(objs_a):
++            if a_idx not in map_forwards:
++                deleted.append(a_idx)
++        for b_idx, b_child in enumerate(objs_b):
++            if b_idx not in map_backwards:
++                added.append(b_idx)
++        return map_forwards, map_backwards, added, deleted
++    def get_child_comparison(self, obj_a, obj_b):
++        return ChildObjectComparison(self.field.related_model, self.field_comparisons, obj_a, obj_b)
++    def get_child_comparisons(self):
++        """
++        Returns a list of ChildObjectComparison objects. Representing all child
++        objects that existed in either version.
++        They are returned in the order they appear in the B version with deletions
++        appended at the end.
++        All child objects are returned, regardless of whether they were actually changed.
++        """
++        objs_a = list(self.val_a.all())
++        objs_b = list(self.val_b.all())
++        map_forwards, map_backwards, added, deleted = self.get_mapping(objs_a, objs_b)
++        objs_a = dict(enumerate(objs_a))
++        objs_b = dict(enumerate(objs_b))
++        comparisons = []
++        for b_idx, b_child in objs_b.items():
++            if b_idx in added:
++                comparisons.append(self.get_child_comparison(None, b_child))
++            else:
++                comparisons.append(self.get_child_comparison(objs_a[map_backwards[b_idx]], b_child))
++        for a_idx, a_child in objs_a.items():
++            if a_idx in deleted:
++                comparisons.append(self.get_child_comparison(a_child, None))
++        return comparisons
++    def has_changed(self):
++        """
++        Returns true if any changes were made to any of the child objects. This includes
++        adding, deleting and reordering.
++        """
++        objs_a = list(self.val_a.all())
++        objs_b = list(self.val_b.all())
++        map_forwards, map_backwards, added, deleted = self.get_mapping(objs_a, objs_b)
++        if added or deleted:
++            return True
++        for a_idx, b_idx in map_forwards.items():
++            comparison = self.get_child_comparison(objs_a[a_idx], objs_b[b_idx])
++            if comparison.has_changed():
++                return True
++        return False
++class ChildObjectComparison:
++    def __init__(self, model, field_comparisons, obj_a, obj_b):
++        self.model = model
++        self.field_comparisons = field_comparisons
++        self.obj_a = obj_a
++        self.obj_b = obj_b
++    def is_addition(self):
++        """
++        Returns True if this child object was created since obj_a
++        """
++        return self.obj_b and not self.obj_a
++    def is_deletion(self):
++        """
++        Returns True if this child object was deleted in obj_b
++        """
++        return self.obj_a and not self.obj_b
++    def get_position_change(self):
++        """
++        Returns the change in position as an integer. Positive if the object
++        was moved down, negative if it moved up.
++        For example: '3' indicates the object moved down three spaces. '-1'
++        indicates the object moved up one space.
++        """
++        if not self.is_addition() and not self.is_deletion():
++            sort_a = getattr(self.obj_a, 'sort_order', 0) or 0
++            sort_b = getattr(self.obj_b, 'sort_order', 0) or 0
++            return sort_b - sort_a
++    def get_field_comparisons(self):
++        """
++        Returns a list of comparisons for all the fields in this object.
++        Fields that haven't changed are included as well.
++        """
++        comparisons = []
++        if self.is_addition() or self.is_deletion():
++            obj = self.obj_a or self.obj_b
++            for field_comparison in self.field_comparisons:
++                comparisons.append(field_comparison(obj, obj))
++        else:
++            for field_comparison in self.field_comparisons:
++                comparisons.append(field_comparison(self.obj_a, self.obj_b))
++        return comparisons
++    def has_changed(self):
++        for comparison in self.get_field_comparisons():
++            if comparison.has_changed():
++                return True
++        return False
++    def get_num_differences(self):
++        """
++        Returns the number of fields that differ between the two
++        objects.
++        """
++        num_differences = 0
++        for comparison in self.get_field_comparisons():
++            if comparison.has_changed():
++                num_differences += 1
++        return num_differences
++class TextDiff:
++    def __init__(self, changes, separator=""):
++        self.changes = changes
++        self.separator = separator
++    def to_html(self, tag='span', addition_class='addition', deletion_class='deletion'):
++        html = []
++        for change_type, value in self.changes:
++            if change_type == 'equal':
++                html.append(escape(value))
++            elif change_type == 'addition':
++                html.append('<{tag} class="{classname}">{value}</{tag}>'.format(
++                    tag=tag,
++                    classname=addition_class,
++                    value=escape(value)
++                ))
++            elif change_type == 'deletion':
++                html.append('<{tag} class="{classname}">{value}</{tag}>'.format(
++                    tag=tag,
++                    classname=deletion_class,
++                    value=escape(value)
++                ))
++        return mark_safe(self.separator.join(html))
++def diff_text(a, b):
++    """
++    Performs a diffing algorithm on two pieces of text. Returns
++    a string of HTML containing the content of both texts with
++    <span> tags inserted indicating where the differences are.
++    """
++    def tokenise(text):
++        """
++        Tokenises a string by spliting it into individual characters
++        and grouping the alphanumeric ones together.
++        This means that punctuation, whitespace, CJK characters, etc
++        become separate tokens and words/numbers are merged together
++        to form bigger tokens.
++        This makes the output of the diff easier to read as words are
++        not broken up.
++        """
++        tokens = []
++        current_token = ""
++        for c in text:
++            if c.isalnum():
++                current_token += c
++            else:
++                if current_token:
++                    tokens.append(current_token)
++                    current_token = ""
++                tokens.append(c)
++        if current_token:
++            tokens.append(current_token)
++        return tokens
++    a_tok = tokenise(a)
++    b_tok = tokenise(b)
++    sm = difflib.SequenceMatcher(lambda t: len(t) <= 4, a_tok, b_tok)
++    changes = []
++    for op, i1, i2, j1, j2 in sm.get_opcodes():
++        if op == 'replace':
++            for token in a_tok[i1:i2]:
++                changes.append(('deletion', token))
++            for token in b_tok[j1:j2]:
++                changes.append(('addition', token))
++        elif op == 'delete':
++            for token in a_tok[i1:i2]:
++                changes.append(('deletion', token))
++        elif op == 'insert':
++            for token in b_tok[j1:j2]:
++                changes.append(('addition', token))
++        elif op == 'equal':
++            for token in a_tok[i1:i2]:
++                changes.append(('equal', token))
++    merged_changes = []
++    current_value = []
++    current_change_type = None
++    for change_type, value in changes:
++        if change_type != current_change_type:
++            if current_change_type is not None:
++                merged_changes.append((current_change_type, ''.join(current_value)))
++                current_value = []
++            current_change_type = change_type
++        current_value.append(value)
++    if current_value:
++        merged_changes.append((current_change_type, ''.join(current_value)))
++    return TextDiff(merged_changes)
+
+--- a//dev/null
++++ b/wagtail/admin/datetimepicker.py
+@@ -0,0 +1,32 @@
++def to_datetimepicker_format(python_format_string):
++    """
++    Given a python datetime format string, attempts to convert it to
++    the nearest PHP datetime format string possible.
++    """
++    python2PHP = {
++        "%a": "D",
++        "%A": "l",
++        "%b": "M",
++        "%B": "F",
++        "%c": "",
++        "%d": "d",
++        "%H": "H",
++        "%I": "h",
++        "%j": "z",
++        "%m": "m",
++        "%M": "i",
++        "%p": "A",
++        "%S": "s",
++        "%U": "",
++        "%w": "w",
++        "%W": "W",
++        "%x": "",
++        "%X": "",
++        "%y": "y",
++        "%Y": "Y",
++        "%Z": "e",
++    }
++    php_format_string = python_format_string
++    for py, php in python2PHP.items():
++        php_format_string = php_format_string.replace(py, php)
++    return php_format_string
+
+--- a//dev/null
++++ b/wagtail/admin/decorators.py
+@@ -0,0 +1,24 @@
++from django.contrib.auth.views import redirect_to_login as auth_redirect_to_login
++from django.core.exceptions import PermissionDenied
++from django.urls import reverse
++from django.utils.translation import activate as activate_lang
++from django.utils.translation import ugettext as _
++from wagtail.admin import messages
++def reject_request(request):
++    if request.is_ajax():
++        raise PermissionDenied
++    return auth_redirect_to_login(
++        request.get_full_path(), login_url=reverse('wagtailadmin_login'))
++def require_admin_access(view_func):
++    def decorated_view(request, *args, **kwargs):
++        user = request.user
++        if user.is_anonymous:
++            return reject_request(request)
++        if user.has_perms(['wagtailadmin.access_admin']):
++            if hasattr(user, 'wagtail_userprofile'):
++                activate_lang(user.wagtail_userprofile.get_preferred_language())
++            return view_func(request, *args, **kwargs)
++        if not request.is_ajax():
++            messages.error(request, _('You do not have permission to access the admin'))
++        return reject_request(request)
++    return decorated_view
+
+--- a//dev/null
++++ b/wagtail/admin/edit_handlers.py
+@@ -0,0 +1,582 @@
++import re
++from django import forms
++from django.core.exceptions import ImproperlyConfigured
++from django.db.models.fields import FieldDoesNotExist
++from django.forms.models import fields_for_model
++from django.template.loader import render_to_string
++from django.utils.encoding import force_text
++from django.utils.functional import curry
++from django.utils.safestring import mark_safe
++from django.utils.translation import ugettext_lazy
++from taggit.managers import TaggableManager
++from wagtail.admin import compare, widgets
++from wagtail.core.fields import RichTextField
++from wagtail.core.models import Page
++from wagtail.core.utils import camelcase_to_underscore, resolve_model_string
++from wagtail.utils.decorators import cached_classmethod
++from .forms import (  # NOQA
++    DIRECT_FORM_FIELD_OVERRIDES, FORM_FIELD_OVERRIDES, WagtailAdminModelForm, WagtailAdminPageForm,
++    formfield_for_dbfield)
++def widget_with_script(widget, script):
++    return mark_safe('{0}<script>{1}</script>'.format(widget, script))
++def get_form_for_model(
++    model, form_class=WagtailAdminModelForm,
++    fields=None, exclude=None, formsets=None, exclude_formsets=None, widgets=None
++):
++    attrs = {'model': model}
++    if fields is not None:
++        attrs['fields'] = fields
++    if exclude is not None:
++        attrs['exclude'] = exclude
++    if widgets is not None:
++        attrs['widgets'] = widgets
++    if formsets is not None:
++        attrs['formsets'] = formsets
++    if exclude_formsets is not None:
++        attrs['exclude_formsets'] = exclude_formsets
++    class_name = model.__name__ + str('Form')
++    bases = (object,)
++    if hasattr(form_class, 'Meta'):
++        bases = (form_class.Meta,) + bases
++    form_class_attrs = {
++        'Meta': type(str('Meta'), bases, attrs)
++    }
++    metaclass = type(form_class)
++    return metaclass(class_name, (form_class,), form_class_attrs)
++def extract_panel_definitions_from_model_class(model, exclude=None):
++    if hasattr(model, 'panels'):
++        return model.panels
++    panels = []
++    _exclude = []
++    if exclude:
++        _exclude.extend(exclude)
++    fields = fields_for_model(model, exclude=_exclude, formfield_callback=formfield_for_dbfield)
++    for field_name, field in fields.items():
++        try:
++            panel_class = field.widget.get_panel()
++        except AttributeError:
++            panel_class = FieldPanel
++        panel = panel_class(field_name)
++        panels.append(panel)
++    return panels
++class EditHandler:
++    """
++    Abstract class providing sensible default behaviours for objects implementing
++    the EditHandler API
++    """
++    def __init__(self, heading='', classname='', help_text=''):
++        self.heading = heading
++        self.classname = classname
++        self.help_text = help_text
++    def clone(self):
++        return self.__class__(
++            heading=self.heading,
++            classname=self.classname,
++            help_text=self.help_text,
++        )
++    def widget_overrides(self):
++        return {}
++    def required_fields(self):
++        return []
++    def required_formsets(self):
++        return {}
++    def html_declarations(self):
++        return ''
++    def bind_to_model(self, model):
++        new = self.clone()
++        new.model = model
++        new.on_model_bound()
++        return new
++    def on_model_bound(self):
++        pass
++    def bind_to_instance(self, instance=None, form=None):
++        new = self.bind_to_model(self.model)
++        if not instance:
++            raise ValueError("EditHandler did not receive an instance object")
++        new.instance = instance
++        if not form:
++            raise ValueError("EditHandler did not receive a form object")
++        new.form = form
++        new.on_instance_bound()
++        return new
++    def on_instance_bound(self):
++        pass
++    def __repr__(self):
++        class_name = self.__class__.__name__
++        try:
++            bound_to = force_text(getattr(self, 'instance',
++                                          getattr(self, 'model')))
++        except AttributeError:
++            return '<%s>' % class_name
++        return '<%s bound to %s>' % (class_name, bound_to)
++    def classes(self):
++        """
++        Additional CSS classnames to add to whatever kind of object this is at output.
++        Subclasses of EditHandler should override this, invoking super().classes() to
++        append more classes specific to the situation.
++        """
++        if self.classname:
++            return [self.classname]
++        return []
++    def field_type(self):
++        """
++        The kind of field it is e.g boolean_field. Useful for better semantic markup of field display based on type
++        """
++        return ""
++    def id_for_label(self):
++        """
++        The ID to be used as the 'for' attribute of any <label> elements that refer
++        to this object but are rendered outside of it. Leave blank if this object does not render
++        as a single input field.
++        """
++        return ""
++    def render_as_object(self):
++        """
++        Render this object as it should appear within an ObjectList. Should not
++        include the <h2> heading or help text - ObjectList will supply those
++        """
++        return self.render()
++    def render_as_field(self):
++        """
++        Render this object as it should appear within a <ul class="fields"> list item
++        """
++        return self.render()
++    def render_missing_fields(self):
++        """
++        Helper function: render all of the fields that are defined on the form but not "claimed" by
++        any panels via required_fields. These fields are most likely to be hidden fields introduced
++        by the forms framework itself, such as ORDER / DELETE fields on formset members.
++        (If they aren't actually hidden fields, then they will appear as ugly unstyled / label-less fields
++        outside of the panel furniture. But there's not much we can do about that.)
++        """
++        rendered_fields = self.required_fields()
++        missing_fields_html = [
++            str(self.form[field_name])
++            for field_name in self.form.fields
++            if field_name not in rendered_fields
++        ]
++        return mark_safe(''.join(missing_fields_html))
++    def render_form_content(self):
++        """
++        Render this as an 'object', ensuring that all fields necessary for a valid form
++        submission are included
++        """
++        return mark_safe(self.render_as_object() + self.render_missing_fields())
++    def get_comparison(self):
++        return []
++class BaseCompositeEditHandler(EditHandler):
++    """
++    Abstract class for EditHandlers that manage a set of sub-EditHandlers.
++    Concrete subclasses must attach a 'children' property
++    """
++    def __init__(self, children=(), *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.children = children
++    def clone(self):
++        return self.__class__(
++            children=self.children,
++            heading=self.heading,
++            classname=self.classname,
++            help_text=self.help_text,
++        )
++    def widget_overrides(self):
++        widgets = {}
++        for handler_class in self.children:
++            widgets.update(handler_class.widget_overrides())
++        widget_overrides = widgets
++        return widget_overrides
++    def required_fields(self):
++        fields = []
++        for handler in self.children:
++            fields.extend(handler.required_fields())
++        return fields
++    def required_formsets(self):
++        formsets = {}
++        for handler_class in self.children:
++            formsets.update(handler_class.required_formsets())
++        return formsets
++    def html_declarations(self):
++        return mark_safe(''.join([c.html_declarations() for c in self.children]))
++    def on_model_bound(self):
++        self.children = [child.bind_to_model(self.model)
++                         for child in self.children]
++    def on_instance_bound(self):
++        children = []
++        for child in self.children:
++            if isinstance(child, FieldPanel):
++                if self.form._meta.exclude:
++                    if child.field_name in self.form._meta.exclude:
++                        continue
++                if self.form._meta.fields:
++                    if child.field_name not in self.form._meta.fields:
++                        continue
++            children.append(child.bind_to_instance(instance=self.instance,
++                                                   form=self.form))
++        self.children = children
++    def render(self):
++        return mark_safe(render_to_string(self.template, {
++            'self': self
++        }))
++    def get_comparison(self):
++        comparators = []
++        for child in self.children:
++            comparators.extend(child.get_comparison())
++        return comparators
++class BaseFormEditHandler(BaseCompositeEditHandler):
++    """
++    Base class for edit handlers that can construct a form class for all their
++    child edit handlers.
++    """
++    base_form_class = None
++    def get_form_class(self):
++        """
++        Construct a form class that has all the fields and formsets named in
++        the children of this edit handler.
++        """
++        if not hasattr(self, 'model'):
++            raise AttributeError(
++                '%s is not bound to a model yet. Use `.bind_to_model(model)` '
++                'before using this method.' % self.__class__.__name__)
++        model_form_class = getattr(self.model, 'base_form_class',
++                                   WagtailAdminModelForm)
++        base_form_class = self.base_form_class or model_form_class
++        return get_form_for_model(
++            self.model,
++            form_class=base_form_class,
++            fields=self.required_fields(),
++            formsets=self.required_formsets(),
++            widgets=self.widget_overrides())
++class TabbedInterface(BaseFormEditHandler):
++    template = "wagtailadmin/edit_handlers/tabbed_interface.html"
++    def __init__(self, *args, **kwargs):
++        self.base_form_class = kwargs.pop('base_form_class', None)
++        super().__init__(*args, **kwargs)
++    def clone(self):
++        new = super().clone()
++        new.base_form_class = self.base_form_class
++        return new
++class ObjectList(TabbedInterface):
++    template = "wagtailadmin/edit_handlers/object_list.html"
++class FieldRowPanel(BaseCompositeEditHandler):
++    template = "wagtailadmin/edit_handlers/field_row_panel.html"
++    def on_instance_bound(self):
++        super().on_instance_bound()
++        col_count = ' col%s' % (12 // len(self.children))
++        for child in self.children:
++            if not re.search(r'\bcol\d+\b', child.classname):
++                child.classname += col_count
++class MultiFieldPanel(BaseCompositeEditHandler):
++    template = "wagtailadmin/edit_handlers/multi_field_panel.html"
++    def classes(self):
++        classes = super().classes()
++        classes.append("multi-field")
++        return classes
++class FieldPanel(EditHandler):
++    TEMPLATE_VAR = 'field_panel'
++    def __init__(self, field_name, *args, **kwargs):
++        widget = kwargs.pop('widget', None)
++        if widget is not None:
++            self.widget = widget
++        super().__init__(*args, **kwargs)
++        self.field_name = field_name
++    def clone(self):
++        return self.__class__(
++            field_name=self.field_name,
++            widget=self.widget if hasattr(self, 'widget') else None,
++            heading=self.heading,
++            classname=self.classname,
++            help_text=self.help_text
++        )
++    def widget_overrides(self):
++        """check if a specific widget has been defined for this field"""
++        if hasattr(self, 'widget'):
++            return {self.field_name: self.widget}
++        return {}
++    def classes(self):
++        classes = super().classes()
++        if self.bound_field.field.required:
++            classes.append("required")
++        if self.bound_field.errors:
++            classes.append("error")
++        classes.append(self.field_type())
++        return classes
++    def field_type(self):
++        return camelcase_to_underscore(self.bound_field.field.__class__.__name__)
++    def id_for_label(self):
++        return self.bound_field.id_for_label
++    object_template = "wagtailadmin/edit_handlers/single_field_panel.html"
++    def render_as_object(self):
++        return mark_safe(render_to_string(self.object_template, {
++            'self': self,
++            self.TEMPLATE_VAR: self,
++            'field': self.bound_field,
++        }))
++    field_template = "wagtailadmin/edit_handlers/field_panel_field.html"
++    def render_as_field(self):
++        return mark_safe(render_to_string(self.field_template, {
++            'field': self.bound_field,
++            'field_type': self.field_type(),
++        }))
++    def required_fields(self):
++        return [self.field_name]
++    def get_comparison_class(self):
++        widget_override = self.widget_overrides().get(self.field_name, None)
++        if widget_override and widget_override.is_hidden:
++            return
++        try:
++            field = self.db_field
++            if field.choices:
++                return compare.ChoiceFieldComparison
++            if field.is_relation:
++                if isinstance(field, TaggableManager):
++                    return compare.TagsFieldComparison
++                elif field.many_to_many:
++                    return compare.M2MFieldComparison
++                return compare.ForeignObjectComparison
++            if isinstance(field, RichTextField):
++                return compare.RichTextFieldComparison
++        except FieldDoesNotExist:
++            pass
++        return compare.FieldComparison
++    def get_comparison(self):
++        comparator_class = self.get_comparison_class()
++        if comparator_class:
++            return [curry(comparator_class, self.db_field)]
++        return []
++    def on_model_bound(self):
++        self.db_field = self.model._meta.get_field(self.field_name)
++    def on_instance_bound(self):
++        self.bound_field = self.form[self.field_name]
++        self.heading = self.bound_field.label
++        self.help_text = self.bound_field.help_text
++    def __repr__(self):
++        class_name = self.__class__.__name__
++        try:
++            bound_to = force_text(getattr(self, 'instance',
++                                          getattr(self, 'model')))
++        except AttributeError:
++            return "<%s '%s'>" % (class_name, self.field_name)
++        return "<%s '%s' bound to %s>" % (class_name, self.field_name, bound_to)
++class RichTextFieldPanel(FieldPanel):
++    def get_comparison_class(self):
++        return compare.RichTextFieldComparison
++class BaseChooserPanel(FieldPanel):
++    """
++    Abstract superclass for panels that provide a modal interface for choosing (or creating)
++    a database object such as an image, resulting in an ID that is used to populate
++    a hidden foreign key input.
++    Subclasses provide:
++    * field_template (only required if the default template of field_panel_field.html is not usable)
++    * object_type_name - something like 'image' which will be used as the var name
++      for the object instance in the field_template
++    """
++    def get_chosen_item(self):
++        field = self.instance._meta.get_field(self.field_name)
++        related_model = field.remote_field.model
++        try:
++            return getattr(self.instance, self.field_name)
++        except related_model.DoesNotExist:
++            return
++    def render_as_field(self):
++        instance_obj = self.get_chosen_item()
++        context = {
++            'field': self.bound_field,
++            self.object_type_name: instance_obj,
++            'is_chosen': bool(instance_obj),  # DEPRECATED - passed to templates for backwards compatibility only
++        }
++        return mark_safe(render_to_string(self.field_template, context))
++class PageChooserPanel(BaseChooserPanel):
++    object_type_name = "page"
++    def __init__(self, field_name, page_type=None, can_choose_root=False):
++        super().__init__(field_name=field_name)
++        if page_type:
++            if not isinstance(page_type, (list, tuple)):
++                page_type = [page_type]
++        else:
++            page_type = []
++        self.page_type = page_type
++        self.can_choose_root = can_choose_root
++    def clone(self):
++        return self.__class__(
++            field_name=self.field_name,
++            page_type=self.page_type,
++            can_choose_root=self.can_choose_root,
++        )
++    def widget_overrides(self):
++        return {self.field_name: widgets.AdminPageChooser(
++            target_models=self.target_models(),
++            can_choose_root=self.can_choose_root)}
++    def target_models(self):
++        if self.page_type:
++            target_models = []
++            for page_type in self.page_type:
++                try:
++                    target_models.append(resolve_model_string(page_type))
++                except LookupError:
++                    raise ImproperlyConfigured(
++                        "{0}.page_type must be of the form 'app_label.model_name', given {1!r}".format(
++                            self.__class__.__name__, page_type
++                        )
++                    )
++                except ValueError:
++                    raise ImproperlyConfigured(
++                        "{0}.page_type refers to model {1!r} that has not been installed".format(
++                            self.__class__.__name__, page_type
++                        )
++                    )
++            return target_models
++        return [self.db_field.remote_field.model]
++class InlinePanel(EditHandler):
++    def __init__(self, relation_name, panels=None, heading='', label='',
++                 min_num=None, max_num=None, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.relation_name = relation_name
++        self.panels = panels
++        self.heading = heading or label
++        self.label = label
++        self.min_num = min_num
++        self.max_num = max_num
++    def clone(self):
++        return self.__class__(
++            relation_name=self.relation_name,
++            panels=self.panels,
++            heading=self.heading,
++            label=self.label,
++            help_text=self.help_text,
++            min_num=self.min_num,
++            max_num=self.max_num,
++            classname=self.classname,
++        )
++    def get_panel_definitions(self):
++        if self.panels is not None:
++            return self.panels
++        return extract_panel_definitions_from_model_class(
++            self.related.related_model,
++            exclude=[self.related.field.name]
++        )
++    def get_child_edit_handler(self):
++        panels = self.get_panel_definitions()
++        child_edit_handler = MultiFieldPanel(panels, heading=self.heading)
++        return child_edit_handler.bind_to_model(self.related.related_model)
++    def required_formsets(self):
++        child_edit_handler = self.get_child_edit_handler()
++        return {
++            self.relation_name: {
++                'fields': child_edit_handler.required_fields(),
++                'widgets': child_edit_handler.widget_overrides(),
++                'min_num': self.min_num,
++                'validate_min': self.min_num is not None,
++                'max_num': self.max_num,
++                'validate_max': self.max_num is not None
++            }
++        }
++    def html_declarations(self):
++        return self.get_child_edit_handler().html_declarations()
++    def get_comparison(self):
++        field_comparisons = []
++        for panel in self.get_panel_definitions():
++            field_comparisons.extend(
++                panel.bind_to_model(self.related.related_model)
++                .get_comparison())
++        return [curry(compare.ChildRelationComparison, self.db_field,
++                      field_comparisons)]
++    def on_model_bound(self):
++        self.db_field = self.model._meta.get_field(self.relation_name)
++        manager = getattr(self.model, self.relation_name)
++        self.related = manager.rel
++    def on_instance_bound(self):
++        self.formset = self.form.formsets[self.relation_name]
++        self.children = []
++        for subform in self.formset.forms:
++            subform.fields['DELETE'].widget = forms.HiddenInput()
++            if self.formset.can_order:
++                subform.fields['ORDER'].widget = forms.HiddenInput()
++            child_edit_handler = self.get_child_edit_handler()
++            self.children.append(
++                child_edit_handler.bind_to_instance(instance=subform.instance,
++                                                    form=subform))
++        if self.formset.can_order and self.formset.is_valid():
++            self.children = sorted(self.children, key=lambda x: x.form.cleaned_data['ORDER'])
++        empty_form = self.formset.empty_form
++        empty_form.fields['DELETE'].widget = forms.HiddenInput()
++        if self.formset.can_order:
++            empty_form.fields['ORDER'].widget = forms.HiddenInput()
++        self.empty_child = self.get_child_edit_handler()
++        self.empty_child = self.empty_child.bind_to_instance(
++            instance=empty_form.instance, form=empty_form)
++    template = "wagtailadmin/edit_handlers/inline_panel.html"
++    def render(self):
++        formset = render_to_string(self.template, {
++            'self': self,
++            'can_order': self.formset.can_order,
++        })
++        js = self.render_js_init()
++        return widget_with_script(formset, js)
++    js_template = "wagtailadmin/edit_handlers/inline_panel.js"
++    def render_js_init(self):
++        return mark_safe(render_to_string(self.js_template, {
++            'self': self,
++            'can_order': self.formset.can_order,
++        }))
++class PublishingPanel(MultiFieldPanel):
++    def __init__(self, **kwargs):
++        updated_kwargs = {
++            'children': [
++                FieldRowPanel([
++                    FieldPanel('go_live_at'),
++                    FieldPanel('expire_at'),
++                ], classname="label-above"),
++            ],
++            'heading': ugettext_lazy('Scheduled publishing'),
++            'classname': 'publishing',
++        }
++        updated_kwargs.update(kwargs)
++        super().__init__(**updated_kwargs)
++Page.content_panels = [
++    FieldPanel('title', classname="full title"),
++]
++Page.promote_panels = [
++    MultiFieldPanel([
++        FieldPanel('slug'),
++        FieldPanel('seo_title'),
++        FieldPanel('show_in_menus'),
++        FieldPanel('search_description'),
++    ], ugettext_lazy('Common page configuration')),
++]
++Page.settings_panels = [
++    PublishingPanel()
++]
++Page.base_form_class = WagtailAdminPageForm
++@cached_classmethod
++def get_edit_handler(cls):
++    """
++    Get the EditHandler to use in the Wagtail admin when editing this page type.
++    """
++    if hasattr(cls, 'edit_handler'):
++        return cls.edit_handler.bind_to_model(cls)
++    tabs = []
++    if cls.content_panels:
++        tabs.append(ObjectList(cls.content_panels, heading=ugettext_lazy('Content')))
++    if cls.promote_panels:
++        tabs.append(ObjectList(cls.promote_panels, heading=ugettext_lazy('Promote')))
++    if cls.settings_panels:
++        tabs.append(ObjectList(cls.settings_panels, heading=ugettext_lazy('Settings'), classname="settings"))
++    edit_handler = TabbedInterface(tabs, base_form_class=cls.base_form_class)
++    return edit_handler.bind_to_model(cls)
++Page.get_edit_handler = get_edit_handler
++class StreamFieldPanel(FieldPanel):
++    def classes(self):
++        classes = super().classes()
++        classes.append("stream-field")
++        if 'error' in classes:
++            classes.remove("error")
++        return classes
++    def html_declarations(self):
++        return self.block_def.all_html_declarations()
++    def get_comparison_class(self):
++        return compare.StreamFieldComparison
++    def id_for_label(self):
++        return ""
++    def on_model_bound(self):
++        super().on_model_bound()
++        self.block_def = self.db_field.stream_block
+
+--- a//dev/null
++++ b/wagtail/admin/forms.py
+@@ -0,0 +1,396 @@
++import copy
++from itertools import groupby
++from django import forms
++from django.contrib.auth import get_user_model
++from django.contrib.auth.forms import AuthenticationForm, PasswordResetForm
++from django.contrib.auth.models import Group, Permission
++from django.core import validators
++from django.db import models, transaction
++from django.forms.widgets import TextInput
++from django.template.loader import render_to_string
++from django.utils import timezone
++from django.utils.translation import ugettext as _
++from django.utils.translation import ugettext_lazy, ungettext
++from modelcluster.forms import ClusterForm, ClusterFormMetaclass
++from taggit.managers import TaggableManager
++from wagtail.admin import widgets
++from wagtail.core.models import (
++    BaseViewRestriction, Collection, CollectionViewRestriction, GroupCollectionPermission, Page,
++    PageViewRestriction)
++class URLOrAbsolutePathValidator(validators.URLValidator):
++    @staticmethod
++    def is_absolute_path(value):
++        return value.startswith('/')
++    def __call__(self, value):
++        if URLOrAbsolutePathValidator.is_absolute_path(value):
++            return None
++        else:
++            return super().__call__(value)
++class URLOrAbsolutePathField(forms.URLField):
++    widget = TextInput
++    default_validators = [URLOrAbsolutePathValidator()]
++    def to_python(self, value):
++        if not URLOrAbsolutePathValidator.is_absolute_path(value):
++            value = super().to_python(value)
++        return value
++class SearchForm(forms.Form):
++    def __init__(self, *args, **kwargs):
++        placeholder = kwargs.pop('placeholder', _("Search"))
++        super().__init__(*args, **kwargs)
++        self.fields['q'].widget.attrs = {'placeholder': placeholder}
++    q = forms.CharField(label=ugettext_lazy("Search term"), widget=forms.TextInput())
++class ExternalLinkChooserForm(forms.Form):
++    url = URLOrAbsolutePathField(required=True, label=ugettext_lazy("URL"))
++    link_text = forms.CharField(required=False)
++class EmailLinkChooserForm(forms.Form):
++    email_address = forms.EmailField(required=True)
++    link_text = forms.CharField(required=False)
++class LoginForm(AuthenticationForm):
++    username = forms.CharField(
++        max_length=254, widget=forms.TextInput(attrs={'tabindex': '1'}))
++    password = forms.CharField(
++        widget=forms.PasswordInput(attrs={
++            'tabindex': '2',
++            'placeholder': ugettext_lazy("Enter password"),
++        }))
++    def __init__(self, request=None, *args, **kwargs):
++        super().__init__(request=request, *args, **kwargs)
++        self.fields['username'].widget.attrs['placeholder'] = (
++            ugettext_lazy("Enter your %s") % self.username_field.verbose_name)
++    @property
++    def extra_fields(self):
++        for field_name, field in self.fields.items():
++            if field_name not in ['username', 'password']:
++                yield field_name, field
++class PasswordResetForm(PasswordResetForm):
++    email = forms.EmailField(label=ugettext_lazy("Enter your email address to reset your password"), max_length=254)
++    def clean(self):
++        cleaned_data = super().clean()
++        UserModel = get_user_model()
++        email = cleaned_data.get('email')
++        if not email:
++            raise forms.ValidationError(_("Please fill your email address."))
++        active_users = UserModel._default_manager.filter(email__iexact=email, is_active=True)
++        if active_users.exists():
++            found_non_ldap_user = False
++            for user in active_users:
++                if user.has_usable_password():
++                    found_non_ldap_user = True
++                    break
++            if not found_non_ldap_user:
++                raise forms.ValidationError(
++                    _("Sorry, you cannot reset your password here as your user account is managed by another server.")
++                )
++        else:
++            raise forms.ValidationError(_("This email address is not recognised."))
++        return cleaned_data
++class CopyForm(forms.Form):
++    def __init__(self, *args, **kwargs):
++        self.page = kwargs.pop('page')
++        self.user = kwargs.pop('user', None)
++        can_publish = kwargs.pop('can_publish')
++        super().__init__(*args, **kwargs)
++        self.fields['new_title'] = forms.CharField(initial=self.page.title, label=_("New title"))
++        self.fields['new_slug'] = forms.SlugField(initial=self.page.slug, label=_("New slug"))
++        self.fields['new_parent_page'] = forms.ModelChoiceField(
++            initial=self.page.get_parent(),
++            queryset=Page.objects.all(),
++            widget=widgets.AdminPageChooser(can_choose_root=True, user_perms='copy_to'),
++            label=_("New parent page"),
++            help_text=_("This copy will be a child of this given parent page.")
++        )
++        pages_to_copy = self.page.get_descendants(inclusive=True)
++        subpage_count = pages_to_copy.count() - 1
++        if subpage_count > 0:
++            self.fields['copy_subpages'] = forms.BooleanField(
++                required=False, initial=True, label=_("Copy subpages"),
++                help_text=ungettext(
++                    "This will copy %(count)s subpage.",
++                    "This will copy %(count)s subpages.",
++                    subpage_count) % {'count': subpage_count})
++        if can_publish:
++            pages_to_publish_count = pages_to_copy.live().count()
++            if pages_to_publish_count > 0:
++                if subpage_count == 0:
++                    label = _("Publish copied page")
++                    help_text = _("This page is live. Would you like to publish its copy as well?")
++                else:
++                    label = _("Publish copies")
++                    help_text = ungettext(
++                        "%(count)s of the pages being copied is live. Would you like to publish its copy?",
++                        "%(count)s of the pages being copied are live. Would you like to publish their copies?",
++                        pages_to_publish_count) % {'count': pages_to_publish_count}
++                self.fields['publish_copies'] = forms.BooleanField(
++                    required=False, initial=True, label=label, help_text=help_text
++                )
++    def clean(self):
++        cleaned_data = super().clean()
++        slug = cleaned_data.get('new_slug')
++        parent_page = cleaned_data.get('new_parent_page') or self.page.get_parent()
++        if not parent_page.permissions_for_user(self.user).can_add_subpage():
++            self._errors['new_parent_page'] = self.error_class([
++                _("You do not have permission to copy to page \"%(page_title)s\"") % {'page_title': parent_page.get_admin_display_title()}
++            ])
++        if slug and parent_page.get_children().filter(slug=slug).count():
++            self._errors['new_slug'] = self.error_class(
++                [_("This slug is already in use within the context of its parent page \"%s\"" % parent_page)]
++            )
++            del cleaned_data['new_slug']
++        if cleaned_data.get('copy_subpages') and (self.page == parent_page or parent_page.is_descendant_of(self.page)):
++            self._errors['new_parent_page'] = self.error_class(
++                [_("You cannot copy a page into itself when copying subpages")]
++            )
++        return cleaned_data
++class BaseViewRestrictionForm(forms.ModelForm):
++    restriction_type = forms.ChoiceField(
++        label=ugettext_lazy("Visibility"), choices=BaseViewRestriction.RESTRICTION_CHOICES,
++        widget=forms.RadioSelect)
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.fields['groups'].widget = forms.CheckboxSelectMultiple()
++        self.fields['groups'].queryset = Group.objects.all()
++    def clean_password(self):
++        password = self.cleaned_data.get('password')
++        if self.cleaned_data.get('restriction_type') == BaseViewRestriction.PASSWORD and not password:
++            raise forms.ValidationError(_("This field is required."), code='invalid')
++        return password
++    def clean_groups(self):
++        groups = self.cleaned_data.get('groups')
++        if self.cleaned_data.get('restriction_type') == BaseViewRestriction.GROUPS and not groups:
++            raise forms.ValidationError(_("Please select at least one group."), code='invalid')
++        return groups
++    class Meta:
++        model = BaseViewRestriction
++        fields = ('restriction_type', 'password', 'groups')
++class CollectionViewRestrictionForm(BaseViewRestrictionForm):
++    class Meta:
++        model = CollectionViewRestriction
++        fields = ('restriction_type', 'password', 'groups')
++class PageViewRestrictionForm(BaseViewRestrictionForm):
++    class Meta:
++        model = PageViewRestriction
++        fields = ('restriction_type', 'password', 'groups')
++FORM_FIELD_OVERRIDES = {
++    models.DateField: {'widget': widgets.AdminDateInput},
++    models.TimeField: {'widget': widgets.AdminTimeInput},
++    models.DateTimeField: {'widget': widgets.AdminDateTimeInput},
++    TaggableManager: {'widget': widgets.AdminTagWidget},
++}
++DIRECT_FORM_FIELD_OVERRIDES = {
++    models.TextField: {'widget': widgets.AdminAutoHeightTextInput},
++}
++def formfield_for_dbfield(db_field, **kwargs):
++    overrides = None
++    if db_field.__class__ in DIRECT_FORM_FIELD_OVERRIDES:
++        overrides = DIRECT_FORM_FIELD_OVERRIDES[db_field.__class__]
++    else:
++        for klass in db_field.__class__.mro():
++            if klass in FORM_FIELD_OVERRIDES:
++                overrides = FORM_FIELD_OVERRIDES[klass]
++                break
++    if overrides:
++        kwargs = dict(copy.deepcopy(overrides), **kwargs)
++    return db_field.formfield(**kwargs)
++class WagtailAdminModelFormMetaclass(ClusterFormMetaclass):
++    extra_form_count = 0
++    def __new__(cls, name, bases, attrs):
++        if 'formfield_callback' not in attrs or attrs['formfield_callback'] is None:
++            attrs['formfield_callback'] = formfield_for_dbfield
++        new_class = super(WagtailAdminModelFormMetaclass, cls).__new__(cls, name, bases, attrs)
++        return new_class
++class WagtailAdminModelForm(ClusterForm, metaclass=WagtailAdminModelFormMetaclass):
++    @property
++    def media(self):
++        media = super().media
++        for formset in self.formsets.values():
++            media += formset.media
++        return media
++class WagtailAdminPageForm(WagtailAdminModelForm):
++    class Meta:
++        exclude = ['content_type', 'path', 'depth', 'numchild']
++    def __init__(self, data=None, files=None, parent_page=None, *args, **kwargs):
++        super().__init__(data, files, *args, **kwargs)
++        self.parent_page = parent_page
++    def clean(self):
++        cleaned_data = super().clean()
++        if 'slug' in self.cleaned_data:
++            if not Page._slug_is_available(
++                cleaned_data['slug'], self.parent_page, self.instance
++            ):
++                self.add_error('slug', forms.ValidationError(_("This slug is already in use")))
++        go_live_at = cleaned_data.get('go_live_at')
++        expire_at = cleaned_data.get('expire_at')
++        if go_live_at and expire_at:
++            if go_live_at > expire_at:
++                msg = _('Go live date/time must be before expiry date/time')
++                self.add_error('go_live_at', forms.ValidationError(msg))
++                self.add_error('expire_at', forms.ValidationError(msg))
++        if expire_at and expire_at < timezone.now():
++            self.add_error('expire_at', forms.ValidationError(_('Expiry date/time must be in the future')))
++        if 'first_published_at' in cleaned_data and not cleaned_data['first_published_at']:
++            del cleaned_data['first_published_at']
++        return cleaned_data
++class CollectionForm(forms.ModelForm):
++    class Meta:
++        model = Collection
++        fields = ('name',)
++class BaseCollectionMemberForm(forms.ModelForm):
++    """
++    Abstract form handler for editing models that belong to a collection,
++    such as documents and images. These forms are (optionally) instantiated
++    with a 'user' kwarg, and take care of populating the 'collection' field's
++    choices with the collections the user has permission for, as well as
++    hiding the field when only one collection is available.
++    Subclasses must define a 'permission_policy' attribute.
++    """
++    def __init__(self, *args, **kwargs):
++        user = kwargs.pop('user', None)
++        super().__init__(*args, **kwargs)
++        if user is None:
++            self.collections = Collection.objects.all()
++        else:
++            self.collections = (
++                self.permission_policy.collections_user_has_permission_for(user, 'add')
++            )
++        if self.instance.pk:
++            self.collections = (
++                self.collections | Collection.objects.filter(id=self.instance.collection_id)
++            )
++        if len(self.collections) == 0:
++            raise Exception(
++                "Cannot construct %s for a user with no collection permissions" % type(self)
++            )
++        elif len(self.collections) == 1:
++            del self.fields['collection']
++        else:
++            self.fields['collection'].queryset = self.collections
++    def save(self, commit=True):
++        if len(self.collections) == 1:
++            self.instance.collection = self.collections[0]
++        return super().save(commit=commit)
++class BaseGroupCollectionMemberPermissionFormSet(forms.BaseFormSet):
++    """
++    A base formset class for managing GroupCollectionPermissions for a
++    model with CollectionMember behaviour. Subclasses should provide attributes:
++    permission_types - a list of (codename, short_label, long_label) tuples for the permissions
++        being managed here
++    permission_queryset - a queryset of Permission objects for the above permissions
++    default_prefix - prefix to use on form fields if one is not specified in __init__
++    template = template filename
++    """
++    def __init__(self, data=None, files=None, instance=None, prefix=None):
++        if prefix is None:
++            prefix = self.default_prefix
++        if instance is None:
++            instance = Group()
++        self.instance = instance
++        initial_data = []
++        for collection, collection_permissions in groupby(
++            instance.collection_permissions.filter(
++                permission__in=self.permission_queryset
++            ).select_related('permission__content_type', 'collection').order_by('collection'),
++            lambda cp: cp.collection
++        ):
++            initial_data.append({
++                'collection': collection,
++                'permissions': [cp.permission for cp in collection_permissions]
++            })
++        super().__init__(
++            data, files, initial=initial_data, prefix=prefix
++        )
++        for form in self.forms:
++            form.fields['DELETE'].widget = forms.HiddenInput()
++    @property
++    def empty_form(self):
++        empty_form = super().empty_form
++        empty_form.fields['DELETE'].widget = forms.HiddenInput()
++        return empty_form
++    def clean(self):
++        """Checks that no two forms refer to the same collection object"""
++        if any(self.errors):
++            return
++        collections = [
++            form.cleaned_data['collection']
++            for form in self.forms
++            if form not in self.deleted_forms and 'collection' in form.cleaned_data
++        ]
++        if len(set(collections)) != len(collections):
++            raise forms.ValidationError(
++                _("You cannot have multiple permission records for the same collection.")
++            )
++    @transaction.atomic
++    def save(self):
++        if self.instance.pk is None:
++            raise Exception(
++                "Cannot save a GroupCollectionMemberPermissionFormSet "
++                "for an unsaved group instance"
++            )
++        forms_to_save = [
++            form for form in self.forms
++            if form not in self.deleted_forms and 'collection' in form.cleaned_data
++        ]
++        final_permission_records = set()
++        for form in forms_to_save:
++            for permission in form.cleaned_data['permissions']:
++                final_permission_records.add((form.cleaned_data['collection'], permission))
++        permission_ids_to_delete = []
++        permission_records_to_keep = set()
++        for cp in self.instance.collection_permissions.filter(
++            permission__in=self.permission_queryset,
++        ):
++            if (cp.collection, cp.permission) in final_permission_records:
++                permission_records_to_keep.add((cp.collection, cp.permission))
++            else:
++                permission_ids_to_delete.append(cp.id)
++        self.instance.collection_permissions.filter(id__in=permission_ids_to_delete).delete()
++        permissions_to_add = final_permission_records - permission_records_to_keep
++        GroupCollectionPermission.objects.bulk_create([
++            GroupCollectionPermission(
++                group=self.instance, collection=collection, permission=permission
++            )
++            for (collection, permission) in permissions_to_add
++        ])
++    def as_admin_panel(self):
++        return render_to_string(
++            self.template,
++            {'formset': self},
++        )
++def collection_member_permission_formset_factory(
++    model, permission_types, template, default_prefix=None
++):
++    permission_queryset = Permission.objects.filter(
++        content_type__app_label=model._meta.app_label,
++        codename__in=[codename for codename, short_label, long_label in permission_types]
++    ).select_related('content_type')
++    if default_prefix is None:
++        default_prefix = '%s_permissions' % model._meta.model_name
++    class CollectionMemberPermissionsForm(forms.Form):
++        """
++        For a given model with CollectionMember behaviour,
++        defines the permissions that are assigned to an entity
++        (i.e. group or user) for a specific collection
++        """
++        collection = forms.ModelChoiceField(
++            queryset=Collection.objects.all().prefetch_related('group_permissions')
++        )
++        permissions = forms.ModelMultipleChoiceField(
++            queryset=permission_queryset,
++            required=False,
++            widget=forms.CheckboxSelectMultiple
++        )
++    GroupCollectionMemberPermissionFormSet = type(
++        str('GroupCollectionMemberPermissionFormSet'),
++        (BaseGroupCollectionMemberPermissionFormSet, ),
++        {
++            'permission_types': permission_types,
++            'permission_queryset': permission_queryset,
++            'default_prefix': default_prefix,
++            'template': template,
++        }
++    )
++    return forms.formset_factory(
++        CollectionMemberPermissionsForm,
++        formset=GroupCollectionMemberPermissionFormSet,
++        extra=0,
++        can_delete=True
++    )
+
+--- a//dev/null
++++ b/wagtail/admin/jinja2tags.py
+@@ -0,0 +1,10 @@
++import jinja2
++from jinja2.ext import Extension
++from .templatetags.wagtailuserbar import wagtailuserbar
++class WagtailUserbarExtension(Extension):
++    def __init__(self, environment):
++        super().__init__(environment)
++        self.environment.globals.update({
++            'wagtailuserbar': jinja2.contextfunction(wagtailuserbar),
++        })
++userbar = WagtailUserbarExtension
+
+--- a//dev/null
++++ b/wagtail/admin/menu.py
+@@ -0,0 +1,92 @@
++from django.contrib.staticfiles.templatetags.staticfiles import static
++from django.forms import Media, MediaDefiningClass
++from django.forms.utils import flatatt
++from django.template.loader import render_to_string
++from django.utils.safestring import mark_safe
++from django.utils.text import slugify
++from wagtail.core import hooks
++class MenuItem(metaclass=MediaDefiningClass):
++    template = 'wagtailadmin/shared/menu_item.html'
++    def __init__(self, label, url, name=None, classnames='', attrs=None, order=1000):
++        self.label = label
++        self.url = url
++        self.classnames = classnames
++        self.name = (name or slugify(str(label)))
++        self.order = order
++        if attrs:
++            self.attr_string = flatatt(attrs)
++        else:
++            self.attr_string = ""
++    def is_shown(self, request):
++        """
++        Whether this menu item should be shown for the given request; permission
++        checks etc should go here. By default, menu items are shown all the time
++        """
++        return True
++    def is_active(self, request):
++        return request.path.startswith(str(self.url))
++    def get_context(self, request):
++        """Defines context for the template, overridable to use more data"""
++        return {
++            'name': self.name,
++            'url': self.url,
++            'classnames': self.classnames,
++            'attr_string': self.attr_string,
++            'label': self.label,
++            'active': self.is_active(request)
++        }
++    def render_html(self, request):
++        context = self.get_context(request)
++        return render_to_string(self.template, context, request=request)
++class Menu:
++    def __init__(self, register_hook_name, construct_hook_name=None):
++        self.register_hook_name = register_hook_name
++        self.construct_hook_name = construct_hook_name
++        self._registered_menu_items = None
++    @property
++    def registered_menu_items(self):
++        if self._registered_menu_items is None:
++            self._registered_menu_items = [fn() for fn in hooks.get_hooks(self.register_hook_name)]
++        return self._registered_menu_items
++    def menu_items_for_request(self, request):
++        return [item for item in self.registered_menu_items if item.is_shown(request)]
++    def active_menu_items(self, request):
++        return [item for item in self.menu_items_for_request(request) if item.is_active(request)]
++    @property
++    def media(self):
++        media = Media()
++        for item in self.registered_menu_items:
++            media += item.media
++        return media
++    def render_html(self, request):
++        menu_items = self.menu_items_for_request(request)
++        if self.construct_hook_name:
++            for fn in hooks.get_hooks(self.construct_hook_name):
++                fn(request, menu_items)
++        rendered_menu_items = []
++        for item in sorted(menu_items, key=lambda i: i.order):
++            try:
++                rendered_menu_items.append(item.render_html(request))
++            except TypeError:
++                rendered_menu_items.append(item.render_html(request))
++        return mark_safe(''.join(rendered_menu_items))
++class SubmenuMenuItem(MenuItem):
++    template = 'wagtailadmin/shared/menu_submenu_item.html'
++    """A MenuItem which wraps an inner Menu object"""
++    def __init__(self, label, menu, **kwargs):
++        self.menu = menu
++        super().__init__(label, '#', **kwargs)
++    @property
++    def media(self):
++        return Media(js=[static('wagtailadmin/js/submenu.js')]) + self.menu.media
++    def is_shown(self, request):
++        return bool(self.menu.menu_items_for_request(request))
++    def is_active(self, request):
++        return bool(self.menu.active_menu_items(request))
++    def get_context(self, request):
++        context = super().get_context(request)
++        context['menu_html'] = self.menu.render_html(request)
++        context['request'] = request
++        return context
++admin_menu = Menu(register_hook_name='register_admin_menu_item', construct_hook_name='construct_main_menu')
++settings_menu = Menu(register_hook_name='register_settings_menu_item')
+
+--- a//dev/null
++++ b/wagtail/admin/messages.py
+@@ -0,0 +1,43 @@
++from django.contrib import messages
++from django.core.exceptions import NON_FIELD_ERRORS
++from django.template.loader import render_to_string
++from django.utils.html import format_html, format_html_join
++def render(message, buttons, detail=''):
++    return render_to_string('wagtailadmin/shared/messages.html', {
++        'message': message,
++        'buttons': buttons,
++        'detail': detail,
++    })
++def debug(request, message, buttons=None):
++    return messages.debug(request, render(message, buttons))
++def info(request, message, buttons=None):
++    return messages.info(request, render(message, buttons))
++def success(request, message, buttons=None):
++    return messages.success(request, render(message, buttons))
++def warning(request, message, buttons=None):
++    return messages.warning(request, render(message, buttons))
++def error(request, message, buttons=None):
++    return messages.error(request, render(message, buttons))
++def validation_error(request, message, form, buttons=None):
++    if not form.non_field_errors():
++        detail = ''
++    else:
++        all_errors = []
++        for field_name, errors in form.errors.items():
++            if field_name == NON_FIELD_ERRORS:
++                prefix = ''
++            else:
++                try:
++                    field_label = form[field_name].label
++                except KeyError:
++                    field_label = field_name
++                prefix = "%s: " % field_label
++            for error in errors:
++                all_errors.append(prefix + error)
++        errors_html = format_html_join('\n', '<li>{}</li>', ((e,) for e in all_errors))
++        detail = format_html("""<ul class="errorlist">{}</ul>""", errors_html)
++    return messages.error(request, render(message, buttons, detail=detail))
++def button(url, text, new_window=False):
++    if url is None:
++        raise ValueError("Button URLs must not be None")
++    return url, text, new_window
+
+--- a//dev/null
++++ b/wagtail/admin/migrations/0001_create_admin_access_permissions.py
+@@ -0,0 +1,35 @@
++from django.db import migrations
++def create_admin_access_permissions(apps, schema_editor):
++    ContentType = apps.get_model('contenttypes.ContentType')
++    Permission = apps.get_model('auth.Permission')
++    Group = apps.get_model('auth.Group')
++    wagtailadmin_content_type, created = ContentType.objects.get_or_create(
++        app_label='wagtailadmin',
++        model='admin'
++    )
++    admin_permission, created = Permission.objects.get_or_create(
++        content_type=wagtailadmin_content_type,
++        codename='access_admin',
++        name='Can access Wagtail admin'
++    )
++    for group in Group.objects.filter(name__in=['Editors', 'Moderators']):
++        group.permissions.add(admin_permission)
++def remove_admin_access_permissions(apps, schema_editor):
++    """Reverse the above additions of permissions."""
++    ContentType = apps.get_model('contenttypes.ContentType')
++    Permission = apps.get_model('auth.Permission')
++    wagtailadmin_content_type = ContentType.objects.get(
++        app_label='wagtailadmin',
++        model='admin',
++    )
++    Permission.objects.filter(
++        content_type=wagtailadmin_content_type,
++        codename='access_admin',
++    ).delete()
++class Migration(migrations.Migration):
++    dependencies = [
++        ('wagtailcore', '0026_group_collection_permission'),
++    ]
++    operations = [
++        migrations.RunPython(create_admin_access_permissions, remove_admin_access_permissions),
++    ]
+
+--- a//dev/null
++++ b/wagtail/admin/modal_workflow.py
+@@ -0,0 +1,17 @@
++import json
++from django.http import HttpResponse
++from django.template.loader import render_to_string
++def render_modal_workflow(request, html_template, js_template, template_vars=None):
++    """"
++    Render a response consisting of an HTML chunk and a JS onload chunk
++    in the format required by the modal-workflow framework.
++    """
++    response_keyvars = []
++    if html_template:
++        html = render_to_string(html_template, template_vars or {}, request=request)
++        response_keyvars.append("'html': %s" % json.dumps(html))
++    if js_template:
++        js = render_to_string(js_template, template_vars or {}, request=request)
++        response_keyvars.append("'onload': %s" % js)
++    response_text = "{%s}" % ','.join(response_keyvars)
++    return HttpResponse(response_text, content_type="text/javascript")
+
+--- a//dev/null
++++ b/wagtail/admin/models.py
+@@ -0,0 +1 @@
++from wagtail.admin import edit_handlers  # NOQA
+
+--- a//dev/null
++++ b/wagtail/admin/navigation.py
+@@ -0,0 +1,17 @@
++from wagtail.core.models import Page
++def get_pages_with_direct_explore_permission(user):
++    if user.is_superuser:
++        return Page.objects.filter(depth=1)
++    else:
++        return Page.objects.filter(
++            group_permissions__group__in=user.groups.all(),
++            group_permissions__permission_type__in=['add', 'edit', 'publish', 'lock']
++        )
++def get_explorable_root_page(user):
++    pages = get_pages_with_direct_explore_permission(user)
++    if pages:
++        return pages.first_common_ancestor(
++            include_self=True,
++            strict=True)
++    else:
++        return None
+
+--- a//dev/null
++++ b/wagtail/admin/rich_text/__init__.py
+@@ -0,0 +1,24 @@
++from django.conf import settings
++from django.utils.module_loading import import_string
++from wagtail.admin.rich_text.editors.hallo import (  # NOQA
++    HalloFormatPlugin, HalloHeadingPlugin, HalloListPlugin, HalloPlugin, HalloRichTextArea
++)
++from wagtail.admin.rich_text.editors.draftail import DraftailRichTextArea  # NOQA
++DEFAULT_RICH_TEXT_EDITORS = {
++    'default': {
++        'WIDGET': 'wagtail.admin.rich_text.DraftailRichTextArea'
++    }
++}
++def get_rich_text_editor_widget(name='default', features=None):
++    editor_settings = getattr(settings, 'WAGTAILADMIN_RICH_TEXT_EDITORS', DEFAULT_RICH_TEXT_EDITORS)
++    editor = editor_settings[name]
++    options = editor.get('OPTIONS', None)
++    if features is None and options is not None:
++        features = options.get('features', None)
++    cls = import_string(editor['WIDGET'])
++    kwargs = {}
++    if options is not None:
++        kwargs['options'] = options
++    if getattr(cls, 'accepts_features', False):
++        kwargs['features'] = features
++    return cls(**kwargs)
+
+--- a//dev/null
++++ b/wagtail/admin/rich_text/converters/contentstate.py
+@@ -0,0 +1,69 @@
++import json
++import logging
++import re
++from draftjs_exporter.defaults import render_children
++from draftjs_exporter.dom import DOM
++from draftjs_exporter.html import HTML as HTMLExporter
++from wagtail.admin.rich_text.converters.html_to_contentstate import HtmlToContentStateHandler
++from wagtail.core.rich_text import features as feature_registry
++def link_entity(props):
++    """
++    <a linktype="page" id="1">internal page link</a>
++    """
++    id_ = props.get('id')
++    link_props = {}
++    if id_ is not None:
++        link_props['linktype'] = 'page'
++        link_props['id'] = id_
++    else:
++        link_props['href'] = props.get('url')
++    return DOM.create_element('a', link_props, props['children'])
++def br(props):
++    if props['block']['type'] == 'code-block':
++        return props['children']
++    return DOM.create_element('br')
++def block_fallback(props):
++    type_ = props['block']['type']
++    logging.error('Missing config for "%s". Deleting block.' % type_)
++    return None
++def entity_fallback(props):
++    type_ = props['entity']['type']
++    logging.warn('Missing config for "%s". Deleting entity' % type_)
++    return None
++class ContentstateConverter():
++    def __init__(self, features=None):
++        self.features = features
++        self.html_to_contentstate_handler = HtmlToContentStateHandler(features)
++        exporter_config = {
++            'block_map': {
++                'unstyled': 'p',
++                'atomic': render_children,
++                'fallback': block_fallback,
++            },
++            'style_map': {},
++            'entity_decorators': {
++                'FALLBACK': entity_fallback,
++            },
++            'composite_decorators': [
++                {
++                    'strategy': re.compile(r'\n'),
++                    'component': br,
++                },
++            ],
++            'engine': DOM.STRING,
++        }
++        for feature in self.features:
++            rule = feature_registry.get_converter_rule('contentstate', feature)
++            if rule is not None:
++                feature_config = rule['to_database_format']
++                exporter_config['block_map'].update(feature_config.get('block_map', {}))
++                exporter_config['style_map'].update(feature_config.get('style_map', {}))
++                exporter_config['entity_decorators'].update(feature_config.get('entity_decorators', {}))
++        self.exporter = HTMLExporter(exporter_config)
++    def from_database_format(self, html):
++        self.html_to_contentstate_handler.reset()
++        self.html_to_contentstate_handler.feed(html)
++        self.html_to_contentstate_handler.close()
++        return self.html_to_contentstate_handler.contentstate.as_json(indent=4, separators=(',', ': '))
++    def to_database_format(self, contentstate_json):
++        return self.exporter.render(json.loads(contentstate_json))
+
+--- a//dev/null
++++ b/wagtail/admin/rich_text/converters/contentstate_models.py
+@@ -0,0 +1,72 @@
++import json
++import random
++import string
++ALPHANUM = string.ascii_lowercase + string.digits
++class Block(object):
++    def __init__(self, typ, depth=0):
++        self.type = typ
++        self.depth = depth
++        self.text = ""
++        self.key = ''.join(random.choice(ALPHANUM) for _ in range(5))
++        self.inline_style_ranges = []
++        self.entity_ranges = []
++    def as_dict(self):
++        return {
++            'key': self.key,
++            'type': self.type,
++            'depth': self.depth,
++            'text': self.text,
++            'inlineStyleRanges': [isr.as_dict() for isr in self.inline_style_ranges],
++            'entityRanges': [er.as_dict() for er in self.entity_ranges],
++        }
++class InlineStyleRange(object):
++    def __init__(self, style):
++        self.style = style
++        self.offset = None
++        self.length = None
++    def as_dict(self):
++        return {
++            'offset': self.offset,
++            'length': self.length,
++            'style': self.style,
++        }
++class Entity(object):
++    def __init__(self, entity_type, mutability, data):
++        self.entity_type = entity_type
++        self.mutability = mutability
++        self.data = data
++    def as_dict(self):
++        return {
++            'mutability': self.mutability,
++            'type': self.entity_type,
++            'data': self.data,
++        }
++class EntityRange(object):
++    def __init__(self, key):
++        self.key = key
++        self.offset = None
++        self.length = None
++    def as_dict(self):
++        return {
++            'key': self.key,
++            'offset': self.offset,
++            'length': self.length,
++        }
++class ContentState(object):
++    """Pythonic representation of a draft.js contentState structure"""
++    def __init__(self):
++        self.blocks = []
++        self.entity_count = 0
++        self.entity_map = {}
++    def add_entity(self, entity):
++        key = self.entity_count
++        self.entity_map[key] = entity
++        self.entity_count += 1
++        return key
++    def as_dict(self):
++        return {
++            'blocks': [block.as_dict() for block in self.blocks],
++            'entityMap': {key: entity.as_dict() for (key, entity) in self.entity_map.items()},
++        }
++    def as_json(self, **kwargs):
++        return json.dumps(self.as_dict(), **kwargs)
+
+--- a//dev/null
++++ b/wagtail/admin/rich_text/converters/editor_html.py
+@@ -0,0 +1,124 @@
++import warnings
++from django.utils.functional import cached_property
++from wagtail.core import hooks
++from wagtail.core.rich_text import features as feature_registry
++from wagtail.core.rich_text.rewriters import EmbedRewriter, LinkRewriter, MultiRuleRewriter
++from wagtail.core.whitelist import Whitelister, allow_without_attributes
++from wagtail.utils.deprecation import RemovedInWagtail22Warning
++class WhitelistRule:
++    def __init__(self, element, handler):
++        self.element = element
++        self.handler = handler
++class EmbedTypeRule:
++    def __init__(self, embed_type, handler):
++        self.embed_type = embed_type
++        self.handler = handler
++class LinkTypeRule:
++    def __init__(self, link_type, handler):
++        self.link_type = link_type
++        self.handler = handler
++BASE_WHITELIST_RULES = {
++    '[document]': allow_without_attributes,
++    'p': allow_without_attributes,
++    'div': allow_without_attributes,
++    'br': allow_without_attributes,
++}
++class DbWhitelister(Whitelister):
++    """
++    A custom whitelisting engine to convert the HTML as returned by the rich text editor
++    into the pseudo-HTML format stored in the database (in which images, documents and other
++    linked objects are identified by ID rather than URL):
++    * implements a 'construct_whitelister_element_rules' hook so that other apps can modify
++      the whitelist ruleset (e.g. to permit additional HTML elements beyond those in the base
++      Whitelister module);
++    * replaces any element with a 'data-embedtype' attribute with an <embed> element, with
++      attributes supplied by the handler for that type as defined in embed_handlers;
++    * rewrites the attributes of any <a> element with a 'data-linktype' attribute, as
++      determined by the handler for that type defined in link_handlers, while keeping the
++      element content intact.
++    """
++    def __init__(self, converter_rules):
++        self.converter_rules = converter_rules
++        self.element_rules = BASE_WHITELIST_RULES.copy()
++        for rule in self.converter_rules:
++            if isinstance(rule, WhitelistRule):
++                self.element_rules[rule.element] = rule.handler
++        construct_whitelist_hooks = hooks.get_hooks('construct_whitelister_element_rules')
++        if construct_whitelist_hooks:
++            warnings.warn(
++                'The construct_whitelister_element_rules hook is deprecated and will be removed '
++                'in Wagtail 2.2. Use register_rich_text_features instead',
++                RemovedInWagtail22Warning
++            )
++            for fn in construct_whitelist_hooks:
++                self.element_rules.update(fn())
++    @cached_property
++    def embed_handlers(self):
++        return {
++            rule.embed_type: rule.handler for rule in self.converter_rules
++            if isinstance(rule, EmbedTypeRule)
++        }
++    @cached_property
++    def link_handlers(self):
++        return {
++            rule.link_type: rule.handler for rule in self.converter_rules
++            if isinstance(rule, LinkTypeRule)
++        }
++    def clean_tag_node(self, doc, tag):
++        if 'data-embedtype' in tag.attrs:
++            embed_type = tag['data-embedtype']
++            try:
++                embed_handler = self.embed_handlers[embed_type]
++            except KeyError:
++                tag.decompose()
++                return
++            embed_attrs = embed_handler.get_db_attributes(tag)
++            embed_attrs['embedtype'] = embed_type
++            embed_tag = doc.new_tag('embed', **embed_attrs)
++            embed_tag.can_be_empty_element = True
++            tag.replace_with(embed_tag)
++        elif tag.name == 'a' and 'data-linktype' in tag.attrs:
++            for child in tag.contents:
++                self.clean_node(doc, child)
++            link_type = tag['data-linktype']
++            try:
++                link_handler = self.link_handlers[link_type]
++            except KeyError:
++                tag.unwrap()
++                return
++            link_attrs = link_handler.get_db_attributes(tag)
++            link_attrs['linktype'] = link_type
++            tag.attrs.clear()
++            tag.attrs.update(**link_attrs)
++        else:
++            if tag.name == 'div':
++                tag.name = 'p'
++            super(DbWhitelister, self).clean_tag_node(doc, tag)
++class EditorHTMLConverter:
++    def __init__(self, features=None):
++        if features is None:
++            features = feature_registry.get_default_features()
++        self.converter_rules = []
++        for feature in features:
++            rule = feature_registry.get_converter_rule('editorhtml', feature)
++            if rule is not None:
++                self.converter_rules.extend(rule)
++    @cached_property
++    def whitelister(self):
++        return DbWhitelister(self.converter_rules)
++    def to_database_format(self, html):
++        return self.whitelister.clean(html)
++    @cached_property
++    def html_rewriter(self):
++        embed_rules = {}
++        link_rules = {}
++        for rule in self.converter_rules:
++            if isinstance(rule, EmbedTypeRule):
++                embed_rules[rule.embed_type] = rule.handler.expand_db_attributes
++            elif isinstance(rule, LinkTypeRule):
++                link_rules[rule.link_type] = rule.handler.expand_db_attributes
++        return MultiRuleRewriter([
++            LinkRewriter(link_rules), EmbedRewriter(embed_rules)
++        ])
++    def from_database_format(self, html):
++        return self.html_rewriter(html)
+
+--- a//dev/null
++++ b/wagtail/admin/rich_text/converters/html_ruleset.py
+@@ -0,0 +1,71 @@
++import re
++from collections import Mapping
++ELEMENT_SELECTOR = re.compile(r'^([\w-]+)$')
++ELEMENT_WITH_ATTR_SELECTOR = re.compile(r'^([\w-]+)\[([\w-]+)\]$')
++ELEMENT_WITH_ATTR_EXACT_SINGLE_QUOTE_SELECTOR = re.compile(r"^([\w-]+)\[([\w-]+)='(.*)'\]$")
++ELEMENT_WITH_ATTR_EXACT_DOUBLE_QUOTE_SELECTOR = re.compile(r'^([\w-]+)\[([\w-]+)="(.*)"\]$')
++ELEMENT_WITH_ATTR_EXACT_UNQUOTED_SELECTOR = re.compile(r"^([\w-]+)\[([\w-]+)=([\w-]+)\]$")
++class HTMLRuleset():
++    """
++    Maintains a set of rules for matching HTML elements.
++    Each rule defines a mapping from a CSS-like selector to an arbitrary result object.
++    The following forms of rule are currently supported:
++    'a' = matches any <a> element
++    'a[href]' = matches any <a> element with an 'href' attribute
++    'a[linktype="page"]' = matches any <a> element with a 'linktype' attribute equal to 'page'
++    """
++    def __init__(self, rules=None):
++        self.element_rules = {}
++        if rules:
++            self.add_rules(rules)
++    def add_rules(self, rules):
++        if isinstance(rules, Mapping):
++            rules = rules.items()
++        for selector, result in rules:
++            self.add_rule(selector, result)
++    def _add_element_rule(self, name, result):
++        self.element_rules.setdefault(name, []).append(
++            ((lambda attrs: True), result)
++        )
++    def _add_element_with_attr_rule(self, name, attr, result):
++        self.element_rules.setdefault(name, []).append(
++            ((lambda attrs: attr in attrs), result)
++        )
++    def _add_element_with_attr_exact_rule(self, name, attr, value, result):
++        self.element_rules.setdefault(name, []).append(
++            ((lambda attrs: attr in attrs and attrs[attr] == value), result)
++        )
++    def add_rule(self, selector, result):
++        match = ELEMENT_SELECTOR.match(selector)
++        if match:
++            name = match.group(1)
++            self._add_element_rule(name, result)
++            return
++        match = ELEMENT_WITH_ATTR_SELECTOR.match(selector)
++        if match:
++            name, attr = match.groups()
++            self._add_element_with_attr_rule(name, attr, result)
++            return
++        for regex in (
++            ELEMENT_WITH_ATTR_EXACT_SINGLE_QUOTE_SELECTOR,
++            ELEMENT_WITH_ATTR_EXACT_DOUBLE_QUOTE_SELECTOR,
++            ELEMENT_WITH_ATTR_EXACT_UNQUOTED_SELECTOR
++        ):
++            match = regex.match(selector)
++            if match:
++                name, attr, value = match.groups()
++                self._add_element_with_attr_exact_rule(name, attr, value, result)
++                return
++    def match(self, name, attrs):
++        """
++        Look for a rule matching an HTML element with the given name and attribute dict,
++        and return the corresponding result object. If no rule matches, return None.
++        If multiple rules match, the one chosen is undetermined.
++        """
++        try:
++            rules_to_test = self.element_rules[name]
++        except KeyError:
++            return None
++        for attr_check, result in rules_to_test:
++            if attr_check(attrs):
++                return result
+
+--- a//dev/null
++++ b/wagtail/admin/rich_text/converters/html_to_contentstate.py
+@@ -0,0 +1,233 @@
++import re
++from html.parser import HTMLParser
++from wagtail.admin.rich_text.converters.contentstate_models import (
++    Block, ContentState, Entity, EntityRange, InlineStyleRange)
++from wagtail.admin.rich_text.converters.html_ruleset import HTMLRuleset
++from wagtail.core.models import Page
++from wagtail.core.rich_text import features as feature_registry
++STRIP_WHITESPACE = 0
++KEEP_WHITESPACE = 1
++FORCE_WHITESPACE = 2
++WHITESPACE_RE = re.compile(r'\s+')
++class HandlerState:
++    def __init__(self):
++        self.current_block = None
++        self.current_inline_styles = []
++        self.current_entity_ranges = []
++        self.leading_whitespace = STRIP_WHITESPACE
++        self.list_depth = 0
++        self.list_item_type = None
++        self.has_preceding_nonatomic_block = False
++        self.pushed_states = []
++    def push(self):
++        self.pushed_states.append({
++            'current_block': self.current_block,
++            'current_inline_styles': self.current_inline_styles,
++            'current_entity_ranges': self.current_entity_ranges,
++            'leading_whitespace': self.leading_whitespace,
++            'list_depth': self.list_depth,
++            'list_item_type': self.list_item_type,
++        })
++    def pop(self):
++        last_state = self.pushed_states.pop()
++        self.current_block = last_state['current_block']
++        self.current_inline_styles = last_state['current_inline_styles']
++        self.current_entity_ranges = last_state['current_entity_ranges']
++        self.leading_whitespace = last_state['leading_whitespace']
++        self.list_depth = last_state['list_depth']
++        self.list_item_type = last_state['list_item_type']
++def add_paragraph_block(state, contentstate):
++    """
++    Utility function for adding an unstyled (paragraph) block to contentstate;
++    useful for element handlers that aren't paragraph elements themselves, but need
++    to insert paragraphs to ensure correctness
++    """
++    block = Block('unstyled', depth=state.list_depth)
++    contentstate.blocks.append(block)
++    state.current_block = block
++    state.leading_whitespace = STRIP_WHITESPACE
++    state.has_preceding_nonatomic_block = True
++class ListElementHandler:
++    """ Handler for <ul> / <ol> tags """
++    def __init__(self, list_item_type):
++        self.list_item_type = list_item_type
++    def handle_starttag(self, name, attrs, state, contentstate):
++        state.push()
++        if state.list_item_type is None:
++            pass
++        else:
++            state.list_depth += 1
++        state.list_item_type = self.list_item_type
++    def handle_endtag(self, name, state, contentstate):
++        state.pop()
++class BlockElementHandler:
++    def __init__(self, block_type):
++        self.block_type = block_type
++    def create_block(self, name, attrs, state, contentstate):
++        return Block(self.block_type, depth=state.list_depth)
++    def handle_starttag(self, name, attrs, state, contentstate):
++        attr_dict = dict(attrs)  # convert attrs from list of (name, value) tuples to a dict
++        block = self.create_block(name, attr_dict, state, contentstate)
++        contentstate.blocks.append(block)
++        state.current_block = block
++        state.leading_whitespace = STRIP_WHITESPACE
++        state.has_preceding_nonatomic_block = True
++    def handle_endtag(self, name, state, contentState):
++        assert not state.current_inline_styles, "End of block reached without closing inline style elements"
++        assert not state.current_entity_ranges, "End of block reached without closing entity elements"
++        state.current_block = None
++class ListItemElementHandler(BlockElementHandler):
++    """ Handler for <li> tag """
++    def __init__(self):
++        pass  # skip setting self.block_type
++    def create_block(self, name, attrs, state, contentstate):
++        assert state.list_item_type is not None, "%s element found outside of an enclosing list element" % name
++        return Block(state.list_item_type, depth=state.list_depth)
++class InlineStyleElementHandler:
++    def __init__(self, style):
++        self.style = style
++    def handle_starttag(self, name, attrs, state, contentstate):
++        if state.current_block is None:
++            add_paragraph_block(state, contentstate)
++        if state.leading_whitespace == FORCE_WHITESPACE:
++            state.current_block.text += ' '
++            state.leading_whitespace = STRIP_WHITESPACE
++        inline_style_range = InlineStyleRange(self.style)
++        inline_style_range.offset = len(state.current_block.text)
++        state.current_block.inline_style_ranges.append(inline_style_range)
++        state.current_inline_styles.append(inline_style_range)
++    def handle_endtag(self, name, state, contentstate):
++        inline_style_range = state.current_inline_styles.pop()
++        assert inline_style_range.style == self.style
++        inline_style_range.length = len(state.current_block.text) - inline_style_range.offset
++class InlineEntityElementHandler:
++    """
++    Abstract superclass for elements that will be represented as inline entities.
++    Subclasses should define a `mutability` property
++    """
++    def __init__(self, entity_type):
++        self.entity_type = entity_type
++    def handle_starttag(self, name, attrs, state, contentstate):
++        if state.current_block is None:
++            add_paragraph_block(state, contentstate)
++        if state.leading_whitespace == FORCE_WHITESPACE:
++            state.current_block.text += ' '
++            state.leading_whitespace = STRIP_WHITESPACE
++        attrs = dict(attrs)
++        entity = Entity(self.entity_type, self.mutability, self.get_attribute_data(attrs))
++        key = contentstate.add_entity(entity)
++        entity_range = EntityRange(key)
++        entity_range.offset = len(state.current_block.text)
++        state.current_block.entity_ranges.append(entity_range)
++        state.current_entity_ranges.append(entity_range)
++    def get_attribute_data(self, attrs):
++        """
++        Given a dict of attributes found on the source element, return the data dict
++        to be associated with the resulting entity
++        """
++        return {}
++    def handle_endtag(self, name, state, contentstate):
++        entity_range = state.current_entity_ranges.pop()
++        entity_range.length = len(state.current_block.text) - entity_range.offset
++class LinkElementHandler(InlineEntityElementHandler):
++    mutability = 'MUTABLE'
++class ExternalLinkElementHandler(LinkElementHandler):
++    def get_attribute_data(self, attrs):
++        return {'url': attrs['href']}
++class PageLinkElementHandler(LinkElementHandler):
++    def get_attribute_data(self, attrs):
++        try:
++            page = Page.objects.get(id=attrs['id']).specific
++        except Page.DoesNotExist:
++            return {}
++        return {
++            'id': page.id,
++            'url': page.url,
++            'parentId': page.get_parent().id,
++        }
++class AtomicBlockEntityElementHandler:
++    """
++    Handler for elements like <img> that exist as a single immutable item at the block level
++    """
++    def handle_starttag(self, name, attrs, state, contentstate):
++        state.current_block = None
++        if not state.has_preceding_nonatomic_block:
++            add_paragraph_block(state, contentstate)
++        attr_dict = dict(attrs)  # convert attrs from list of (name, value) tuples to a dict
++        entity = self.create_entity(name, attr_dict, state, contentstate)
++        key = contentstate.add_entity(entity)
++        block = Block('atomic', depth=state.list_depth)
++        contentstate.blocks.append(block)
++        block.text = ' '
++        entity_range = EntityRange(key)
++        entity_range.offset = 0
++        entity_range.length = 1
++        block.entity_ranges.append(entity_range)
++        state.has_preceding_nonatomic_block = False
++    def handle_endtag(self, name, state, contentstate):
++        pass
++class HorizontalRuleHandler(AtomicBlockEntityElementHandler):
++    def create_entity(self, name, attrs, state, contentstate):
++        return Entity('HORIZONTAL_RULE', 'IMMUTABLE', {})
++class LineBreakHandler:
++    def handle_starttag(self, name, attrs, state, contentstate):
++        if state.current_block is None:
++            return
++        state.current_block.text += '\n'
++    def handle_endtag(self, name, state, contentstate):
++        pass
++class HtmlToContentStateHandler(HTMLParser):
++    def __init__(self, features=()):
++        self.paragraph_handler = BlockElementHandler('unstyled')
++        self.element_handlers = HTMLRuleset({
++            'p': self.paragraph_handler,
++            'br': LineBreakHandler(),
++        })
++        for feature in features:
++            rule = feature_registry.get_converter_rule('contentstate', feature)
++            if rule is not None:
++                self.element_handlers.add_rules(rule['from_database_format'])
++        super().__init__(convert_charrefs=True)
++    def reset(self):
++        self.state = HandlerState()
++        self.contentstate = ContentState()
++        self.open_elements = []
++        super().reset()
++    def handle_starttag(self, name, attrs):
++        attr_dict = dict(attrs)  # convert attrs from list of (name, value) tuples to a dict
++        element_handler = self.element_handlers.match(name, attr_dict)
++        if element_handler is None and not self.open_elements:
++            element_handler = self.paragraph_handler
++        self.open_elements.append((name, element_handler))
++        if element_handler:
++            element_handler.handle_starttag(name, attrs, self.state, self.contentstate)
++    def handle_endtag(self, name):
++        expected_name, element_handler = self.open_elements.pop()
++        assert name == expected_name, "Unmatched tags: expected %s, got %s" % (expected_name, name)
++        if element_handler:
++            element_handler.handle_endtag(name, self.state, self.contentstate)
++    def handle_data(self, content):
++        content = re.sub(WHITESPACE_RE, ' ', content)
++        if self.state.current_block is None:
++            if content == ' ':
++                return
++            else:
++                add_paragraph_block(self.state, self.contentstate)
++        if content == ' ':
++            if self.state.leading_whitespace != STRIP_WHITESPACE:
++                self.state.leading_whitespace = FORCE_WHITESPACE
++        else:
++            if self.state.leading_whitespace == STRIP_WHITESPACE:
++                content = content.lstrip()
++            elif self.state.leading_whitespace == FORCE_WHITESPACE and not content.startswith(' '):
++                content = ' ' + content
++            if content.endswith(' '):
++                content = content.rstrip()
++                self.state.leading_whitespace = FORCE_WHITESPACE
++            else:
++                self.state.leading_whitespace = KEEP_WHITESPACE
++            self.state.current_block.text += content
++    def close(self):
++        if not self.state.has_preceding_nonatomic_block:
++            add_paragraph_block(self.state, self.contentstate)
++        super().close()
+
+--- a//dev/null
++++ b/wagtail/admin/rich_text/editors/draftail/__init__.py
+@@ -0,0 +1,46 @@
++import json
++from django.forms import Media, widgets
++from wagtail.admin.edit_handlers import RichTextFieldPanel
++from wagtail.admin.rich_text.converters.contentstate import ContentstateConverter
++from wagtail.core.rich_text import features as feature_registry
++from wagtail.utils.widgets import WidgetWithScript
++class DraftailRichTextArea(WidgetWithScript, widgets.HiddenInput):
++    accepts_features = True
++    def get_panel(self):
++        return RichTextFieldPanel
++    def __init__(self, *args, **kwargs):
++        self.options = {}
++        self.features = kwargs.pop('features', None)
++        if self.features is None:
++            self.features = feature_registry.get_default_features()
++        for feature in self.features:
++            plugin = feature_registry.get_editor_plugin('draftail', feature)
++            if plugin:
++                plugin.construct_options(self.options)
++        self.converter = ContentstateConverter(self.features)
++        super().__init__(*args, **kwargs)
++    def translate_value(self, value):
++        if value is None:
++            value = ''
++        return self.converter.from_database_format(value)
++    def render(self, name, value, attrs=None):
++        if attrs is None:
++            attrs = {}
++        attrs['data-draftail-input'] = True
++        translated_value = self.translate_value(value)
++        return super().render(name, translated_value, attrs)
++    def render_js_init(self, id_, name, value):
++        return "window.draftail.initEditor('#{id}', {opts}, document.currentScript)".format(
++            id=id_, opts=json.dumps(self.options))
++    def value_from_datadict(self, data, files, name):
++        original_value = super().value_from_datadict(data, files, name)
++        if original_value is None:
++            return None
++        return self.converter.to_database_format(original_value)
++    @property
++    def media(self):
++        return Media(js=[
++            'wagtailadmin/js/draftail.js',
++        ], css={
++            'all': ['wagtailadmin/css/panels/draftail.css']
++        })
+
+--- a//dev/null
++++ b/wagtail/admin/rich_text/editors/draftail/features.py
+@@ -0,0 +1,29 @@
++class BooleanFeature:
++    """
++    A feature which is enabled by a boolean flag at the top level of
++    the options dict
++    """
++    def __init__(self, option_name):
++        self.option_name = option_name
++    def construct_options(self, options):
++        options[self.option_name] = True
++class ListFeature:
++    """
++    Abstract class for features that are defined in a list within the options dict.
++    Subclasses must define option_name
++    """
++    def __init__(self, data):
++        self.data = data
++    def construct_options(self, options):
++        if self.option_name not in options:
++            options[self.option_name] = []
++        options[self.option_name].append(self.data)
++class EntityFeature(ListFeature):
++    """A feature which is listed in the entityTypes list of the options"""
++    option_name = 'entityTypes'
++class BlockFeature(ListFeature):
++    """A feature which is listed in the blockTypes list of the options"""
++    option_name = 'blockTypes'
++class InlineStyleFeature(ListFeature):
++    """A feature which is listed in the inlineStyles list of the options"""
++    option_name = 'inlineStyles'
+
+--- a/wagtail/images/views/images.py
++++ b//dev/null
+@@ -1,343 +0,0 @@
+-import os
+-from tempfile import SpooledTemporaryFile
+-from django.conf import settings
+-from django.core.exceptions import PermissionDenied
+-from django.core.paginator import InvalidPage, Paginator
+-from django.http import FileResponse, Http404, HttpResponse, JsonResponse
+-from django.shortcuts import get_object_or_404, redirect
+-from django.template.response import TemplateResponse
+-from django.urls import reverse
+-from django.urls.exceptions import NoReverseMatch
+-from django.utils.decorators import method_decorator
+-from django.utils.http import urlencode
+-from django.utils.translation import gettext as _
+-from django.utils.translation import gettext_lazy, ngettext
+-from django.views.generic import TemplateView
+-from wagtail.admin import messages
+-from wagtail.admin.auth import PermissionPolicyChecker
+-from wagtail.admin.forms.search import SearchForm
+-from wagtail.admin.models import popular_tags_for_model
+-from wagtail.admin.utils import get_valid_next_url_from_request
+-from wagtail.admin.views import generic
+-from wagtail.images import get_image_model
+-from wagtail.images.exceptions import InvalidFilterSpecError
+-from wagtail.images.forms import URLGeneratorForm, get_image_form
+-from wagtail.images.models import Filter, SourceImageIOError
+-from wagtail.images.permissions import permission_policy
+-from wagtail.images.utils import generate_signature
+-from wagtail.models import Collection, Site
+-from wagtail.search.backends import get_search_backend
+-permission_checker = PermissionPolicyChecker(permission_policy)
+-INDEX_PAGE_SIZE = getattr(settings, "WAGTAILIMAGES_INDEX_PAGE_SIZE", 30)
+-USAGE_PAGE_SIZE = getattr(settings, "WAGTAILIMAGES_USAGE_PAGE_SIZE", 20)
+-class BaseListingView(TemplateView):
+-    ENTRIES_PER_PAGE_CHOICES = sorted({10, 30, 60, 100, 250, INDEX_PAGE_SIZE})
+-    ORDERING_OPTIONS = {
+-        "-created_at": _("Newest"),
+-        "created_at": _("Oldest"),
+-        "title": _("Title: (A -> Z)"),
+-        "-title": _("Title: (Z -> A)"),
+-        "file_size": _("File size: (low to high)"),
+-        "-file_size": _("File size: (high to low)"),
+-    }
+-    default_ordering = "-created_at"
+-    @method_decorator(permission_checker.require_any("add", "change", "delete"))
+-    def get(self, request):
+-        return super().get(request)
+-    def get_num_entries_per_page(self):
+-        entries_per_page = self.request.GET.get("entries_per_page", INDEX_PAGE_SIZE)
+-        try:
+-            entries_per_page = int(entries_per_page)
+-        except ValueError:
+-            entries_per_page = INDEX_PAGE_SIZE
+-        if entries_per_page not in self.ENTRIES_PER_PAGE_CHOICES:
+-            entries_per_page = INDEX_PAGE_SIZE
+-        return entries_per_page
+-    def get_valid_orderings(self):
+-        return self.ORDERING_OPTIONS
+-    def get_ordering(self):
+-        ordering = self.request.GET.get("ordering")
+-        if ordering is None or ordering not in self.get_valid_orderings():
+-            ordering = self.default_ordering
+-        return ordering
+-    def get_context_data(self, **kwargs):
+-        context = super().get_context_data(**kwargs)
+-        ordering = self.get_ordering()
+-        images = (
+-            permission_policy.instances_user_has_any_permission_for(
+-                self.request.user, ["change", "delete"]
+-            )
+-            .order_by(ordering)
+-            .select_related("collection")
+-            .prefetch_renditions("max-165x165")
+-        )
+-        self.current_collection = None
+-        collection_id = self.request.GET.get("collection_id")
+-        if collection_id:
+-            try:
+-                self.current_collection = Collection.objects.get(id=collection_id)
+-                images = images.filter(collection=self.current_collection)
+-            except (ValueError, Collection.DoesNotExist):
+-                pass
+-        query_string = None
+-        if "q" in self.request.GET:
+-            self.form = SearchForm(self.request.GET, placeholder=_("Search images"))
+-            if self.form.is_valid():
+-                query_string = self.form.cleaned_data["q"]
+-                if query_string:
+-                    search_backend = get_search_backend()
+-                    images = search_backend.autocomplete(query_string, images)
+-        else:
+-            self.form = SearchForm(placeholder=_("Search images"))
+-        self.current_tag = self.request.GET.get("tag")
+-        if self.current_tag:
+-            try:
+-                images = images.filter(tags__name=self.current_tag)
+-            except (AttributeError):
+-                self.current_tag = None
+-        entries_per_page = self.get_num_entries_per_page()
+-        paginator = Paginator(images, per_page=entries_per_page)
+-        try:
+-            images = paginator.page(self.request.GET.get("p", 1))
+-        except InvalidPage:
+-            raise Http404
+-        next_url = reverse("wagtailimages:index")
+-        request_query_string = self.request.META.get("QUERY_STRING")
+-        if request_query_string:
+-            next_url += "?" + request_query_string
+-        context.update(
+-            {
+-                "images": images,
+-                "query_string": query_string,
+-                "is_searching": bool(query_string),
+-                "next": next_url,
+-                "entries_per_page": entries_per_page,
+-                "ENTRIES_PER_PAGE_CHOICES": self.ENTRIES_PER_PAGE_CHOICES,
+-                "current_ordering": ordering,
+-                "ORDERING_OPTIONS": self.ORDERING_OPTIONS,
+-            }
+-        )
+-        return context
+-class IndexView(BaseListingView):
+-    template_name = "wagtailimages/images/index.html"
+-    def get_context_data(self, **kwargs):
+-        context = super().get_context_data(**kwargs)
+-        collections = permission_policy.collections_user_has_any_permission_for(
+-            self.request.user, ["add", "change"]
+-        )
+-        if len(collections) < 2:
+-            collections = None
+-        Image = get_image_model()
+-        context.update(
+-            {
+-                "search_form": self.form,
+-                "popular_tags": popular_tags_for_model(get_image_model()),
+-                "current_tag": self.current_tag,
+-                "collections": collections,
+-                "current_collection": self.current_collection,
+-                "user_can_add": permission_policy.user_has_permission(
+-                    self.request.user, "add"
+-                ),
+-                "app_label": Image._meta.app_label,
+-                "model_name": Image._meta.model_name,
+-            }
+-        )
+-        return context
+-class ListingResultsView(BaseListingView):
+-    template_name = "wagtailimages/images/results.html"
+-@permission_checker.require("change")
+-def edit(request, image_id):
+-    Image = get_image_model()
+-    ImageForm = get_image_form(Image)
+-    image = get_object_or_404(Image, id=image_id)
+-    if not permission_policy.user_has_permission_for_instance(
+-        request.user, "change", image
+-    ):
+-        raise PermissionDenied
+-    next_url = get_valid_next_url_from_request(request)
+-    if request.method == "POST":
+-        form = ImageForm(request.POST, request.FILES, instance=image, user=request.user)
+-        if form.is_valid():
+-            form.save()
+-            edit_url = reverse("wagtailimages:edit", args=(image.id,))
+-            redirect_url = "wagtailimages:index"
+-            if next_url:
+-                edit_url = f"{edit_url}?{urlencode({'next': next_url})}"
+-                redirect_url = next_url
+-            messages.success(
+-                request,
+-                _("Image '%(image_title)s' updated.") % {"image_title": image.title},
+-                buttons=[messages.button(edit_url, _("Edit again"))],
+-            )
+-            return redirect(redirect_url)
+-        else:
+-            messages.error(request, _("The image could not be saved due to errors."))
+-    else:
+-        form = ImageForm(instance=image, user=request.user)
+-    try:
+-        reverse("wagtailimages_serve", args=("foo", "1", "bar"))
+-        url_generator_enabled = True
+-    except NoReverseMatch:
+-        url_generator_enabled = False
+-    if image.is_stored_locally():
+-        if not os.path.isfile(image.file.path):
+-            messages.error(
+-                request,
+-                _(
+-                    "The source image file could not be found. Please change the source or delete the image."
+-                )
+-                % {"image_title": image.title},
+-                buttons=[
+-                    messages.button(
+-                        reverse("wagtailimages:delete", args=(image.id,)), _("Delete")
+-                    )
+-                ],
+-            )
+-    try:
+-        filesize = image.get_file_size()
+-    except SourceImageIOError:
+-        filesize = None
+-    return TemplateResponse(
+-        request,
+-        "wagtailimages/images/edit.html",
+-        {
+-            "image": image,
+-            "form": form,
+-            "url_generator_enabled": url_generator_enabled,
+-            "filesize": filesize,
+-            "user_can_delete": permission_policy.user_has_permission_for_instance(
+-                request.user, "delete", image
+-            ),
+-            "next": next_url,
+-        },
+-    )
+-def url_generator(request, image_id):
+-    image = get_object_or_404(get_image_model(), id=image_id)
+-    if not permission_policy.user_has_permission_for_instance(
+-        request.user, "change", image
+-    ):
+-        raise PermissionDenied
+-    form = URLGeneratorForm(
+-        initial={
+-            "filter_method": "original",
+-            "width": image.width,
+-            "height": image.height,
+-        }
+-    )
+-    return TemplateResponse(
+-        request,
+-        "wagtailimages/images/url_generator.html",
+-        {
+-            "image": image,
+-            "form": form,
+-        },
+-    )
+-def generate_url(request, image_id, filter_spec):
+-    Image = get_image_model()
+-    try:
+-        image = Image.objects.get(id=image_id)
+-    except Image.DoesNotExist:
+-        return JsonResponse({"error": "Cannot find image."}, status=404)
+-    if not permission_policy.user_has_permission_for_instance(
+-        request.user, "change", image
+-    ):
+-        return JsonResponse(
+-            {"error": "You do not have permission to generate a URL for this image."},
+-            status=403,
+-        )
+-    try:
+-        Filter(spec=filter_spec).operations
+-    except InvalidFilterSpecError:
+-        return JsonResponse({"error": "Invalid filter spec."}, status=400)
+-    signature = generate_signature(image_id, filter_spec)
+-    url = reverse("wagtailimages_serve", args=(signature, image_id, filter_spec))
+-    try:
+-        site_root_url = Site.objects.get(is_default_site=True).root_url
+-    except Site.DoesNotExist:
+-        site_root_url = Site.objects.first().root_url
+-    preview_url = reverse("wagtailimages:preview", args=(image_id, filter_spec))
+-    return JsonResponse(
+-        {"url": site_root_url + url, "preview_url": preview_url}, status=200
+-    )
+-def preview(request, image_id, filter_spec):
+-    image = get_object_or_404(get_image_model(), id=image_id)
+-    try:
+-        temp_image = SpooledTemporaryFile(max_size=settings.FILE_UPLOAD_MAX_MEMORY_SIZE)
+-        image = Filter(spec=filter_spec).run(image, temp_image)
+-        temp_image.seek(0)
+-        response = FileResponse(temp_image)
+-        response["Content-Type"] = "image/" + image.format_name
+-        return response
+-    except InvalidFilterSpecError:
+-        return HttpResponse(
+-            "Invalid filter spec: " + filter_spec, content_type="text/plain", status=400
+-        )
+-class DeleteView(generic.DeleteView):
+-    model = get_image_model()
+-    pk_url_kwarg = "image_id"
+-    permission_policy = permission_policy
+-    permission_required = "delete"
+-    header_icon = "image"
+-    template_name = "wagtailimages/images/confirm_delete.html"
+-    usage_url_name = "wagtailimages:image_usage"
+-    delete_url_name = "wagtailimages:delete"
+-    index_url_name = "wagtailimages:index"
+-    page_title = gettext_lazy("Delete image")
+-    def user_has_permission(self, permission):
+-        return self.permission_policy.user_has_permission_for_instance(
+-            self.request.user, permission, self.object
+-        )
+-    @property
+-    def confirmation_message(self):
+-        return ngettext(
+-            "Are you sure you want to delete this image?",
+-            "Are you sure you want to delete these images?",
+-            1,
+-        )
+-    def get_success_message(self):
+-        return _("Image '%(image_title)s' deleted.") % {
+-            "image_title": self.object.title
+-        }
+-@permission_checker.require("add")
+-def add(request):
+-    ImageModel = get_image_model()
+-    ImageForm = get_image_form(ImageModel)
+-    if request.method == "POST":
+-        image = ImageModel(uploaded_by_user=request.user)
+-        form = ImageForm(request.POST, request.FILES, instance=image, user=request.user)
+-        if form.is_valid():
+-            form.save()
+-            messages.success(
+-                request,
+-                _("Image '%(image_title)s' added.") % {"image_title": image.title},
+-                buttons=[
+-                    messages.button(
+-                        reverse("wagtailimages:edit", args=(image.id,)), _("Edit")
+-                    )
+-                ],
+-            )
+-            return redirect("wagtailimages:index")
+-        else:
+-            messages.error(request, _("The image could not be created due to errors."))
+-    else:
+-        form = ImageForm(user=request.user)
+-    return TemplateResponse(
+-        request,
+-        "wagtailimages/images/add.html",
+-        {
+-            "form": form,
+-        },
+-    )
+-class UsageView(generic.UsageView):
+-    model = get_image_model()
+-    paginate_by = USAGE_PAGE_SIZE
+-    pk_url_kwarg = "image_id"
+-    permission_policy = permission_policy
+-    permission_required = "change"
+-    header_icon = "image"
+-    def user_has_permission(self, permission):
+-        return self.permission_policy.user_has_permission_for_instance(
+-            self.request.user, permission, self.object
+-        )
+-    def get_page_subtitle(self):
+-        return self.object.title
+
+--- a/wagtail/search/utils.py
++++ b//dev/null
+@@ -1,142 +0,0 @@
+-import operator
+-import re
+-from functools import partial
+-from django.apps import apps
+-from django.db import connections
+-from django.http import QueryDict
+-from wagtail.search.index import RelatedFields, SearchField
+-from .query import MATCH_NONE, Phrase, PlainText
+-NOT_SET = object()
+-def balanced_reduce(operator, seq, initializer=NOT_SET):
+-    """
+-    Has the same result as Python's reduce function, but performs the calculations in a different order.
+-    This is important when the operator is constructing data structures such as search query classes.
+-    This method will make the resulting data structures flatter, so operations that need to traverse
+-    them don't end up crashing with recursion errors.
+-    For example:
+-    Python's builtin reduce() function will do the following calculation:
+-    reduce(add, [1, 2, 3, 4, 5, 6, 7, 8])
+-    (1 + (2 + (3 + (4 + (5 + (6 + (7 + 8)))))))
+-    When using this with query classes, it would create a large data structure with a depth of 7
+-    Whereas balanced_reduce will execute this like so:
+-    balanced_reduce(add, [1, 2, 3, 4, 5, 6, 7, 8])
+-    ((1 + 2) + (3 + 4)) + ((5 + 6) + (7 + 8))
+-    Which only has a depth of 2
+-    """
+-    if not isinstance(seq, list):
+-        seq = list(seq)
+-    if initializer is not NOT_SET:
+-        if len(seq) == 0:
+-            return initializer
+-        else:
+-            return operator(initializer, balanced_reduce(operator, seq))
+-    if len(seq) == 0:
+-        raise TypeError("reduce() of empty sequence with no initial value")
+-    elif len(seq) == 1:
+-        return seq[0]
+-    else:
+-        break_point = len(seq) // 2
+-        first_set = balanced_reduce(operator, seq[:break_point])
+-        second_set = balanced_reduce(operator, seq[break_point:])
+-        return operator(first_set, second_set)
+-OR = partial(balanced_reduce, operator.or_)
+-AND = partial(balanced_reduce, operator.and_)
+-ADD = partial(balanced_reduce, operator.add)
+-MUL = partial(balanced_reduce, operator.mul)
+-MAX_QUERY_STRING_LENGTH = 255
+-filters_regexp = re.compile(r'\b(\w+):(\w+|"[^"]+"|\'[^\']+\')')
+-def normalise_query_string(query_string):
+-    query_string = query_string[:MAX_QUERY_STRING_LENGTH]
+-    query_string = query_string.lower()
+-    query_string = re.sub(" +", " ", query_string).strip()
+-    return query_string
+-def separate_filters_from_query(query_string):
+-    filters = QueryDict(mutable=True)
+-    for match_object in filters_regexp.finditer(query_string):
+-        key, value = match_object.groups()
+-        filters.update({key: value.strip("\"'")})
+-    query_string = filters_regexp.sub("", query_string).strip()
+-    return filters, query_string
+-def parse_query_string(query_string, operator=None, zero_terms=MATCH_NONE):
+-    """
+-    This takes a query string typed in by a user and extracts the following:
+-     - Quoted terms (for phrase search)
+-     - Filters
+-    For example, the following query:
+-      `hello "this is a phrase" live:true` would be parsed into:
+-    filters: {'live': 'true'}
+-    tokens: And([PlainText('hello'), Phrase('this is a phrase')])
+-    """
+-    filters, query_string = separate_filters_from_query(query_string)
+-    is_phrase = False
+-    tokens = []
+-    if '"' in query_string:
+-        parts = query_string.split('"')
+-    else:
+-        parts = query_string.split("'")
+-    for part in parts:
+-        part = part.strip()
+-        if part:
+-            if is_phrase:
+-                tokens.append(Phrase(part))
+-            else:
+-                tokens.append(
+-                    PlainText(part, operator=operator or PlainText.DEFAULT_OPERATOR)
+-                )
+-        is_phrase = not is_phrase
+-    if tokens:
+-        if operator == "or":
+-            search_query = OR(tokens)
+-        else:
+-            search_query = AND(tokens)
+-    else:
+-        search_query = zero_terms
+-    return filters, search_query
+-def get_descendant_models(model):
+-    """
+-    Returns all descendants of a model, including the model itself.
+-    """
+-    descendant_models = {
+-        other_model
+-        for other_model in apps.get_models()
+-        if issubclass(other_model, model)
+-    }
+-    descendant_models.add(model)
+-    return descendant_models
+-def get_content_type_pk(model):
+-    from django.contrib.contenttypes.models import ContentType
+-    return ContentType.objects.get_for_model(model).pk
+-def get_ancestors_content_types_pks(model):
+-    """
+-    Returns content types ids for the ancestors of this model, excluding it.
+-    """
+-    from django.contrib.contenttypes.models import ContentType
+-    return [
+-        ct.pk
+-        for ct in ContentType.objects.get_for_models(
+-            *model._meta.get_parent_list()
+-        ).values()
+-    ]
+-def get_descendants_content_types_pks(model):
+-    """
+-    Returns content types ids for the descendants of this model, including it.
+-    """
+-    from django.contrib.contenttypes.models import ContentType
+-    return [
+-        ct.pk
+-        for ct in ContentType.objects.get_for_models(
+-            *get_descendant_models(model)
+-        ).values()
+-    ]
+-def get_search_fields(search_fields):
+-    for search_field in search_fields:
+-        if isinstance(search_field, SearchField):
+-            yield search_field
+-        elif isinstance(search_field, RelatedFields):
+-            yield from get_search_fields(search_field.fields)
+-def get_postgresql_connections():
+-    return [
+-        connection
+-        for connection in connections.all()
+-        if connection.vendor == "postgresql"
+-    ]

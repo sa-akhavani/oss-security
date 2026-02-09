@@ -1,0 +1,2981 @@
+# ====================================================================
+# FILE: .devcontainer/scripts/onCreateCommand.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-15 ---
+     1| set -e
+     2| opt=$1
+     3| case "$opt" in
+     4|     libraries)
+     5|         ./build.sh libs+clr -rc Release
+     6|         ./build.sh libs.tests -restore
+     7|     ;;
+     8|     wasm)
+     9|         make -C src/mono/wasm provision-wasm
+    10|         export EMSDK_PATH=$PWD/src/mono/wasm/emsdk
+    11|         ./build.sh mono+libs -os browser -c Release
+    12|         ./dotnet.sh tool install dotnet-serve --tool-path ./.dotnet-tools-global
+    13|     ;;
+    14| esac
+    15| git rev-parse HEAD > ./artifacts/prebuild.sha
+
+
+# ====================================================================
+# FILE: eng/build.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-495 ---
+     1| set -ue
+     2| source="${BASH_SOURCE[0]}"
+     3| while [[ -h "$source" ]]; do
+     4|   scriptroot="$( cd -P "$( dirname "$source" )" && pwd )"
+     5|   source="$(readlink "$source")"
+     6|   [[ $source != /* ]] && source="$scriptroot/$source"
+     7| done
+     8| scriptroot="$( cd -P "$( dirname "$source" )" && pwd )"
+     9| usage()
+    10| {
+    11|   echo "Common settings:"
+    12|   echo "  --arch (-a)                     Target platform: x86, x64, arm, armv6, armel, arm64, loongarch64, riscv64, s390x, ppc64le or wasm."
+    13|   echo "                                  [Default: Your machine's architecture.]"
+    14|   echo "  --binaryLog (-bl)               Output binary log."
+    15|   echo "  --cross                         Optional argument to signify cross compilation."
+    16|   echo "  --configuration (-c)            Build configuration: Debug, Release or Checked."
+    17|   echo "                                  Checked is exclusive to the CLR subset. It is the same as Debug, except code is"
+    18|   echo "                                  compiled with optimizations enabled."
+    19|   echo "                                  [Default: Debug]"
+    20|   echo "  --help (-h)                     Print help and exit."
+    21|   echo "  --hostConfiguration (-hc)       Host build configuration: Debug, Release or Checked."
+    22|   echo "                                  [Default: Debug]"
+    23|   echo "  --librariesConfiguration (-lc)  Libraries build configuration: Debug or Release."
+    24|   echo "                                  [Default: Debug]"
+    25|   echo "  --os                            Target operating system: windows, linux, freebsd, osx, maccatalyst, tvos,"
+    26|   echo "                                  tvossimulator, ios, iossimulator, android, browser, wasi, netbsd, illumos, solaris"
+    27|   echo "                                  linux-musl, linux-bionic or haiku."
+    28|   echo "                                  [Default: Your machine's OS.]"
+    29|   echo "  --outputrid <rid>               Optional argument that overrides the target rid name."
+    30|   echo "  --projects <value>              Project or solution file(s) to build."
+    31|   echo "  --runtimeConfiguration (-rc)    Runtime build configuration: Debug, Release or Checked."
+    32|   echo "                                  Checked is exclusive to the CLR runtime. It is the same as Debug, except code is"
+    33|   echo "                                  compiled with optimizations enabled."
+    34|   echo "                                  [Default: Debug]"
+    35|   echo "  -runtimeFlavor (-rf)            Runtime flavor: CoreCLR or Mono."
+    36|   echo "                                  [Default: CoreCLR]"
+    37|   echo "  --subset (-s)                   Build a subset, print available subsets with -subset help."
+    38|   echo "                                 '--subset' can be omitted if the subset is given as the first argument."
+    39|   echo "                                  [Default: Builds the entire repo.]"
+    40|   echo "  --usemonoruntime                Product a .NET runtime with Mono as the underlying runtime."
+    41|   echo "  --verbosity (-v)                MSBuild verbosity: q[uiet], m[inimal], n[ormal], d[etailed], and diag[nostic]."
+    42|   echo "                                  [Default: Minimal]"
+    43|   echo ""
+    44|   echo "Actions (defaults to --restore --build):"
+    45|   echo "  --build (-b)               Build all source projects."
+    46|   echo "                             This assumes --restore has been run already."
+    47|   echo "  --clean                    Clean the solution."
+    48|   echo "  --pack                     Package build outputs into NuGet packages."
+    49|   echo "  --publish                  Publish artifacts (e.g. symbols)."
+    50|   echo "                             This assumes --build has been run already."
+    51|   echo "  --rebuild                  Rebuild all source projects."
+    52|   echo "  --restore (-r)             Restore dependencies."
+    53|   echo "  --sign                     Sign build outputs."
+    54|   echo "  --test (-t)                Incrementally builds and runs tests."
+    55|   echo "                             Use in conjunction with --testnobuild to only run tests."
+    56|   echo ""
+    57|   echo "Libraries settings:"
+    58|   echo "  --allconfigurations        Build packages for all build configurations."
+    59|   echo "  --coverage                 Collect code coverage when testing."
+    60|   echo "  --framework (-f)           Build framework: net8.0 or net48."
+    61|   echo "                             [Default: net8.0]"
+    62|   echo "  --testnobuild              Skip building tests when invoking -test."
+    63|   echo "  --testscope                Test scope, allowed values: innerloop, outerloop, all."
+    64|   echo ""
+    65|   echo "Native build settings:"
+    66|   echo "  --clang                    Optional argument to build using clang in PATH (default)."
+    67|   echo "  --clangx                   Optional argument to build using clang version x (used for Clang 7 and newer)."
+    68|   echo "  --clangx.y                 Optional argument to build using clang version x.y (used for Clang 6 and older)."
+    69|   echo "  --cmakeargs                User-settable additional arguments passed to CMake."
+    70|   echo "  --gcc                      Optional argument to build using gcc in PATH (default)."
+    71|   echo "  --gccx.y                   Optional argument to build using gcc version x.y."
+    72|   echo "  --portablebuild            Optional argument: set to false to force a non-portable build."
+    73|   echo "  --keepnativesymbols        Optional argument: set to true to keep native symbols/debuginfo in generated binaries."
+    74|   echo "  --ninja                    Optional argument: set to true to use Ninja instead of Make to run the native build."
+    75|   echo "  --pgoinstrument            Optional argument: build PGO-instrumented runtime"
+    76|   echo "  --fsanitize                Optional argument: Specify native sanitizers to instrument the native build with. Supported values are: 'address'."
+    77|   echo ""
+    78|   echo "Command line arguments starting with '/p:' are passed through to MSBuild."
+    79|   echo "Arguments can also be passed in with a single hyphen."
+    80|   echo ""
+    81|   echo "Here are some quick examples. These assume you are on a Linux x64 machine:"
+    82|   echo ""
+    83|   echo "* Build CoreCLR for Linux x64 on Release configuration:"
+    84|   echo "./build.sh clr -c release"
+    85|   echo ""
+    86|   echo "* Build Debug libraries with a Release runtime for Linux x64."
+    87|   echo "./build.sh clr+libs -rc release"
+    88|   echo ""
+    89|   echo "* Build Release libraries and their tests with a Checked runtime for Linux x64, and run the tests."
+    90|   echo "./build.sh clr+libs+libs.tests -rc checked -lc release -test"
+    91|   echo ""
+    92|   echo "* Build CoreCLR for Linux x64 on Debug configuration using Clang 9."
+    93|   echo "./build.sh clr -clang9"
+    94|   echo ""
+    95|   echo "* Build CoreCLR for Linux x64 on Debug configuration using GCC 8.4."
+    96|   echo "./build.sh clr -gcc8.4"
+    97|   echo ""
+    98|   echo "* Build CoreCLR for Linux x64 using extra compiler flags (-fstack-clash-protection)."
+    99|   echo "EXTRA_CFLAGS=-fstack-clash-protection EXTRA_CXXFLAGS=-fstack-clash-protection ./build.sh clr"
+   100|   echo ""
+   101|   echo "* Cross-compile CoreCLR runtime for Linux ARM64 on Release configuration."
+   102|   echo "./build.sh clr.runtime -arch arm64 -c release -cross"
+   103|   echo ""
+   104|   echo "However, for this example, you need to already have ROOTFS_DIR set up."
+   105|   echo "Further information on this can be found here:"
+   106|   echo "https://github.com/dotnet/runtime/blob/main/docs/workflow/building/coreclr/linux-instructions.md"
+   107|   echo ""
+   108|   echo "* Build Mono runtime for Linux x64 on Release configuration."
+   109|   echo "./build.sh mono -c release"
+   110|   echo ""
+   111|   echo "* Build Release coreclr corelib, crossgen corelib and update Debug libraries testhost to run test on an updated corelib."
+   112|   echo "./build.sh clr.corelib+clr.nativecorelib+libs.pretest -rc release"
+   113|   echo ""
+   114|   echo "* Build Debug mono corelib and update Release libraries testhost to run test on an updated corelib."
+   115|   echo "./build.sh mono.corelib+libs.pretest -rc debug -c release"
+   116|   echo ""
+   117|   echo ""
+   118|   echo "For more general information, check out https://github.com/dotnet/runtime/blob/main/docs/workflow/README.md"
+   119| }
+   120| initDistroRid()
+   121| {
+   122|     source "$scriptroot"/native/init-distro-rid.sh
+   123|     local passedRootfsDir=""
+   124|     local targetOs="$1"
+   125|     local targetArch="$2"
+   126|     local isCrossBuild="$3"
+   127|     local isPortableBuild="$4"
+   128|     if [[ $isCrossBuild == 1 && "$targetOs" != "osx" && "$targetOs" != "ios" && "$targetOs" != "iossimulator" && "$targetOs" != "tvos" && "$targetOs" != "tvossimulator" && "$targetOs" != "maccatalyst" ]]; then
+   129|         passedRootfsDir=${ROOTFS_DIR}
+   130|     fi
+   131|     initDistroRidGlobal "${targetOs}" "${targetArch}" "${isPortableBuild}" "${passedRootfsDir}"
+   132| }
+   133| showSubsetHelp()
+   134| {
+   135|   "$scriptroot/common/build.sh" "-restore" "-build" "/p:Subset=help" "/clp:nosummary"
+   136| }
+   137| arguments=''
+   138| cmakeargs=''
+   139| extraargs=''
+   140| crossBuild=0
+   141| portableBuild=1
+   142| source $scriptroot/native/init-os-and-arch.sh
+   143| hostArch=$arch
+   144| declare -a actions=("b" "build" "r" "restore" "rebuild" "testnobuild" "sign" "publish" "clean")
+   145| actInt=($(comm -12 <(printf '%s\n' "${actions[@]/#/-}" | sort) <(printf '%s\n' "${@/#--/-}" | sort)))
+   146| firstArgumentChecked=0
+   147| while [[ $# > 0 ]]; do
+   148|   opt="$(echo "${1/#--/-}" | tr "[:upper:]" "[:lower:]")"
+   149|   if [[ $firstArgumentChecked -eq 0 && $opt =~ ^[a-zA-Z.+]+$ ]]; then
+   150|     if [[ "$opt" == "help" ]]; then
+   151|       showSubsetHelp
+   152|       exit 0
+   153|     fi
+   154|     arguments="$arguments /p:Subset=$1"
+   155|     shift 1
+   156|     continue
+   157|   fi
+   158|   firstArgumentChecked=1
+   159|   case "$opt" in
+   160|      -help|-h|-\?|/?)
+   161|       usage
+   162|       exit 0
+   163|       ;;
+   164|      -subset|-s)
+   165|       if [ -z ${2+x} ]; then
+   166|         showSubsetHelp
+   167|         exit 0
+   168|       else
+   169|         passedSubset="$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   170|         if [[ "$passedSubset" == "help" ]]; then
+   171|           showSubsetHelp
+   172|           exit 0
+   173|         fi
+   174|         arguments="$arguments /p:Subset=$2"
+   175|         shift 2
+   176|       fi
+   177|       ;;
+   178|      -arch|-a)
+   179|       if [ -z ${2+x} ]; then
+   180|         echo "No architecture supplied. See help (--help) for supported architectures." 1>&2
+   181|         exit 1
+   182|       fi
+   183|       passedArch="$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   184|       case "$passedArch" in
+   185|         x64|x86|arm|armv6|armel|arm64|loongarch64|riscv64|s390x|ppc64le|wasm)
+   186|           arch=$passedArch
+   187|           ;;
+   188|         *)
+   189|           echo "Unsupported target architecture '$2'."
+   190|           echo "The allowed values are x86, x64, arm, armv6, armel, arm64, loongarch64, riscv64, s390x, ppc64le and wasm."
+   191|           exit 1
+   192|           ;;
+   193|       esac
+   194|       shift 2
+   195|       ;;
+   196|      -configuration|-c)
+   197|       if [ -z ${2+x} ]; then
+   198|         echo "No configuration supplied. See help (--help) for supported configurations." 1>&2
+   199|         exit 1
+   200|       fi
+   201|       passedConfig="$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   202|       case "$passedConfig" in
+   203|         debug|release|checked)
+   204|           val="$(tr '[:lower:]' '[:upper:]' <<< ${passedConfig:0:1})${passedConfig:1}"
+   205|           ;;
+   206|         *)
+   207|           echo "Unsupported target configuration '$2'."
+   208|           echo "The allowed values are Debug, Release, and Checked."
+   209|           exit 1
+   210|           ;;
+   211|       esac
+   212|       arguments="$arguments -configuration $val"
+   213|       shift 2
+   214|       ;;
+   215|      -framework|-f)
+   216|       if [ -z ${2+x} ]; then
+   217|         echo "No framework supplied. See help (--help) for supported frameworks." 1>&2
+   218|         exit 1
+   219|       fi
+   220|       val="$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   221|       arguments="$arguments /p:BuildTargetFramework=$val"
+   222|       shift 2
+   223|       ;;
+   224|      -os)
+   225|       if [ -z ${2+x} ]; then
+   226|         echo "No target operating system supplied. See help (--help) for supported target operating systems." 1>&2
+   227|         exit 1
+   228|       fi
+   229|       passedOS="$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   230|       case "$passedOS" in
+   231|         windows)
+   232|           os="windows" ;;
+   233|         linux)
+   234|           os="linux" ;;
+   235|         freebsd)
+   236|           os="freebsd" ;;
+   237|         osx)
+   238|           os="osx" ;;
+   239|         maccatalyst)
+   240|           os="maccatalyst" ;;
+   241|         tvos)
+   242|           os="tvos" ;;
+   243|         tvossimulator)
+   244|           os="tvossimulator" ;;
+   245|         ios)
+   246|           os="ios" ;;
+   247|         iossimulator)
+   248|           os="iossimulator" ;;
+   249|         android)
+   250|           os="android" ;;
+   251|         browser)
+   252|           os="browser" ;;
+   253|         wasi)
+   254|           os="wasi" ;;
+   255|         illumos)
+   256|           os="illumos" ;;
+   257|         solaris)
+   258|           os="solaris" ;;
+   259|         linux-bionic)
+   260|           os="linux"
+   261|           __PortableTargetOS=linux-bionic
+   262|           ;;
+   263|         linux-musl)
+   264|           os="linux"
+   265|           __PortableTargetOS=linux-musl
+   266|           ;;
+   267|         haiku)
+   268|           os="haiku" ;;
+   269|         *)
+   270|           echo "Unsupported target OS '$2'."
+   271|           echo "Try 'build.sh --help' for values supported by '--os'."
+   272|           exit 1
+   273|           ;;
+   274|       esac
+   275|       arguments="$arguments /p:TargetOS=$os"
+   276|       shift 2
+   277|       ;;
+   278|      -allconfigurations)
+   279|       arguments="$arguments /p:BuildAllConfigurations=true"
+   280|       shift 1
+   281|       ;;
+   282|      -testscope)
+   283|       if [ -z ${2+x} ]; then
+   284|         echo "No test scope supplied. See help (--help) for supported test scope values." 1>&2
+   285|         exit 1
+   286|       fi
+   287|       arguments="$arguments /p:TestScope=$2"
+   288|       shift 2
+   289|       ;;
+   290|      -testnobuild)
+   291|       arguments="$arguments /p:TestNoBuild=true"
+   292|       shift 1
+   293|       ;;
+   294|      -coverage)
+   295|       arguments="$arguments /p:Coverage=true"
+   296|       shift 1
+   297|       ;;
+   298|      -runtimeconfiguration|-rc)
+   299|       if [ -z ${2+x} ]; then
+   300|         echo "No runtime configuration supplied. See help (--help) for supported runtime configurations." 1>&2
+   301|         exit 1
+   302|       fi
+   303|       passedRuntimeConf="$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   304|       case "$passedRuntimeConf" in
+   305|         debug|release|checked)
+   306|           val="$(tr '[:lower:]' '[:upper:]' <<< ${passedRuntimeConf:0:1})${passedRuntimeConf:1}"
+   307|           ;;
+   308|         *)
+   309|           echo "Unsupported runtime configuration '$2'."
+   310|           echo "The allowed values are Debug, Release, and Checked."
+   311|           exit 1
+   312|           ;;
+   313|       esac
+   314|       arguments="$arguments /p:RuntimeConfiguration=$val"
+   315|       shift 2
+   316|       ;;
+   317|      -runtimeflavor|-rf)
+   318|       if [ -z ${2+x} ]; then
+   319|         echo "No runtime flavor supplied. See help (--help) for supported runtime flavors." 1>&2
+   320|         exit 1
+   321|       fi
+   322|       passedRuntimeFlav="$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   323|       case "$passedRuntimeFlav" in
+   324|         coreclr|mono)
+   325|           val="$(tr '[:lower:]' '[:upper:]' <<< ${passedRuntimeFlav:0:1})${passedRuntimeFlav:1}"
+   326|           ;;
+   327|         *)
+   328|           echo "Unsupported runtime flavor '$2'."
+   329|           echo "The allowed values are CoreCLR and Mono."
+   330|           exit 1
+   331|           ;;
+   332|       esac
+   333|       arguments="$arguments /p:RuntimeFlavor=$val"
+   334|       shift 2
+   335|       ;;
+   336|      -usemonoruntime)
+   337|       arguments="$arguments /p:PrimaryRuntimeFlavor=Mono"
+   338|       shift 1
+   339|       ;;
+   340|      -librariesconfiguration|-lc)
+   341|       if [ -z ${2+x} ]; then
+   342|         echo "No libraries configuration supplied. See help (--help) for supported libraries configurations." 1>&2
+   343|         exit 1
+   344|       fi
+   345|       passedLibConf="$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   346|       case "$passedLibConf" in
+   347|         debug|release)
+   348|           val="$(tr '[:lower:]' '[:upper:]' <<< ${passedLibConf:0:1})${passedLibConf:1}"
+   349|           ;;
+   350|         *)
+   351|           echo "Unsupported libraries configuration '$2'."
+   352|           echo "The allowed values are Debug and Release."
+   353|           exit 1
+   354|           ;;
+   355|       esac
+   356|       arguments="$arguments /p:LibrariesConfiguration=$val"
+   357|       shift 2
+   358|       ;;
+   359|      -hostconfiguration|-hc)
+   360|       if [ -z ${2+x} ]; then
+   361|         echo "No host configuration supplied. See help (--help) for supported host configurations." 1>&2
+   362|         exit 1
+   363|       fi
+   364|       passedHostConf="$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   365|       case "$passedHostConf" in
+   366|         debug|release|checked)
+   367|           val="$(tr '[:lower:]' '[:upper:]' <<< ${passedHostConf:0:1})${passedHostConf:1}"
+   368|           ;;
+   369|         *)
+   370|           echo "Unsupported host configuration '$2'."
+   371|           echo "The allowed values are Debug, Release, and Checked."
+   372|           exit 1
+   373|           ;;
+   374|       esac
+   375|       arguments="$arguments /p:HostConfiguration=$val"
+   376|       shift 2
+   377|       ;;
+   378|      -cross)
+   379|       crossBuild=1
+   380|       arguments="$arguments /p:CrossBuild=True"
+   381|       shift 1
+   382|       ;;
+   383|      *crossbuild=true*)
+   384|       crossBuild=1
+   385|       extraargs="$extraargs $1"
+   386|       shift 1
+   387|       ;;
+   388|      -clang*)
+   389|       compiler="${opt/#-/}" # -clang-9 => clang-9 or clang-9 => (unchanged)
+   390|       arguments="$arguments /p:Compiler=$compiler /p:CppCompilerAndLinker=$compiler"
+   391|       shift 1
+   392|       ;;
+   393|      -cmakeargs)
+   394|       if [ -z ${2+x} ]; then
+   395|         echo "No cmake args supplied." 1>&2
+   396|         exit 1
+   397|       fi
+   398|       cmakeargs="${cmakeargs} $2"
+   399|       shift 2
+   400|       ;;
+   401|      -gcc*)
+   402|       compiler="${opt/#-/}" # -gcc-9 => gcc-9 or gcc-9 => (unchanged)
+   403|       arguments="$arguments /p:Compiler=$compiler /p:CppCompilerAndLinker=$compiler"
+   404|       shift 1
+   405|       ;;
+   406|      -outputrid)
+   407|       if [ -z ${2+x} ]; then
+   408|         echo "No value for outputrid is supplied. See help (--help) for supported values." 1>&2
+   409|         exit 1
+   410|       fi
+   411|       arguments="$arguments /p:OutputRID=$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   412|       shift 2
+   413|       ;;
+   414|      -portablebuild)
+   415|       if [ -z ${2+x} ]; then
+   416|         echo "No value for portablebuild is supplied. See help (--help) for supported values." 1>&2
+   417|         exit 1
+   418|       fi
+   419|       passedPortable="$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   420|       if [ "$passedPortable" = false ]; then
+   421|         portableBuild=0
+   422|         arguments="$arguments /p:PortableBuild=false"
+   423|       fi
+   424|       shift 2
+   425|       ;;
+   426|      -keepnativesymbols)
+   427|       if [ -z ${2+x} ]; then
+   428|         echo "No value for keepNativeSymbols is supplied. See help (--help) for supported values." 1>&2
+   429|         exit 1
+   430|       fi
+   431|       passedKeepNativeSymbols="$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   432|       if [ "$passedKeepNativeSymbols" = true ]; then
+   433|         arguments="$arguments /p:KeepNativeSymbols=true"
+   434|       fi
+   435|       shift 2
+   436|       ;;
+   437|       -ninja)
+   438|       if [ -z ${2+x} ]; then
+   439|         arguments="$arguments /p:Ninja=true"
+   440|         shift 1
+   441|       else
+   442|         ninja="$(echo "$2" | tr "[:upper:]" "[:lower:]")"
+   443|         if [ "$ninja" = true ]; then
+   444|           arguments="$arguments /p:Ninja=true"
+   445|           shift 2
+   446|         elif [ "$ninja" = false ]; then
+   447|           arguments="$arguments /p:Ninja=false"
+   448|           shift 2
+   449|         else
+   450|           arguments="$arguments /p:Ninja=true"
+   451|           shift 1
+   452|         fi
+   453|       fi
+   454|       ;;
+   455|       -pgoinstrument)
+   456|       arguments="$arguments /p:PgoInstrument=true"
+   457|       shift 1
+   458|       ;;
+   459|       -fsanitize)
+   460|       if [ -z ${2+x} ]; then
+   461|         echo "No value for -fsanitize is supplied. See help (--help) for supported values." 1>&2
+   462|         exit 1
+   463|       fi
+   464|       arguments="$arguments /p:EnableNativeSanitizers=$2"
+   465|       shift 2
+   466|       ;;
+   467|       -fsanitize=*)
+   468|       sanitizers="${opt/#-fsanitize=/}" # -fsanitize=address => address
+   469|       arguments="$arguments /p:EnableNativeSanitizers=$sanitizers"
+   470|       shift 2
+   471|       ;;
+   472|       *)
+   473|       extraargs="$extraargs $1"
+   474|       shift 1
+   475|       ;;
+   476|   esac
+   477| done
+   478| if [ ${#actInt[@]} -eq 0 ]; then
+   479|     arguments="-restore -build $arguments"
+   480| fi
+   481| if [[ "$os" == "browser" ]]; then
+   482|     arch=wasm
+   483| fi
+   484| if [[ "$os" == "wasi" ]]; then
+   485|     arch=wasm
+   486| fi
+   487| if [[ "${TreatWarningsAsErrors:-}" == "false" ]]; then
+   488|     arguments="$arguments -warnAsError 0"
+   489| fi
+   490| initDistroRid "$os" "$arch" "$crossBuild" "$portableBuild"
+   491| export DOTNETSDK_ALLOW_TARGETING_PACK_CACHING=0
+   492| cmakeargs="${cmakeargs// /%20}"
+   493| arguments="$arguments /p:TargetArchitecture=$arch /p:BuildArchitecture=$hostArch"
+   494| arguments="$arguments /p:CMakeArgs=\"$cmakeargs\" $extraargs"
+   495| "$scriptroot/common/build.sh" $arguments
+
+
+# ====================================================================
+# FILE: eng/common/SetupNugetSources.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-110 ---
+     1| ConfigFile=$1
+     2| CredToken=$2
+     3| NL='\n'
+     4| TB='    '
+     5| source="${BASH_SOURCE[0]}"
+     6| while [[ -h "$source" ]]; do
+     7|   scriptroot="$( cd -P "$( dirname "$source" )" && pwd )"
+     8|   source="$(readlink "$source")"
+     9|   [[ $source != /* ]] && source="$scriptroot/$source"
+    10| done
+    11| scriptroot="$( cd -P "$( dirname "$source" )" && pwd )"
+    12| . "$scriptroot/tools.sh"
+    13| if [ ! -f "$ConfigFile" ]; then
+    14|     Write-PipelineTelemetryError -Category 'Build' "Error: Eng/common/SetupNugetSources.sh returned a non-zero exit code. Couldn't find the NuGet config file: $ConfigFile"
+    15|     ExitWithExitCode 1
+    16| fi
+    17| if [ -z "$CredToken" ]; then
+    18|     Write-PipelineTelemetryError -category 'Build' "Error: Eng/common/SetupNugetSources.sh returned a non-zero exit code. Please supply a valid PAT"
+    19|     ExitWithExitCode 1
+    20| fi
+    21| if [[ `uname -s` == "Darwin" ]]; then
+    22|     NL=$'\\\n'
+    23|     TB=''
+    24| fi
+    25| grep -i "<packageSources>" $ConfigFile
+    26| if [ "$?" != "0" ]; then
+    27|     echo "Adding <packageSources>...</packageSources> section."
+    28|     ConfigNodeHeader="<configuration>"
+    29|     PackageSourcesTemplate="${TB}<packageSources>${NL}${TB}</packageSources>"
+    30|     sed -i.bak "s|$ConfigNodeHeader|$ConfigNodeHeader${NL}$PackageSourcesTemplate|" $ConfigFile
+    31| fi
+    32| grep -i "<packageSourceCredentials>" $ConfigFile
+    33| if [ "$?" != "0" ]; then
+    34|     echo "Adding <packageSourceCredentials>...</packageSourceCredentials> section."
+    35|     PackageSourcesNodeFooter="</packageSources>"
+    36|     PackageSourceCredentialsTemplate="${TB}<packageSourceCredentials>${NL}${TB}</packageSourceCredentials>"
+    37|     sed -i.bak "s|$PackageSourcesNodeFooter|$PackageSourcesNodeFooter${NL}$PackageSourceCredentialsTemplate|" $ConfigFile
+    38| fi
+    39| PackageSources=()
+    40| grep -i "<add key=\"dotnet3.1\"" $ConfigFile
+    41| if [ "$?" == "0" ]; then
+    42|     grep -i "<add key=\"dotnet3.1-internal\"" $ConfigFile
+    43|     if [ "$?" != "0" ]; then
+    44|         echo "Adding dotnet3.1-internal to the packageSources."
+    45|         PackageSourcesNodeFooter="</packageSources>"
+    46|         PackageSourceTemplate="${TB}<add key=\"dotnet3.1-internal\" value=\"https://pkgs.dev.azure.com/dnceng/_packaging/dotnet3.1-internal/nuget/v2\" />"
+    47|         sed -i.bak "s|$PackageSourcesNodeFooter|$PackageSourceTemplate${NL}$PackageSourcesNodeFooter|" $ConfigFile
+    48|     fi
+    49|     PackageSources+=('dotnet3.1-internal')
+    50|     grep -i "<add key=\"dotnet3.1-internal-transport\">" $ConfigFile
+    51|     if [ "$?" != "0" ]; then
+    52|         echo "Adding dotnet3.1-internal-transport to the packageSources."
+    53|         PackageSourcesNodeFooter="</packageSources>"
+    54|         PackageSourceTemplate="${TB}<add key=\"dotnet3.1-internal-transport\" value=\"https://pkgs.dev.azure.com/dnceng/_packaging/dotnet3.1-internal-transport/nuget/v2\" />"
+    55|         sed -i.bak "s|$PackageSourcesNodeFooter|$PackageSourceTemplate${NL}$PackageSourcesNodeFooter|" $ConfigFile
+    56|     fi
+    57|     PackageSources+=('dotnet3.1-internal-transport')
+    58| fi
+    59| DotNetVersions=('5' '6' '7' '8')
+    60| for DotNetVersion in ${DotNetVersions[@]} ; do
+    61|     FeedPrefix="dotnet${DotNetVersion}";
+    62|     grep -i "<add key=\"$FeedPrefix\"" $ConfigFile
+    63|     if [ "$?" == "0" ]; then
+    64|         grep -i "<add key=\"$FeedPrefix-internal\"" $ConfigFile
+    65|         if [ "$?" != "0" ]; then
+    66|             echo "Adding $FeedPrefix-internal to the packageSources."
+    67|             PackageSourcesNodeFooter="</packageSources>"
+    68|             PackageSourceTemplate="${TB}<add key=\"$FeedPrefix-internal\" value=\"https://pkgs.dev.azure.com/dnceng/internal/_packaging/$FeedPrefix-internal/nuget/v2\" />"
+    69|             sed -i.bak "s|$PackageSourcesNodeFooter|$PackageSourceTemplate${NL}$PackageSourcesNodeFooter|" $ConfigFile
+    70|         fi
+    71|         PackageSources+=("$FeedPrefix-internal")
+    72|         grep -i "<add key=\"$FeedPrefix-internal-transport\">" $ConfigFile
+    73|         if [ "$?" != "0" ]; then
+    74|             echo "Adding $FeedPrefix-internal-transport to the packageSources."
+    75|             PackageSourcesNodeFooter="</packageSources>"
+    76|             PackageSourceTemplate="${TB}<add key=\"$FeedPrefix-internal-transport\" value=\"https://pkgs.dev.azure.com/dnceng/internal/_packaging/$FeedPrefix-internal-transport/nuget/v2\" />"
+    77|             sed -i.bak "s|$PackageSourcesNodeFooter|$PackageSourceTemplate${NL}$PackageSourcesNodeFooter|" $ConfigFile
+    78|         fi
+    79|         PackageSources+=("$FeedPrefix-internal-transport")
+    80|     fi
+    81| done
+    82| PrevIFS=$IFS
+    83| IFS=$'\n'
+    84| PackageSources+="$IFS"
+    85| PackageSources+=$(grep -oh '"darc-int-[^"]*"' $ConfigFile | tr -d '"')
+    86| IFS=$PrevIFS
+    87| for FeedName in ${PackageSources[@]} ; do
+    88|     grep -i "<$FeedName>" $ConfigFile 
+    89|     if [ "$?" != "0" ]; then
+    90|         echo "Adding credentials for $FeedName."
+    91|         PackageSourceCredentialsNodeFooter="</packageSourceCredentials>"
+    92|         NewCredential="${TB}${TB}<$FeedName>${NL}<add key=\"Username\" value=\"dn-bot\" />${NL}<add key=\"ClearTextPassword\" value=\"$CredToken\" />${NL}</$FeedName>"
+    93|         sed -i.bak "s|$PackageSourceCredentialsNodeFooter|$NewCredential${NL}$PackageSourceCredentialsNodeFooter|" $ConfigFile
+    94|     fi
+    95| done
+    96| grep -i "<disabledPackageSources>" $ConfigFile
+    97| if [ "$?" == "0" ]; then
+    98|     DisabledDarcIntSources=()
+    99|     echo "Re-enabling any disabled \"darc-int\" package sources in $ConfigFile"
+   100|     DisabledDarcIntSources+=$(grep -oh '"darc-int-[^"]*" value="true"' $ConfigFile  | tr -d '"')
+   101|     for DisabledSourceName in ${DisabledDarcIntSources[@]} ; do
+   102|         if [[ $DisabledSourceName == darc-int* ]]
+   103|             then
+   104|                 OldDisableValue="<add key=\"$DisabledSourceName\" value=\"true\" />"
+   105|                 NewDisableValue="<!-- Reenabled for build : $DisabledSourceName -->"
+   106|                 sed -i.bak "s|$OldDisableValue|$NewDisableValue|" $ConfigFile
+   107|                 echo "Neutralized disablePackageSources entry for '$DisabledSourceName'"
+   108|         fi
+   109|     done
+   110| fi
+
+
+# ====================================================================
+# FILE: eng/common/cross/build-android-rootfs.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-105 ---
+     1| set -e
+     2| __NDK_Version=r21
+     3| usage()
+     4| {
+     5|     echo "Creates a toolchain and sysroot used for cross-compiling for Android."
+     6|     echo.
+     7|     echo "Usage: $0 [BuildArch] [ApiLevel]"
+     8|     echo.
+     9|     echo "BuildArch is the target architecture of Android. Currently only arm64 is supported."
+    10|     echo "ApiLevel is the target Android API level. API levels usually match to Android releases. See https://source.android.com/source/build-numbers.html"
+    11|     echo.
+    12|     echo "By default, the toolchain and sysroot will be generated in cross/android-rootfs/toolchain/[BuildArch]. You can change this behavior"
+    13|     echo "by setting the TOOLCHAIN_DIR environment variable"
+    14|     echo.
+    15|     echo "By default, the NDK will be downloaded into the cross/android-rootfs/android-ndk-$__NDK_Version directory. If you already have an NDK installation,"
+    16|     echo "you can set the NDK_DIR environment variable to have this script use that installation of the NDK."
+    17|     echo "By default, this script will generate a file, android_platform, in the root of the ROOTFS_DIR directory that contains the RID for the supported and tested Android build: android.28-arm64. This file is to replace '/etc/os-release', which is not available for Android."
+    18|     exit 1
+    19| }
+    20| __ApiLevel=28 # The minimum platform for arm64 is API level 21 but the minimum version that support glob(3) is 28. See $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/glob.h
+    21| __BuildArch=arm64
+    22| __AndroidArch=aarch64
+    23| __AndroidToolchain=aarch64-linux-android
+    24| for i in "$@"
+    25|     do
+    26|         lowerI="$(echo $i | tr "[:upper:]" "[:lower:]")"
+    27|         case $lowerI in
+    28|         -?|-h|--help)
+    29|             usage
+    30|             exit 1
+    31|             ;;
+    32|         arm64)
+    33|             __BuildArch=arm64
+    34|             __AndroidArch=aarch64
+    35|             __AndroidToolchain=aarch64-linux-android
+    36|             ;;
+    37|         arm)
+    38|             __BuildArch=arm
+    39|             __AndroidArch=arm
+    40|             __AndroidToolchain=arm-linux-androideabi
+    41|             ;;
+    42|         *[0-9])
+    43|             __ApiLevel=$i
+    44|             ;;
+    45|         *)
+    46|             __UnprocessedBuildArgs="$__UnprocessedBuildArgs $i"
+    47|             ;;
+    48|     esac
+    49| done
+    50| __ScriptBaseDir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+    51| __CrossDir="$__ScriptBaseDir/../../../.tools/android-rootfs"
+    52| if [[ ! -f "$__CrossDir" ]]; then
+    53|     mkdir -p "$__CrossDir"
+    54| fi
+    55| __CrossDir="$( cd "$__CrossDir" && pwd )"
+    56| __NDK_Dir="$__CrossDir/android-ndk-$__NDK_Version"
+    57| __lldb_Dir="$__CrossDir/lldb"
+    58| __ToolchainDir="$__CrossDir/android-ndk-$__NDK_Version"
+    59| if [[ -n "$TOOLCHAIN_DIR" ]]; then
+    60|     __ToolchainDir=$TOOLCHAIN_DIR
+    61| fi
+    62| if [[ -n "$NDK_DIR" ]]; then
+    63|     __NDK_Dir=$NDK_DIR
+    64| fi
+    65| echo "Target API level: $__ApiLevel"
+    66| echo "Target architecture: $__BuildArch"
+    67| echo "NDK location: $__NDK_Dir"
+    68| echo "Target Toolchain location: $__ToolchainDir"
+    69| if [ ! -d $__NDK_Dir ]; then
+    70|     echo Downloading the NDK into $__NDK_Dir
+    71|     mkdir -p $__NDK_Dir
+    72|     wget -q --progress=bar:force:noscroll --show-progress https://dl.google.com/android/repository/android-ndk-$__NDK_Version-linux-x86_64.zip -O $__CrossDir/android-ndk-$__NDK_Version-linux-x86_64.zip
+    73|     unzip -q $__CrossDir/android-ndk-$__NDK_Version-linux-x86_64.zip -d $__CrossDir
+    74| fi
+    75| if [ ! -d $__lldb_Dir ]; then
+    76|     mkdir -p $__lldb_Dir
+    77|     echo Downloading LLDB into $__lldb_Dir
+    78|     wget -q --progress=bar:force:noscroll --show-progress https://dl.google.com/android/repository/lldb-2.3.3614996-linux-x86_64.zip -O $__CrossDir/lldb-2.3.3614996-linux-x86_64.zip
+    79|     unzip -q $__CrossDir/lldb-2.3.3614996-linux-x86_64.zip -d $__lldb_Dir
+    80| fi
+    81| echo "Download dependencies..."
+    82| __TmpDir=$__CrossDir/tmp/$__BuildArch/
+    83| mkdir -p "$__TmpDir"
+    84| __AndroidPackages="libicu"
+    85| __AndroidPackages+=" libandroid-glob"
+    86| __AndroidPackages+=" liblzma"
+    87| __AndroidPackages+=" krb5"
+    88| __AndroidPackages+=" openssl"
+    89| for path in $(wget -qO- https://packages.termux.dev/termux-main-21/dists/stable/main/binary-$__AndroidArch/Packages |\
+    90|     grep -A15 "Package: \(${__AndroidPackages// /\\|}\)" | grep -v "static\|tool" | grep Filename); do
+    91|     if [[ "$path" != "Filename:" ]]; then
+    92|         echo "Working on: $path"
+    93|         wget -qO- https://packages.termux.dev/termux-main-21/$path | dpkg -x - "$__TmpDir"
+    94|     fi
+    95| done
+    96| cp -R "$__TmpDir/data/data/com.termux/files/usr/"* "$__ToolchainDir/sysroot/usr/"
+    97| echo "Generating platform file..."
+    98| echo "RID=android.${__ApiLevel}-${__BuildArch}" > $__ToolchainDir/sysroot/android_platform
+    99| echo "Now to build coreclr, libraries and installers; run:"
+   100| echo ROOTFS_DIR=\$\(realpath $__ToolchainDir/sysroot\) ./build.sh --cross --arch $__BuildArch \
+   101|     --subsetCategory coreclr
+   102| echo ROOTFS_DIR=\$\(realpath $__ToolchainDir/sysroot\) ./build.sh --cross --arch $__BuildArch \
+   103|     --subsetCategory libraries
+   104| echo ROOTFS_DIR=\$\(realpath $__ToolchainDir/sysroot\) ./build.sh --cross --arch $__BuildArch \
+   105|     --subsetCategory installer
+
+
+# ====================================================================
+# FILE: eng/common/cross/build-rootfs.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-561 ---
+     1| set -e
+     2| usage()
+     3| {
+     4|     echo "Usage: $0 [BuildArch] [CodeName] [lldbx.y] [llvmx[.y]] [--skipunmount] --rootfsdir <directory>]"
+     5|     echo "BuildArch can be: arm(default), arm64, armel, armv6, ppc64le, riscv64, s390x, x64, x86"
+     6|     echo "CodeName - optional, Code name for Linux, can be: xenial(default), zesty, bionic, alpine"
+     7|     echo "                               for alpine can be specified with version: alpineX.YY or alpineedge"
+     8|     echo "                               for FreeBSD can be: freebsd12, freebsd13"
+     9|     echo "                               for illumos can be: illumos"
+    10|     echo "                               for Haiku can be: haiku."
+    11|     echo "lldbx.y - optional, LLDB version, can be: lldb3.9(default), lldb4.0, lldb5.0, lldb6.0 no-lldb. Ignored for alpine and FreeBSD"
+    12|     echo "llvmx[.y] - optional, LLVM version for LLVM related packages."
+    13|     echo "--skipunmount - optional, will skip the unmount of rootfs folder."
+    14|     echo "--skipsigcheck - optional, will skip package signature checks (allowing untrusted packages)."
+    15|     echo "--use-mirror - optional, use mirror URL to fetch resources, when available."
+    16|     echo "--jobs N - optional, restrict to N jobs."
+    17|     exit 1
+    18| }
+    19| __CodeName=xenial
+    20| __CrossDir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+    21| __BuildArch=arm
+    22| __AlpineArch=armv7
+    23| __FreeBSDArch=arm
+    24| __FreeBSDMachineArch=armv7
+    25| __IllumosArch=arm7
+    26| __HaikuArch=arm
+    27| __QEMUArch=arm
+    28| __UbuntuArch=armhf
+    29| __UbuntuRepo="http://ports.ubuntu.com/"
+    30| __LLDB_Package="liblldb-3.9-dev"
+    31| __SkipUnmount=0
+    32| __UbuntuPackages="build-essential"
+    33| __AlpinePackages="alpine-base"
+    34| __AlpinePackages+=" build-base"
+    35| __AlpinePackages+=" linux-headers"
+    36| __AlpinePackages+=" lldb-dev"
+    37| __AlpinePackages+=" python3"
+    38| __AlpinePackages+=" libedit"
+    39| __UbuntuPackages+=" symlinks"
+    40| __UbuntuPackages+=" libicu-dev"
+    41| __UbuntuPackages+=" liblttng-ust-dev"
+    42| __UbuntuPackages+=" libunwind8-dev"
+    43| __UbuntuPackages+=" libnuma-dev"
+    44| __AlpinePackages+=" gettext-dev"
+    45| __AlpinePackages+=" icu-dev"
+    46| __AlpinePackages+=" libunwind-dev"
+    47| __AlpinePackages+=" lttng-ust-dev"
+    48| __AlpinePackages+=" compiler-rt"
+    49| __AlpinePackages+=" numactl-dev"
+    50| __UbuntuPackages+=" libcurl4-openssl-dev"
+    51| __UbuntuPackages+=" libkrb5-dev"
+    52| __UbuntuPackages+=" libssl-dev"
+    53| __UbuntuPackages+=" zlib1g-dev"
+    54| __AlpinePackages+=" curl-dev"
+    55| __AlpinePackages+=" krb5-dev"
+    56| __AlpinePackages+=" openssl-dev"
+    57| __AlpinePackages+=" zlib-dev"
+    58| __FreeBSDBase="12.4-RELEASE"
+    59| __FreeBSDPkg="1.17.0"
+    60| __FreeBSDABI="12"
+    61| __FreeBSDPackages="libunwind"
+    62| __FreeBSDPackages+=" icu"
+    63| __FreeBSDPackages+=" libinotify"
+    64| __FreeBSDPackages+=" openssl"
+    65| __FreeBSDPackages+=" krb5"
+    66| __FreeBSDPackages+=" terminfo-db"
+    67| __IllumosPackages="icu"
+    68| __IllumosPackages+=" mit-krb5"
+    69| __IllumosPackages+=" openssl"
+    70| __IllumosPackages+=" zlib"
+    71| __HaikuPackages="gcc_syslibs"
+    72| __HaikuPackages+=" gcc_syslibs_devel"
+    73| __HaikuPackages+=" gmp"
+    74| __HaikuPackages+=" gmp_devel"
+    75| __HaikuPackages+=" icu66"
+    76| __HaikuPackages+=" icu66_devel"
+    77| __HaikuPackages+=" krb5"
+    78| __HaikuPackages+=" krb5_devel"
+    79| __HaikuPackages+=" libiconv"
+    80| __HaikuPackages+=" libiconv_devel"
+    81| __HaikuPackages+=" llvm12_libunwind"
+    82| __HaikuPackages+=" llvm12_libunwind_devel"
+    83| __HaikuPackages+=" mpfr"
+    84| __HaikuPackages+=" mpfr_devel"
+    85| __HaikuPackages+=" openssl"
+    86| __HaikuPackages+=" openssl_devel"
+    87| __HaikuPackages+=" zlib"
+    88| __HaikuPackages+=" zlib_devel"
+    89| __UbuntuPackages+=" libomp5"
+    90| __UbuntuPackages+=" libomp-dev"
+    91| __AlpineKeys='
+    92| 4a6a0840:MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1yHJxQgsHQREclQu4Ohe\nqxTxd1tHcNnvnQTu/UrTky8wWvgXT+jpveroeWWnzmsYlDI93eLI2ORakxb3gA2O\nQ0Ry4ws8vhaxLQGC74uQR5+/yYrLuTKydFzuPaS1dK19qJPXB8GMdmFOijnXX4SA\njixuHLe1WW7kZVtjL7nufvpXkWBGjsfrvskdNA/5MfxAeBbqPgaq0QMEfxMAn6/R\nL5kNepi/Vr4S39Xvf2DzWkTLEK8pcnjNkt9/aafhWqFVW7m3HCAII6h/qlQNQKSo\nGuH34Q8GsFG30izUENV9avY7hSLq7nggsvknlNBZtFUcmGoQrtx3FmyYsIC8/R+B\nywIDAQAB
+    93| 5243ef4b:MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvNijDxJ8kloskKQpJdx+\nmTMVFFUGDoDCbulnhZMJoKNkSuZOzBoFC94omYPtxnIcBdWBGnrm6ncbKRlR+6oy\nDO0W7c44uHKCFGFqBhDasdI4RCYP+fcIX/lyMh6MLbOxqS22TwSLhCVjTyJeeH7K\naA7vqk+QSsF4TGbYzQDDpg7+6aAcNzg6InNePaywA6hbT0JXbxnDWsB+2/LLSF2G\nmnhJlJrWB1WGjkz23ONIWk85W4S0XB/ewDefd4Ly/zyIciastA7Zqnh7p3Ody6Q0\nsS2MJzo7p3os1smGjUF158s6m/JbVh4DN6YIsxwl2OjDOz9R0OycfJSDaBVIGZzg\ncQIDAQAB
+    94| 524d27bb:MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAr8s1q88XpuJWLCZALdKj\nlN8wg2ePB2T9aIcaxryYE/Jkmtu+ZQ5zKq6BT3y/udt5jAsMrhHTwroOjIsF9DeG\ne8Y3vjz+Hh4L8a7hZDaw8jy3CPag47L7nsZFwQOIo2Cl1SnzUc6/owoyjRU7ab0p\niWG5HK8IfiybRbZxnEbNAfT4R53hyI6z5FhyXGS2Ld8zCoU/R4E1P0CUuXKEN4p0\n64dyeUoOLXEWHjgKiU1mElIQj3k/IF02W89gDj285YgwqA49deLUM7QOd53QLnx+\nxrIrPv3A+eyXMFgexNwCKQU9ZdmWa00MjjHlegSGK8Y2NPnRoXhzqSP9T9i2HiXL\nVQIDAQAB
+    95| 5261cecb:MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwlzMkl7b5PBdfMzGdCT0\ncGloRr5xGgVmsdq5EtJvFkFAiN8Ac9MCFy/vAFmS8/7ZaGOXoCDWbYVLTLOO2qtX\nyHRl+7fJVh2N6qrDDFPmdgCi8NaE+3rITWXGrrQ1spJ0B6HIzTDNEjRKnD4xyg4j\ng01FMcJTU6E+V2JBY45CKN9dWr1JDM/nei/Pf0byBJlMp/mSSfjodykmz4Oe13xB\nCa1WTwgFykKYthoLGYrmo+LKIGpMoeEbY1kuUe04UiDe47l6Oggwnl+8XD1MeRWY\nsWgj8sF4dTcSfCMavK4zHRFFQbGp/YFJ/Ww6U9lA3Vq0wyEI6MCMQnoSMFwrbgZw\nwwIDAQAB
+    96| 58199dcc:MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3v8/ye/V/t5xf4JiXLXa\nhWFRozsnmn3hobON20GdmkrzKzO/eUqPOKTpg2GtvBhK30fu5oY5uN2ORiv2Y2ht\neLiZ9HVz3XP8Fm9frha60B7KNu66FO5P2o3i+E+DWTPqqPcCG6t4Znk2BypILcit\nwiPKTsgbBQR2qo/cO01eLLdt6oOzAaF94NH0656kvRewdo6HG4urbO46tCAizvCR\nCA7KGFMyad8WdKkTjxh8YLDLoOCtoZmXmQAiwfRe9pKXRH/XXGop8SYptLqyVVQ+\ntegOD9wRs2tOlgcLx4F/uMzHN7uoho6okBPiifRX+Pf38Vx+ozXh056tjmdZkCaV\naQIDAQAB
+    97| 58cbb476:MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoSPnuAGKtRIS5fEgYPXD\n8pSGvKAmIv3A08LBViDUe+YwhilSHbYXUEAcSH1KZvOo1WT1x2FNEPBEFEFU1Eyc\n+qGzbA03UFgBNvArurHQ5Z/GngGqE7IarSQFSoqewYRtFSfp+TL9CUNBvM0rT7vz\n2eMu3/wWG+CBmb92lkmyWwC1WSWFKO3x8w+Br2IFWvAZqHRt8oiG5QtYvcZL6jym\nY8T6sgdDlj+Y+wWaLHs9Fc+7vBuyK9C4O1ORdMPW15qVSl4Lc2Wu1QVwRiKnmA+c\nDsH/m7kDNRHM7TjWnuj+nrBOKAHzYquiu5iB3Qmx+0gwnrSVf27Arc3ozUmmJbLj\nzQIDAQAB
+    98| 58e4f17d:MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvBxJN9ErBgdRcPr5g4hV\nqyUSGZEKuvQliq2Z9SRHLh2J43+EdB6A+yzVvLnzcHVpBJ+BZ9RV30EM9guck9sh\nr+bryZcRHyjG2wiIEoduxF2a8KeWeQH7QlpwGhuobo1+gA8L0AGImiA6UP3LOirl\nI0G2+iaKZowME8/tydww4jx5vG132JCOScMjTalRsYZYJcjFbebQQolpqRaGB4iG\nWqhytWQGWuKiB1A22wjmIYf3t96l1Mp+FmM2URPxD1gk/BIBnX7ew+2gWppXOK9j\n1BJpo0/HaX5XoZ/uMqISAAtgHZAqq+g3IUPouxTphgYQRTRYpz2COw3NF43VYQrR\nbQIDAQAB
+    99| 60ac2099:MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwR4uJVtJOnOFGchnMW5Y\nj5/waBdG1u5BTMlH+iQMcV5+VgWhmpZHJCBz3ocD+0IGk2I68S5TDOHec/GSC0lv\n6R9o6F7h429GmgPgVKQsc8mPTPtbjJMuLLs4xKc+viCplXc0Nc0ZoHmCH4da6fCV\ntdpHQjVe6F9zjdquZ4RjV6R6JTiN9v924dGMAkbW/xXmamtz51FzondKC52Gh8Mo\n/oA0/T0KsCMCi7tb4QNQUYrf+Xcha9uus4ww1kWNZyfXJB87a2kORLiWMfs2IBBJ\nTmZ2Fnk0JnHDb8Oknxd9PvJPT0mvyT8DA+KIAPqNvOjUXP4bnjEHJcoCP9S5HkGC\nIQIDAQAB
+   100| 6165ee59:MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAutQkua2CAig4VFSJ7v54\nALyu/J1WB3oni7qwCZD3veURw7HxpNAj9hR+S5N/pNeZgubQvJWyaPuQDm7PTs1+\ntFGiYNfAsiibX6Rv0wci3M+z2XEVAeR9Vzg6v4qoofDyoTbovn2LztaNEjTkB+oK\ntlvpNhg1zhou0jDVYFniEXvzjckxswHVb8cT0OMTKHALyLPrPOJzVtM9C1ew2Nnc\n3848xLiApMu3NBk0JqfcS3Bo5Y2b1FRVBvdt+2gFoKZix1MnZdAEZ8xQzL/a0YS5\nHd0wj5+EEKHfOd3A75uPa/WQmA+o0cBFfrzm69QDcSJSwGpzWrD1ScH3AK8nWvoj\nv7e9gukK/9yl1b4fQQ00vttwJPSgm9EnfPHLAtgXkRloI27H6/PuLoNvSAMQwuCD\nhQRlyGLPBETKkHeodfLoULjhDi1K2gKJTMhtbnUcAA7nEphkMhPWkBpgFdrH+5z4\nLxy+3ek0cqcI7K68EtrffU8jtUj9LFTUC8dERaIBs7NgQ/LfDbDfGh9g6qVj1hZl\nk9aaIPTm/xsi8v3u+0qaq7KzIBc9s59JOoA8TlpOaYdVgSQhHHLBaahOuAigH+VI\nisbC9vmqsThF2QdDtQt37keuqoda2E6sL7PUvIyVXDRfwX7uMDjlzTxHTymvq2Ck\nhtBqojBnThmjJQFgZXocHG8CAwEAAQ==
+   101| 61666e3f:MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAlEyxkHggKCXC2Wf5Mzx4\nnZLFZvU2bgcA3exfNPO/g1YunKfQY+Jg4fr6tJUUTZ3XZUrhmLNWvpvSwDS19ZmC\nIXOu0+V94aNgnhMsk9rr59I8qcbsQGIBoHzuAl8NzZCgdbEXkiY90w1skUw8J57z\nqCsMBydAueMXuWqF5nGtYbi5vHwK42PffpiZ7G5Kjwn8nYMW5IZdL6ZnMEVJUWC9\nI4waeKg0yskczYDmZUEAtrn3laX9677ToCpiKrvmZYjlGl0BaGp3cxggP2xaDbUq\nqfFxWNgvUAb3pXD09JM6Mt6HSIJaFc9vQbrKB9KT515y763j5CC2KUsilszKi3mB\nHYe5PoebdjS7D1Oh+tRqfegU2IImzSwW3iwA7PJvefFuc/kNIijfS/gH/cAqAK6z\nbhdOtE/zc7TtqW2Wn5Y03jIZdtm12CxSxwgtCF1NPyEWyIxAQUX9ACb3M0FAZ61n\nfpPrvwTaIIxxZ01L3IzPLpbc44x/DhJIEU+iDt6IMTrHOphD9MCG4631eIdB0H1b\n6zbNX1CXTsafqHRFV9XmYYIeOMggmd90s3xIbEujA6HKNP/gwzO6CDJ+nHFDEqoF\nSkxRdTkEqjTjVKieURW7Swv7zpfu5PrsrrkyGnsRrBJJzXlm2FOOxnbI2iSL1B5F\nrO5kbUxFeZUIDq+7Yv4kLWcCAwEAAQ==
+   102| 616a9724:MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAnC+bR4bHf/L6QdU4puhQ\ngl1MHePszRC38bzvVFDUJsmCaMCL2suCs2A2yxAgGb9pu9AJYLAmxQC4mM3jNqhg\n/E7yuaBbek3O02zN/ctvflJ250wZCy+z0ZGIp1ak6pu1j14IwHokl9j36zNfGtfv\nADVOcdpWITFFlPqwq1qt/H3UsKVmtiF3BNWWTeUEQwKvlU8ymxgS99yn0+4OPyNT\nL3EUeS+NQJtDS01unau0t7LnjUXn+XIneWny8bIYOQCuVR6s/gpIGuhBaUqwaJOw\n7jkJZYF2Ij7uPb4b5/R3vX2FfxxqEHqssFSg8FFUNTZz3qNZs0CRVyfA972g9WkJ\nhPfn31pQYil4QGRibCMIeU27YAEjXoqfJKEPh4UWMQsQLrEfdGfb8VgwrPbniGfU\nL3jKJR3VAafL9330iawzVQDlIlwGl6u77gEXMl9K0pfazunYhAp+BMP+9ot5ckK+\nosmrqj11qMESsAj083GeFdfV3pXEIwUytaB0AKEht9DbqUfiE/oeZ/LAXgySMtVC\nsbC4ESmgVeY2xSBIJdDyUap7FR49GGrw0W49NUv9gRgQtGGaNVQQO9oGL2PBC41P\niWF9GLoX30HIz1P8PF/cZvicSSPkQf2Z6TV+t0ebdGNS5DjapdnCrq8m9Z0pyKsQ\nuxAL2a7zX8l5i1CZh1ycUGsCAwEAAQ==
+   103| 616abc23:MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA0MfCDrhODRCIxR9Dep1s\neXafh5CE5BrF4WbCgCsevyPIdvTeyIaW4vmO3bbG4VzhogDZju+R3IQYFuhoXP5v\nY+zYJGnwrgz3r5wYAvPnLEs1+dtDKYOgJXQj+wLJBW1mzRDL8FoRXOe5iRmn1EFS\nwZ1DoUvyu7/J5r0itKicZp3QKED6YoilXed+1vnS4Sk0mzN4smuMR9eO1mMCqNp9\n9KTfRDHTbakIHwasECCXCp50uXdoW6ig/xUAFanpm9LtK6jctNDbXDhQmgvAaLXZ\nLvFqoaYJ/CvWkyYCgL6qxvMvVmPoRv7OPcyni4xR/WgWa0MSaEWjgPx3+yj9fiMA\n1S02pFWFDOr5OUF/O4YhFJvUCOtVsUPPfA/Lj6faL0h5QI9mQhy5Zb9TTaS9jB6p\nLw7u0dJlrjFedk8KTJdFCcaGYHP6kNPnOxMylcB/5WcztXZVQD5WpCicGNBxCGMm\nW64SgrV7M07gQfL/32QLsdqPUf0i8hoVD8wfQ3EpbQzv6Fk1Cn90bZqZafg8XWGY\nwddhkXk7egrr23Djv37V2okjzdqoyLBYBxMz63qQzFoAVv5VoY2NDTbXYUYytOvG\nGJ1afYDRVWrExCech1mX5ZVUB1br6WM+psFLJFoBFl6mDmiYt0vMYBddKISsvwLl\nIJQkzDwtXzT2cSjoj3T5QekCAwEAAQ==
+   104| 616ac3bc:MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAvaaoSLab+IluixwKV5Od\n0gib2YurjPatGIbn5Ov2DLUFYiebj2oJINXJSwUOO+4WcuHFEqiL/1rya+k5hLZt\nhnPL1tn6QD4rESznvGSasRCQNT2vS/oyZbTYJRyAtFkEYLlq0t3S3xBxxHWuvIf0\nqVxVNYpQWyM3N9RIeYBR/euXKJXileSHk/uq1I5wTC0XBIHWcthczGN0m9wBEiWS\n0m3cnPk4q0Ea8mUJ91Rqob19qETz6VbSPYYpZk3qOycjKosuwcuzoMpwU8KRiMFd\n5LHtX0Hx85ghGsWDVtS0c0+aJa4lOMGvJCAOvDfqvODv7gKlCXUpgumGpLdTmaZ8\n1RwqspAe3IqBcdKTqRD4m2mSg23nVx2FAY3cjFvZQtfooT7q1ItRV5RgH6FhQSl7\n+6YIMJ1Bf8AAlLdRLpg+doOUGcEn+pkDiHFgI8ylH1LKyFKw+eXaAml/7DaWZk1d\ndqggwhXOhc/UUZFQuQQ8A8zpA13PcbC05XxN2hyP93tCEtyynMLVPtrRwDnHxFKa\nqKzs3rMDXPSXRn3ZZTdKH3069ApkEjQdpcwUh+EmJ1Ve/5cdtzT6kKWCjKBFZP/s\n91MlRrX2BTRdHaU5QJkUheUtakwxuHrdah2F94lRmsnQlpPr2YseJu6sIE+Dnx4M\nCfhdVbQL2w54R645nlnohu8CAwEAAQ==
+   105| 616adfeb:MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAq0BFD1D4lIxQcsqEpQzU\npNCYM3aP1V/fxxVdT4DWvSI53JHTwHQamKdMWtEXetWVbP5zSROniYKFXd/xrD9X\n0jiGHey3lEtylXRIPxe5s+wXoCmNLcJVnvTcDtwx/ne2NLHxp76lyc25At+6RgE6\nADjLVuoD7M4IFDkAsd8UQ8zM0Dww9SylIk/wgV3ZkifecvgUQRagrNUdUjR56EBZ\nraQrev4hhzOgwelT0kXCu3snbUuNY/lU53CoTzfBJ5UfEJ5pMw1ij6X0r5S9IVsy\nKLWH1hiO0NzU2c8ViUYCly4Fe9xMTFc6u2dy/dxf6FwERfGzETQxqZvSfrRX+GLj\n/QZAXiPg5178hT/m0Y3z5IGenIC/80Z9NCi+byF1WuJlzKjDcF/TU72zk0+PNM/H\nKuppf3JT4DyjiVzNC5YoWJT2QRMS9KLP5iKCSThwVceEEg5HfhQBRT9M6KIcFLSs\nmFjx9kNEEmc1E8hl5IR3+3Ry8G5/bTIIruz14jgeY9u5jhL8Vyyvo41jgt9sLHR1\n/J1TxKfkgksYev7PoX6/ZzJ1ksWKZY5NFoDXTNYUgzFUTOoEaOg3BAQKadb3Qbbq\nXIrxmPBdgrn9QI7NCgfnAY3Tb4EEjs3ON/BNyEhUENcXOH6I1NbcuBQ7g9P73kE4\nVORdoc8MdJ5eoKBpO8Ww8HECAwEAAQ==
+   106| 616ae350:MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAyduVzi1mWm+lYo2Tqt/0\nXkCIWrDNP1QBMVPrE0/ZlU2bCGSoo2Z9FHQKz/mTyMRlhNqTfhJ5qU3U9XlyGOPJ\npiM+b91g26pnpXJ2Q2kOypSgOMOPA4cQ42PkHBEqhuzssfj9t7x47ppS94bboh46\nxLSDRff/NAbtwTpvhStV3URYkxFG++cKGGa5MPXBrxIp+iZf9GnuxVdST5PGiVGP\nODL/b69sPJQNbJHVquqUTOh5Ry8uuD2WZuXfKf7/C0jC/ie9m2+0CttNu9tMciGM\nEyKG1/Xhk5iIWO43m4SrrT2WkFlcZ1z2JSf9Pjm4C2+HovYpihwwdM/OdP8Xmsnr\nDzVB4YvQiW+IHBjStHVuyiZWc+JsgEPJzisNY0Wyc/kNyNtqVKpX6dRhMLanLmy+\nf53cCSI05KPQAcGj6tdL+D60uKDkt+FsDa0BTAobZ31OsFVid0vCXtsbplNhW1IF\nHwsGXBTVcfXg44RLyL8Lk/2dQxDHNHzAUslJXzPxaHBLmt++2COa2EI1iWlvtznk\nOk9WP8SOAIj+xdqoiHcC4j72BOVVgiITIJNHrbppZCq6qPR+fgXmXa+sDcGh30m6\n9Wpbr28kLMSHiENCWTdsFij+NQTd5S47H7XTROHnalYDuF1RpS+DpQidT5tUimaT\nJZDr++FjKrnnijbyNF8b98UCAwEAAQ==
+   107| 616db30d:MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAnpUpyWDWjlUk3smlWeA0\nlIMW+oJ38t92CRLHH3IqRhyECBRW0d0aRGtq7TY8PmxjjvBZrxTNDpJT6KUk4LRm\na6A6IuAI7QnNK8SJqM0DLzlpygd7GJf8ZL9SoHSH+gFsYF67Cpooz/YDqWrlN7Vw\ntO00s0B+eXy+PCXYU7VSfuWFGK8TGEv6HfGMALLjhqMManyvfp8hz3ubN1rK3c8C\nUS/ilRh1qckdbtPvoDPhSbTDmfU1g/EfRSIEXBrIMLg9ka/XB9PvWRrekrppnQzP\nhP9YE3x/wbFc5QqQWiRCYyQl/rgIMOXvIxhkfe8H5n1Et4VAorkpEAXdsfN8KSVv\nLSMazVlLp9GYq5SUpqYX3KnxdWBgN7BJoZ4sltsTpHQ/34SXWfu3UmyUveWj7wp0\nx9hwsPirVI00EEea9AbP7NM2rAyu6ukcm4m6ATd2DZJIViq2es6m60AE6SMCmrQF\nwmk4H/kdQgeAELVfGOm2VyJ3z69fQuywz7xu27S6zTKi05Qlnohxol4wVb6OB7qG\nLPRtK9ObgzRo/OPumyXqlzAi/Yvyd1ZQk8labZps3e16bQp8+pVPiumWioMFJDWV\nGZjCmyMSU8V6MB6njbgLHoyg2LCukCAeSjbPGGGYhnKLm1AKSoJh3IpZuqcKCk5C\n8CM1S15HxV78s9dFntEqIokCAwEAAQ==
+   108| '
+   109| __Keyring=
+   110| __SkipSigCheck=0
+   111| __UseMirror=0
+   112| __UnprocessedBuildArgs=
+   113| while :; do
+   114|     if [[ "$#" -le 0 ]]; then
+   115|         break
+   116|     fi
+   117|     lowerI="$(echo "$1" | tr "[:upper:]" "[:lower:]")"
+   118|     case $lowerI in
+   119|         -\?|-h|--help)
+   120|             usage
+   121|             exit 1
+   122|             ;;
+   123|         arm)
+   124|             __BuildArch=arm
+   125|             __UbuntuArch=armhf
+   126|             __AlpineArch=armv7
+   127|             __QEMUArch=arm
+   128|             ;;
+   129|         arm64)
+   130|             __BuildArch=arm64
+   131|             __UbuntuArch=arm64
+   132|             __AlpineArch=aarch64
+   133|             __QEMUArch=aarch64
+   134|             __FreeBSDArch=arm64
+   135|             __FreeBSDMachineArch=aarch64
+   136|             ;;
+   137|         armel)
+   138|             __BuildArch=armel
+   139|             __UbuntuArch=armel
+   140|             __UbuntuRepo="http://ftp.debian.org/debian/"
+   141|             __CodeName=jessie
+   142|             ;;
+   143|         armv6)
+   144|             __BuildArch=armv6
+   145|             __UbuntuArch=armhf
+   146|             __QEMUArch=arm
+   147|             __UbuntuRepo="http://raspbian.raspberrypi.org/raspbian/"
+   148|             __CodeName=buster
+   149|             __LLDB_Package="liblldb-6.0-dev"
+   150|             if [[ -e "/usr/share/keyrings/raspbian-archive-keyring.gpg" ]]; then
+   151|                 __Keyring="--keyring /usr/share/keyrings/raspbian-archive-keyring.gpg"
+   152|             fi
+   153|             ;;
+   154|         riscv64)
+   155|             __BuildArch=riscv64
+   156|             __AlpineArch=riscv64
+   157|             __AlpinePackages="${__AlpinePackages// lldb-dev/}"
+   158|             __QEMUArch=riscv64
+   159|             __UbuntuArch=riscv64
+   160|             __UbuntuRepo="http://deb.debian.org/debian-ports"
+   161|             __UbuntuPackages="${__UbuntuPackages// libunwind8-dev/}"
+   162|             unset __LLDB_Package
+   163|             if [[ -e "/usr/share/keyrings/debian-ports-archive-keyring.gpg" ]]; then
+   164|                 __Keyring="--keyring /usr/share/keyrings/debian-ports-archive-keyring.gpg --include=debian-ports-archive-keyring"
+   165|             fi
+   166|             ;;
+   167|         ppc64le)
+   168|             __BuildArch=ppc64le
+   169|             __AlpineArch=ppc64le
+   170|             __QEMUArch=ppc64le
+   171|             __UbuntuArch=ppc64el
+   172|             __UbuntuRepo="http://ports.ubuntu.com/ubuntu-ports/"
+   173|             __UbuntuPackages="${__UbuntuPackages// libunwind8-dev/}"
+   174|             __UbuntuPackages="${__UbuntuPackages// libomp-dev/}"
+   175|             __UbuntuPackages="${__UbuntuPackages// libomp5/}"
+   176|             unset __LLDB_Package
+   177|             ;;
+   178|         s390x)
+   179|             __BuildArch=s390x
+   180|             __AlpineArch=s390x
+   181|             __QEMUArch=s390x
+   182|             __UbuntuArch=s390x
+   183|             __UbuntuRepo="http://ports.ubuntu.com/ubuntu-ports/"
+   184|             __UbuntuPackages="${__UbuntuPackages// libunwind8-dev/}"
+   185|             __UbuntuPackages="${__UbuntuPackages// libomp-dev/}"
+   186|             __UbuntuPackages="${__UbuntuPackages// libomp5/}"
+   187|             unset __LLDB_Package
+   188|             ;;
+   189|         x64)
+   190|             __BuildArch=x64
+   191|             __AlpineArch=x86_64
+   192|             __UbuntuArch=amd64
+   193|             __FreeBSDArch=amd64
+   194|             __FreeBSDMachineArch=amd64
+   195|             __illumosArch=x86_64
+   196|             __HaikuArch=x86_64
+   197|             __UbuntuRepo="http://archive.ubuntu.com/ubuntu/"
+   198|             ;;
+   199|         x86)
+   200|             __BuildArch=x86
+   201|             __UbuntuArch=i386
+   202|             __AlpineArch=x86
+   203|             __UbuntuRepo="http://archive.ubuntu.com/ubuntu/"
+   204|             ;;
+   205|         lldb*)
+   206|             version="${lowerI/lldb/}"
+   207|             parts=(${version//./ })
+   208|             if [[ "${parts[0]}" -gt 6 ]]; then
+   209|                 version="${parts[0]}"
+   210|             fi
+   211|             __LLDB_Package="liblldb-${version}-dev"
+   212|             ;;
+   213|         no-lldb)
+   214|             unset __LLDB_Package
+   215|             ;;
+   216|         llvm*)
+   217|             version="${lowerI/llvm/}"
+   218|             parts=(${version//./ })
+   219|             __LLVM_MajorVersion="${parts[0]}"
+   220|             __LLVM_MinorVersion="${parts[1]}"
+   221|             if [[ -z "$__LLVM_MinorVersion" && "$__LLVM_MajorVersion" -le 6 ]]; then
+   222|                 __LLVM_MinorVersion=0;
+   223|             fi
+   224|             ;;
+   225|         xenial) # Ubuntu 16.04
+   226|             if [[ "$__CodeName" != "jessie" ]]; then
+   227|                 __CodeName=xenial
+   228|             fi
+   229|             ;;
+   230|         zesty) # Ubuntu 17.04
+   231|             if [[ "$__CodeName" != "jessie" ]]; then
+   232|                 __CodeName=zesty
+   233|             fi
+   234|             ;;
+   235|         bionic) # Ubuntu 18.04
+   236|             if [[ "$__CodeName" != "jessie" ]]; then
+   237|                 __CodeName=bionic
+   238|             fi
+   239|             ;;
+   240|         focal) # Ubuntu 20.04
+   241|             if [[ "$__CodeName" != "jessie" ]]; then
+   242|                 __CodeName=focal
+   243|             fi
+   244|             ;;
+   245|         jammy) # Ubuntu 22.04
+   246|             if [[ "$__CodeName" != "jessie" ]]; then
+   247|                 __CodeName=jammy
+   248|             fi
+   249|             ;;
+   250|         jessie) # Debian 8
+   251|             __CodeName=jessie
+   252|             if [[ -z "$__UbuntuRepo" ]]; then
+   253|                 __UbuntuRepo="http://ftp.debian.org/debian/"
+   254|             fi
+   255|             ;;
+   256|         stretch) # Debian 9
+   257|             __CodeName=stretch
+   258|             __LLDB_Package="liblldb-6.0-dev"
+   259|             if [[ -z "$__UbuntuRepo" ]]; then
+   260|                 __UbuntuRepo="http://ftp.debian.org/debian/"
+   261|             fi
+   262|             ;;
+   263|         buster) # Debian 10
+   264|             __CodeName=buster
+   265|             __LLDB_Package="liblldb-6.0-dev"
+   266|             if [[ -z "$__UbuntuRepo" ]]; then
+   267|                 __UbuntuRepo="http://ftp.debian.org/debian/"
+   268|             fi
+   269|             ;;
+   270|         bullseye) # Debian 11
+   271|             __CodeName=bullseye
+   272|             if [[ -z "$__UbuntuRepo" ]]; then
+   273|                 __UbuntuRepo="http://ftp.debian.org/debian/"
+   274|             fi
+   275|             ;;
+   276|         sid) # Debian sid
+   277|             __CodeName=sid
+   278|             if [[ -z "$__UbuntuRepo" ]]; then
+   279|                 __UbuntuRepo="http://ftp.debian.org/debian/"
+   280|             fi
+   281|             ;;
+   282|         tizen)
+   283|             __CodeName=
+   284|             __UbuntuRepo=
+   285|             __Tizen=tizen
+   286|             ;;
+   287|         alpine*)
+   288|             __CodeName=alpine
+   289|             __UbuntuRepo=
+   290|             version="${lowerI/alpine/}"
+   291|             if [[ "$version" == "edge" ]]; then
+   292|                 __AlpineVersion=edge
+   293|             else
+   294|                 parts=(${version//./ })
+   295|                 __AlpineMajorVersion="${parts[0]}"
+   296|                 __AlpineMinoVersion="${parts[1]}"
+   297|                 __AlpineVersion="$__AlpineMajorVersion.$__AlpineMinoVersion"
+   298|             fi
+   299|             ;;
+   300|         freebsd12)
+   301|             __CodeName=freebsd
+   302|             __SkipUnmount=1
+   303|             ;;
+   304|         freebsd13)
+   305|             __CodeName=freebsd
+   306|             __FreeBSDBase="13.2-RELEASE"
+   307|             __FreeBSDABI="13"
+   308|             __SkipUnmount=1
+   309|             ;;
+   310|         illumos)
+   311|             __CodeName=illumos
+   312|             __SkipUnmount=1
+   313|             ;;
+   314|         haiku)
+   315|             __CodeName=haiku
+   316|             __SkipUnmount=1
+   317|             ;;
+   318|         --skipunmount)
+   319|             __SkipUnmount=1
+   320|             ;;
+   321|         --skipsigcheck)
+   322|             __SkipSigCheck=1
+   323|             ;;
+   324|         --rootfsdir|-rootfsdir)
+   325|             shift
+   326|             __RootfsDir="$1"
+   327|             ;;
+   328|         --use-mirror)
+   329|             __UseMirror=1
+   330|             ;;
+   331|         --use-jobs)
+   332|             shift
+   333|             MAXJOBS=$1
+   334|             ;;
+   335|         *)
+   336|             __UnprocessedBuildArgs="$__UnprocessedBuildArgs $1"
+   337|             ;;
+   338|     esac
+   339|     shift
+   340| done
+   341| case "$__AlpineVersion" in
+   342|     3.14) __AlpinePackages+=" llvm11-libs" ;;
+   343|     3.15) __AlpinePackages+=" llvm12-libs" ;;
+   344|     3.16) __AlpinePackages+=" llvm13-libs" ;;
+   345|     3.17) __AlpinePackages+=" llvm15-libs" ;;
+   346|     edge) __AlpineLlvmLibsLookup=1 ;;
+   347|     *)
+   348|         if [[ "$__AlpineArch" =~ s390x|ppc64le ]]; then
+   349|             __AlpineVersion=3.15 # minimum version that supports lldb-dev
+   350|             __AlpinePackages+=" llvm12-libs"
+   351|         elif [[ "$__AlpineArch" == "x86" ]]; then
+   352|             __AlpineVersion=3.17 # minimum version that supports lldb-dev
+   353|             __AlpinePackages+=" llvm15-libs"
+   354|         elif [[ "$__AlpineArch" == "riscv64" ]]; then
+   355|             __AlpineLlvmLibsLookup=1
+   356|             __AlpineVersion=edge # minimum version with APKINDEX.tar.gz (packages archive)
+   357|         else
+   358|             __AlpineVersion=3.13 # 3.13 to maximize compatibility
+   359|             __AlpinePackages+=" llvm10-libs"
+   360|             if [[ "$__AlpineArch" == "armv7" ]]; then
+   361|                 __AlpinePackages="${__AlpinePackages//numactl-dev/}"
+   362|             fi
+   363|         fi
+   364| esac
+   365| if [[ "$__AlpineVersion" =~ 3\.1[345] ]]; then
+   366|     __AlpinePackages="${__AlpinePackages/compiler-rt/compiler-rt-static}"
+   367| fi
+   368| if [[ "$__BuildArch" == "armel" ]]; then
+   369|     __LLDB_Package="lldb-3.5-dev"
+   370| fi
+   371| if [[ "$__CodeName" == "xenial" && "$__UbuntuArch" == "armhf" ]]; then
+   372|     __UbuntuPackages="${__UbuntuPackages//libnuma-dev/}"
+   373| fi
+   374| __UbuntuPackages+=" ${__LLDB_Package:-}"
+   375| if [[ -n "$__LLVM_MajorVersion" ]]; then
+   376|     __UbuntuPackages+=" libclang-common-${__LLVM_MajorVersion}${__LLVM_MinorVersion:+.$__LLVM_MinorVersion}-dev"
+   377| fi
+   378| if [[ -z "$__RootfsDir" && -n "$ROOTFS_DIR" ]]; then
+   379|     __RootfsDir="$ROOTFS_DIR"
+   380| fi
+   381| if [[ -z "$__RootfsDir" ]]; then
+   382|     __RootfsDir="$__CrossDir/../../../.tools/rootfs/$__BuildArch"
+   383| fi
+   384| if [[ -d "$__RootfsDir" ]]; then
+   385|     if [[ "$__SkipUnmount" == "0" ]]; then
+   386|         umount "$__RootfsDir"/* || true
+   387|     fi
+   388|     rm -rf "$__RootfsDir"
+   389| fi
+   390| mkdir -p "$__RootfsDir"
+   391| __RootfsDir="$( cd "$__RootfsDir" && pwd )"
+   392| if [[ "$__CodeName" == "alpine" ]]; then
+   393|     __ApkToolsVersion=2.12.11
+   394|     __ApkToolsSHA512SUM=53e57b49230da07ef44ee0765b9592580308c407a8d4da7125550957bb72cb59638e04f8892a18b584451c8d841d1c7cb0f0ab680cc323a3015776affaa3be33
+   395|     __ApkToolsDir="$(mktemp -d)"
+   396|     __ApkKeysDir="$(mktemp -d)"
+   397|     wget "https://gitlab.alpinelinux.org/api/v4/projects/5/packages/generic//v$__ApkToolsVersion/x86_64/apk.static" -P "$__ApkToolsDir"
+   398|     echo "$__ApkToolsSHA512SUM $__ApkToolsDir/apk.static" | sha512sum -c
+   399|     chmod +x "$__ApkToolsDir/apk.static"
+   400|     if [[ -f "/usr/bin/qemu-$__QEMUArch-static" ]]; then
+   401|         mkdir -p "$__RootfsDir"/usr/bin
+   402|         cp -v "/usr/bin/qemu-$__QEMUArch-static" "$__RootfsDir/usr/bin"
+   403|     fi
+   404|     if [[ "$__AlpineVersion" == "edge" ]]; then
+   405|         version=edge
+   406|     else
+   407|         version="v$__AlpineVersion"
+   408|     fi
+   409|     for line in $__AlpineKeys; do
+   410|         id="${line%%:*}"
+   411|         content="${line#*:}"
+   412|         echo -e "-----BEGIN PUBLIC KEY-----\n$content\n-----END PUBLIC KEY-----" > "$__ApkKeysDir/alpine-devel@lists.alpinelinux.org-$id.rsa.pub"
+   413|     done
+   414|     if [[ "$__SkipSigCheck" == "1" ]]; then
+   415|         __ApkSignatureArg="--allow-untrusted"
+   416|     else
+   417|         __ApkSignatureArg="--keys-dir $__ApkKeysDir"
+   418|     fi
+   419|     "$__ApkToolsDir/apk.static" \
+   420|         -X "http://dl-cdn.alpinelinux.org/alpine/$version/main" \
+   421|         -X "http://dl-cdn.alpinelinux.org/alpine/$version/community" \
+   422|         -U $__ApkSignatureArg --root "$__RootfsDir" --arch "$__AlpineArch" --initdb add
+   423|     if [[ "$__AlpineLlvmLibsLookup" == 1 ]]; then
+   424|         __AlpinePackages+=" $("$__ApkToolsDir/apk.static" \
+   425|             -X "http://dl-cdn.alpinelinux.org/alpine/$version/main" \
+   426|             -X "http://dl-cdn.alpinelinux.org/alpine/$version/community" \
+   427|             -U $__ApkSignatureArg --root "$__RootfsDir" --arch "$__AlpineArch" \
+   428|             search 'llvm*-libs' | sort | tail -1 | sed 's/-[^-]*//2g')"
+   429|     fi
+   430|     "$__ApkToolsDir/apk.static" \
+   431|         -X "http://dl-cdn.alpinelinux.org/alpine/$version/main" \
+   432|         -X "http://dl-cdn.alpinelinux.org/alpine/$version/community" \
+   433|         -U $__ApkSignatureArg --root "$__RootfsDir" --arch "$__AlpineArch" \
+   434|         add $__AlpinePackages
+   435|     rm -r "$__ApkToolsDir"
+   436| elif [[ "$__CodeName" == "freebsd" ]]; then
+   437|     mkdir -p "$__RootfsDir"/usr/local/etc
+   438|     JOBS=${MAXJOBS:="$(getconf _NPROCESSORS_ONLN)"}
+   439|     wget -O - "https://download.freebsd.org/ftp/releases/${__FreeBSDArch}/${__FreeBSDMachineArch}/${__FreeBSDBase}/base.txz" | tar -C "$__RootfsDir" -Jxf - ./lib ./usr/lib ./usr/libdata ./usr/include ./usr/share/keys ./etc ./bin/freebsd-version
+   440|     echo "ABI = \"FreeBSD:${__FreeBSDABI}:${__FreeBSDMachineArch}\"; FINGERPRINTS = \"${__RootfsDir}/usr/share/keys\"; REPOS_DIR = [\"${__RootfsDir}/etc/pkg\"]; REPO_AUTOUPDATE = NO; RUN_SCRIPTS = NO;" > "${__RootfsDir}"/usr/local/etc/pkg.conf
+   441|     echo "FreeBSD: { url: \"pkg+http://pkg.FreeBSD.org/\${ABI}/quarterly\", mirror_type: \"srv\", signature_type: \"fingerprints\", fingerprints: \"${__RootfsDir}/usr/share/keys/pkg\", enabled: yes }" > "${__RootfsDir}"/etc/pkg/FreeBSD.conf
+   442|     mkdir -p "$__RootfsDir"/tmp
+   443|     wget -O - "https://github.com/freebsd/pkg/archive/${__FreeBSDPkg}.tar.gz" | tar -C "$__RootfsDir"/tmp -zxf -
+   444|     cd "$__RootfsDir/tmp/pkg-${__FreeBSDPkg}"
+   445|     mkdir -p "$__RootfsDir"/host/etc
+   446|     ./autogen.sh && ./configure --prefix="$__RootfsDir"/host && make -j "$JOBS" && make install
+   447|     rm -rf "$__RootfsDir/tmp/pkg-${__FreeBSDPkg}"
+   448|     INSTALL_AS_USER=$(whoami) "$__RootfsDir"/host/sbin/pkg -r "$__RootfsDir" -C "$__RootfsDir"/usr/local/etc/pkg.conf update
+   449|     INSTALL_AS_USER=$(whoami) "$__RootfsDir"/host/sbin/pkg -r "$__RootfsDir" -C "$__RootfsDir"/usr/local/etc/pkg.conf install --yes $__FreeBSDPackages
+   450| elif [[ "$__CodeName" == "illumos" ]]; then
+   451|     mkdir "$__RootfsDir/tmp"
+   452|     pushd "$__RootfsDir/tmp"
+   453|     JOBS=${MAXJOBS:="$(getconf _NPROCESSORS_ONLN)"}
+   454|     echo "Downloading sysroot."
+   455|     wget -O - https://github.com/illumos/sysroot/releases/download/20181213-de6af22ae73b-v1/illumos-sysroot-i386-20181213-de6af22ae73b-v1.tar.gz | tar -C "$__RootfsDir" -xzf -
+   456|     echo "Building binutils. Please wait.."
+   457|     wget -O - https://ftp.gnu.org/gnu/binutils/binutils-2.33.1.tar.bz2 | tar -xjf -
+   458|     mkdir build-binutils && cd build-binutils
+   459|     ../binutils-2.33.1/configure --prefix="$__RootfsDir" --target="${__illumosArch}-sun-solaris2.10" --program-prefix="${__illumosArch}-illumos-" --with-sysroot="$__RootfsDir"
+   460|     make -j "$JOBS" && make install && cd ..
+   461|     echo "Building gcc. Please wait.."
+   462|     wget -O - https://ftp.gnu.org/gnu/gcc/gcc-8.4.0/gcc-8.4.0.tar.xz | tar -xJf -
+   463|     CFLAGS="-fPIC"
+   464|     CXXFLAGS="-fPIC"
+   465|     CXXFLAGS_FOR_TARGET="-fPIC"
+   466|     CFLAGS_FOR_TARGET="-fPIC"
+   467|     export CFLAGS CXXFLAGS CXXFLAGS_FOR_TARGET CFLAGS_FOR_TARGET
+   468|     mkdir build-gcc && cd build-gcc
+   469|     ../gcc-8.4.0/configure --prefix="$__RootfsDir" --target="${__illumosArch}-sun-solaris2.10" --program-prefix="${__illumosArch}-illumos-" --with-sysroot="$__RootfsDir" --with-gnu-as       \
+   470|         --with-gnu-ld --disable-nls --disable-libgomp --disable-libquadmath --disable-libssp --disable-libvtv --disable-libcilkrts --disable-libada --disable-libsanitizer \
+   471|         --disable-libquadmath-support --disable-shared --enable-tls
+   472|     make -j "$JOBS" && make install && cd ..
+   473|     BaseUrl=https://pkgsrc.smartos.org
+   474|     if [[ "$__UseMirror" == 1 ]]; then
+   475|         BaseUrl=https://pkgsrc.smartos.skylime.net
+   476|     fi
+   477|     BaseUrl="$BaseUrl/packages/SmartOS/trunk/${__illumosArch}/All"
+   478|     echo "Downloading manifest"
+   479|     wget "$BaseUrl"
+   480|     echo "Downloading dependencies."
+   481|     read -ra array <<<"$__IllumosPackages"
+   482|     for package in "${array[@]}"; do
+   483|         echo "Installing '$package'"
+   484|         package="$(sed -En '/.*href="('"$package"'-[0-9].*).tgz".*/h;$!d;g;s//\1/p' All)"
+   485|         echo "Resolved name '$package'"
+   486|         wget "$BaseUrl"/"$package".tgz
+   487|         ar -x "$package".tgz
+   488|         tar --skip-old-files -xzf "$package".tmp.tg* -C "$__RootfsDir" 2>/dev/null
+   489|     done
+   490|     echo "Cleaning up temporary files."
+   491|     popd
+   492|     rm -rf "$__RootfsDir"/{tmp,+*}
+   493|     mkdir -p "$__RootfsDir"/usr/include/net
+   494|     mkdir -p "$__RootfsDir"/usr/include/netpacket
+   495|     wget -P "$__RootfsDir"/usr/include/net https://raw.githubusercontent.com/illumos/illumos-gate/master/usr/src/uts/common/io/bpf/net/bpf.h
+   496|     wget -P "$__RootfsDir"/usr/include/net https://raw.githubusercontent.com/illumos/illumos-gate/master/usr/src/uts/common/io/bpf/net/dlt.h
+   497|     wget -P "$__RootfsDir"/usr/include/netpacket https://raw.githubusercontent.com/illumos/illumos-gate/master/usr/src/uts/common/inet/sockmods/netpacket/packet.h
+   498|     wget -P "$__RootfsDir"/usr/include/sys https://raw.githubusercontent.com/illumos/illumos-gate/master/usr/src/uts/common/sys/sdt.h
+   499| elif [[ "$__CodeName" == "haiku" ]]; then
+   500|     JOBS=${MAXJOBS:="$(getconf _NPROCESSORS_ONLN)"}
+   501|     echo "Building Haiku sysroot for $__HaikuArch"
+   502|     mkdir -p "$__RootfsDir/tmp"
+   503|     pushd "$__RootfsDir/tmp"
+   504|     mkdir "$__RootfsDir/tmp/download"
+   505|     echo "Downloading Haiku package tool"
+   506|     git clone https://github.com/haiku/haiku-toolchains-ubuntu --depth 1 $__RootfsDir/tmp/script
+   507|     wget -O "$__RootfsDir/tmp/download/hosttools.zip" $($__RootfsDir/tmp/script/fetch.sh --hosttools)
+   508|     unzip -o "$__RootfsDir/tmp/download/hosttools.zip" -d "$__RootfsDir/tmp/bin"
+   509|     DepotBaseUrl="https://depot.haiku-os.org/__api/v2/pkg/get-pkg"
+   510|     HpkgBaseUrl="https://eu.hpkg.haiku-os.org/haiku/master/$__HaikuArch/current"
+   511|     echo "Downloading Haiku packages"
+   512|     read -ra array <<<"$__HaikuPackages"
+   513|     for package in "${array[@]}"; do
+   514|         echo "Downloading $package..."
+   515|         hpkgDownloadUrl="$(wget -qO- --post-data='{"name":"'"$package"'","repositorySourceCode":"haikuports_'$__HaikuArch'","versionType":"LATEST","naturalLanguageCode":"en"}' \
+   516|             --header='Content-Type:application/json' "$DepotBaseUrl" | jq -r '.result.versions[].hpkgDownloadURL')"
+   517|         wget -P "$__RootfsDir/tmp/download" "$hpkgDownloadUrl"
+   518|     done
+   519|     for package in haiku haiku_devel; do
+   520|         echo "Downloading $package..."
+   521|         hpkgVersion="$(wget -qO- $HpkgBaseUrl | sed -n 's/^.*version: "\([^"]*\)".*$/\1/p')"
+   522|         wget -P "$__RootfsDir/tmp/download" "$HpkgBaseUrl/packages/$package-$hpkgVersion-1-$__HaikuArch.hpkg"
+   523|     done
+   524|     echo "Setting up sysroot and extracting required packages"
+   525|     mkdir -p "$__RootfsDir/boot/system"
+   526|     for file in "$__RootfsDir/tmp/download/"*.hpkg; do
+   527|         echo "Extracting $file..."
+   528|         LD_LIBRARY_PATH="$__RootfsDir/tmp/bin" "$__RootfsDir/tmp/bin/package" extract -C "$__RootfsDir/boot/system" "$file"
+   529|     done
+   530|     echo "Downloading Haiku buildtools"
+   531|     wget -O "$__RootfsDir/tmp/download/buildtools.zip" $($__RootfsDir/tmp/script/fetch.sh --buildtools --arch=$__HaikuArch)
+   532|     unzip -o "$__RootfsDir/tmp/download/buildtools.zip" -d "$__RootfsDir"
+   533|     echo "Cleaning up temporary files"
+   534|     popd
+   535|     rm -rf "$__RootfsDir/tmp"
+   536| elif [[ -n "$__CodeName" ]]; then
+   537|     if [[ "$__SkipSigCheck" == "0" ]]; then
+   538|         __Keyring="$__Keyring --force-check-gpg"
+   539|     fi
+   540|     debootstrap "--variant=minbase" $__Keyring --arch "$__UbuntuArch" "$__CodeName" "$__RootfsDir" "$__UbuntuRepo"
+   541|     cp "$__CrossDir/$__BuildArch/sources.list.$__CodeName" "$__RootfsDir/etc/apt/sources.list"
+   542|     chroot "$__RootfsDir" apt-get update
+   543|     chroot "$__RootfsDir" apt-get -f -y install
+   544|     chroot "$__RootfsDir" apt-get -y install $__UbuntuPackages
+   545|     chroot "$__RootfsDir" symlinks -cr /usr
+   546|     chroot "$__RootfsDir" apt-get clean
+   547|     if [[ "$__SkipUnmount" == "0" ]]; then
+   548|         umount "$__RootfsDir"/* || true
+   549|     fi
+   550|     if [[ "$__BuildArch" == "armel" && "$__CodeName" == "jessie" ]]; then
+   551|         pushd "$__RootfsDir"
+   552|         patch -p1 < "$__CrossDir/$__BuildArch/armel.jessie.patch"
+   553|         popd
+   554|     fi
+   555| elif [[ "$__Tizen" == "tizen" ]]; then
+   556|     ROOTFS_DIR="$__RootfsDir" "$__CrossDir/tizen-build-rootfs.sh" "$__BuildArch"
+   557| else
+   558|     echo "Unsupported target platform."
+   559|     usage;
+   560|     exit 1
+   561| fi
+
+
+# ====================================================================
+# FILE: eng/common/cross/tizen-build-rootfs.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-48 ---
+     1| set -e
+     2| ARCH=$1
+     3| LINK_ARCH=$ARCH
+     4| case "$ARCH" in
+     5|     arm)
+     6|         TIZEN_ARCH="armv7hl"
+     7|         ;;
+     8|     armel)
+     9|         TIZEN_ARCH="armv7l"
+    10|         LINK_ARCH="arm"
+    11|         ;;
+    12|     arm64)
+    13|         TIZEN_ARCH="aarch64"
+    14|         ;;
+    15|     x86)
+    16|         TIZEN_ARCH="i686"
+    17|         ;;
+    18|     x64)
+    19|         TIZEN_ARCH="x86_64"
+    20|         LINK_ARCH="x86"
+    21|         ;;
+    22|     *)
+    23|         echo "Unsupported architecture for tizen: $ARCH"
+    24|         exit 1
+    25| esac
+    26| __CrossDir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+    27| __TIZEN_CROSSDIR="$__CrossDir/${ARCH}/tizen"
+    28| if [[ -z "$ROOTFS_DIR" ]]; then
+    29|     echo "ROOTFS_DIR is not defined."
+    30|     exit 1;
+    31| fi
+    32| TIZEN_TMP_DIR=$ROOTFS_DIR/tizen_tmp
+    33| mkdir -p $TIZEN_TMP_DIR
+    34| echo ">>Start downloading files"
+    35| VERBOSE=1 $__CrossDir/tizen-fetch.sh $TIZEN_TMP_DIR $TIZEN_ARCH
+    36| echo "<<Finish downloading files"
+    37| echo ">>Start constructing Tizen rootfs"
+    38| TIZEN_RPM_FILES=`ls $TIZEN_TMP_DIR/*.rpm`
+    39| cd $ROOTFS_DIR
+    40| for f in $TIZEN_RPM_FILES; do
+    41|     rpm2cpio $f  | cpio -idm --quiet
+    42| done
+    43| echo "<<Finish constructing Tizen rootfs"
+    44| rm -rf $TIZEN_TMP_DIR
+    45| echo ">>Start configuring Tizen rootfs"
+    46| ln -sfn asm-${LINK_ARCH} ./usr/include/asm
+    47| patch -p1 < $__TIZEN_CROSSDIR/tizen.patch
+    48| echo "<<Finish configuring Tizen rootfs"
+
+
+# ====================================================================
+# FILE: eng/common/cross/tizen-fetch.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-135 ---
+     1| set -e
+     2| if [[ -z "${VERBOSE// }" ]] || [ "$VERBOSE" -ne "$VERBOSE" ] 2>/dev/null; then
+     3|     VERBOSE=0
+     4| fi
+     5| Log()
+     6| {
+     7|     if [ $VERBOSE -ge $1 ]; then
+     8|         echo ${@:2}
+     9|     fi
+    10| }
+    11| Inform()
+    12| {
+    13|     Log 1 -e "\x1B[0;34m$@\x1B[m"
+    14| }
+    15| Debug()
+    16| {
+    17|     Log 2 -e "\x1B[0;32m$@\x1B[m"
+    18| }
+    19| Error()
+    20| {
+    21|     >&2 Log 0 -e "\x1B[0;31m$@\x1B[m"
+    22| }
+    23| Fetch()
+    24| {
+    25|     URL=$1
+    26|     FILE=$2
+    27|     PROGRESS=$3
+    28|     if [ $VERBOSE -ge 1 ] && [ $PROGRESS ]; then
+    29|         CURL_OPT="--progress-bar"
+    30|     else
+    31|         CURL_OPT="--silent"
+    32|     fi
+    33|     curl $CURL_OPT $URL > $FILE
+    34| }
+    35| hash curl 2> /dev/null || { Error "Require 'curl' Aborting."; exit 1; }
+    36| hash xmllint 2> /dev/null || { Error "Require 'xmllint' Aborting."; exit 1; }
+    37| hash sha256sum 2> /dev/null || { Error "Require 'sha256sum' Aborting."; exit 1; }
+    38| TMPDIR=$1
+    39| if [ ! -d $TMPDIR ]; then
+    40|     TMPDIR=./tizen_tmp
+    41|     Debug "Create temporary directory : $TMPDIR"
+    42|     mkdir -p $TMPDIR
+    43| fi
+    44| TIZEN_ARCH=$2
+    45| TIZEN_URL=http://download.tizen.org/snapshots/TIZEN/Tizen
+    46| BUILD_XML=build.xml
+    47| REPOMD_XML=repomd.xml
+    48| PRIMARY_XML=primary.xml
+    49| TARGET_URL="http://__not_initialized"
+    50| Xpath_get()
+    51| {
+    52|     XPATH_RESULT=''
+    53|     XPATH=$1
+    54|     XML_FILE=$2
+    55|     RESULT=$(xmllint --xpath $XPATH $XML_FILE)
+    56|     if [[ -z ${RESULT// } ]]; then
+    57|         Error "Can not find target from $XML_FILE"
+    58|         Debug "Xpath = $XPATH"
+    59|         exit 1
+    60|     fi
+    61|     XPATH_RESULT=$RESULT
+    62| }
+    63| fetch_tizen_pkgs_init()
+    64| {
+    65|     TARGET=$1
+    66|     PROFILE=$2
+    67|     Debug "Initialize TARGET=$TARGET, PROFILE=$PROFILE"
+    68|     TMP_PKG_DIR=$TMPDIR/tizen_${PROFILE}_pkgs
+    69|     if [ -d $TMP_PKG_DIR ]; then rm -rf $TMP_PKG_DIR; fi
+    70|     mkdir -p $TMP_PKG_DIR
+    71|     PKG_URL=$TIZEN_URL/$PROFILE/latest
+    72|     BUILD_XML_URL=$PKG_URL/$BUILD_XML
+    73|     TMP_BUILD=$TMP_PKG_DIR/$BUILD_XML
+    74|     TMP_REPOMD=$TMP_PKG_DIR/$REPOMD_XML
+    75|     TMP_PRIMARY=$TMP_PKG_DIR/$PRIMARY_XML
+    76|     TMP_PRIMARYGZ=${TMP_PRIMARY}.gz
+    77|     Fetch $BUILD_XML_URL $TMP_BUILD
+    78|     Debug "fetch $BUILD_XML_URL to $TMP_BUILD"
+    79|     TARGET_XPATH="//build/buildtargets/buildtarget[@name=\"$TARGET\"]/repo[@type=\"binary\"]/text()"
+    80|     Xpath_get $TARGET_XPATH $TMP_BUILD
+    81|     TARGET_PATH=$XPATH_RESULT
+    82|     TARGET_URL=$PKG_URL/$TARGET_PATH
+    83|     REPOMD_URL=$TARGET_URL/repodata/repomd.xml
+    84|     PRIMARY_XPATH='string(//*[local-name()="data"][@type="primary"]/*[local-name()="location"]/@href)'
+    85|     Fetch $REPOMD_URL $TMP_REPOMD
+    86|     Debug "fetch $REPOMD_URL to $TMP_REPOMD"
+    87|     Xpath_get $PRIMARY_XPATH $TMP_REPOMD
+    88|     PRIMARY_XML_PATH=$XPATH_RESULT
+    89|     PRIMARY_URL=$TARGET_URL/$PRIMARY_XML_PATH
+    90|     Fetch $PRIMARY_URL $TMP_PRIMARYGZ
+    91|     Debug "fetch $PRIMARY_URL to $TMP_PRIMARYGZ"
+    92|     gunzip $TMP_PRIMARYGZ
+    93|     Debug "unzip $TMP_PRIMARYGZ to $TMP_PRIMARY"
+    94| }
+    95| fetch_tizen_pkgs()
+    96| {
+    97|     ARCH=$1
+    98|     PACKAGE_XPATH_TPL='string(//*[local-name()="metadata"]/*[local-name()="package"][*[local-name()="name"][text()="_PKG_"]][*[local-name()="arch"][text()="_ARCH_"]]/*[local-name()="location"]/@href)'
+    99|     PACKAGE_CHECKSUM_XPATH_TPL='string(//*[local-name()="metadata"]/*[local-name()="package"][*[local-name()="name"][text()="_PKG_"]][*[local-name()="arch"][text()="_ARCH_"]]/*[local-name()="checksum"]/text())'
+   100|     for pkg in ${@:2}
+   101|     do
+   102|         Inform "Fetching... $pkg"
+   103|         XPATH=${PACKAGE_XPATH_TPL/_PKG_/$pkg}
+   104|         XPATH=${XPATH/_ARCH_/$ARCH}
+   105|         Xpath_get $XPATH $TMP_PRIMARY
+   106|         PKG_PATH=$XPATH_RESULT
+   107|         XPATH=${PACKAGE_CHECKSUM_XPATH_TPL/_PKG_/$pkg}
+   108|         XPATH=${XPATH/_ARCH_/$ARCH}
+   109|         Xpath_get $XPATH $TMP_PRIMARY
+   110|         CHECKSUM=$XPATH_RESULT
+   111|         PKG_URL=$TARGET_URL/$PKG_PATH
+   112|         PKG_FILE=$(basename $PKG_PATH)
+   113|         PKG_PATH=$TMPDIR/$PKG_FILE
+   114|         Debug "Download $PKG_URL to $PKG_PATH"
+   115|         Fetch $PKG_URL $PKG_PATH true
+   116|         echo "$CHECKSUM $PKG_PATH" | sha256sum -c - > /dev/null
+   117|         if [ $? -ne 0 ]; then
+   118|             Error "Fail to fetch $PKG_URL to $PKG_PATH"
+   119|             Debug "Checksum = $CHECKSUM"
+   120|             exit 1
+   121|         fi
+   122|     done
+   123| }
+   124| Inform "Initialize ${TIZEN_ARCH} base"
+   125| fetch_tizen_pkgs_init standard Tizen-Base
+   126| Inform "fetch common packages"
+   127| fetch_tizen_pkgs ${TIZEN_ARCH} gcc gcc-devel-static glibc glibc-devel libicu libicu-devel libatomic linux-glibc-devel keyutils keyutils-devel libkeyutils
+   128| Inform "fetch coreclr packages"
+   129| fetch_tizen_pkgs ${TIZEN_ARCH} lldb lldb-devel libgcc libstdc++ libstdc++-devel libunwind libunwind-devel lttng-ust-devel lttng-ust userspace-rcu-devel userspace-rcu
+   130| Inform "fetch corefx packages"
+   131| fetch_tizen_pkgs ${TIZEN_ARCH} libcom_err libcom_err-devel zlib zlib-devel libopenssl11 libopenssl1.1-devel krb5 krb5-devel
+   132| Inform "Initialize standard unified"
+   133| fetch_tizen_pkgs_init standard Tizen-Unified
+   134| Inform "fetch corefx packages"
+   135| fetch_tizen_pkgs ${TIZEN_ARCH} gssdp gssdp-devel tizen-release
+
+
+# ====================================================================
+# FILE: eng/common/dotnet-install.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-78 ---
+     1| source="${BASH_SOURCE[0]}"
+     2| while [[ -h "$source" ]]; do
+     3|   scriptroot="$( cd -P "$( dirname "$source" )" && pwd )"
+     4|   source="$(readlink "$source")"
+     5|   [[ $source != /* ]] && source="$scriptroot/$source"
+     6| done
+     7| scriptroot="$( cd -P "$( dirname "$source" )" && pwd )"
+     8| . "$scriptroot/tools.sh"
+     9| version='Latest'
+    10| architecture=''
+    11| runtime='dotnet'
+    12| runtimeSourceFeed=''
+    13| runtimeSourceFeedKey=''
+    14| while [[ $# > 0 ]]; do
+    15|   opt="$(echo "$1" | tr "[:upper:]" "[:lower:]")"
+    16|   case "$opt" in
+    17|     -version|-v)
+    18|       shift
+    19|       version="$1"
+    20|       ;;
+    21|     -architecture|-a)
+    22|       shift
+    23|       architecture="$1"
+    24|       ;;
+    25|     -runtime|-r)
+    26|       shift
+    27|       runtime="$1"
+    28|       ;;
+    29|     -runtimesourcefeed)
+    30|       shift
+    31|       runtimeSourceFeed="$1"
+    32|       ;;
+    33|     -runtimesourcefeedkey)
+    34|       shift
+    35|       runtimeSourceFeedKey="$1"
+    36|       ;;
+    37|     *)
+    38|       Write-PipelineTelemetryError -Category 'Build' -Message "Invalid argument: $1"
+    39|       exit 1
+    40|       ;;
+    41|   esac
+    42|   shift
+    43| done
+    44| cpuname=$(uname -m)
+    45| case $cpuname in
+    46|   arm64|aarch64)
+    47|     buildarch=arm64
+    48|     if [ "$(getconf LONG_BIT)" -lt 64 ]; then
+    49|         buildarch=arm
+    50|     fi
+    51|     ;;
+    52|   loongarch64)
+    53|     buildarch=loongarch64
+    54|     ;;
+    55|   amd64|x86_64)
+    56|     buildarch=x64
+    57|     ;;
+    58|   armv*l)
+    59|     buildarch=arm
+    60|     ;;
+    61|   i[3-6]86)
+    62|     buildarch=x86
+    63|     ;;
+    64|   *)
+    65|     echo "Unknown CPU $cpuname detected, treating it as x64"
+    66|     buildarch=x64
+    67|     ;;
+    68| esac
+    69| dotnetRoot="${repo_root}.dotnet"
+    70| if [[ $architecture != "" ]] && [[ $architecture != $buildarch ]]; then
+    71|   dotnetRoot="$dotnetRoot/$architecture"
+    72| fi
+    73| InstallDotNet $dotnetRoot $version "$architecture" $runtime true $runtimeSourceFeed $runtimeSourceFeedKey || {
+    74|   local exit_code=$?
+    75|   Write-PipelineTelemetryError -Category 'InitializeToolset' -Message "dotnet-install.sh failed (exit code '$exit_code')." >&2
+    76|   ExitWithExitCode $exit_code
+    77| }
+    78| ExitWithExitCode 0
+
+
+# ====================================================================
+# FILE: eng/common/native/init-compiler.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-106 ---
+     1| if [ -z "$build_arch" ] || [ -z "$compiler" ]; then
+     2|   echo "Usage..."
+     3|   echo "build_arch=<ARCH> compiler=<NAME> init-compiler.sh"
+     4|   echo "Specify the target architecture."
+     5|   echo "Specify the name of compiler (clang or gcc)."
+     6|   exit 1
+     7| fi
+     8| case "$compiler" in
+     9|     clang*|-clang*|--clang*)
+    10|         version="$(echo "$compiler" | tr -d '[:alpha:]-=')"
+    11|         majorVersion="${version%%.*}"
+    12|         [ -z "${version##*.*}" ] && minorVersion="${version#*.}"
+    13|         if [ -z "$minorVersion" ] && [ -n "$majorVersion" ] && [ "$majorVersion" -le 6 ]; then
+    14|             minorVersion=0;
+    15|         fi
+    16|         compiler=clang
+    17|         ;;
+    18|     gcc*|-gcc*|--gcc*)
+    19|         version="$(echo "$compiler" | tr -d '[:alpha:]-=')"
+    20|         majorVersion="${version%%.*}"
+    21|         [ -z "${version##*.*}" ] && minorVersion="${version#*.}"
+    22|         compiler=gcc
+    23|         ;;
+    24| esac
+    25| cxxCompiler="$compiler++"
+    26| CC=
+    27| CXX=
+    28| LDFLAGS=
+    29| if [ "$compiler" = "gcc" ]; then cxxCompiler="g++"; fi
+    30| check_version_exists() {
+    31|     desired_version=-1
+    32|     if command -v "$compiler-$1.$2" > /dev/null; then
+    33|         desired_version="-$1.$2"
+    34|     elif command -v "$compiler$1$2" > /dev/null; then
+    35|         desired_version="$1$2"
+    36|     elif command -v "$compiler-$1$2" > /dev/null; then
+    37|         desired_version="-$1$2"
+    38|     fi
+    39|     echo "$desired_version"
+    40| }
+    41| if [ -z "$CLR_CC" ]; then
+    42|     if [ -z "$majorVersion" ]; then
+    43|         if [ "$compiler" = "clang" ]; then versions="17 16 15 14 13 12 11 10 9 8 7 6.0 5.0 4.0 3.9 3.8 3.7 3.6 3.5"
+    44|         elif [ "$compiler" = "gcc" ]; then versions="13 12 11 10 9 8 7 6 5 4.9"; fi
+    45|         for version in $versions; do
+    46|             _major="${version%%.*}"
+    47|             [ -z "${version##*.*}" ] && _minor="${version#*.}"
+    48|             desired_version="$(check_version_exists "$_major" "$_minor")"
+    49|             if [ "$desired_version" != "-1" ]; then majorVersion="$_major"; break; fi
+    50|         done
+    51|         if [ -z "$majorVersion" ]; then
+    52|             if command -v "$compiler" > /dev/null; then
+    53|                 if [ "$(uname)" != "Darwin" ]; then
+    54|                     echo "Warning: Specific version of $compiler not found, falling back to use the one in PATH."
+    55|                 fi
+    56|                 CC="$(command -v "$compiler")"
+    57|                 CXX="$(command -v "$cxxCompiler")"
+    58|             else
+    59|                 echo "No usable version of $compiler found."
+    60|                 exit 1
+    61|             fi
+    62|         else
+    63|             if [ "$compiler" = "clang" ] && [ "$majorVersion" -lt 5 ]; then
+    64|                 if [ "$build_arch" = "arm" ] || [ "$build_arch" = "armel" ]; then
+    65|                     if command -v "$compiler" > /dev/null; then
+    66|                         echo "Warning: Found clang version $majorVersion which is not supported on arm/armel architectures, falling back to use clang from PATH."
+    67|                         CC="$(command -v "$compiler")"
+    68|                         CXX="$(command -v "$cxxCompiler")"
+    69|                     else
+    70|                         echo "Found clang version $majorVersion which is not supported on arm/armel architectures, and there is no clang in PATH."
+    71|                         exit 1
+    72|                     fi
+    73|                 fi
+    74|             fi
+    75|         fi
+    76|     else
+    77|         desired_version="$(check_version_exists "$majorVersion" "$minorVersion")"
+    78|         if [ "$desired_version" = "-1" ]; then
+    79|             echo "Could not find specific version of $compiler: $majorVersion $minorVersion."
+    80|             exit 1
+    81|         fi
+    82|     fi
+    83|     if [ -z "$CC" ]; then
+    84|         CC="$(command -v "$compiler$desired_version")"
+    85|         CXX="$(command -v "$cxxCompiler$desired_version")"
+    86|         if [ -z "$CXX" ]; then CXX="$(command -v "$cxxCompiler")"; fi
+    87|     fi
+    88| else
+    89|     if [ ! -f "$CLR_CC" ]; then
+    90|         echo "CLR_CC is set but path '$CLR_CC' does not exist"
+    91|         exit 1
+    92|     fi
+    93|     CC="$CLR_CC"
+    94|     CXX="$CLR_CXX"
+    95| fi
+    96| if [ -z "$CC" ]; then
+    97|     echo "Unable to find $compiler."
+    98|     exit 1
+    99| fi
+   100| if [ "$compiler" = "clang" ] && [ -n "$majorVersion" ] && [ "$majorVersion" -ge 9 ] && [ "$build_arch" != "s390x" ]; then
+   101|     if "$CC" -fuse-ld=lld -Wl,--version >/dev/null 2>&1; then
+   102|         LDFLAGS="-fuse-ld=lld"
+   103|     fi
+   104| fi
+   105| SCAN_BUILD_COMMAND="$(command -v "scan-build$desired_version")"
+   106| export CC CXX LDFLAGS SCAN_BUILD_COMMAND
+
+
+# ====================================================================
+# FILE: eng/common/native/init-distro-rid.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-81 ---
+     1| getNonPortableDistroRid()
+     2| {
+     3|     local targetOs="$1"
+     4|     local targetArch="$2"
+     5|     local rootfsDir="$3"
+     6|     local nonPortableRid=""
+     7|     if [ "$targetOs" = "linux" ]; then
+     8|         if [ -e "${rootfsDir}/etc/os-release" ]; then
+     9|             source "${rootfsDir}/etc/os-release"
+    10|             if [[ "${ID}" == "rhel" || "${ID}" == "rocky" || "${ID}" == "alpine" ]]; then
+    11|                 VERSION_ID="${VERSION_ID%.*}"
+    12|             fi
+    13|             if [[ "${VERSION_ID:-}" =~ ^([[:digit:]]|\.)+$ ]]; then
+    14|                 nonPortableRid="${ID}.${VERSION_ID}-${targetArch}"
+    15|             else
+    16|                 nonPortableRid="${ID}-${targetArch}"
+    17|             fi
+    18|         elif [ -e "${rootfsDir}/android_platform" ]; then
+    19|             source "$rootfsDir"/android_platform
+    20|             nonPortableRid="$RID"
+    21|         fi
+    22|     fi
+    23|     if [ "$targetOs" = "freebsd" ]; then
+    24|         __freebsd_major_version=$($rootfsDir/bin/freebsd-version | { read v; echo "${v%%.*}"; })
+    25|         nonPortableRid="freebsd.$__freebsd_major_version-${targetArch}"
+    26|     elif command -v getprop && getprop ro.product.system.model 2>&1 | grep -qi android; then
+    27|         __android_sdk_version=$(getprop ro.build.version.sdk)
+    28|         nonPortableRid="android.$__android_sdk_version-${targetArch}"
+    29|     elif [ "$targetOs" = "illumos" ]; then
+    30|         __uname_version=$(uname -v)
+    31|         case "$__uname_version" in
+    32|             omnios-*)
+    33|                 __omnios_major_version=$(echo "${__uname_version:8:2}")
+    34|                 nonPortableRid=omnios."$__omnios_major_version"-"$targetArch"
+    35|             ;;
+    36|             joyent_*)
+    37|                 __smartos_major_version=$(echo "${__uname_version:7:4}")
+    38|                 nonPortableRid=smartos."$__smartos_major_version"-"$targetArch"
+    39|             ;;
+    40|             illumos_*)
+    41|                 nonPortableRid=openindiana-"$targetArch"
+    42|             ;;
+    43|         esac
+    44|     elif [ "$targetOs" = "solaris" ]; then
+    45|         __uname_version=$(uname -v)
+    46|         __solaris_major_version=$(echo "${__uname_version%.*}")
+    47|         nonPortableRid=solaris."$__solaris_major_version"-"$targetArch"
+    48|     elif [ "$targetOs" = "haiku" ]; then
+    49|         __uname_release=$(uname -r)
+    50|         nonPortableRid=haiku.r"$__uname_release"-"$targetArch"
+    51|     fi
+    52|     echo "$(echo $nonPortableRid | tr '[:upper:]' '[:lower:]')"
+    53| }
+    54| initDistroRidGlobal()
+    55| {
+    56|     local targetOs="$1"
+    57|     local targetArch="$2"
+    58|     local rootfsDir=""
+    59|     if [ "$#" -ge 3 ]; then
+    60|         rootfsDir="$3"
+    61|     fi
+    62|     if [ -n "${rootfsDir}" ]; then
+    63|         if [ ! -e "${rootfsDir}" ]; then
+    64|             echo "Error rootfsDir has been passed, but the location is not valid."
+    65|             exit 1
+    66|         fi
+    67|     fi
+    68|     __DistroRid=$(getNonPortableDistroRid "${targetOs}" "${targetArch}" "${rootfsDir}")
+    69|     if [ -z "${__PortableTargetOS:-}" ]; then
+    70|         __PortableTargetOS="$targetOs"
+    71|         STRINGS="$(command -v strings || true)"
+    72|         if [ -z "$STRINGS" ]; then
+    73|             STRINGS="$(command -v llvm-strings || true)"
+    74|         fi
+    75|         if "${rootfsDir}/usr/bin/ldd" --version 2>&1 | grep -q musl ||
+    76|                 ( [ -n "$STRINGS" ] && "$STRINGS" "${rootfsDir}/usr/bin/ldd" 2>&1 | grep -q musl ); then
+    77|             __PortableTargetOS="linux-musl"
+    78|         fi
+    79|     fi
+    80|     export __DistroRid __PortableTargetOS
+    81| }
+
+
+# ====================================================================
+# FILE: eng/common/native/init-os-and-arch.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-61 ---
+     1| OSName=$(uname -s | tr '[:upper:]' '[:lower:]')
+     2| if command -v getprop && getprop ro.product.system.model 2>&1 | grep -qi android; then
+     3|     OSName="android"
+     4| fi
+     5| case "$OSName" in
+     6| freebsd|linux|netbsd|openbsd|sunos|android|haiku)
+     7|     os="$OSName" ;;
+     8| darwin)
+     9|     os=osx ;;
+    10| *)
+    11|     echo "Unsupported OS $OSName detected!"
+    12|     exit 1 ;;
+    13| esac
+    14| if [ "$os" = "sunos" ]; then
+    15|     if uname -o 2>&1 | grep -q illumos; then
+    16|         os="illumos"
+    17|     else
+    18|         os="solaris"
+    19|     fi
+    20|     CPUName=$(isainfo -n)
+    21| else
+    22|     CPUName=$(uname -m)
+    23| fi
+    24| case "$CPUName" in
+    25|     arm64|aarch64)
+    26|         arch=arm64
+    27|         ;;
+    28|     loongarch64)
+    29|         arch=loongarch64
+    30|         ;;
+    31|     riscv64)
+    32|         arch=riscv64
+    33|         ;;
+    34|     amd64|x86_64)
+    35|         arch=x64
+    36|         ;;
+    37|     armv7l|armv8l)
+    38|         if (NAME=""; . /etc/os-release; test "$NAME" = "Tizen"); then
+    39|             arch=armel
+    40|         else
+    41|             arch=arm
+    42|         fi
+    43|         ;;
+    44|     armv6l)
+    45|         arch=armv6
+    46|         ;;
+    47|     i[3-6]86)
+    48|         echo "Unsupported CPU $CPUName detected, build might not succeed!"
+    49|         arch=x86
+    50|         ;;
+    51|     s390x)
+    52|         arch=s390x
+    53|         ;;
+    54|     ppc64le)
+    55|         arch=ppc64le
+    56|         ;;
+    57|     *)
+    58|         echo "Unknown CPU $CPUName detected!"
+    59|         exit 1
+    60|         ;;
+    61| esac
+
+
+# ====================================================================
+# FILE: eng/common/tools.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-420 ---
+     1| ci=${ci:-false}
+     2| if [[ "$ci" == true ]]; then
+     3|   pipelines_log=${pipelines_log:-true}
+     4| else
+     5|   pipelines_log=${pipelines_log:-false}
+     6| fi
+     7| configuration=${configuration:-'Debug'}
+     8| exclude_ci_binary_log=${exclude_ci_binary_log:-false}
+     9| if [[ "$ci" == true && "$exclude_ci_binary_log" == false ]]; then
+    10|   binary_log_default=true
+    11| else
+    12|   binary_log_default=false
+    13| fi
+    14| binary_log=${binary_log:-$binary_log_default}
+    15| prepare_machine=${prepare_machine:-false}
+    16| restore=${restore:-true}
+    17| verbosity=${verbosity:-'minimal'}
+    18| if [[ "$ci" == true ]]; then
+    19|   node_reuse=${node_reuse:-false}
+    20| else
+    21|   node_reuse=${node_reuse:-true}
+    22| fi
+    23| warn_as_error=${warn_as_error:-true}
+    24| use_installed_dotnet_cli=${use_installed_dotnet_cli:-true}
+    25| dotnetInstallScriptVersion=${dotnetInstallScriptVersion:-'v1'}
+    26| if [[ "$ci" == true ]]; then
+    27|   use_global_nuget_cache=${use_global_nuget_cache:-false}
+    28| else
+    29|   use_global_nuget_cache=${use_global_nuget_cache:-true}
+    30| fi
+    31| runtime_source_feed=${runtime_source_feed:-''}
+    32| runtime_source_feed_key=${runtime_source_feed_key:-''}
+    33| function ResolvePath {
+    34|   local path=$1
+    35|   while [[ -h $path ]]; do
+    36|     local dir="$( cd -P "$( dirname "$path" )" && pwd )"
+    37|     path="$(readlink "$path")"
+    38|     [[ $path != /* ]] && path="$dir/$path"
+    39|   done
+    40|   _ResolvePath="$path"
+    41| }
+    42| function ReadGlobalVersion {
+    43|   local key=$1
+    44|   if command -v jq &> /dev/null; then
+    45|     _ReadGlobalVersion="$(jq -r ".[] | select(has(\"$key\")) | .\"$key\"" "$global_json_file")"
+    46|   elif [[ "$(cat "$global_json_file")" =~ \"$key\"[[:space:]\:]*\"([^\"]+) ]]; then
+    47|     _ReadGlobalVersion=${BASH_REMATCH[1]}
+    48|   fi
+    49|   if [[ -z "$_ReadGlobalVersion" ]]; then
+    50|     Write-PipelineTelemetryError -category 'Build' "Error: Cannot find \"$key\" in $global_json_file"
+    51|     ExitWithExitCode 1
+    52|   fi
+    53| }
+    54| function InitializeDotNetCli {
+    55|   if [[ -n "${_InitializeDotNetCli:-}" ]]; then
+    56|     return
+    57|   fi
+    58|   local install=$1
+    59|   export DOTNET_MULTILEVEL_LOOKUP=0
+    60|   export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+    61|   if [[ $ci == true ]]; then
+    62|     export DOTNET_CLI_TELEMETRY_OPTOUT=1
+    63|   fi
+    64|   export LTTNG_HOME="$HOME"
+    65|   if [[ -n "${DotNetCoreSdkDir:-}" ]]; then
+    66|     export DOTNET_INSTALL_DIR="$DotNetCoreSdkDir"
+    67|   fi
+    68|   if [[ "$use_installed_dotnet_cli" == true && $global_json_has_runtimes == false && -z "${DOTNET_INSTALL_DIR:-}" ]]; then
+    69|     local dotnet_path=`command -v dotnet`
+    70|     if [[ -n "$dotnet_path" ]]; then
+    71|       ResolvePath "$dotnet_path"
+    72|       export DOTNET_INSTALL_DIR=`dirname "$_ResolvePath"`
+    73|     fi
+    74|   fi
+    75|   ReadGlobalVersion "dotnet"
+    76|   local dotnet_sdk_version=$_ReadGlobalVersion
+    77|   local dotnet_root=""
+    78|   if [[ $global_json_has_runtimes == false && -n "${DOTNET_INSTALL_DIR:-}" && -d "$DOTNET_INSTALL_DIR/sdk/$dotnet_sdk_version" ]]; then
+    79|     dotnet_root="$DOTNET_INSTALL_DIR"
+    80|   else
+    81|     dotnet_root="$repo_root/.dotnet"
+    82|     export DOTNET_INSTALL_DIR="$dotnet_root"
+    83|     if [[ ! -d "$DOTNET_INSTALL_DIR/sdk/$dotnet_sdk_version" ]]; then
+    84|       if [[ "$install" == true ]]; then
+    85|         InstallDotNetSdk "$dotnet_root" "$dotnet_sdk_version"
+    86|       else
+    87|         Write-PipelineTelemetryError -category 'InitializeToolset' "Unable to find dotnet with SDK version '$dotnet_sdk_version'"
+    88|         ExitWithExitCode 1
+    89|       fi
+    90|     fi
+    91|   fi
+    92|   Write-PipelinePrependPath -path "$dotnet_root"
+    93|   Write-PipelineSetVariable -name "DOTNET_MULTILEVEL_LOOKUP" -value "0"
+    94|   Write-PipelineSetVariable -name "DOTNET_SKIP_FIRST_TIME_EXPERIENCE" -value "1"
+    95|   _InitializeDotNetCli="$dotnet_root"
+    96| }
+    97| function InstallDotNetSdk {
+    98|   local root=$1
+    99|   local version=$2
+   100|   local architecture="unset"
+   101|   if [[ $# -ge 3 ]]; then
+   102|     architecture=$3
+   103|   fi
+   104|   InstallDotNet "$root" "$version" $architecture 'sdk' 'true' $runtime_source_feed $runtime_source_feed_key
+   105| }
+   106| function InstallDotNet {
+   107|   local root=$1
+   108|   local version=$2
+   109|   local runtime=$4
+   110|   local dotnetVersionLabel="'$runtime v$version'"
+   111|   if [[ -n "${4:-}" ]] && [ "$4" != 'sdk' ]; then
+   112|     runtimePath="$root"
+   113|     runtimePath="$runtimePath/shared"
+   114|     case "$runtime" in
+   115|       dotnet)
+   116|         runtimePath="$runtimePath/Microsoft.NETCore.App"
+   117|         ;;
+   118|       aspnetcore)
+   119|         runtimePath="$runtimePath/Microsoft.AspNetCore.App"
+   120|         ;;
+   121|       windowsdesktop)
+   122|         runtimePath="$runtimePath/Microsoft.WindowsDesktop.App"
+   123|         ;;
+   124|       *)
+   125|         ;;
+   126|     esac
+   127|     runtimePath="$runtimePath/$version"
+   128|     dotnetVersionLabel="runtime toolset '$runtime/$architecture v$version'"
+   129|     if [ -d "$runtimePath" ]; then
+   130|       echo "  Runtime toolset '$runtime/$architecture v$version' already installed."
+   131|       local installSuccess=1
+   132|       return
+   133|     fi
+   134|   fi
+   135|   GetDotNetInstallScript "$root"
+   136|   local install_script=$_GetDotNetInstallScript
+   137|   local installParameters=(--version $version --install-dir "$root")
+   138|   if [[ -n "${3:-}" ]] && [ "$3" != 'unset' ]; then
+   139|     installParameters+=(--architecture $3)
+   140|   fi
+   141|   if [[ -n "${4:-}" ]] && [ "$4" != 'sdk' ]; then
+   142|     installParameters+=(--runtime $4)
+   143|   fi
+   144|   if [[ "$#" -ge "5" ]] && [[ "$5" != 'false' ]]; then
+   145|     installParameters+=(--skip-non-versioned-files)
+   146|   fi
+   147|   local variations=() # list of variable names with parameter arrays in them
+   148|   local public_location=("${installParameters[@]}")
+   149|   variations+=(public_location)
+   150|   local dotnetbuilds=("${installParameters[@]}" --azure-feed "https://dotnetbuilds.azureedge.net/public")
+   151|   variations+=(dotnetbuilds)
+   152|   if [[ -n "${6:-}" ]]; then
+   153|     variations+=(private_feed)
+   154|     local private_feed=("${installParameters[@]}" --azure-feed $6)
+   155|     if [[ -n "${7:-}" ]]; then
+   156|       decodeArg="--decode"
+   157|       if base64 --help 2>&1 | grep -q "BusyBox"; then
+   158|           decodeArg="-d"
+   159|       fi
+   160|       decodedFeedKey=`echo $7 | base64 $decodeArg`
+   161|       private_feed+=(--feed-credential $decodedFeedKey)
+   162|     fi
+   163|   fi
+   164|   local installSuccess=0
+   165|   for variationName in "${variations[@]}"; do
+   166|     local name="$variationName[@]"
+   167|     local variation=("${!name}")
+   168|     echo "  Attempting to install $dotnetVersionLabel from $variationName."
+   169|     bash "$install_script" "${variation[@]}" && installSuccess=1
+   170|     if [[ "$installSuccess" -eq 1 ]]; then
+   171|       break
+   172|     fi
+   173|     echo "  Failed to install $dotnetVersionLabel from $variationName."
+   174|   done
+   175|   if [[ "$installSuccess" -eq 0 ]]; then
+   176|     Write-PipelineTelemetryError -category 'InitializeToolset' "Failed to install $dotnetVersionLabel from any of the specified locations."
+   177|     ExitWithExitCode 1
+   178|   fi
+   179| }
+   180| function with_retries {
+   181|   local maxRetries=5
+   182|   local retries=1
+   183|   echo "Trying to run '$@' for maximum of $maxRetries attempts."
+   184|   while [[ $((retries++)) -le $maxRetries ]]; do
+   185|     "$@"
+   186|     if [[ $? == 0 ]]; then
+   187|       echo "Ran '$@' successfully."
+   188|       return 0
+   189|     fi
+   190|     timeout=$((3**$retries-1))
+   191|     echo "Failed to execute '$@'. Waiting $timeout seconds before next attempt ($retries out of $maxRetries)." 1>&2
+   192|     sleep $timeout
+   193|   done
+   194|   echo "Failed to execute '$@' for $maxRetries times." 1>&2
+   195|   return 1
+   196| }
+   197| function GetDotNetInstallScript {
+   198|   local root=$1
+   199|   local install_script="$root/dotnet-install.sh"
+   200|   local install_script_url="https://dotnet.microsoft.com/download/dotnet/scripts/$dotnetInstallScriptVersion/dotnet-install.sh"
+   201|   if [[ ! -a "$install_script" ]]; then
+   202|     mkdir -p "$root"
+   203|     echo "Downloading '$install_script_url'"
+   204|     if command -v curl > /dev/null; then
+   205|       curl "$install_script_url" -sSL --retry 10 --create-dirs -o "$install_script" || {
+   206|         if command -v openssl &> /dev/null; then
+   207|           echo "Curl failed; dumping some information about dotnet.microsoft.com for later investigation"
+   208|           echo | openssl s_client -showcerts -servername dotnet.microsoft.com  -connect dotnet.microsoft.com:443
+   209|         fi
+   210|         echo "Will now retry the same URL with verbose logging."
+   211|         with_retries curl "$install_script_url" -sSL --verbose --retry 10 --create-dirs -o "$install_script" || {
+   212|           local exit_code=$?
+   213|           Write-PipelineTelemetryError -category 'InitializeToolset' "Failed to acquire dotnet install script (exit code '$exit_code')."
+   214|           ExitWithExitCode $exit_code
+   215|         }
+   216|       }
+   217|     else
+   218|       with_retries wget -v -O "$install_script" "$install_script_url" || {
+   219|         local exit_code=$?
+   220|         Write-PipelineTelemetryError -category 'InitializeToolset' "Failed to acquire dotnet install script (exit code '$exit_code')."
+   221|         ExitWithExitCode $exit_code
+   222|       }
+   223|     fi
+   224|   fi
+   225|   _GetDotNetInstallScript="$install_script"
+   226| }
+   227| function InitializeBuildTool {
+   228|   if [[ -n "${_InitializeBuildTool:-}" ]]; then
+   229|     return
+   230|   fi
+   231|   InitializeDotNetCli $restore
+   232|   _InitializeBuildTool="$_InitializeDotNetCli/dotnet"
+   233|   _InitializeBuildToolCommand="msbuild"
+   234|   _InitializeBuildToolFramework="net8.0"
+   235| }
+   236| function GetNuGetPackageCachePath {
+   237|   if [[ -z ${NUGET_PACKAGES:-} ]]; then
+   238|     if [[ "$use_global_nuget_cache" == true ]]; then
+   239|       export NUGET_PACKAGES="$HOME/.nuget/packages"
+   240|     else
+   241|       export NUGET_PACKAGES="$repo_root/.packages"
+   242|       export RESTORENOCACHE=true
+   243|     fi
+   244|   fi
+   245|   _GetNuGetPackageCachePath=$NUGET_PACKAGES
+   246| }
+   247| function InitializeNativeTools() {
+   248|   if [[ -n "${DisableNativeToolsetInstalls:-}" ]]; then
+   249|     return
+   250|   fi
+   251|   if grep -Fq "native-tools" $global_json_file
+   252|   then
+   253|     local nativeArgs=""
+   254|     if [[ "$ci" == true ]]; then
+   255|       nativeArgs="--installDirectory $tools_dir"
+   256|     fi
+   257|     "$_script_dir/init-tools-native.sh" $nativeArgs
+   258|   fi
+   259| }
+   260| function InitializeToolset {
+   261|   if [[ -n "${_InitializeToolset:-}" ]]; then
+   262|     return
+   263|   fi
+   264|   GetNuGetPackageCachePath
+   265|   ReadGlobalVersion "Microsoft.DotNet.Arcade.Sdk"
+   266|   local toolset_version=$_ReadGlobalVersion
+   267|   local toolset_location_file="$toolset_dir/$toolset_version.txt"
+   268|   if [[ -a "$toolset_location_file" ]]; then
+   269|     local path=`cat "$toolset_location_file"`
+   270|     if [[ -a "$path" ]]; then
+   271|       _InitializeToolset="$path"
+   272|       return
+   273|     fi
+   274|   fi
+   275|   if [[ "$restore" != true ]]; then
+   276|     Write-PipelineTelemetryError -category 'InitializeToolset' "Toolset version $toolset_version has not been restored."
+   277|     ExitWithExitCode 2
+   278|   fi
+   279|   local proj="$toolset_dir/restore.proj"
+   280|   local bl=""
+   281|   if [[ "$binary_log" == true ]]; then
+   282|     bl="/bl:$log_dir/ToolsetRestore.binlog"
+   283|   fi
+   284|   echo '<Project Sdk="Microsoft.DotNet.Arcade.Sdk"/>' > "$proj"
+   285|   MSBuild-Core "$proj" $bl /t:__WriteToolsetLocation /clp:ErrorsOnly\;NoSummary /p:__ToolsetLocationOutputFile="$toolset_location_file"
+   286|   local toolset_build_proj=`cat "$toolset_location_file"`
+   287|   if [[ ! -a "$toolset_build_proj" ]]; then
+   288|     Write-PipelineTelemetryError -category 'Build' "Invalid toolset path: $toolset_build_proj"
+   289|     ExitWithExitCode 3
+   290|   fi
+   291|   _InitializeToolset="$toolset_build_proj"
+   292| }
+   293| function ExitWithExitCode {
+   294|   if [[ "$ci" == true && "$prepare_machine" == true ]]; then
+   295|     StopProcesses
+   296|   fi
+   297|   exit $1
+   298| }
+   299| function StopProcesses {
+   300|   echo "Killing running build processes..."
+   301|   pkill -9 "dotnet" || true
+   302|   pkill -9 "vbcscompiler" || true
+   303|   return 0
+   304| }
+   305| function MSBuild {
+   306|   local args=$@
+   307|   if [[ "$pipelines_log" == true ]]; then
+   308|     InitializeBuildTool
+   309|     InitializeToolset
+   310|     if [[ "$ci" == true ]]; then
+   311|       export NUGET_PLUGIN_HANDSHAKE_TIMEOUT_IN_SECONDS=20
+   312|       export NUGET_PLUGIN_REQUEST_TIMEOUT_IN_SECONDS=20
+   313|       Write-PipelineSetVariable -name "NUGET_PLUGIN_HANDSHAKE_TIMEOUT_IN_SECONDS" -value "20"
+   314|       Write-PipelineSetVariable -name "NUGET_PLUGIN_REQUEST_TIMEOUT_IN_SECONDS" -value "20"
+   315|     fi
+   316|     local toolset_dir="${_InitializeToolset%/*}"
+   317|     local selectedPath=
+   318|     local possiblePaths=()
+   319|     possiblePaths+=( "$toolset_dir/$_InitializeBuildToolFramework/Microsoft.DotNet.ArcadeLogging.dll" )
+   320|     possiblePaths+=( "$toolset_dir/$_InitializeBuildToolFramework/Microsoft.DotNet.Arcade.Sdk.dll" )
+   321|     possiblePaths+=( "$toolset_dir/netcoreapp2.1/Microsoft.DotNet.ArcadeLogging.dll" )
+   322|     possiblePaths+=( "$toolset_dir/netcoreapp2.1/Microsoft.DotNet.Arcade.Sdk.dll" )
+   323|     possiblePaths+=( "$toolset_dir/netcoreapp3.1/Microsoft.DotNet.ArcadeLogging.dll" )
+   324|     possiblePaths+=( "$toolset_dir/netcoreapp3.1/Microsoft.DotNet.Arcade.Sdk.dll" )
+   325|     possiblePaths+=( "$toolset_dir/net7.0/Microsoft.DotNet.ArcadeLogging.dll" )
+   326|     possiblePaths+=( "$toolset_dir/net7.0/Microsoft.DotNet.Arcade.Sdk.dll" )
+   327|     for path in "${possiblePaths[@]}"; do
+   328|       if [[ -f $path ]]; then
+   329|         selectedPath=$path
+   330|         break
+   331|       fi
+   332|     done
+   333|     if [[ -z "$selectedPath" ]]; then
+   334|       Write-PipelineTelemetryError -category 'Build'  "Unable to find arcade sdk logger assembly."
+   335|       ExitWithExitCode 1
+   336|     fi
+   337|     args+=( "-logger:$selectedPath" )
+   338|   fi
+   339|   MSBuild-Core ${args[@]}
+   340| }
+   341| function MSBuild-Core {
+   342|   if [[ "$ci" == true ]]; then
+   343|     if [[ "$binary_log" != true && "$exclude_ci_binary_log" != true ]]; then
+   344|       Write-PipelineTelemetryError -category 'Build'  "Binary log must be enabled in CI build, or explicitly opted-out from with the -noBinaryLog switch."
+   345|       ExitWithExitCode 1
+   346|     fi
+   347|     if [[ "$node_reuse" == true ]]; then
+   348|       Write-PipelineTelemetryError -category 'Build'  "Node reuse must be disabled in CI build."
+   349|       ExitWithExitCode 1
+   350|     fi
+   351|   fi
+   352|   InitializeBuildTool
+   353|   local warnaserror_switch=""
+   354|   if [[ $warn_as_error == true ]]; then
+   355|     warnaserror_switch="/warnaserror"
+   356|   fi
+   357|   function RunBuildTool {
+   358|     export ARCADE_BUILD_TOOL_COMMAND="$_InitializeBuildTool $@"
+   359|     "$_InitializeBuildTool" "$@" || {
+   360|       local exit_code=$?
+   361|       echo "Build failed with exit code $exit_code. Check errors above."
+   362|       if [[ "$ci" == "true" && -n ${SYSTEM_TEAMPROJECT:-} ]]; then
+   363|         Write-PipelineSetResult -result "Failed" -message "msbuild execution failed."
+   364|         ExitWithExitCode 0
+   365|       else
+   366|         ExitWithExitCode $exit_code
+   367|       fi
+   368|     }
+   369|   }
+   370|   RunBuildTool "$_InitializeBuildToolCommand" /m /nologo /clp:Summary /v:$verbosity /nr:$node_reuse $warnaserror_switch /p:TreatWarningsAsErrors=$warn_as_error /p:ContinuousIntegrationBuild=$ci "$@"
+   371| }
+   372| function GetDarc {
+   373|     darc_path="$temp_dir/darc"
+   374|     version="$1"
+   375|     if [[ -n "$version" ]]; then
+   376|       version="--darcversion $version"
+   377|     fi
+   378|     "$eng_root/common/darc-init.sh" --toolpath "$darc_path" $version
+   379| }
+   380| ResolvePath "${BASH_SOURCE[0]}"
+   381| _script_dir=`dirname "$_ResolvePath"`
+   382| . "$_script_dir/pipeline-logging-functions.sh"
+   383| eng_root=`cd -P "$_script_dir/.." && pwd`
+   384| repo_root=`cd -P "$_script_dir/../.." && pwd`
+   385| repo_root="${repo_root}/"
+   386| artifacts_dir="${repo_root}artifacts"
+   387| toolset_dir="$artifacts_dir/toolset"
+   388| tools_dir="${repo_root}.tools"
+   389| log_dir="$artifacts_dir/log/$configuration"
+   390| temp_dir="$artifacts_dir/tmp/$configuration"
+   391| global_json_file="${repo_root}global.json"
+   392| global_json_has_runtimes=false
+   393| if command -v jq &> /dev/null; then
+   394|   if jq -e '.tools | has("runtimes")' "$global_json_file" &> /dev/null; then
+   395|     global_json_has_runtimes=true
+   396|   fi
+   397| elif [[ "$(cat "$global_json_file")" =~ \"runtimes\"[[:space:]\:]*\{ ]]; then
+   398|   global_json_has_runtimes=true
+   399| fi
+   400| if [[ -z $HOME ]]; then
+   401|   export HOME="${repo_root}artifacts/.home/"
+   402|   mkdir -p "$HOME"
+   403| fi
+   404| mkdir -p "$toolset_dir"
+   405| mkdir -p "$temp_dir"
+   406| mkdir -p "$log_dir"
+   407| Write-PipelineSetVariable -name "Artifacts" -value "$artifacts_dir"
+   408| Write-PipelineSetVariable -name "Artifacts.Toolset" -value "$toolset_dir"
+   409| Write-PipelineSetVariable -name "Artifacts.Log" -value "$log_dir"
+   410| Write-PipelineSetVariable -name "Temp" -value "$temp_dir"
+   411| Write-PipelineSetVariable -name "TMP" -value "$temp_dir"
+   412| if [ -z "${disable_configure_toolset_import:-}" ]; then
+   413|   configure_toolset_script="$eng_root/configure-toolset.sh"
+   414|   if [[ -a "$configure_toolset_script" ]]; then
+   415|     . "$configure_toolset_script"
+   416|   fi
+   417| fi
+   418| if [[ -n "${useInstalledDotNetCli:-}" ]]; then
+   419|   use_installed_dotnet_cli="$useInstalledDotNetCli"
+   420| fi
+
+
+# ====================================================================
+# FILE: eng/formatting/download-tools.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-40 ---
+     1| set -ue
+     2| source="${BASH_SOURCE[0]}"
+     3| while [[ -h "$source" ]]; do
+     4|   scriptroot="$( cd -P "$( dirname "$source" )" && pwd )"
+     5|   source="$(readlink "$source")"
+     6|   [[ $source != /* ]] && source="$scriptroot/$source"
+     7| done
+     8| scriptroot="$( cd -P "$( dirname "$source" )" && pwd )"
+     9| function DownloadClangTool {
+    10|     targetPlatform=$(dotnet --info |grep RID:)
+    11|     targetPlatform=${targetPlatform##*RID:* }
+    12|     echo "dotnet RID: ${targetPlatform}"
+    13|     case $targetPlatform in
+    14|         osx.*-x64)
+    15|             targetPlatform=osx.10.15-x64
+    16|             ;;
+    17|         ubuntu.*-x64)
+    18|             targetPlatform=ubuntu.18.04-x64
+    19|             ;;
+    20|     esac
+    21|     toolUrl=https://clrjit.blob.core.windows.net/clang-tools/${targetPlatform}/$1
+    22|     toolOutput=$2/$1
+    23|     echo "Downloading $1 from ${toolUrl} to ${toolOutput}"
+    24|     if [[ ! -x "$toolOutput" ]]; then
+    25|         curl --silent --retry 5 --fail -o "${toolOutput}" "$toolUrl"
+    26|         chmod 751 $toolOutput
+    27|     fi
+    28|     if [[ ! -x "$toolOutput" ]]; then
+    29|         echo "Failed to download $1"
+    30|         exit 1
+    31|     fi
+    32| }
+    33| engFolder="$(cd -P "$( dirname "$scriptroot" )" && pwd )"
+    34| downloadPathFolder="$(cd -P "$( dirname "$engFolder" )" && pwd )/artifacts/tools"
+    35| mkdir -p "$downloadPathFolder"
+    36| . "$scriptroot/../common/tools.sh"
+    37| InitializeDotNetCli true
+    38| DownloadClangTool "clang-format" "$downloadPathFolder"
+    39| DownloadClangTool "clang-tidy" "$downloadPathFolder"
+    40| export PATH=$downloadPathFolder:$PATH
+
+
+# ====================================================================
+# FILE: eng/install-native-dependencies.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-30 ---
+     1| set -e
+     2| os="$(echo "$1" | tr "[:upper:]" "[:lower:]")"
+     3| if [ -z "$os" ]; then
+     4|     . "$(dirname "$0")"/native/init-os-and-arch.sh
+     5| fi
+     6| case "$os" in
+     7|     linux)
+     8|         if [ -e /etc/os-release ]; then
+     9|             . /etc/os-release
+    10|         fi
+    11|         if [ "$ID" != "debian" ] && [ "$ID_LIKE" != "debian" ]; then
+    12|             echo "Unsupported distro. distro: $ID"
+    13|             exit 1
+    14|         fi
+    15|         apt update
+    16|         apt install -y build-essential gettext locales cmake llvm clang lldb liblldb-dev libunwind8-dev libicu-dev liblttng-ust-dev \
+    17|             libssl-dev libkrb5-dev zlib1g-dev
+    18|         localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8
+    19|         ;;
+    20|     osx|maccatalyst|ios|iossimulator|tvos|tvossimulator)
+    21|         echo "Installed xcode version: $(xcode-select -p)"
+    22|         export HOMEBREW_NO_INSTALL_CLEANUP=1
+    23|         export HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
+    24|         brew bundle --no-upgrade --no-lock --file "$(dirname "$0")/Brewfile"
+    25|         ;;
+    26|     *)
+    27|         echo "Unsupported platform. OS: $os"
+    28|         exit 1
+    29|         ;;
+    30| esac
+
+
+# ====================================================================
+# FILE: eng/native/build-commons.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-455 ---
+     1| initTargetDistroRid()
+     2| {
+     3|     source "$__RepoRootDir/eng/native/init-distro-rid.sh"
+     4|     local passedRootfsDir=""
+     5|     if [[ "$__CrossBuild" == 1 && "$platform" != "darwin" ]]; then
+     6|         passedRootfsDir="$ROOTFS_DIR"
+     7|     fi
+     8|     initDistroRidGlobal "$__TargetOS" "$__TargetArch" "$__PortableBuild" "$passedRootfsDir"
+     9| }
+    10| setup_dirs()
+    11| {
+    12|     echo Setting up directories for build
+    13|     mkdir -p "$__RootBinDir"
+    14|     mkdir -p "$__BinDir"
+    15|     mkdir -p "$__IntermediatesDir"
+    16| }
+    17| check_prereqs()
+    18| {
+    19|     echo "Checking prerequisites..."
+    20|     if [[ "$__HostOS" == "osx" ]]; then
+    21|         command -v pkg-config 2>/dev/null || { echo >&2 "Please install pkg-config before running this script, see https://github.com/dotnet/runtime/blob/main/docs/workflow/requirements/macos-requirements.md"; exit 1; }
+    22|         if ! pkg-config openssl ; then
+    23|             export PKG_CONFIG_PATH=$(brew --prefix)/opt/openssl@3/lib/pkgconfig:$(brew --prefix)/opt/openssl@1.1/lib/pkgconfig:$(brew --prefix)/opt/openssl/lib/pkgconfig
+    24|             pkg-config openssl || { echo >&2 "Please install openssl before running this script, see https://github.com/dotnet/runtime/blob/main/docs/workflow/requirements/macos-requirements.md"; exit 1; }
+    25|         fi
+    26|     fi
+    27|     if [[ "$__UseNinja" == 1 ]]; then
+    28|         command -v ninja 2>/dev/null || command -v ninja-build 2>/dev/null || { echo "Unable to locate ninja!"; exit 1; }
+    29|     fi
+    30| }
+    31| build_native()
+    32| {
+    33|     if [[ ! -e "$__RepoRootDir/artifacts/obj/_version.c" ]]; then
+    34|         eval "$__RepoRootDir/eng/native/version/copy_version_files.sh"
+    35|     fi
+    36|     targetOS="$1"
+    37|     hostArch="$2"
+    38|     cmakeDir="$3"
+    39|     intermediatesDir="$4"
+    40|     target="$5"
+    41|     cmakeArgs="$6"
+    42|     message="$7"
+    43|     echo "Commencing build of \"$target\" target in \"$message\" for $__TargetOS.$__TargetArch.$__BuildType in $intermediatesDir"
+    44|     if [[ "$targetOS" == osx || "$targetOS" == maccatalyst ]]; then
+    45|         if [[ "$hostArch" == x64 ]]; then
+    46|             cmakeArgs="-DCMAKE_OSX_ARCHITECTURES=\"x86_64\" $cmakeArgs"
+    47|         elif [[ "$hostArch" == arm64 ]]; then
+    48|             cmakeArgs="-DCMAKE_OSX_ARCHITECTURES=\"arm64\" $cmakeArgs"
+    49|         else
+    50|             echo "Error: Unknown OSX architecture $hostArch."
+    51|             exit 1
+    52|         fi
+    53|     fi
+    54|     if [[ "$targetOS" == maccatalyst ]]; then
+    55|         cmakeArgs="-DCMAKE_SYSTEM_VARIANT=maccatalyst $cmakeArgs"
+    56|     fi
+    57|     if [[ "$targetOS" == android || "$targetOS" == linux-bionic ]]; then
+    58|         if [[ -z "$ANDROID_NDK_ROOT" ]]; then
+    59|             echo "Error: You need to set the ANDROID_NDK_ROOT environment variable pointing to the Android NDK root."
+    60|             exit 1
+    61|         fi
+    62|         cmakeArgs="-C $__RepoRootDir/eng/native/tryrun.cmake $cmakeArgs"
+    63|         cmakeArgs="-DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake -DANDROID_PLATFORM=android-21 $cmakeArgs"
+    64|         __Compiler="default"
+    65|         if [[ "$hostArch" == x64 ]]; then
+    66|             cmakeArgs="-DANDROID_ABI=x86_64 $cmakeArgs"
+    67|         elif [[ "$hostArch" == x86 ]]; then
+    68|             cmakeArgs="-DANDROID_ABI=x86 $cmakeArgs"
+    69|         elif [[ "$hostArch" == arm64 ]]; then
+    70|             cmakeArgs="-DANDROID_ABI=arm64-v8a $cmakeArgs"
+    71|         elif [[ "$hostArch" == arm ]]; then
+    72|             cmakeArgs="-DANDROID_ABI=armeabi-v7a $cmakeArgs"
+    73|         else
+    74|             echo "Error: Unknown Android architecture $hostArch."
+    75|             exit 1
+    76|         fi
+    77|     elif [[ "$targetOS" == iossimulator ]]; then
+    78|         cmakeArgs="-C $__RepoRootDir/eng/native/tryrun_ios_tvos.cmake $cmakeArgs"
+    79|         cmakeArgs="-DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 $cmakeArgs"
+    80|         if [[ "$__TargetArch" == x64 ]]; then
+    81|             cmakeArgs="-DCMAKE_OSX_ARCHITECTURES=\"x86_64\" $cmakeArgs"
+    82|         elif [[ "$__TargetArch" == arm64 ]]; then
+    83|             cmakeArgs="-DCMAKE_OSX_ARCHITECTURES=\"arm64\" $cmakeArgs"
+    84|         else
+    85|             echo "Error: Unknown iOS Simulator architecture $__TargetArch."
+    86|             exit 1
+    87|         fi
+    88|     elif [[ "$targetOS" == ios ]]; then
+    89|         cmakeArgs="-C $__RepoRootDir/eng/native/tryrun_ios_tvos.cmake $cmakeArgs"
+    90|         cmakeArgs="-DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 $cmakeArgs"
+    91|         if [[ "$__TargetArch" == arm64 ]]; then
+    92|             cmakeArgs="-DCMAKE_OSX_ARCHITECTURES=\"arm64\" $cmakeArgs"
+    93|         else
+    94|             echo "Error: Unknown iOS architecture $__TargetArch."
+    95|             exit 1
+    96|         fi
+    97|     elif [[ "$targetOS" == tvossimulator ]]; then
+    98|         cmakeArgs="-C $__RepoRootDir/eng/native/tryrun_ios_tvos.cmake $cmakeArgs"
+    99|         cmakeArgs="-DCMAKE_SYSTEM_NAME=tvOS -DCMAKE_OSX_SYSROOT=appletvsimulator -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 $cmakeArgs"
+   100|         if [[ "$__TargetArch" == x64 ]]; then
+   101|             cmakeArgs="-DCMAKE_OSX_ARCHITECTURES=\"x86_64\" $cmakeArgs"
+   102|         elif [[ "$__TargetArch" == arm64 ]]; then
+   103|             cmakeArgs="-DCMAKE_OSX_ARCHITECTURES=\"arm64\" $cmakeArgs"
+   104|         else
+   105|             echo "Error: Unknown tvOS Simulator architecture $__TargetArch."
+   106|             exit 1
+   107|         fi
+   108|     elif [[ "$targetOS" == tvos ]]; then
+   109|         cmakeArgs="-C $__RepoRootDir/eng/native/tryrun_ios_tvos.cmake $cmakeArgs"
+   110|         cmakeArgs="-DCMAKE_SYSTEM_NAME=tvOS -DCMAKE_OSX_SYSROOT=appletvos -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 $cmakeArgs"
+   111|         if [[ "$__TargetArch" == arm64 ]]; then
+   112|             cmakeArgs="-DCMAKE_OSX_ARCHITECTURES=\"arm64\" $cmakeArgs"
+   113|         else
+   114|             echo "Error: Unknown tvOS architecture $__TargetArch."
+   115|             exit 1
+   116|         fi
+   117|     fi
+   118|     if [[ "$__UseNinja" == 1 ]]; then
+   119|         generator="ninja"
+   120|         buildTool="$(command -v ninja || command -v ninja-build)"
+   121|     else
+   122|         buildTool="make"
+   123|     fi
+   124|     if [[ "$__SkipConfigure" == 0 ]]; then
+   125|         if [[ "$__StaticAnalyzer" == 1 ]]; then
+   126|             scan_build=scan-build
+   127|         fi
+   128|         nextCommand="\"$__RepoRootDir/eng/native/gen-buildsys.sh\" \"$cmakeDir\" \"$intermediatesDir\" $hostArch $targetOS $__Compiler $__BuildType \"$generator\" $scan_build $cmakeArgs"
+   129|         echo "Invoking $nextCommand"
+   130|         eval $nextCommand
+   131|         local exit_code="$?"
+   132|         if [[ "$exit_code" != 0  ]]; then
+   133|             echo "${__ErrMsgPrefix}Failed to generate \"$message\" build project!"
+   134|             exit "$exit_code"
+   135|         fi
+   136|     fi
+   137|     if [[ ! -f "$intermediatesDir/CMakeCache.txt" ]]; then
+   138|         echo "${__ErrMsgPrefix}Unable to find generated build files for \"$message\" project!"
+   139|         exit 1
+   140|     fi
+   141|     if [[ "$__ConfigureOnly" == 1 ]]; then
+   142|         echo "Finish configuration & skipping \"$message\" build."
+   143|         return
+   144|     fi
+   145|     SAVED_CFLAGS="${CFLAGS}"
+   146|     SAVED_CXXFLAGS="${CXXFLAGS}"
+   147|     SAVED_LDFLAGS="${LDFLAGS}"
+   148|     export CFLAGS="${CFLAGS} ${EXTRA_CFLAGS}"
+   149|     export CXXFLAGS="${CXXFLAGS} ${EXTRA_CXXFLAGS}"
+   150|     export LDFLAGS="${LDFLAGS} ${EXTRA_LDFLAGS}"
+   151|     local exit_code
+   152|     if [[ "$__StaticAnalyzer" == 1 ]]; then
+   153|         pushd "$intermediatesDir"
+   154|         buildTool="$SCAN_BUILD_COMMAND -o $__BinDir/scan-build-log $buildTool"
+   155|         echo "Executing $buildTool $target -j $__NumProc"
+   156|         "$buildTool" $target -j "$__NumProc"
+   157|         exit_code="$?"
+   158|         popd
+   159|     else
+   160|         cmake_command=cmake
+   161|         if [[ "$build_arch" == "wasm" && "$__TargetOS" == "browser" ]]; then
+   162|             cmake_command="emcmake cmake"
+   163|             echo "Executing $cmake_command --build \"$intermediatesDir\" --target $target -- -j $__NumProc"
+   164|             $cmake_command --build "$intermediatesDir" --target $target -- -j "$__NumProc"
+   165|             exit_code="$?"
+   166|         else
+   167|             pushd "$intermediatesDir"
+   168|             echo "Executing $buildTool $target -j $__NumProc"
+   169|             "$buildTool" $target -j "$__NumProc"
+   170|             exit_code="$?"
+   171|             popd
+   172|         fi
+   173|     fi
+   174|     CFLAGS="${SAVED_CFLAGS}"
+   175|     CXXFLAGS="${SAVED_CXXFLAGS}"
+   176|     LDFLAGS="${SAVED_LDFLAGS}"
+   177|     if [[ "$exit_code" != 0 ]]; then
+   178|         echo "${__ErrMsgPrefix}Failed to build \"$message\"."
+   179|         exit "$exit_code"
+   180|     fi
+   181| }
+   182| usage()
+   183| {
+   184|     echo "Usage: $0 <options>"
+   185|     echo ""
+   186|     echo "Common Options:"
+   187|     echo ""
+   188|     echo "BuildArch can be: -arm, -armv6, -armel, -arm64, -loongarch64, -riscv64, -s390x, -ppc64le, x64, x86, -wasm"
+   189|     echo "BuildType can be: -debug, -checked, -release"
+   190|     echo "-os: target OS (defaults to running OS)"
+   191|     echo "-bindir: output directory (defaults to $__ProjectRoot/artifacts)"
+   192|     echo "-ci: indicates if this is a CI build."
+   193|     echo "-clang: optional argument to build using clang in PATH (default)."
+   194|     echo "-clangx.y: optional argument to build using clang version x.y."
+   195|     echo "-cmakeargs: user-settable additional arguments passed to CMake."
+   196|     echo "-configureonly: do not perform any builds; just configure the build."
+   197|     echo "-cross: optional argument to signify cross compilation,"
+   198|     echo "        will use ROOTFS_DIR environment variable if set."
+   199|     echo "-gcc: optional argument to build using gcc in PATH."
+   200|     echo "-gccx.y: optional argument to build using gcc version x.y."
+   201|     echo "-ninja: target ninja instead of GNU make"
+   202|     echo "-numproc: set the number of build processes."
+   203|     echo "-outputrid: optional argument that overrides the target rid name."
+   204|     echo "-portablebuild: pass -portablebuild=false to force a non-portable build."
+   205|     echo "-skipconfigure: skip build configuration."
+   206|     echo "-keepnativesymbols: keep native/unmanaged debug symbols."
+   207|     echo "-fsanitize: Enable native sanitizers"
+   208|     echo "-verbose: optional argument to enable verbose build output."
+   209|     echo ""
+   210|     echo "Additional Options:"
+   211|     echo ""
+   212|     for i in "${!usage_list[@]}"; do
+   213|         echo "${usage_list[${i}]}"
+   214|     done
+   215|     echo ""
+   216|     exit 1
+   217| }
+   218| source "$__RepoRootDir/eng/native/init-os-and-arch.sh"
+   219| __TargetArch=$arch
+   220| __TargetOS=$os
+   221| __OutputRid=''
+   222| platform="$(uname -s | tr '[:upper:]' '[:lower:]')"
+   223| if [[ "$platform" == "freebsd" ]]; then
+   224|   __NumProc="$(($(sysctl -n hw.ncpu)+1))"
+   225| elif [[ "$platform" == "netbsd" || "$platform" == "sunos" ]]; then
+   226|   __NumProc="$(($(getconf NPROCESSORS_ONLN)+1))"
+   227| elif [[ "$platform" == "darwin" ]]; then
+   228|   __NumProc="$(($(getconf _NPROCESSORS_ONLN)+1))"
+   229| elif command -v nproc > /dev/null 2>&1; then
+   230|   __NumProc="$(nproc)"
+   231| elif (NAME=""; . /etc/os-release; test "$NAME" = "Tizen"); then
+   232|   __NumProc="$(getconf _NPROCESSORS_ONLN)"
+   233| else
+   234|   __NumProc=1
+   235| fi
+   236| while :; do
+   237|     if [[ "$#" -le 0 ]]; then
+   238|         break
+   239|     fi
+   240|     lowerI="$(echo "${1/--/-}" | tr "[:upper:]" "[:lower:]")"
+   241|     case "$lowerI" in
+   242|         -\?|-h|--help)
+   243|             usage
+   244|             exit 1
+   245|             ;;
+   246|         arm|-arm)
+   247|             __TargetArch=arm
+   248|             ;;
+   249|         armv6|-armv6)
+   250|             __TargetArch=armv6
+   251|             ;;
+   252|         arm64|-arm64)
+   253|             __TargetArch=arm64
+   254|             ;;
+   255|         armel|-armel)
+   256|             __TargetArch=armel
+   257|             ;;
+   258|         bindir|-bindir)
+   259|             if [[ -n "$2" ]]; then
+   260|                 __RootBinDir="$2"
+   261|                 if [[ ! -d "$__RootBinDir" ]]; then
+   262|                     mkdir "$__RootBinDir"
+   263|                 fi
+   264|                 __RootBinParent=$(dirname "$__RootBinDir")
+   265|                 __RootBinName="${__RootBinDir##*/}"
+   266|                 __RootBinDir="$(cd "$__RootBinParent" &>/dev/null && printf %s/%s "$PWD" "$__RootBinName")"
+   267|                 shift
+   268|             else
+   269|                 echo "ERROR: 'bindir' requires a non-empty option argument"
+   270|                 exit 1
+   271|             fi
+   272|             ;;
+   273|         checked|-checked)
+   274|             __BuildType=Checked
+   275|             ;;
+   276|         ci|-ci)
+   277|             __ArcadeScriptArgs="--ci"
+   278|             __ErrMsgPrefix="##vso[task.logissue type=error]"
+   279|             ;;
+   280|         clang*|-clang*)
+   281|             __Compiler="$lowerI"
+   282|             ;;
+   283|         cmakeargs|-cmakeargs)
+   284|             if [[ -n "$2" ]]; then
+   285|                 __CMakeArgs="$2 $__CMakeArgs"
+   286|                 shift
+   287|             else
+   288|                 echo "ERROR: 'cmakeargs' requires a non-empty option argument"
+   289|                 exit 1
+   290|             fi
+   291|             ;;
+   292|         configureonly|-configureonly)
+   293|             __ConfigureOnly=1
+   294|             __SkipMSCorLib=1
+   295|             __SkipNuget=1
+   296|             ;;
+   297|         cross|-cross)
+   298|             __CrossBuild=1
+   299|             ;;
+   300|         debug|-debug)
+   301|             __BuildType=Debug
+   302|             ;;
+   303|         gcc*|-gcc*)
+   304|             __Compiler="$lowerI"
+   305|             ;;
+   306|         keepnativesymbols|-keepnativesymbols)
+   307|             __CMakeArgs="$__CMakeArgs -DCLR_CMAKE_KEEP_NATIVE_SYMBOLS=true"
+   308|             ;;
+   309|         -fsanitize)
+   310|             __CMakeArgs="$__CMakeArgs -DCLR_CMAKE_ENABLE_SANITIZERS=$2"
+   311|             EnableNativeSanitizers=$2
+   312|             shift
+   313|             ;;
+   314|         -fsanitize=*)
+   315|             sanitizers="${lowerI/#-fsanitize=/}" # -fsanitize=address => address
+   316|             __CMakeArgs="$__CMakeArgs -DCLR_CMAKE_ENABLE_SANITIZERS=$sanitizers"
+   317|             EnableNativeSanitizers=$sanitizers
+   318|             ;;
+   319|         ninja|-ninja)
+   320|             __UseNinja=1
+   321|             ;;
+   322|         numproc|-numproc)
+   323|             if [[ -n "$2" ]]; then
+   324|               __NumProc="$2"
+   325|               shift
+   326|             else
+   327|               echo "ERROR: 'numproc' requires a non-empty option argument"
+   328|               exit 1
+   329|             fi
+   330|             ;;
+   331|         portablebuild=false|-portablebuild=false)
+   332|             __PortableBuild=0
+   333|             ;;
+   334|         release|-release)
+   335|             __BuildType=Release
+   336|             ;;
+   337|         skipconfigure|-skipconfigure)
+   338|             __SkipConfigure=1
+   339|             ;;
+   340|         verbose|-verbose)
+   341|             __VerboseBuild=1
+   342|             ;;
+   343|         x86|-x86)
+   344|             __TargetArch=x86
+   345|             ;;
+   346|         x64|-x64)
+   347|             __TargetArch=x64
+   348|             ;;
+   349|         loongarch64|-loongarch64)
+   350|             __TargetArch=loongarch64
+   351|             ;;
+   352|         riscv64|-riscv64)
+   353|             __TargetArch=riscv64
+   354|             ;;
+   355|         s390x|-s390x)
+   356|             __TargetArch=s390x
+   357|             ;;
+   358|         wasm|-wasm)
+   359|             __TargetArch=wasm
+   360|             ;;
+   361|         outputrid|-outputrid)
+   362|             if [[ -n "$2" ]]; then
+   363|                 __OutputRid="$2"
+   364|                 shift
+   365|             else
+   366|                 echo "ERROR: 'outputrid' requires a non-empty option argument"
+   367|                 exit 1
+   368|             fi
+   369|             ;;
+   370|         ppc64le|-ppc64le)
+   371|             __TargetArch=ppc64le
+   372|             ;;
+   373|         os|-os)
+   374|             if [[ -n "$2" ]]; then
+   375|                 __TargetOS=$(echo "$2" | tr '[:upper:]' '[:lower:]')
+   376|                 shift
+   377|             else
+   378|                 echo "ERROR: 'os' requires a non-empty option argument"
+   379|                 exit 1
+   380|             fi
+   381|             ;;
+   382|         hostarch|-hostarch)
+   383|             if [[ -n "$2" ]]; then
+   384|                 __HostArch="$2"
+   385|                 __ExplicitHostArch=1
+   386|                 shift
+   387|             else
+   388|                 echo "ERROR: 'hostarch' requires a non-empty option argument"
+   389|                 exit 1
+   390|             fi
+   391|             ;;
+   392|         hostos|-hostos)
+   393|             if [[ -n "$2" ]]; then
+   394|                 __HostOS="$2"
+   395|                 shift
+   396|             else
+   397|                 echo "ERROR: 'hostos' requires a non-empty option argument"
+   398|                 exit 1
+   399|             fi
+   400|             ;;
+   401|         *)
+   402|             handle_arguments "$1" "$2"
+   403|             if [[ "$__ShiftArgs" == 1 ]]; then
+   404|                 shift
+   405|                 __ShiftArgs=0
+   406|             fi
+   407|             ;;
+   408|     esac
+   409|     shift
+   410| done
+   411| if [[ -z "$__HostArch" ]]; then
+   412|     __HostArch=$__TargetArch
+   413| fi
+   414| if [[ -z "$__HostOS" ]]; then
+   415|     __HostOS=$__TargetOS
+   416| fi
+   417| __CommonMSBuildArgs="/p:TargetArchitecture=$__TargetArch /p:Configuration=$__BuildType /p:TargetOS=$__TargetOS /nodeReuse:false $__OfficialBuildIdArg $__SignTypeArg $__SkipRestoreArg"
+   418| if [[ "$__VerboseBuild" == 1 ]]; then
+   419|     VERBOSE=1
+   420|     export VERBOSE
+   421|     __CommonMSBuildArgs="$__CommonMSBuildArgs /v:detailed"
+   422| fi
+   423| if [[ "$__PortableBuild" == 0 ]]; then
+   424|     __CommonMSBuildArgs="$__CommonMSBuildArgs /p:PortableBuild=false"
+   425| fi
+   426| if [[ "$__TargetArch" == wasm ]]; then
+   427|     true
+   428| elif [[ "$__TargetOS" == ios || "$__TargetOS" == iossimulator ]]; then
+   429|     true
+   430| elif [[ "$__TargetOS" == tvos || "$__TargetOS" == tvossimulator ]]; then
+   431|     true
+   432| elif [[ "$__TargetOS" == android ]]; then
+   433|     true
+   434| else
+   435|     __CMakeArgs="-DFEATURE_DISTRO_AGNOSTIC_SSL=$__PortableBuild $__CMakeArgs"
+   436| fi
+   437| if [[ "$__CrossBuild" == 1 ]]; then
+   438|     CROSSCOMPILE=1
+   439|     export CROSSCOMPILE
+   440|     if [[ -z "$ROOTFS_DIR" && "$platform" != "darwin" ]]; then
+   441|         ROOTFS_DIR="$__RepoRootDir/.tools/rootfs/$__TargetArch"
+   442|         export ROOTFS_DIR
+   443|     fi
+   444| fi
+   445| initTargetDistroRid
+   446| if [ -z "$__OutputRid" ]; then
+   447|     if [[ "$__PortableBuild" == 0 ]]; then
+   448|         __OutputRid="$__DistroRid"
+   449|     else
+   450|         __OutputRid="$__PortableTargetOS-$__TargetArch"
+   451|     fi
+   452| fi
+   453| export __OutputRid
+   454| echo "__OutputRid: ${__OutputRid}"
+   455| __HostFallbackOS="${__OutputRid%-*}" # Strip architecture
+
+
+# ====================================================================
+# FILE: eng/native/gen-buildsys.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-93 ---
+     1| scriptroot="$( cd -P "$( dirname "$0" )" && pwd )"
+     2| if [[ "$#" -lt 4 ]]; then
+     3|   echo "Usage..."
+     4|   echo "gen-buildsys.sh <path to top level CMakeLists.txt> <path to intermediate directory> <Architecture> <Os> <compiler> [build flavor] [ninja] [scan-build] [cmakeargs]"
+     5|   echo "Specify the path to the top level CMake file."
+     6|   echo "Specify the path that the build system files are generated in."
+     7|   echo "Specify the host architecture (the architecture the built tools should run on)."
+     8|   echo "Specify the name of compiler (clang or gcc)."
+     9|   echo "Optionally specify the build configuration (flavor.) Defaults to DEBUG."
+    10|   echo "Optionally specify 'scan-build' to enable build with clang static analyzer."
+    11|   echo "Use the Ninja generator instead of the Unix Makefiles generator."
+    12|   echo "Pass additional arguments to CMake call."
+    13|   exit 1
+    14| fi
+    15| host_arch="$3"
+    16| target_os="$4"
+    17| compiler="$5"
+    18| if [[ "$compiler" != "default" ]]; then
+    19|     nativescriptroot="$( cd -P "$scriptroot/../common/native" && pwd )"
+    20|     build_arch="$host_arch" compiler="$compiler" . "$nativescriptroot/init-compiler.sh"
+    21|     CCC_CC="$CC"
+    22|     CCC_CXX="$CXX"
+    23| fi
+    24| export CCC_CC CCC_CXX
+    25| buildtype=DEBUG
+    26| code_coverage=OFF
+    27| build_tests=OFF
+    28| scan_build=OFF
+    29| generator="Unix Makefiles"
+    30| __UnprocessedCMakeArgs=""
+    31| for i in "${@:6}"; do
+    32|     upperI="$(echo "$i" | tr "[:lower:]" "[:upper:]")"
+    33|     case "$upperI" in
+    34|       DEBUG | CHECKED | RELEASE | RELWITHDEBINFO)
+    35|       buildtype="$upperI"
+    36|       ;;
+    37|       NINJA)
+    38|       generator=Ninja
+    39|       ;;
+    40|       SCAN-BUILD)
+    41|       echo "Static analysis is turned on for this build."
+    42|       scan_build=ON
+    43|       ;;
+    44|       *)
+    45|       __UnprocessedCMakeArgs="${__UnprocessedCMakeArgs}${__UnprocessedCMakeArgs:+ }$i"
+    46|     esac
+    47| done
+    48| cmake_extra_defines=
+    49| if [[ "$CROSSCOMPILE" == "1" ]]; then
+    50|     platform="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    51|     if ! [[ -n "$ROOTFS_DIR" || "$platform" == "darwin" ]]; then
+    52|         echo "ROOTFS_DIR not set for crosscompile"
+    53|         exit 1
+    54|     fi
+    55|     TARGET_BUILD_ARCH="$host_arch"
+    56|     export TARGET_BUILD_ARCH
+    57|     cmake_extra_defines="$cmake_extra_defines -C $scriptroot/tryrun.cmake"
+    58|     if [[ "$platform" == "darwin" ]]; then
+    59|         cmake_extra_defines="$cmake_extra_defines -DCMAKE_SYSTEM_NAME=Darwin"
+    60|     else
+    61|         cmake_extra_defines="$cmake_extra_defines -DCMAKE_TOOLCHAIN_FILE=$scriptroot/../common/cross/toolchain.cmake"
+    62|     fi
+    63| fi
+    64| if [[ "$host_arch" == "armel" ]]; then
+    65|     cmake_extra_defines="$cmake_extra_defines -DARM_SOFTFP=1"
+    66| fi
+    67| if ! cmake_command=$(command -v cmake); then
+    68|     echo "CMake was not found in PATH."
+    69|     exit 1
+    70| fi
+    71| if [[ "$scan_build" == "ON" && -n "$SCAN_BUILD_COMMAND" ]]; then
+    72|     cmake_command="$SCAN_BUILD_COMMAND $cmake_command"
+    73| fi
+    74| if [[ "$host_arch" == "wasm" ]]; then
+    75|     if [[ "$target_os" == "browser" ]]; then
+    76|         cmake_command="emcmake $cmake_command"
+    77|     elif [[ "$target_os" == "wasi" ]]; then
+    78|         true
+    79|     else
+    80|         echo "target_os was not specified"
+    81|         exit 1
+    82|     fi
+    83| fi
+    84| pushd "$2"
+    85| $cmake_command \
+    86|   --no-warn-unused-cli \
+    87|   -G "$generator" \
+    88|   "-DCMAKE_BUILD_TYPE=$buildtype" \
+    89|   "-DCMAKE_INSTALL_PREFIX=$__CMakeBinDir" \
+    90|   $cmake_extra_defines \
+    91|   $__UnprocessedCMakeArgs \
+    92|   "$1"
+    93| popd
+
+
+# ====================================================================
+# FILE: eng/native/genmoduleindex.sh
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-30 ---
+     1| set -euo pipefail
+     2| if [[ "$#" -lt 2 ]]; then
+     3|   echo "Usage: genmoduleindex.sh ModuleBinaryFile IndexHeaderFile readelfBinaryPath"
+     4|   exit 1
+     5| fi
+     6| function printIdAsBinary() {
+     7|   id="$1"
+     8|   bytesLength="${#id}"
+     9|   printf "0x%02x, " "$((bytesLength/2))"
+    10|   while [[ "$id" ]]; do
+    11|     printf '0x%s, ' "${id:0:2}"
+    12|     id=${id:2}
+    13|   done
+    14| }
+    15| case "$(uname -s)" in
+    16| Darwin)
+    17|   cmd="dwarfdump"
+    18|   arg="-u"
+    19|   pattern='^UUID: ([0-9A-Fa-f\-]+)';;
+    20| *)
+    21|   cmd="$3"
+    22|   arg="-n"
+    23|   pattern='^[[:space:]]*Build ID: ([0-9A-Fa-f\-]+)';;
+    24| esac
+    25| "$cmd" "$arg" "$1" | while read -r line; do
+    26|   if [[ "$line" =~ $pattern ]]; then
+    27|     printIdAsBinary "${BASH_REMATCH[1]//-/}"
+    28|     break
+    29|   fi
+    30| done > "$2"
+
