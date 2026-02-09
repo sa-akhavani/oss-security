@@ -1,8 +1,8 @@
-# Open Source, Open Threats?
+# Vulnerability Evolution and the Promise of Automated Gatekeeping in Open-Source Software
 
-This repository contains datasets, scripts, and files for the
-"Open Source, Open Threats? Investigating Security Challenges in Open-Source Software"
-paper which is currently in submission to a security conference.
+This repository contains datasets, scripts, and analysis code for the paper
+"Vulnerability Evolution and the Promise of Automated Gatekeeping in Open-Source Software"
+which is currently in submission to a security conference.
 
 
 <!-- ### Citation -->
@@ -14,46 +14,78 @@ paper which is currently in submission to a security conference.
 <!-- ``` -->
 
 
-## Dataset
+## Datasets
+
 Here, we explain what each dataset folder contains and the CSV format we used to represent that data.
 
 ### Vulnerable Package Metadata
-This is a detailed dataset that contains our extracted vulnrability and metadata information for each studied package.
-`vulnerable_package_repository_info`
+Detailed dataset containing extracted vulnerability and metadata information for each studied package.
+`datasets/vulnerable_package_repository_info/`
 
 ```csv
 ID,Package,CWE,Date,Platform,GitHub URL,Stars,Contributors,Dependencies,Dependents
 ```
 
-### Github Advisory Parsed Data
-Parsed data from the Github advisory database from 2017 to 2025 in a csv format.
-`github_advisory_parsed_data`
+### GitHub Advisory Parsed Data
+Parsed data from the GitHub Advisory database from 2017 to 2025 in CSV format.
+`datasets/github_advisory_parsed_data/`
 
 ```csv
 ID,SOURCE,REVIEWED,PUBLISH_DATE,CWE_IDS,ALIASES,SUMMARY,SEVERITY,ECOSYSTEM,PACKAGE_NAME,VERSION_RANGE,REFERENCES
 ```
 
-### Libraries.io
-This includes the status of total packages in each ecosystem from 2017 to 2025.
-`libraries.io`
+### Snyk Crawls
+Vulnerability data crawled from Snyk.io, organized by ecosystem (npm, PyPI, Maven, etc.).
+`datasets/snyk_crawls/`
 
-### npm data
-Some of the top downloaded npm packages and their metadata.
-`npm-data`
+### Libraries.io
+Total package counts for each ecosystem from 2017 to 2025, with historical screenshots.
+`datasets/libraries.io/`
+
+### npm Data
+Top downloaded npm packages and their metadata.
+`datasets/npm-data/`
 
 ### Contributor History
-Includes the studied Github package contributor history.
-`contributor_history`
+GitHub package contributor history over time.
+`datasets/contributor_history/`
 
 ```csv
 REPO_NAME,GITHUB_URL,PERIOD_START,PERIOD_END,CONTRIBUTORS,CUMULATIVE_CONTRIBUTORS
 ```
 
+### Version Crawls
+Version information for packages across ecosystems (Composer, Crates, Go, Maven, NPM, NuGet, PyPI, RubyGems).
+`datasets/version_crawls/`
+
+
 ## Scripts
-Scripts folder contains the scripts we used to crawl
-`github advisory` and `snyk.io` data,
-and also the code we used to extract the contributor history from github packages. It includes the code to merge the data from the two sources with a unified structure and stores it in `csv` format to be used in the analysis.
+
+Scripts used for data collection and processing:
+
+- **GitHub Advisory Parser** (`scripts/github_advisory_parser/`): Parse GitHub Advisory database
+- **Snyk Crawler** (`scripts/snyk_crawl.ipynb`): Crawl vulnerability data from Snyk.io
+- **GitHub Contributor History** (`scripts/github_contributor_history/`): Extract contributor history from GitHub repositories
+- **GitHub File Change Extractor** (`scripts/github_filechange_extractor/`): Extract file changes between vulnerable and patched versions
+- **Data Merging** (`scripts/merge_data.ipynb`): Merge data from multiple sources into unified CSV format
 
 
 ## Analysis
-Analysis folder contains the code utilized for analysis of the data and plots related to differnect sections of the manuscript.
+
+Analysis notebooks for data exploration and visualization:
+
+- `analysis/plots_and_stats.ipynb`: General statistics and plots
+- `analysis/version_analysis.ipynb`: Version-related analysis
+- `analysis/git_repo_attrbutes_analysis.ipynb`: Repository attributes analysis
+- `analysis/total_pkgs_analysis.ipynb`: Total packages analysis
+
+
+## LLM Analysis
+
+LLM-based vulnerability detection analysis using code diffs:
+
+- `llm_analysis/main.py`: Main pipeline for diff-based vulnerability analysis using LLMs
+- `llm_analysis/diff_dataset/`: Code diffs organized by ecosystem (vulnerable vs patched code)
+- `llm_analysis/diff_analysis_results/`: Results from LLM vulnerability detection experiments
+- `llm_analysis/results_analysis.ipynb`: Analysis of LLM detection results
+- `llm_analysis/cwe_classification_analysis.ipynb`: CWE classification analysis
