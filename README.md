@@ -100,6 +100,6 @@ Code diffs between vulnerable and patched versions, organized by ecosystem. Each
 
 A representative sample of 100 vulnerabilities distributed across ecosystems:
 
-**Full Dataset**: [Download from Zenodo](https://zenodo.org/TODO)
+**Full Dataset**: [Download from Google Drive](https://drive.google.com/file/d/1GLB_SqsQpMkdZ2lTBrU02Fq9_CZPXpwS/view?usp=sharing)
 
 <!-- TODO: Upload diff_dataset.zip to Zenodo and update the link above -->
