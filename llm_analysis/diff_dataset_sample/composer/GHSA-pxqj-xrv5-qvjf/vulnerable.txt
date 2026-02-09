@@ -1,0 +1,507 @@
+# ====================================================================
+# FILE: debugger/action.php
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-45 ---
+     1| <?php
+     2| /**
+     3|  * @author Gaetano Giunta
+     4|  * @copyright (C) 2005-2021 G. Giunta
+     5|  * @license code licensed under the BSD License: see file license.txt
+     6|  *
+     7|  * @todo switch params for http compression from 0,1,2 to values to be used directly
+     8|  * @todo use ob_start to catch debug info and echo it AFTER method call results?
+     9|  * @todo be smarter in creating client stub for proxy/auth cases: only set appropriate property of client obj
+    10|  **/
+    11| header('Content-Type: text/html; charset=utf-8');
+    12| ?>
+    13| <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+    14|     "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+    15| <html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+    16| <head>
+    17|     <link rel="icon" type="image/vnd.microsoft.icon" href="favicon.ico">
+    18|     <title><?php if (defined('DEFAULT_WSTYPE') && DEFAULT_WSTYPE == 1) echo 'JSONRPC'; else echo 'XMLRPC'; ?> Debugger</title>
+    19|     <meta name="robots" content="index,nofollow"/>
+    20|     <style type="text/css">
+    21|         <!--
+    22|         body {
+    23|             border-top: 1px solid gray;
+    24|             padding: 1em;
+    25|             font-family: Verdana, Arial, Helvetica;
+    26|             font-size: 8pt;
+    27|         }
+    28|         h3 {
+    29|             font-size: 9.5pt;
+    30|         }
+    31|         h2 {
+    32|             font-size: 12pt;
+    33|         }
+    34|         .dbginfo {
+    35|             padding: 1em;
+    36|             background-color: #EEEEEE;
+    37|             border: 1px dashed silver;
+    38|             font-family: monospace;
+    39|         }
+    40|             padding: 1em;
+    41|             margin-top: 1em;
+    42|             background-color: #DDDDDD;
+    43|             border: 1px solid gray;
+    44|             white-space: pre;
+    45|             font-family: monospace;
+
+# --- HUNK 2: Lines 454-493 ---
+   454|         <li>If list of methods appears, click on 'describe method' for desired method</li>
+   455|         <li>To run method: click on 'load method synopsis' for desired method. This will load a skeleton for method call
+   456|             parameters in the form above. Complete all xmlrpc values with appropriate data and click 'Execute'
+   457|         </li>
+   458|     </ol>
+   459|     <?php
+   460|     if (!extension_loaded('curl')) {
+   461|         echo "<p class=\"evidence\">You will need to enable the CURL extension to use the HTTPS, HTTP 1.1 and HTTP/2 transports</p>\n";
+   462|     }
+   463|     ?>
+   464|     <h3>Example</h3>
+   465|     <p>
+   466|         Server Address: gggeek.altervista.org<br/>
+   467|         Path: /sw/xmlrpc/demo/server/server.php
+   468|     </p>
+   469|     <h3>Notice</h3>
+   470|     <p>all usernames and passwords entered on the above form will be written to the web server logs of this server. Use
+   471|         with care.</p>
+   472|     <h3>Changelog</h3>
+   473|     <ul>
+   474|         <li>2022-11-28: allow to use http/2 protocol; two security issues fixed in the underlying library</li>
+   475|         <li>2020-12-11: fix problems with running the debugger on php 8</li>
+   476|         <li>2015-05-30: fix problems with generating method payloads for NIL and Undefined parameters</li>
+   477|         <li>2015-04-19: fix problems with LATIN-1 characters in payload</li>
+   478|         <li>2007-02-20: add visual editor for method payload; allow strings, bools as jsonrpc msg id</li>
+   479|         <li>2006-06-26: support building php code stub for calling remote methods</li>
+   480|         <li>2006-05-25: better support for long running queries; check for no-curl installs</li>
+   481|         <li>2006-05-02: added support for JSON-RPC. Note that many interesting json-rpc features are not implemented
+   482|             yet, such as notifications or multicall.
+   483|         </li>
+   484|         <li>2006-04-22: added option for setting custom CA certs to verify peer with in SSLmode</li>
+   485|         <li>2006-03-05: added option for setting Basic/Digest/NTLM auth type</li>
+   486|         <li>2006-01-18: added option echoing to screen xmlrpc request before sending it ('More' debug)</li>
+   487|         <li>2005-10-01: added option for setting cookies to be sent to server</li>
+   488|         <li>2005-08-07: added switches for compression of requests and responses and http 1.1</li>
+   489|         <li>2005-06-27: fixed possible security breach in parsing malformed xml</li>
+   490|         <li>2005-06-24: fixed error with calling methods having parameters...</li>
+   491|     </ul>
+   492| <?php
+   493| }
+
+
+# ====================================================================
+# FILE: debugger/controller.php
+# Total hunks: 5
+# ====================================================================
+# --- HUNK 1: Lines 2-97 ---
+     2| /**
+     3|  * @author Gaetano Giunta
+     4|  * @copyright (C) 2005-2021 G. Giunta
+     5|  * @license code licensed under the BSD License: see file license.txt
+     6|  *
+     7|  * @todo add links to documentation from every option caption
+     8|  * @todo switch params for http compression from 0,1,2 to values to be used directly
+     9|  * @todo add a little bit more CSS formatting: we broke IE box model getting a width > 100%...
+    10|  * @todo add support for more options, such as ntlm auth to proxy, or request charset encoding
+    11|  * @todo parse content of payload textarea to be fed to visual editor
+    12|  * @todo add http no-cache headers
+    13|  * @todo if jsonrpc php classes are not available, gray out or hide altogether the JSONRPC option & title
+    14|  * @todo if js libs are not available, do not try to load them
+    15|  **/
+    16| header('Content-Type: text/html; charset=utf-8');
+    17| include __DIR__ . '/common.php';
+    18| if ($action == '') {
+    19|     $action = 'list';
+    20| }
+    21| $editorpath = (defined('JSXMLRPC_PATH') ? JSXMLRPC_PATH : '../..') . '/jsxmlrpc/debugger/';
+    22| $editorlibs = (defined('JSXMLRPC_PATH') ? JSXMLRPC_PATH : '../..') . '/jsxmlrpc/lib/';
+    23| ?>
+    24| <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+    25|     "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+    26| <html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+    27| <head>
+    28|     <link rel="icon" type="image/vnd.microsoft.icon" href="favicon.ico">
+    29|     <title><?php if (defined('DEFAULT_WSTYPE') && DEFAULT_WSTYPE == 1) echo 'JSONRPC'; else echo 'XMLRPC'; ?> Debugger</title>
+    30|     <meta name="robots" content="index,nofollow"/>
+    31|     <script type="text/javascript" language="Javascript">
+    32|         if (window.name != 'frmcontroller')
+    33|             top.location.replace('index.php?run=' + escape(self.location));
+    34|     </script>
+    35|     <!-- xmlrpc/jsonrpc base library -->
+    36|     <script type="text/javascript" src="<?php echo $editorlibs; ?>xmlrpc_lib.js"></script>
+    37|     <script type="text/javascript" src="<?php echo $editorlibs; ?>jsonrpc_lib.js"></script>
+    38|     <style type="text/css">
+    39|         <!--
+    40|         html {
+    41|             overflow: -moz-scrollbars-vertical;
+    42|         }
+    43|         body {
+    44|             padding: 0.5em;
+    45|             background-color: #EEEEEE;
+    46|             font-family: Verdana, Arial, Helvetica;
+    47|             font-size: 8pt;
+    48|         }
+    49|         h1 {
+    50|             font-size: 12pt;
+    51|             margin: 0.5em;
+    52|         }
+    53|         h2 {
+    54|             font-size: 10pt;
+    55|             display: inline;
+    56|             vertical-align: top;
+    57|         }
+    58|         table {
+    59|             border: 1px solid gray;
+    60|             margin-bottom: 0.5em;
+    61|             padding: 0.25em;
+    62|             width: 100%;
+    63|         }
+    64|             display: inline;
+    65|         }
+    66|         td {
+    67|             vertical-align: top;
+    68|             font-family: Verdana, Arial, Helvetica;
+    69|             font-size: 8pt;
+    70|         }
+    71|         .labelcell {
+    72|             text-align: right;
+    73|         }
+    74|         -->
+    75|     </style>
+    76|     <script language="JavaScript" type="text/javascript">
+    77|         <!--
+    78|         function verifyserver() {
+    79|             if (document.frmaction.host.value == '') {
+    80|                 alert('Please insert a server name or address');
+    81|                 return false;
+    82|             }
+    83|             if (document.frmaction.path.value == '')
+    84|                 document.frmaction.path.value = '/';
+    85|             var action = '';
+    86|             for (counter = 0; counter < document.frmaction.action.length; counter++)
+    87|                 if (document.frmaction.action[counter].checked) {
+    88|                     action = document.frmaction.action[counter].value;
+    89|                 }
+    90|             if (document.frmaction.method.value == '' && (action == 'execute' || action == 'wrap' || action == 'describe')) {
+    91|                 alert('Please insert a method name');
+    92|                 return false;
+    93|             }
+    94|             if (document.frmaction.authtype.value != '1' && document.frmaction.username.value == '') {
+    95|                 alert('No username for authenticating to server: authentication disabled');
+    96|             }
+    97|             return true;
+
+# --- HUNK 2: Lines 150-232 ---
+   150|             }
+   151|             else {
+   152|                 document.frmaction.cainfo.disabled = true;
+   153|             }
+   154|         }
+   155|         function switchtransport(is_json) {
+   156|             if (is_json == 0) {
+   157|                 document.getElementById("idcell").style.visibility = 'hidden';
+   158|                 document.frmjsonrpc.yes.checked = false;
+   159|                 document.frmxmlrpc.yes.checked = true;
+   160|                 document.frmaction.wstype.value = "0";
+   161|             }
+   162|             else {
+   163|                 document.getElementById("idcell").style.visibility = 'visible';
+   164|                 document.frmjsonrpc.yes.checked = true;
+   165|                 document.frmxmlrpc.yes.checked = false;
+   166|                 document.frmaction.wstype.value = "1";
+   167|             }
+   168|         }
+   169|         function displaydialogeditorbtn(show) {
+   170|             if (show && ((typeof base64_decode) == 'function')) {
+   171|                 document.getElementById('methodpayloadbtn').innerHTML = '[<a href="#" onclick="activateeditor(); return false;">Edit</a>]';
+   172|             }
+   173|             else {
+   174|                 document.getElementById('methodpayloadbtn').innerHTML = '';
+   175|             }
+   176|         }
+   177|         function activateeditor() {
+   178|             var url = '<?php echo $editorpath; ?>visualeditor.php?params=<?php echo $alt_payload; ?>';
+   179|             if (document.frmaction.wstype.value == "1")
+   180|                 url += '&type=jsonrpc';
+   181|             var wnd = window.open(url, '_blank', 'width=750, height=400, location=0, resizable=1, menubar=0, scrollbars=1');
+   182|         }
+   183|         function buildparams(base64data) {
+   184|             if (typeof base64_decode == 'function') {
+   185|                 if (base64data == '0') // workaround for bug in base64_encode...
+   186|                     document.getElementById('methodpayload').value = '';
+   187|                 else
+   188|                     document.getElementById('methodpayload').value = base64_decode(base64data);
+   189|             }
+   190|         }
+   191|         function switchFormMethod() {
+   192|             if (document.frmaction.methodpayload.value.length > 1536) {
+   193|                 document.frmaction.action = 'action.php?usepost=true';
+   194|                 document.frmaction.method = 'post';
+   195|             }
+   196|         }
+   197|     </script>
+   198| </head>
+   199| <body
+   200|     onload="switchtransport(<?php echo $wstype; ?>); switchaction(); switchssl(); switchauth(); swicthcainfo();<?php if ($run) {
+   201|         echo ' document.forms[2].submit();';
+   202|     } ?>">
+   203| <h1>XMLRPC
+   204|     <form name="frmxmlrpc" style="display: inline;" action="."><input name="yes" type="radio" onclick="switchtransport(0);" <?php if (!class_exists('\PhpXmlRpc\Client')) { echo 'disabled="disabled"';} ?>/></form>
+   205|     /
+   206|     <form name="frmjsonrpc" style="display: inline;" action="."><input name="yes" type="radio" onclick="switchtransport(1);" <?php if (!class_exists('\PhpXmlRpc\JsonRpc\Client')) { echo 'disabled="disabled"';} ?>/></form>
+   207|     JSONRPC Debugger (based on the <a href="https://gggeek.github.io/phpxmlrpc/">PHP-XMLRPC</a> library)
+   208| </h1>
+   209| <form name="frmaction" method="get" action="action.php" target="frmaction" onSubmit="switchFormMethod();">
+   210|     <table id="serverblock">
+   211|         <tr>
+   212|             <td><h2>Target server</h2></td>
+   213|             <td class="labelcell">Address:</td>
+   214|             <td><input type="text" name="host" value="<?php echo htmlspecialchars($host, ENT_COMPAT, $inputcharset); ?>"/></td>
+   215|             <td class="labelcell">Port:</td>
+   216|             <td><input type="text" name="port" value="<?php echo htmlspecialchars($port, ENT_COMPAT, $inputcharset); ?>" size="5" maxlength="5"/>
+   217|             </td>
+   218|             <td class="labelcell">Path:</td>
+   219|             <td><input type="text" name="path" value="<?php echo htmlspecialchars($path, ENT_COMPAT, $inputcharset); ?>"/></td>
+   220|         </tr>
+   221|     </table>
+   222|     <table id="actionblock">
+   223|         <tr>
+   224|             <td><h2>Action</h2></td>
+   225|             <td>List available methods<input type="radio" name="action" value="list"<?php if ($action == 'list') { echo ' checked="checked"'; } ?> onclick="switchaction();"/></td>
+   226|             <td>Describe method<input type="radio" name="action" value="describe"<?php if ($action == 'describe') { echo ' checked="checked"'; } ?> onclick="switchaction();"/></td>
+   227|             <td>Execute method<input type="radio" name="action" value="execute"<?php if ($action == 'execute') { echo ' checked="checked"'; } ?> onclick="switchaction();"/></td>
+   228|             <td>Generate stub for method call<input type="radio" name="action" value="wrap"<?php if ($action == 'wrap') { echo ' checked="checked"'; } ?> onclick="switchaction();"/></td>
+   229|         </tr>
+   230|     </table>
+   231|     <input type="hidden" name="methodsig" value="<?php echo htmlspecialchars($methodsig, ENT_COMPAT, $inputcharset); ?>"/>
+   232|     <table id="methodblock">
+
+# --- HUNK 3: Lines 238-285 ---
+   238|                 <div id="methodpayloadbtn"></div>
+   239|             </td>
+   240|             <td><textarea id="methodpayload" name="methodpayload" rows="1" cols="40"><?php echo htmlspecialchars($payload, ENT_COMPAT, $inputcharset); ?></textarea></td>
+   241|             <td class="labelcell" id="idcell">Msg id: <input type="text" name="id" size="3" value="<?php echo htmlspecialchars($id, ENT_COMPAT, $inputcharset); ?>"/></td>
+   242|             <td><input type="hidden" name="wstype" value="<?php echo $wstype; ?>"/>
+   243|                 <input type="submit" value="Execute" onclick="return verifyserver();"/></td>
+   244|         </tr>
+   245|     </table>
+   246|     <table id="optionsblock">
+   247|         <tr>
+   248|             <td><h2>Client options</h2></td>
+   249|             <td class="labelcell">Show debug info:</td>
+   250|             <td><select name="debug">
+   251|                     <option value="0"<?php if ($debug == 0) { echo ' selected="selected"'; } ?>>No</option>
+   252|                     <option value="1"<?php if ($debug == 1) { echo ' selected="selected"'; } ?>>Yes</option>
+   253|                     <option value="2"<?php if ($debug == 2) { echo ' selected="selected"'; } ?>>More</option>
+   254|                 </select>
+   255|             </td>
+   256|             <td class="labelcell">Timeout:</td>
+   257|             <td><input type="text" name="timeout" size="3" value="<?php if ($timeout > 0) { echo $timeout; } ?>"/></td>
+   258|             <td class="labelcell">Protocol:</td>
+   259|             <td><select name="protocol" onchange="switchssl(); switchauth(); swicthcainfo();">
+   260|                     <option value="0"<?php if ($protocol == 0) { echo ' selected="selected"'; } ?>>HTTP 1.0</option>
+   261|                     <option value="1"<?php if ($protocol == 1) { echo ' selected="selected"'; } ?>>HTTP 1.1</option>
+   262|                     <option value="2"<?php if ($protocol == 2) { echo ' selected="selected"'; } ?>>HTTPS</option>
+   263|                     <option value="3"<?php if ($protocol == 3) { echo ' selected="selected"'; } ?>>HTTP2</option>
+   264|                     <option value="4"<?php if ($protocol == 3) { echo ' selected="selected"'; } ?>>HTTP2 no TLS</option>
+   265|                 </select></td>
+   266|         </tr>
+   267|         <tr>
+   268|             <td class="labelcell">AUTH:</td>
+   269|             <td class="labelcell">Username:</td>
+   270|             <td><input type="text" name="username" value="<?php echo htmlspecialchars($username, ENT_COMPAT, $inputcharset); ?>"/></td>
+   271|             <td class="labelcell">Pwd:</td>
+   272|             <td><input type="password" name="password" value="<?php echo htmlspecialchars($password, ENT_COMPAT, $inputcharset); ?>"/></td>
+   273|             <td class="labelcell">Type</td>
+   274|             <td><select name="authtype">
+   275|                     <option value="1"<?php if ($authtype == 1) { echo ' selected="selected"'; } ?>>Basic</option>
+   276|                     <option value="2"<?php if ($authtype == 2) { echo ' selected="selected"'; } ?>>Digest</option>
+   277|                     <option value="8"<?php if ($authtype == 8) { echo ' selected="selected"'; } ?>>NTLM</option>
+   278|                 </select></td>
+   279|             <td></td>
+   280|         </tr>
+   281|         <tr>
+   282|             <td class="labelcell">SSL:</td>
+   283|             <td class="labelcell">Verify Host's CN:</td>
+   284|             <td><select name="verifyhost">
+   285|                     <option value="0"<?php if ($verifyhost == 0) { echo ' selected="selected"'; } ?>>No</option>
+
+
+# ====================================================================
+# FILE: debugger/index.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-22 ---
+     1| <?php
+     2| $query = '';
+     3| if (isset($_GET['run'])) {
+     4|     $path = parse_url($_GET['run']);
+     5|     if (isset($path['query'])) {
+     6|         $query = '?' . $path['query'];
+     7|     }
+     8| }
+     9| ?>
+    10| <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Frameset//EN"
+    11|     "http://www.w3.org/TR/xhtml1/DTD/xhtml1-frameset.dtd">
+    12| <html lang="en">
+    13| <head>
+    14|     <link rel="icon" type="image/vnd.microsoft.icon" href="favicon.ico">
+    15|     <title><?php if (defined('DEFAULT_WSTYPE') && DEFAULT_WSTYPE == 1) echo 'JSONRPC'; else echo 'XMLRPC'; ?> Debugger</title>
+    16| </head>
+    17| <frameset rows="360,*">
+    18|     <frame name="frmcontroller" src="controller.php<?php echo htmlspecialchars($query); ?>" marginwidth="0"
+    19|            marginheight="0" frameborder="0"/>
+    20|     <frame name="frmaction" src="action.php" marginwidth="0" marginheight="0" frameborder="0"/>
+    21| </frameset>
+    22| </html>
+
+
+# ====================================================================
+# FILE: pakefile.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 80-123 ---
+    80|      * @return string
+    81|      */
+    82|     public static function option($name)
+    83|     {
+    84|         return self::$options[$name];
+    85|     }
+    86|     /**
+    87|      * @param string $inFile
+    88|      * @param string $xssFile
+    89|      * @param string $outFileOrDir
+    90|      * @throws \Exception
+    91|      */
+    92|     public static function applyXslt($inFile, $xssFile, $outFileOrDir)
+    93|     {
+    94|         if (!file_exists($inFile)) {
+    95|             throw new \Exception("File $inFile cannot be found");
+    96|         }
+    97|         if (!file_exists($xssFile)) {
+    98|             throw new \Exception("File $xssFile cannot be found");
+    99|         }
+   100|         $docbookXslPath = realpath(Builder::buildDir().'/tools/vendor/docbook/docbook-xsl/fo/docbook.xsl');
+   101|         file_put_contents(
+   102|             $xssFile,
+   103|             str_replace('%docbook.xsl%', $docbookXslPath, file_get_contents($xssFile))
+   104|         );
+   105|         $xml = new \DOMDocument();
+   106|         $xml->load($inFile);
+   107|         $xsl = new \DOMDocument();
+   108|         $xsl->load($xssFile);
+   109|         $processor = new \XSLTProcessor();
+   110|         if (version_compare(PHP_VERSION, '5.4', "<")) {
+   111|             if (defined('XSL_SECPREF_WRITE_FILE')) {
+   112|                 ini_set("xsl.security_prefs", XSL_SECPREF_CREATE_DIRECTORY | XSL_SECPREF_WRITE_FILE);
+   113|             }
+   114|         } else {
+   115|             if (method_exists('XSLTProcessor', 'setSecurityPrefs')) {
+   116|                 $processor->setSecurityPrefs(XSL_SECPREF_CREATE_DIRECTORY | XSL_SECPREF_WRITE_FILE);
+   117|             } else {
+   118|                 $processor->setSecurityPreferences(XSL_SECPREF_CREATE_DIRECTORY | XSL_SECPREF_WRITE_FILE);
+   119|             }
+   120|         }
+   121|         $processor->importStyleSheet($xsl); // attach the xsl rules
+   122|         if (is_dir($outFileOrDir)) {
+   123|             if (!$processor->setParameter('', 'base.dir', realpath($outFileOrDir))) {
+
+
+# ====================================================================
+# FILE: src/PhpXmlRpc.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 50-90 ---
+    50|         'multicall_notstruct' => 'system.multicall expected struct',
+    51|         'multicall_nomethod' => 'Missing methodName',
+    52|         'multicall_notstring' => 'methodName is not a string',
+    53|         'multicall_recursion' => 'Recursive system.multicall forbidden',
+    54|         'multicall_noparams' => 'Missing params',
+    55|         'multicall_notarray' => 'params is not an array',
+    56|         'no_http2' => 'No HTTP/2 support compiled in',
+    57|         'invalid_xml' => 'Invalid response payload (you can use the setDebug method to allow analysis of the response)',
+    58|         'xml_not_compliant' => 'Invalid response payload (you can use the setDebug method to allow analysis of the response)',
+    59|         'xml_parsing_error' => 'Invalid response payload (you can use the setDebug method to allow analysis of the response)',
+    60|         'cannot_decompress' => 'Received from server compressed HTTP and cannot decompress',
+    61|         'decompress_fail' => 'Received from server invalid compressed HTTP',
+    62|         'dechunk_fail' => 'Received from server invalid chunked HTTP',
+    63|         'server_cannot_decompress' => 'Received from client compressed HTTP request and cannot decompress',
+    64|         'server_decompress_fail' => 'Received from client invalid compressed HTTP request',
+    65|     );
+    66|     public static $xmlrpc_defencoding = "UTF-8";
+    67|     public static $xmlrpc_detectencodings = array();
+    68|     public static $xmlrpc_internalencoding = "UTF-8";
+    69|     public static $xmlrpcName = "XML-RPC for PHP";
+    70|     public static $xmlrpcVersion = "4.9.1";
+    71|     public static $xmlrpcerruser = 800;
+    72|     public static $xmlrpcerrxml = 100;
+    73|     public static $xmlrpc_null_extension = false;
+    74|     public static $xmlrpc_null_apache_encoding = false;
+    75|     public static $xmlrpc_null_apache_encoding_ns = "http://ws.apache.org/xmlrpc/namespaces/extensions";
+    76|     public static $xmlpc_double_precision = 128;
+    77|     /**
+    78|      * A function to be used for compatibility with legacy code: it creates all global variables which used to be declared,
+    79|      * such as library version etc...
+    80|      */
+    81|     public static function exportGlobals()
+    82|     {
+    83|         $reflection = new \ReflectionClass('PhpXmlRpc\PhpXmlRpc');
+    84|         foreach ($reflection->getStaticProperties() as $name => $value) {
+    85|             $GLOBALS[$name] = $value;
+    86|         }
+    87|         $reflection = new \ReflectionClass('PhpXmlRpc\Value');
+    88|         foreach ($reflection->getStaticProperties() as $name => $value) {
+    89|             $GLOBALS[$name] = $value;
+    90|         }
+
+
+# ====================================================================
+# FILE: src/Wrapper.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 835-875 ---
+   835|             $pType = $mSig[$i];
+   836|             if ($pType == 'i4' || $pType == 'i8' || $pType == 'int' || $pType == 'boolean' || $pType == 'double' ||
+   837|                 $pType == 'string' || $pType == 'dateTime.iso8601' || $pType == 'base64' || $pType == 'null'
+   838|             ) {
+   839|                 $innerCode .= "\$p$i = new {$namespace}Value(\$p$i, '$pType');\n";
+   840|             } else {
+   841|                 if ($encodePhpObjects) {
+   842|                     $innerCode .= "\$p$i = \$encoder->encode(\$p$i, array('encode_php_objs'));\n";
+   843|                 } else {
+   844|                     $innerCode .= "\$p$i = \$encoder->encode(\$p$i);\n";
+   845|                 }
+   846|             }
+   847|             $innerCode .= "\$req->addparam(\$p$i);\n";
+   848|             $mDesc .= '* @param ' . $this->xmlrpc2PhpType($pType) . " \$p$i\n";
+   849|         }
+   850|         if ($clientCopyMode < 2) {
+   851|             $plist[] = '$debug=0';
+   852|             $mDesc .= "* @param int \$debug when 1 (or 2) will enable debugging of the underlying {$prefix} call (defaults to 0)\n";
+   853|         }
+   854|         $plist = implode(', ', $plist);
+   855|         $mDesc .= '* @return {$namespace}Response|' . $this->xmlrpc2PhpType($mSig[0]) . " (an {$namespace}Response obj instance if call fails)\n*/\n";
+   856|         $innerCode .= "\$res = \${$this_}client->send(\$req, $timeout, '$protocol');\n";
+   857|         if ($decodeFault) {
+   858|             if (is_string($faultResponse) && ((strpos($faultResponse, '%faultCode%') !== false) || (strpos($faultResponse, '%faultString%') !== false))) {
+   859|                 $respCode = "str_replace(array('%faultCode%', '%faultString%'), array(\$res->faultCode(), \$res->faultString()), '" . str_replace("'", "''", $faultResponse) . "')";
+   860|             } else {
+   861|                 $respCode = var_export($faultResponse, true);
+   862|             }
+   863|         } else {
+   864|             $respCode = '$res';
+   865|         }
+   866|         if ($decodePhpObjects) {
+   867|             $innerCode .= "if (\$res->faultcode()) return $respCode; else return \$encoder->decode(\$res->value(), array('decode_php_objs'));";
+   868|         } else {
+   869|             $innerCode .= "if (\$res->faultcode()) return $respCode; else return \$encoder->decode(\$res->value());";
+   870|         }
+   871|         $code = $code . $plist . ") {\n" . $innerCode . "\n}\n";
+   872|         return array('source' => $code, 'docstring' => $mDesc);
+   873|     }
+   874|     /**
+   875|      * Similar to wrapXmlrpcMethod, but will generate a php class that wraps
+

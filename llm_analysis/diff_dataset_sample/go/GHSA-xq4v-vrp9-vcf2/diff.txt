@@ -1,0 +1,244 @@
+--- a/gogs.go
++++ b/gogs.go
+@@ -1,20 +1,20 @@
+ package main
+ import (
+ 	"os"
+ 	"github.com/urfave/cli"
+ 	log "unknwon.dev/clog/v2"
+ 	"gogs.io/gogs/internal/cmd"
+ 	"gogs.io/gogs/internal/conf"
+ )
+ func init() {
+-	conf.App.Version = "0.12.9"
++	conf.App.Version = "0.12.8"
+ }
+ func main() {
+ 	app := cli.NewApp()
+ 	app.Name = "Gogs"
+ 	app.Usage = "A painless self-hosted Git service"
+ 	app.Version = conf.App.Version
+ 	app.Commands = []cli.Command{
+ 		cmd.Web,
+ 		cmd.Serv,
+ 		cmd.Hook,
+
+--- a/internal/db/pull.go
++++ b/internal/db/pull.go
+@@ -471,20 +471,24 @@
+ }
+ func (pr *PullRequest) Update() error {
+ 	_, err := x.Id(pr.ID).AllCols().Update(pr)
+ 	return err
+ }
+ func (pr *PullRequest) UpdateCols(cols ...string) error {
+ 	_, err := x.Id(pr.ID).Cols(cols...).Update(pr)
+ 	return err
+ }
+ func (pr *PullRequest) UpdatePatch() (err error) {
++	if pr.HeadRepo == nil {
++		log.Trace("PullRequest[%d].UpdatePatch: ignored cruppted data", pr.ID)
++		return nil
++	}
+ 	headGitRepo, err := git.Open(pr.HeadRepo.RepoPath())
+ 	if err != nil {
+ 		return fmt.Errorf("open repository: %v", err)
+ 	}
+ 	tmpRemote := com.ToStr(time.Now().UnixNano())
+ 	baseRepoPath := RepoPath(pr.BaseRepo.MustOwner().Name, pr.BaseRepo.Name)
+ 	err = headGitRepo.AddRemote(tmpRemote, baseRepoPath, git.AddRemoteOptions{Fetch: true})
+ 	if err != nil {
+ 		return fmt.Errorf("add remote %q [repo_id: %d]: %v", tmpRemote, pr.HeadRepoID, err)
+ 	}
+@@ -576,24 +580,20 @@
+ 			return fmt.Errorf("loadAttributes [%d]: %v", prs[i].ID, err)
+ 		}
+ 	}
+ 	return nil
+ }
+ func (prs PullRequestList) LoadAttributes() error {
+ 	return prs.loadAttributes(x)
+ }
+ func addHeadRepoTasks(prs []*PullRequest) {
+ 	for _, pr := range prs {
+-		if pr.HeadRepo == nil {
+-			log.Trace("addHeadRepoTasks[%d]: missing head repository", pr.ID)
+-			continue
+-		}
+ 		log.Trace("addHeadRepoTasks[%d]: composing new test task", pr.ID)
+ 		if err := pr.UpdatePatch(); err != nil {
+ 			log.Error("UpdatePatch: %v", err)
+ 			continue
+ 		} else if err := pr.PushToBaseRepo(); err != nil {
+ 			log.Error("PushToBaseRepo: %v", err)
+ 			continue
+ 		}
+ 		pr.AddToTaskQueue()
+ 	}
+
+--- a/internal/db/repo.go
++++ b/internal/db/repo.go
+@@ -700,21 +700,21 @@
+ 		return fmt.Errorf("git add: %s", stderr)
+ 	}
+ 	if _, stderr, err = process.ExecDir(-1,
+ 		tmpPath, fmt.Sprintf("initRepoCommit (git commit): %s", tmpPath),
+ 		"git", "commit", fmt.Sprintf("--author='%s <%s>'", sig.Name, sig.Email),
+ 		"-m", "Initial commit"); err != nil {
+ 		return fmt.Errorf("git commit: %s", stderr)
+ 	}
+ 	if _, stderr, err = process.ExecDir(-1,
+ 		tmpPath, fmt.Sprintf("initRepoCommit (git push): %s", tmpPath),
+-		"git", "push"); err != nil {
++		"git", "push", "origin", "master"); err != nil {
+ 		return fmt.Errorf("git push: %s", stderr)
+ 	}
+ 	return nil
+ }
+ type CreateRepoOptions struct {
+ 	Name        string
+ 	Description string
+ 	Gitignores  string
+ 	License     string
+ 	Readme      string
+
+--- a/internal/db/repo_editor.go
++++ b/internal/db/repo_editor.go
+@@ -334,25 +334,23 @@
+ type UploadRepoFileOptions struct {
+ 	LastCommitID string
+ 	OldBranch    string
+ 	NewBranch    string
+ 	TreePath     string
+ 	Message      string
+ 	Files        []string // In UUID format
+ }
+ func isRepositoryGitPath(path string) bool {
+ 	return strings.HasSuffix(path, ".git") ||
+-		strings.Contains(path, ".git/") ||
+-		strings.Contains(path, `.git\`) ||
++		strings.Contains(path, ".git"+string(os.PathSeparator)) ||
+ 		strings.HasSuffix(path, ".git.") ||
+-		strings.Contains(path, ".git./") ||
+-		strings.Contains(path, `.git.\`)
++		strings.Contains(path, ".git."+string(os.PathSeparator))
+ }
+ func (repo *Repository) UploadRepoFiles(doer *User, opts UploadRepoFileOptions) error {
+ 	if len(opts.Files) == 0 {
+ 		return nil
+ 	}
+ 	if isRepositoryGitPath(opts.TreePath) {
+ 		return errors.Errorf("bad tree path %q", opts.TreePath)
+ 	}
+ 	uploads, err := GetUploadsByUUIDs(opts.Files)
+ 	if err != nil {
+
+--- a/internal/pathutil/pathutil.go
++++ b/internal/pathutil/pathutil.go
+@@ -1,9 +1,8 @@
+ package pathutil
+ import (
+ 	"path"
+ 	"strings"
+ )
+ func Clean(p string) string {
+-	p = strings.ReplaceAll(p, `\`, "/")
+ 	return strings.Trim(path.Clean("/"+p), "/")
+ }
+
+--- a/internal/route/repo/http.go
++++ b/internal/route/repo/http.go
+@@ -9,21 +9,20 @@
+ 	"path"
+ 	"path/filepath"
+ 	"strconv"
+ 	"strings"
+ 	"time"
+ 	"gopkg.in/macaron.v1"
+ 	log "unknwon.dev/clog/v2"
+ 	"gogs.io/gogs/internal/conf"
+ 	"gogs.io/gogs/internal/db"
+ 	"gogs.io/gogs/internal/lazyregexp"
+-	"gogs.io/gogs/internal/pathutil"
+ 	"gogs.io/gogs/internal/tool"
+ )
+ type HTTPContext struct {
+ 	*macaron.Context
+ 	OwnerName string
+ 	OwnerSalt string
+ 	RepoID    int64
+ 	RepoName  string
+ 	AuthUser  *db.User
+ }
+@@ -71,21 +70,21 @@
+ 			c.Map(&HTTPContext{
+ 				Context: c,
+ 			})
+ 			return
+ 		}
+ 		action := c.Params("*")
+ 		if !strings.Contains(action, "git-") &&
+ 			!strings.Contains(action, "info/") &&
+ 			!strings.Contains(action, "HEAD") &&
+ 			!strings.Contains(action, "objects/") {
+-			c.Error(http.StatusBadRequest, fmt.Sprintf("Unrecognized action %q", action))
++			c.NotFound()
+ 			return
+ 		}
+ 		authHead := c.Req.Header.Get("Authorization")
+ 		if len(authHead) == 0 {
+ 			askCredentials(c, http.StatusUnauthorized, "")
+ 			return
+ 		}
+ 		auths := strings.Fields(authHead)
+ 		if len(auths) != 2 || auths[0] != "Basic" {
+ 			askCredentials(c, http.StatusUnauthorized, "")
+@@ -325,40 +324,35 @@
+ 		reqPath := strings.ToLower(c.Req.URL.Path)
+ 		m := route.re.FindStringSubmatch(reqPath)
+ 		if m == nil {
+ 			continue
+ 		}
+ 		if conf.Repository.DisableHTTPGit {
+ 			c.Error(http.StatusForbidden, "Interacting with repositories by HTTP protocol is disabled")
+ 			return
+ 		}
+ 		if route.method != c.Req.Method {
+-			c.Error(http.StatusNotFound)
+-			return
+-		}
+-		cleaned := pathutil.Clean(m[1])
+-		if m[1] != "/"+cleaned {
+-			c.Error(http.StatusBadRequest, "Request path contains suspicious characters")
+-			return
+-		}
+-		file := strings.TrimPrefix(reqPath, cleaned)
+-		dir, err := getGitRepoPath(cleaned)
++			c.NotFound()
++			return
++		}
++		file := strings.TrimPrefix(reqPath, m[1]+"/")
++		dir, err := getGitRepoPath(m[1])
+ 		if err != nil {
+ 			log.Warn("HTTP.getGitRepoPath: %v", err)
+-			c.Error(http.StatusNotFound)
++			c.NotFound()
+ 			return
+ 		}
+ 		route.handler(serviceHandler{
+ 			w:    c.Resp,
+ 			r:    c.Req.Request,
+ 			dir:  dir,
+ 			file: file,
+ 			authUser:  c.AuthUser,
+ 			ownerName: c.OwnerName,
+ 			ownerSalt: c.OwnerSalt,
+ 			repoID:    c.RepoID,
+ 			repoName:  c.RepoName,
+ 		})
+ 		return
+ 	}
+-	c.Error(http.StatusNotFound)
+-}
++	c.NotFound()
++}

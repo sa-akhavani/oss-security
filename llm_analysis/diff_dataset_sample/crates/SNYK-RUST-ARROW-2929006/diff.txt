@@ -1,0 +1,1724 @@
+--- a/arrow/src/array/array_binary.rs
++++ b/arrow/src/array/array_binary.rs
+@@ -996,38 +996,11 @@
+             Some(vec![7, 8]),
+             Some(vec![9, 10]),
+             None,
+             Some(vec![13, 14]),
+         ];
+         let arr =
+             FixedSizeBinaryArray::try_from_sparse_iter(input_arg.into_iter()).unwrap();
+         assert_eq!(2, arr.value_length());
+         assert_eq!(5, arr.len())
+     }
+-    #[test]
+-    fn test_binary_array_all_null() {
+-        let data = vec![None];
+-        let array = BinaryArray::from(data);
+-        array
+-            .data()
+-            .validate_full()
+-            .expect("All null array has valid array data");
+-    }
+-    #[test]
+-    fn test_large_binary_array_all_null() {
+-        let data = vec![None];
+-        let array = LargeBinaryArray::from(data);
+-        array
+-            .data()
+-            .validate_full()
+-            .expect("All null array has valid array data");
+-    }
+-    #[test]
+-    fn fixed_size_binary_array_all_null() {
+-        let data = vec![None] as Vec<Option<String>>;
+-        let array = FixedSizeBinaryArray::try_from_sparse_iter(data.into_iter()).unwrap();
+-        array
+-            .data()
+-            .validate_full()
+-            .expect("All null array has valid array data");
+-    }
+-}
++}
+
+--- a/arrow/src/array/array_dictionary.rs
++++ b/arrow/src/array/array_dictionary.rs
+@@ -263,20 +263,11 @@
+         assert!(keys.is_valid(0));
+         assert!(!keys.is_valid(1));
+         assert!(keys.is_valid(2));
+         assert!(!keys.is_valid(3));
+         assert!(!keys.is_valid(4));
+         assert!(keys.is_valid(5));
+         assert_eq!(0, keys.value(0));
+         assert_eq!(1, keys.value(2));
+         assert_eq!(0, keys.value(5));
+     }
+-    #[test]
+-    fn test_dictionary_all_nulls() {
+-        let test = vec![None, None, None];
+-        let array: DictionaryArray<Int32Type> = test.into_iter().collect();
+-        array
+-            .data()
+-            .validate_full()
+-            .expect("All null array has valid array data");
+-    }
+-}
++}
+
+--- a/arrow/src/array/array_string.rs
++++ b/arrow/src/array/array_string.rs
+@@ -396,28 +396,19 @@
+                     None
+                 }
+             })
+             .take(100);
+         let (_, upper_size_bound) = string_iter.size_hint();
+         assert_eq!(upper_size_bound, Some(100));
+         let string_array: StringArray = string_iter.collect();
+         assert_eq!(string_array.len(), 10);
+     }
+     #[test]
+-    fn test_string_array_all_null() {
+-        let data = vec![None];
++    fn test_string_array_from_string_vec() {
++        let data = vec!["Foo".to_owned(), "Bar".to_owned(), "Baz".to_owned()];
+         let array = StringArray::from(data);
+-        array
+-            .data()
+-            .validate_full()
+-            .expect("All null array has valid array data");
+-    }
+-    #[test]
+-    fn test_large_string_array_all_null() {
+-        let data = vec![None];
+-        let array = LargeStringArray::from(data);
+-        array
+-            .data()
+-            .validate_full()
+-            .expect("All null array has valid array data");
+-    }
+-}
++        assert_eq!(array.len(), 3);
++        assert_eq!(array.value(0), "Foo");
++        assert_eq!(array.value(1), "Bar");
++        assert_eq!(array.value(2), "Baz");
++    }
++}
+
+--- a/arrow/src/array/data.rs
++++ b/arrow/src/array/data.rs
+@@ -1,13 +1,12 @@
+ use std::convert::TryInto;
+ use std::mem;
+-use std::ops::Range;
+ use std::sync::Arc;
+ use crate::datatypes::{DataType, IntervalUnit};
+ use crate::error::{ArrowError, Result};
+ use crate::{bitmap::Bitmap, datatypes::ArrowNativeType};
+ use crate::{
+     buffer::{Buffer, MutableBuffer},
+     util::bit_util,
+ };
+ use super::equal::equal;
+ #[inline]
+@@ -240,21 +239,21 @@
+             Self::new_unchecked(
+                 data_type,
+                 len,
+                 null_count,
+                 null_bit_buffer,
+                 offset,
+                 buffers,
+                 child_data,
+             )
+         };
+-        new_self.validate_full()?;
++        new_self.validate()?;
+         Ok(new_self)
+     }
+     #[inline]
+     pub const fn builder(data_type: DataType) -> ArrayDataBuilder {
+         ArrayDataBuilder::new(data_type)
+     }
+     #[inline]
+     pub const fn data_type(&self) -> &DataType {
+         &self.data_type
+     }
+@@ -505,47 +504,36 @@
+                     return Err(ArrowError::InvalidArgumentError(format!(
+                         "Dictionary values must be integer, but was {}",
+                         key_type
+                     )));
+                 }
+             }
+             _ => {}
+         };
+         Ok(())
+     }
+-    fn typed_offsets<'a, T: ArrowNativeType + num::Num + std::fmt::Display>(
+-        &'a self,
+-        buffer: &'a Buffer,
+-    ) -> Result<&'a [T]> {
++    fn validate_offsets<T: ArrowNativeType + num::Num + std::fmt::Display>(
++        &self,
++        buffer: &Buffer,
++        values_length: usize,
++    ) -> Result<()> {
+         let required_offsets = self.len + self.offset + 1;
+         if buffer.is_empty() {
+-            return Ok(&[]);
++            return Ok(());
+         }
+         if (buffer.len() / std::mem::size_of::<T>()) < required_offsets {
+             return Err(ArrowError::InvalidArgumentError(format!(
+                 "Offsets buffer size (bytes): {} isn't large enough for {}. Length {} needs {}",
+                 buffer.len(), self.data_type, self.len, required_offsets
+             )));
+         }
+-        Ok(unsafe {
+-            &(buffer.typed_data::<T>()[self.offset..self.offset + self.len + 1])
+-        })
+-    }
+-    fn validate_offsets<T: ArrowNativeType + num::Num + std::fmt::Display>(
+-        &self,
+-        buffer: &Buffer,
+-        values_length: usize,
+-    ) -> Result<()> {
+-        let offsets = self.typed_offsets::<T>(buffer)?;
+-        if offsets.is_empty() {
+-            return Ok(());
+-        }
++        let offsets = unsafe { &(buffer.typed_data::<T>()[self.offset..]) };
+         let first_offset = offsets[0].to_usize().ok_or_else(|| {
+             ArrowError::InvalidArgumentError(format!(
+                 "Error converting offset[0] ({}) to usize for {}",
+                 offsets[0], self.data_type
+             ))
+         })?;
+         let last_offset = offsets[self.len].to_usize().ok_or_else(|| {
+             ArrowError::InvalidArgumentError(format!(
+                 "Error converting offset[{}] ({}) to usize for {}",
+                 self.len, offsets[self.len], self.data_type
+@@ -667,206 +655,20 @@
+                 ))
+             })?;
+         if expected_type != &values_data.data_type {
+             return Err(ArrowError::InvalidArgumentError(format!(
+                 "Child type mismatch for {}. Expected {} but child data had {}",
+                 self.data_type, expected_type, values_data.data_type
+             )));
+         }
+         values_data.validate()?;
+         Ok(values_data)
+-    }
+-    pub fn validate_full(&self) -> Result<()> {
+-        self.validate()?;
+-        let null_bitmap_buffer = self
+-            .null_bitmap
+-            .as_ref()
+-            .map(|null_bitmap| null_bitmap.buffer_ref());
+-        let actual_null_count = count_nulls(null_bitmap_buffer, self.offset, self.len);
+-        if actual_null_count != self.null_count {
+-            return Err(ArrowError::InvalidArgumentError(format!(
+-                "null_count value ({}) doesn't match actual number of nulls in array ({})",
+-                self.null_count, actual_null_count
+-            )));
+-        }
+-        match &self.data_type {
+-            DataType::Utf8 => {
+-                self.validate_utf8::<i32>()?;
+-            }
+-            DataType::LargeUtf8 => {
+-                self.validate_utf8::<i64>()?;
+-            }
+-            DataType::Binary => {
+-                self.validate_offsets_full::<i32>(self.buffers[1].len())?;
+-            }
+-            DataType::LargeBinary => {
+-                self.validate_offsets_full::<i64>(self.buffers[1].len())?;
+-            }
+-            DataType::List(_) | DataType::Map(_, _) => {
+-                let child = &self.child_data[0];
+-                self.validate_offsets_full::<i32>(child.len + child.offset)?;
+-            }
+-            DataType::LargeList(_) => {
+-                let child = &self.child_data[0];
+-                self.validate_offsets_full::<i64>(child.len + child.offset)?;
+-            }
+-            DataType::Union(_) => {
+-            }
+-            DataType::Dictionary(key_type, _value_type) => {
+-                let dictionary_length: i64 = self.child_data[0].len.try_into().unwrap();
+-                let max_value = dictionary_length - 1;
+-                match key_type.as_ref() {
+-                    DataType::UInt8 => self.check_bounds::<u8>(max_value)?,
+-                    DataType::UInt16 => self.check_bounds::<u16>(max_value)?,
+-                    DataType::UInt32 => self.check_bounds::<u32>(max_value)?,
+-                    DataType::UInt64 => self.check_bounds::<u64>(max_value)?,
+-                    DataType::Int8 => self.check_bounds::<i8>(max_value)?,
+-                    DataType::Int16 => self.check_bounds::<i16>(max_value)?,
+-                    DataType::Int32 => self.check_bounds::<i32>(max_value)?,
+-                    DataType::Int64 => self.check_bounds::<i64>(max_value)?,
+-                    _ => unreachable!(),
+-                }
+-            }
+-            _ => {
+-            }
+-        };
+-        self.child_data
+-            .iter()
+-            .enumerate()
+-            .try_for_each(|(i, child_data)| {
+-                child_data.validate_full().map_err(|e| {
+-                    ArrowError::InvalidArgumentError(format!(
+-                        "{} child #{} invalid: {}",
+-                        self.data_type, i, e
+-                    ))
+-                })
+-            })?;
+-        Ok(())
+-    }
+-    fn validate_each_offset<T, V>(
+-        &self,
+-        offset_buffer: &Buffer,
+-        offset_limit: usize,
+-        validate: V,
+-    ) -> Result<()>
+-    where
+-        T: ArrowNativeType + std::convert::TryInto<usize> + num::Num + std::fmt::Display,
+-        V: Fn(usize, Range<usize>) -> Result<()>,
+-    {
+-        if self.len == 0 && offset_buffer.is_empty() {
+-            return Ok(());
+-        }
+-        let offsets = self.typed_offsets::<T>(offset_buffer)?;
+-        offsets
+-            .iter()
+-            .zip(offsets.iter().skip(1))
+-            .enumerate()
+-            .map(|(i, (&start_offset, &end_offset))| {
+-                let start_offset: usize = start_offset
+-                    .try_into()
+-                    .map_err(|_| {
+-                        ArrowError::InvalidArgumentError(format!(
+-                            "Offset invariant failure: could not convert start_offset {} to usize in slot {}",
+-                            start_offset, i))
+-                    })?;
+-                let end_offset: usize = end_offset
+-                    .try_into()
+-                    .map_err(|_| {
+-                        ArrowError::InvalidArgumentError(format!(
+-                            "Offset invariant failure: Could not convert end_offset {} to usize in slot {}",
+-                            end_offset, i+1))
+-                    })?;
+-                if start_offset > offset_limit {
+-                    return Err(ArrowError::InvalidArgumentError(format!(
+-                        "Offset invariant failure: offset for slot {} out of bounds: {} > {}",
+-                        i, start_offset, offset_limit))
+-                    );
+-                }
+-                if end_offset > offset_limit {
+-                    return Err(ArrowError::InvalidArgumentError(format!(
+-                        "Offset invariant failure: offset for slot {} out of bounds: {} > {}",
+-                        i, end_offset, offset_limit))
+-                    );
+-                }
+-                if start_offset > end_offset {
+-                    return Err(ArrowError::InvalidArgumentError(format!(
+-                        "Offset invariant failure: non-monotonic offset at slot {}: {} > {}",
+-                        i, start_offset, end_offset))
+-                    );
+-                }
+-                Ok((i, start_offset..end_offset))
+-            })
+-            .try_for_each(|res: Result<(usize, Range<usize>)>| {
+-                let (item_index, range) = res?;
+-                validate(item_index, range)
+-            })
+-    }
+-    fn validate_utf8<T>(&self) -> Result<()>
+-    where
+-        T: ArrowNativeType + std::convert::TryInto<usize> + num::Num + std::fmt::Display,
+-    {
+-        let offset_buffer = &self.buffers[0];
+-        let values_buffer = &self.buffers[1].as_slice();
+-        self.validate_each_offset::<T, _>(
+-            offset_buffer,
+-            values_buffer.len(),
+-            |string_index, range| {
+-                std::str::from_utf8(&values_buffer[range.clone()]).map_err(|e| {
+-                    ArrowError::InvalidArgumentError(format!(
+-                        "Invalid UTF8 sequence at string index {} ({:?}): {}",
+-                        string_index, range, e
+-                    ))
+-                })?;
+-                Ok(())
+-            },
+-        )
+-    }
+-    fn validate_offsets_full<T>(&self, offset_limit: usize) -> Result<()>
+-    where
+-        T: ArrowNativeType + std::convert::TryInto<usize> + num::Num + std::fmt::Display,
+-    {
+-        let offset_buffer = &self.buffers[0];
+-        self.validate_each_offset::<T, _>(
+-            offset_buffer,
+-            offset_limit,
+-            |_string_index, _range| {
+-                Ok(())
+-            },
+-        )
+-    }
+-    fn check_bounds<T>(&self, max_value: i64) -> Result<()>
+-    where
+-        T: ArrowNativeType + std::convert::TryInto<i64> + num::Num + std::fmt::Display,
+-    {
+-        let required_len = self.len + self.offset;
+-        let buffer = &self.buffers[0];
+-        assert!(buffer.len() / std::mem::size_of::<T>() >= required_len);
+-        let indexes: &[T] =
+-            unsafe { &(buffer.typed_data::<T>()[self.offset..self.offset + self.len]) };
+-        indexes.iter().enumerate().try_for_each(|(i, &dict_index)| {
+-            if self.is_null(i) {
+-                return Ok(());
+-            }
+-            let dict_index: i64 = dict_index.try_into().map_err(|_| {
+-                ArrowError::InvalidArgumentError(format!(
+-                    "Value at position {} out of bounds: {} (can not convert to i64)",
+-                    i, dict_index
+-                ))
+-            })?;
+-            if dict_index < 0 || dict_index > max_value {
+-                return Err(ArrowError::InvalidArgumentError(format!(
+-                    "Value at position {} out of bounds: {} (should be in [0, {}])",
+-                    i, dict_index, max_value
+-                )));
+-            }
+-            Ok(())
+-        })
+     }
+ }
+ fn layout(data_type: &DataType) -> DataTypeLayout {
+     use std::mem::size_of;
+     match data_type {
+         DataType::Null => DataTypeLayout::new_empty(),
+         DataType::Boolean => DataTypeLayout {
+             buffers: vec![BufferSpec::BitMap],
+         },
+         DataType::Int8 => DataTypeLayout::new_fixed_width(size_of::<i8>()),
+@@ -1033,21 +835,20 @@
+             self.buffers,
+             self.child_data,
+         )
+     }
+ }
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crate::array::{
+         Array, BooleanBuilder, Int32Array, Int32Builder, StringArray, StructBuilder,
+-        UInt64Array,
+     };
+     use crate::buffer::Buffer;
+     use crate::datatypes::Field;
+     use crate::util::bit_util;
+     #[test]
+     fn test_builder() {
+         let v = (0..25).collect::<Vec<i32>>();
+         let b1 = Buffer::from_slice_ref(&v);
+         let arr_data = ArrayData::builder(DataType::Int32)
+             .len(20)
+@@ -1493,306 +1294,20 @@
+         ArrayData::try_new(
+             DataType::Struct(vec![Field::new("field1", DataType::Int32, true)]),
+             6,
+             None,
+             None,
+             0,
+             vec![],
+             vec![field1.data().clone()],
+         )
+         .unwrap();
+-    }
+-    fn check_utf8_validation<T: ArrowNativeType>(data_type: DataType) {
+-        let data_buffer = Buffer::from_slice_ref(&[b'a', b'a', 0x80, 0x00]);
+-        let offsets: Vec<T> = [0, 2, 3]
+-            .iter()
+-            .map(|&v| T::from_usize(v).unwrap())
+-            .collect();
+-        let offsets_buffer = Buffer::from_slice_ref(&offsets);
+-        ArrayData::try_new(
+-            data_type,
+-            2,
+-            None,
+-            None,
+-            0,
+-            vec![offsets_buffer, data_buffer],
+-            vec![],
+-        )
+-        .unwrap();
+-    }
+-    #[test]
+-    #[should_panic(expected = "Invalid UTF8 sequence at string index 1 (2..3)")]
+-    fn test_validate_utf8_content() {
+-        check_utf8_validation::<i32>(DataType::Utf8);
+-    }
+-    #[test]
+-    #[should_panic(expected = "Invalid UTF8 sequence at string index 1 (2..3)")]
+-    fn test_validate_large_utf8_content() {
+-        check_utf8_validation::<i64>(DataType::LargeUtf8);
+-    }
+-    fn check_index_out_of_bounds_validation<T: ArrowNativeType>(data_type: DataType) {
+-        let data_buffer = Buffer::from_slice_ref(&[b'a', b'b', b'c', b'd']);
+-        let offsets: Vec<T> = [0, 1, 2, 5, 2]
+-            .iter()
+-            .map(|&v| T::from_usize(v).unwrap())
+-            .collect();
+-        let offsets_buffer = Buffer::from_slice_ref(&offsets);
+-        ArrayData::try_new(
+-            data_type,
+-            4,
+-            None,
+-            None,
+-            0,
+-            vec![offsets_buffer, data_buffer],
+-            vec![],
+-        )
+-        .unwrap();
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Offset invariant failure: offset for slot 2 out of bounds: 5 > 4"
+-    )]
+-    fn test_validate_utf8_out_of_bounds() {
+-        check_index_out_of_bounds_validation::<i32>(DataType::Utf8);
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Offset invariant failure: offset for slot 2 out of bounds: 5 > 4"
+-    )]
+-    fn test_validate_large_utf8_out_of_bounds() {
+-        check_index_out_of_bounds_validation::<i64>(DataType::LargeUtf8);
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Offset invariant failure: offset for slot 2 out of bounds: 5 > 4"
+-    )]
+-    fn test_validate_binary_out_of_bounds() {
+-        check_index_out_of_bounds_validation::<i32>(DataType::Binary);
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Offset invariant failure: offset for slot 2 out of bounds: 5 > 4"
+-    )]
+-    fn test_validate_large_binary_out_of_bounds() {
+-        check_index_out_of_bounds_validation::<i64>(DataType::LargeBinary);
+-    }
+-    fn check_index_backwards_validation<T: ArrowNativeType>(data_type: DataType) {
+-        let data_buffer = Buffer::from_slice_ref(&[b'a', b'b', b'c', b'd']);
+-        let offsets: Vec<T> = [0, 1, 2, 2, 1]
+-            .iter()
+-            .map(|&v| T::from_usize(v).unwrap())
+-            .collect();
+-        let offsets_buffer = Buffer::from_slice_ref(&offsets);
+-        ArrayData::try_new(
+-            data_type,
+-            4,
+-            None,
+-            None,
+-            0,
+-            vec![offsets_buffer, data_buffer],
+-            vec![],
+-        )
+-        .unwrap();
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Offset invariant failure: non-monotonic offset at slot 3: 2 > 1"
+-    )]
+-    fn test_validate_utf8_index_backwards() {
+-        check_index_backwards_validation::<i32>(DataType::Utf8);
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Offset invariant failure: non-monotonic offset at slot 3: 2 > 1"
+-    )]
+-    fn test_validate_large_utf8_index_backwards() {
+-        check_index_backwards_validation::<i64>(DataType::LargeUtf8);
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Offset invariant failure: non-monotonic offset at slot 3: 2 > 1"
+-    )]
+-    fn test_validate_binary_index_backwards() {
+-        check_index_backwards_validation::<i32>(DataType::Binary);
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Offset invariant failure: non-monotonic offset at slot 3: 2 > 1"
+-    )]
+-    fn test_validate_large_binary_index_backwards() {
+-        check_index_backwards_validation::<i64>(DataType::LargeBinary);
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Value at position 1 out of bounds: 3 (should be in [0, 1])"
+-    )]
+-    fn test_validate_dictionary_index_too_large() {
+-        let values: StringArray = [Some("foo"), Some("bar")].iter().collect();
+-        let keys: Int32Array = [Some(1), Some(3)].iter().collect();
+-        let data_type = DataType::Dictionary(
+-            Box::new(keys.data_type().clone()),
+-            Box::new(values.data_type().clone()),
+-        );
+-        ArrayData::try_new(
+-            data_type,
+-            2,
+-            None,
+-            None,
+-            0,
+-            vec![keys.data().buffers[0].clone()],
+-            vec![values.data().clone()],
+-        )
+-        .unwrap();
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Value at position 1 out of bounds: -1 (should be in [0, 1]"
+-    )]
+-    fn test_validate_dictionary_index_negative() {
+-        let values: StringArray = [Some("foo"), Some("bar")].iter().collect();
+-        let keys: Int32Array = [Some(1), Some(-1)].iter().collect();
+-        let data_type = DataType::Dictionary(
+-            Box::new(keys.data_type().clone()),
+-            Box::new(values.data_type().clone()),
+-        );
+-        ArrayData::try_new(
+-            data_type,
+-            2,
+-            None,
+-            None,
+-            0,
+-            vec![keys.data().buffers[0].clone()],
+-            vec![values.data().clone()],
+-        )
+-        .unwrap();
+-    }
+-    #[test]
+-    fn test_validate_dictionary_index_negative_but_not_referenced() {
+-        let values: StringArray = [Some("foo"), Some("bar")].iter().collect();
+-        let keys: Int32Array = [Some(1), Some(-1)].iter().collect();
+-        let data_type = DataType::Dictionary(
+-            Box::new(keys.data_type().clone()),
+-            Box::new(values.data_type().clone()),
+-        );
+-        ArrayData::try_new(
+-            data_type,
+-            1,
+-            None,
+-            None,
+-            0,
+-            vec![keys.data().buffers[0].clone()],
+-            vec![values.data().clone()],
+-        )
+-        .unwrap();
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Value at position 0 out of bounds: 18446744073709551615 (can not convert to i64)"
+-    )]
+-    fn test_validate_dictionary_index_giant_negative() {
+-        let values: StringArray = [Some("foo"), Some("bar")].iter().collect();
+-        let keys: UInt64Array = [Some(u64::MAX), Some(1)].iter().collect();
+-        let data_type = DataType::Dictionary(
+-            Box::new(keys.data_type().clone()),
+-            Box::new(values.data_type().clone()),
+-        );
+-        ArrayData::try_new(
+-            data_type,
+-            2,
+-            None,
+-            None,
+-            0,
+-            vec![keys.data().buffers[0].clone()],
+-            vec![values.data().clone()],
+-        )
+-        .unwrap();
+-    }
+-    fn check_list_offsets<T: ArrowNativeType>(data_type: DataType) {
+-        let values: Int32Array = [Some(1), Some(2), Some(3), Some(4)].iter().collect();
+-        let offsets: Vec<T> = [0, 2, 5, 4]
+-            .iter()
+-            .map(|&v| T::from_usize(v).unwrap())
+-            .collect();
+-        let offsets_buffer = Buffer::from_slice_ref(&offsets);
+-        ArrayData::try_new(
+-            data_type,
+-            3,
+-            None,
+-            None,
+-            0,
+-            vec![offsets_buffer],
+-            vec![values.data().clone()],
+-        )
+-        .unwrap();
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Offset invariant failure: offset for slot 1 out of bounds: 5 > 4"
+-    )]
+-    fn test_validate_list_offsets() {
+-        let field_type = Field::new("f", DataType::Int32, true);
+-        check_list_offsets::<i32>(DataType::List(Box::new(field_type)));
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Offset invariant failure: offset for slot 1 out of bounds: 5 > 4"
+-    )]
+-    fn test_validate_large_list_offsets() {
+-        let field_type = Field::new("f", DataType::Int32, true);
+-        check_list_offsets::<i64>(DataType::LargeList(Box::new(field_type)));
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "Offset invariant failure: Could not convert end_offset -1 to usize in slot 2"
+-    )]
+-    fn test_validate_list_negative_offsets() {
+-        let values: Int32Array = [Some(1), Some(2), Some(3), Some(4)].iter().collect();
+-        let field_type = Field::new("f", values.data_type().clone(), true);
+-        let data_type = DataType::List(Box::new(field_type));
+-        let offsets: Vec<i32> = vec![0, 2, -1, 4];
+-        let offsets_buffer = Buffer::from_slice_ref(&offsets);
+-        ArrayData::try_new(
+-            data_type,
+-            3,
+-            None,
+-            None,
+-            0,
+-            vec![offsets_buffer],
+-            vec![values.data().clone()],
+-        )
+-        .unwrap();
+-    }
+-    #[test]
+-    #[should_panic(
+-        expected = "child #0 invalid: Invalid argument error: Value at position 1 out of bounds: -1 (should be in [0, 1])"
+-    )]
+-    fn test_validate_recursive() {
+-        let values: StringArray = [Some("foo"), Some("bar")].iter().collect();
+-        let keys: Int32Array = [Some(1), Some(-1), Some(1)].iter().collect();
+-        let dict_data_type = DataType::Dictionary(
+-            Box::new(keys.data_type().clone()),
+-            Box::new(values.data_type().clone()),
+-        );
+-        let dict_data = unsafe {
+-            ArrayData::new_unchecked(
+-                dict_data_type,
+-                2,
+-                None,
+-                None,
+-                0,
+-                vec![keys.data().buffers[0].clone()],
+-                vec![values.data().clone()],
+-            )
+-        };
+-        let data_type =
+-            DataType::Struct(vec![Field::new("d", dict_data.data_type().clone(), true)]);
+-        ArrayData::try_new(data_type, 1, None, None, 0, vec![], vec![dict_data]).unwrap();
+     }
+     fn make_i32_buffer(n: usize) -> Buffer {
+         Buffer::from_slice_ref(&vec![42i32; n])
+     }
+     fn make_f32_buffer(n: usize) -> Buffer {
+         Buffer::from_slice_ref(&vec![42f32; n])
+     }
+     #[test]
+     fn test_try_new_sliced_struct() {
+         let mut builder = StructBuilder::new(
+
+--- a/arrow/src/array/equal/utils.rs
++++ b/arrow/src/array/equal/utils.rs
+@@ -82,46 +82,46 @@
+         DataType::LargeList(_) => Some(logical_list_bitmap::<i64>(
+             parent_data,
+             parent_bitmap,
+             self_null_bitmap,
+         )),
+         DataType::FixedSizeList(_, len) => {
+             let len = *len as usize;
+             let array_offset = parent_data.offset();
+             let bitmap_len = bit_util::ceil(parent_len * len, 8);
+             let mut buffer = MutableBuffer::from_len_zeroed(bitmap_len);
+-            let null_slice = buffer.as_slice_mut();
++            let mut null_slice = buffer.as_slice_mut();
+             (array_offset..parent_len + array_offset).for_each(|index| {
+                 let start = index * len;
+                 let end = start + len;
+                 let mask = parent_bitmap.is_set(index);
+                 (start..end).for_each(|child_index| {
+                     if mask && self_null_bitmap.is_set(child_index) {
+-                        bit_util::set_bit(null_slice, child_index);
++                        bit_util::set_bit(&mut null_slice, child_index);
+                     }
+                 });
+             });
+             Some(buffer.into())
+         }
+         DataType::Struct(_) => {
+             let result = &parent_bitmap & &self_null_bitmap;
+             if let Ok(bitmap) = result {
+                 return Some(bitmap.bits);
+             }
+             let array_offset = parent_data.offset();
+             let mut buffer = MutableBuffer::new_null(parent_len);
+-            let null_slice = buffer.as_slice_mut();
++            let mut null_slice = buffer.as_slice_mut();
+             (0..parent_len).for_each(|index| {
+                 if parent_bitmap.is_set(index + array_offset)
+                     && self_null_bitmap.is_set(index + array_offset)
+                 {
+-                    bit_util::set_bit(null_slice, index);
++                    bit_util::set_bit(&mut null_slice, index);
+                 }
+             });
+             Some(buffer.into())
+         }
+         DataType::Union(_) => {
+             unimplemented!("Logical equality not yet implemented for union arrays")
+         }
+         DataType::Dictionary(_, _) => {
+             unimplemented!("Logical equality not yet implemented for nested dictionaries")
+         }
+@@ -131,32 +131,32 @@
+ #[inline]
+ fn logical_list_bitmap<OffsetSize: OffsetSizeTrait>(
+     parent_data: &ArrayData,
+     parent_bitmap: Bitmap,
+     child_bitmap: Bitmap,
+ ) -> Buffer {
+     let offsets = parent_data.buffer::<OffsetSize>(0);
+     let offset_start = offsets.first().unwrap().to_usize().unwrap();
+     let offset_len = offsets.get(parent_data.len()).unwrap().to_usize().unwrap();
+     let mut buffer = MutableBuffer::new_null(offset_len - offset_start);
+-    let null_slice = buffer.as_slice_mut();
++    let mut null_slice = buffer.as_slice_mut();
+     offsets
+         .windows(2)
+         .enumerate()
+         .take(parent_data.len())
+         .for_each(|(index, window)| {
+             let start = window[0].to_usize().unwrap();
+             let end = window[1].to_usize().unwrap();
+             let mask = parent_bitmap.is_set(index);
+             (start..end).for_each(|child_index| {
+                 if mask && child_bitmap.is_set(child_index) {
+-                    bit_util::set_bit(null_slice, child_index - offset_start);
++                    bit_util::set_bit(&mut null_slice, child_index - offset_start);
+                 }
+             });
+         });
+     buffer.into()
+ }
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crate::datatypes::{Field, ToByteSlice};
+     #[test]
+
+--- a/arrow/src/array/transform/boolean.rs
++++ b/arrow/src/array/transform/boolean.rs
+@@ -3,21 +3,21 @@
+     Extend, _MutableArrayData,
+     utils::{resize_for_bits, set_bits},
+ };
+ pub(super) fn build_extend(array: &ArrayData) -> Extend {
+     let values = array.buffers()[0].as_slice();
+     Box::new(
+         move |mutable: &mut _MutableArrayData, _, start: usize, len: usize| {
+             let buffer = &mut mutable.buffer1;
+             resize_for_bits(buffer, mutable.len + len);
+             set_bits(
+-                buffer.as_slice_mut(),
++                &mut buffer.as_slice_mut(),
+                 values,
+                 mutable.len,
+                 array.offset() + start,
+                 len,
+             );
+         },
+     )
+ }
+ pub(super) fn extend_nulls(mutable: &mut _MutableArrayData, len: usize) {
+     let buffer = &mut mutable.buffer1;
+
+--- a/arrow/src/buffer/mutable.rs
++++ b/arrow/src/buffer/mutable.rs
+@@ -1,18 +1,18 @@
+-use super::Buffer;
++use std::ptr::NonNull;
+ use crate::{
+     alloc,
+     bytes::{Bytes, Deallocation},
+     datatypes::{ArrowNativeType, ToByteSlice},
+     util::bit_util,
+ };
+-use std::ptr::NonNull;
++use super::Buffer;
+ #[derive(Debug)]
+ pub struct MutableBuffer {
+     data: NonNull<u8>,
+     len: usize,
+     capacity: usize,
+ }
+ impl MutableBuffer {
+     #[inline]
+     pub fn new(capacity: usize) -> Self {
+         Self::with_capacity(capacity)
+
+--- a/arrow/src/compute/kernels/cast.rs
++++ b/arrow/src/compute/kernels/cast.rs
+@@ -1292,31 +1292,31 @@
+         .as_any()
+         .downcast_ref::<DictionaryArray<K>>()
+         .ok_or_else(|| {
+             ArrowError::ComputeError(
+                 "Internal Error: Cannot cast dictionary to DictionaryArray of expected type".to_string(),
+             )
+         })?;
+     let cast_dict_values = cast_with_options(dict_array.values(), to_type, cast_options)?;
+     let keys_array: ArrayRef =
+         Arc::new(PrimitiveArray::<K>::from(dict_array.keys().data().clone()));
+-    let indices = cast_with_options(&keys_array, &DataType::UInt32, cast_options)?;
+-    let u32_indices =
+-        indices
++    let indicies = cast_with_options(&keys_array, &DataType::UInt32, cast_options)?;
++    let u32_indicies =
++        indicies
+             .as_any()
+             .downcast_ref::<UInt32Array>()
+             .ok_or_else(|| {
+                 ArrowError::ComputeError(
+                     "Internal Error: Cannot cast dict indices to UInt32".to_string(),
+                 )
+             })?;
+-    take(cast_dict_values.as_ref(), u32_indices, None)
++    take(cast_dict_values.as_ref(), u32_indicies, None)
+ }
+ fn cast_to_dictionary<K: ArrowDictionaryKeyType>(
+     array: &ArrayRef,
+     dict_value_type: &DataType,
+     cast_options: &CastOptions,
+ ) -> Result<ArrayRef> {
+     use DataType::*;
+     match *dict_value_type {
+         Int8 => pack_numeric_to_dictionary::<K, Int8Type>(
+             array,
+
+--- a/arrow/src/compute/kernels/comparison.rs
++++ b/arrow/src/compute/kernels/comparison.rs
+@@ -607,32 +607,20 @@
+                 .null_bitmap()
+                 .as_ref()
+                 .map(|b| b.bits.bit_slice(left_offset, len)),
+             0,
+             vec![values],
+             vec![],
+         )
+     };
+     Ok(BooleanArray::from(data))
+ }
+-pub fn lt_bool_scalar(left: &BooleanArray, right: bool) -> Result<BooleanArray> {
+-    compare_op_scalar!(left, right, |a: bool, b: bool| !a & b)
+-}
+-pub fn lt_eq_bool_scalar(left: &BooleanArray, right: bool) -> Result<BooleanArray> {
+-    compare_op_scalar!(left, right, |a, b| a <= b)
+-}
+-pub fn gt_bool_scalar(left: &BooleanArray, right: bool) -> Result<BooleanArray> {
+-    compare_op_scalar!(left, right, |a: bool, b: bool| a & !b)
+-}
+-pub fn gt_eq_bool_scalar(left: &BooleanArray, right: bool) -> Result<BooleanArray> {
+-    compare_op_scalar!(left, right, |a, b| a >= b)
+-}
+ pub fn neq_bool_scalar(left: &BooleanArray, right: bool) -> Result<BooleanArray> {
+     eq_bool_scalar(left, !right)
+ }
+ pub fn neq_utf8<OffsetSize: StringOffsetSizeTrait>(
+     left: &GenericStringArray<OffsetSize>,
+     right: &GenericStringArray<OffsetSize>,
+ ) -> Result<BooleanArray> {
+     compare_op!(left, right, |a, b| a != b)
+ }
+ pub fn neq_utf8_scalar<OffsetSize: StringOffsetSizeTrait>(
+@@ -706,21 +694,24 @@
+     if len != right.len() {
+         return Err(ArrowError::ComputeError(
+             "Cannot perform comparison operation on arrays of different length"
+                 .to_string(),
+         ));
+     }
+     let null_bit_buffer = combine_option_bitmap(left.data_ref(), right.data_ref(), len)?;
+     let lanes = T::lanes();
+     let buffer_size = bit_util::ceil(len, 8);
+     let mut result = MutableBuffer::new(buffer_size).with_bitset(buffer_size, false);
+-    assert_eq!(lanes % 8, 0, "Number of vector lanes must be multiple of 8");
++    assert!(
++        lanes % 8 == 0,
++        "Number of vector lanes must be multiple of 8"
++    );
+     let mut left_chunks = left.values().chunks_exact(lanes);
+     let mut right_chunks = right.values().chunks_exact(lanes);
+     let result_remainder = left_chunks
+         .borrow_mut()
+         .zip(right_chunks.borrow_mut())
+         .fold(
+             result.typed_data_mut(),
+             |result_slice, (left_slice, right_slice)| {
+                 let simd_left = T::load(left_slice);
+                 let simd_right = T::load(right_slice);
+@@ -1337,56 +1328,20 @@
+     #[test]
+     fn test_boolean_array_neq_scalar() {
+         let a: BooleanArray = vec![Some(true), Some(false), None].into();
+         let res1: Vec<Option<bool>> =
+             neq_bool_scalar(&a, false).unwrap().iter().collect();
+         assert_eq!(res1, vec![Some(true), Some(false), None]);
+         let res2: Vec<Option<bool>> = neq_bool_scalar(&a, true).unwrap().iter().collect();
+         assert_eq!(res2, vec![Some(false), Some(true), None]);
+     }
+     #[test]
+-    fn test_boolean_array_lt_scalar() {
+-        let a: BooleanArray = vec![Some(true), Some(false), None].into();
+-        let res1: Vec<Option<bool>> = lt_bool_scalar(&a, false).unwrap().iter().collect();
+-        assert_eq!(res1, vec![Some(false), Some(false), None]);
+-        let res2: Vec<Option<bool>> = lt_bool_scalar(&a, true).unwrap().iter().collect();
+-        assert_eq!(res2, vec![Some(false), Some(true), None]);
+-    }
+-    #[test]
+-    fn test_boolean_array_lt_eq_scalar() {
+-        let a: BooleanArray = vec![Some(true), Some(false), None].into();
+-        let res1: Vec<Option<bool>> =
+-            lt_eq_bool_scalar(&a, false).unwrap().iter().collect();
+-        assert_eq!(res1, vec![Some(false), Some(true), None]);
+-        let res2: Vec<Option<bool>> =
+-            lt_eq_bool_scalar(&a, true).unwrap().iter().collect();
+-        assert_eq!(res2, vec![Some(true), Some(true), None]);
+-    }
+-    #[test]
+-    fn test_boolean_array_gt_scalar() {
+-        let a: BooleanArray = vec![Some(true), Some(false), None].into();
+-        let res1: Vec<Option<bool>> = gt_bool_scalar(&a, false).unwrap().iter().collect();
+-        assert_eq!(res1, vec![Some(true), Some(false), None]);
+-        let res2: Vec<Option<bool>> = gt_bool_scalar(&a, true).unwrap().iter().collect();
+-        assert_eq!(res2, vec![Some(false), Some(false), None]);
+-    }
+-    #[test]
+-    fn test_boolean_array_gt_eq_scalar() {
+-        let a: BooleanArray = vec![Some(true), Some(false), None].into();
+-        let res1: Vec<Option<bool>> =
+-            gt_eq_bool_scalar(&a, false).unwrap().iter().collect();
+-        assert_eq!(res1, vec![Some(true), Some(true), None]);
+-        let res2: Vec<Option<bool>> =
+-            gt_eq_bool_scalar(&a, true).unwrap().iter().collect();
+-        assert_eq!(res2, vec![Some(true), Some(false), None]);
+-    }
+-    #[test]
+     fn test_primitive_array_lt() {
+         cmp_i64!(
+             lt,
+             lt_dyn,
+             vec![8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+             vec![6, 7, 8, 9, 10, 6, 7, 8, 9, 10],
+             vec![false, false, false, true, true, false, false, false, true, true]
+         );
+     }
+     #[test]
+
+--- a/arrow/src/compute/kernels/filter.rs
++++ b/arrow/src/compute/kernels/filter.rs
+@@ -194,22 +194,22 @@
+     }
+ }
+ pub fn filter_record_batch(
+     record_batch: &RecordBatch,
+     predicate: &BooleanArray,
+ ) -> Result<RecordBatch> {
+     if predicate.null_count() > 0 {
+         let predicate = prep_null_mask_filter(predicate);
+         return filter_record_batch(record_batch, &predicate);
+     }
+-    let num_columns = record_batch.columns().len();
+-    let filtered_arrays = match num_columns {
++    let num_colums = record_batch.columns().len();
++    let filtered_arrays = match num_colums {
+         1 => {
+             vec![filter(record_batch.columns()[0].as_ref(), predicate)?]
+         }
+         _ => {
+             let filter = build_filter(predicate)?;
+             record_batch
+                 .columns()
+                 .iter()
+                 .map(|a| make_array(filter(a.data())))
+                 .collect()
+@@ -360,21 +360,21 @@
+     fn test_filter_string_array_simple() {
+         let a = StringArray::from(vec!["hello", " ", "world", "!"]);
+         let b = BooleanArray::from(vec![true, false, true, false]);
+         let c = filter(&a, &b).unwrap();
+         let d = c.as_ref().as_any().downcast_ref::<StringArray>().unwrap();
+         assert_eq!(2, d.len());
+         assert_eq!("hello", d.value(0));
+         assert_eq!("world", d.value(1));
+     }
+     #[test]
+-    fn test_filter_primitive_array_with_null() {
++    fn test_filter_primative_array_with_null() {
+         let a = Int32Array::from(vec![Some(5), None]);
+         let b = BooleanArray::from(vec![false, true]);
+         let c = filter(&a, &b).unwrap();
+         let d = c.as_ref().as_any().downcast_ref::<Int32Array>().unwrap();
+         assert_eq!(1, d.len());
+         assert!(d.is_null(0));
+     }
+     #[test]
+     fn test_filter_string_array_with_null() {
+         let a = StringArray::from(vec![Some("hello"), None, Some("world"), None]);
+
+--- a/arrow/src/compute/kernels/take.rs
++++ b/arrow/src/compute/kernels/take.rs
+@@ -230,23 +230,30 @@
+         DataType::Null => {
+             if values.len() >= indices.len() {
+                 Ok(values.slice(0, indices.len()))
+             } else {
+                 Ok(new_null_array(&DataType::Null, indices.len()))
+             }
+         }
+         t => unimplemented!("Take not supported for data type {:?}", t),
+     }
+ }
+-#[derive(Clone, Debug, Default)]
++#[derive(Clone, Debug)]
+ pub struct TakeOptions {
+     pub check_bounds: bool,
++}
++impl Default for TakeOptions {
++    fn default() -> Self {
++        Self {
++            check_bounds: false,
++        }
++    }
+ }
+ #[inline(always)]
+ fn maybe_usize<I: ArrowNativeType>(index: I) -> Result<usize> {
+     index
+         .to_usize()
+         .ok_or_else(|| ArrowError::ComputeError("Cast to usize failed".to_string()))
+ }
+ fn take_no_nulls<T, I>(values: &[T], indices: &[I]) -> Result<(Buffer, Option<Buffer>)>
+ where
+     T: ArrowNativeType,
+
+--- a/arrow/src/compute/util.rs
++++ b/arrow/src/compute/util.rs
+@@ -231,21 +231,21 @@
+         let mut values = vec![];
+         let list_len = data.len();
+         let num_bytes = bit_util::ceil(list_len, 8);
+         let mut list_null_count = 0;
+         let mut list_bitmap = MutableBuffer::new(num_bytes).with_bitset(num_bytes, true);
+         for (idx, array) in data.into_iter().enumerate() {
+             if let Some(mut array) = array {
+                 values.append(&mut array);
+             } else {
+                 list_null_count += 1;
+-                bit_util::unset_bit(list_bitmap.as_slice_mut(), idx);
++                bit_util::unset_bit(&mut list_bitmap.as_slice_mut(), idx);
+             }
+             offset.push(values.len() as i64);
+         }
+         let value_data = PrimitiveArray::<T>::from(values).data().clone();
+         let (list_data_type, value_offsets) = if TypeId::of::<S>() == TypeId::of::<i32>()
+         {
+             (
+                 DataType::List(Box::new(Field::new(
+                     "item",
+                     T::DATA_TYPE,
+@@ -308,21 +308,21 @@
+         let mut list_null_count = 0;
+         let list_len = list_values.len();
+         let num_bytes = bit_util::ceil(list_len, 8);
+         let mut list_bitmap = MutableBuffer::new(num_bytes).with_bitset(num_bytes, true);
+         for (idx, list_element) in list_values.into_iter().enumerate() {
+             if let Some(items) = list_element {
+                 debug_assert_eq!(length as usize, items.len());
+                 values.extend(items.into_iter());
+             } else {
+                 list_null_count += 1;
+-                bit_util::unset_bit(list_bitmap.as_slice_mut(), idx);
++                bit_util::unset_bit(&mut list_bitmap.as_slice_mut(), idx);
+                 values.extend(vec![None; length as usize].into_iter());
+             }
+         }
+         let list_data_type = DataType::FixedSizeList(
+             Box::new(Field::new("item", T::DATA_TYPE, list_null_count == 0)),
+             length,
+         );
+         let child_data = PrimitiveArray::<T>::from(values).data().clone();
+         let list_data = ArrayData::builder(list_data_type)
+             .len(list_len)
+
+--- a/arrow/src/datatypes/field.rs
++++ b/arrow/src/datatypes/field.rs
+@@ -220,21 +220,21 @@
+                         }
+                         None => {
+                             return Err(ArrowError::ParseError(
+                                 "Field missing 'children' attribute".to_string(),
+                             ));
+                         }
+                     },
+                     DataType::Struct(mut fields) => match map.get("children") {
+                         Some(Value::Array(values)) => {
+                             let struct_fields: Result<Vec<Field>> =
+-                                values.iter().map(Field::from).collect();
++                                values.iter().map(|v| Field::from(v)).collect();
+                             fields.append(&mut struct_fields?);
+                             DataType::Struct(fields)
+                         }
+                         Some(_) => {
+                             return Err(ArrowError::ParseError(
+                                 "Field 'children' must be an array".to_string(),
+                             ))
+                         }
+                         None => {
+                             return Err(ArrowError::ParseError(
+
+--- a/arrow/src/datatypes/schema.rs
++++ b/arrow/src/datatypes/schema.rs
+@@ -108,21 +108,24 @@
+     pub fn to_json(&self) -> Value {
+         json!({
+             "fields": self.fields.iter().map(|field| field.to_json()).collect::<Vec<Value>>(),
+             "metadata": serde_json::to_value(&self.metadata).unwrap()
+         })
+     }
+     pub fn from(json: &Value) -> Result<Self> {
+         match *json {
+             Value::Object(ref schema) => {
+                 let fields = if let Some(Value::Array(fields)) = schema.get("fields") {
+-                    fields.iter().map(Field::from).collect::<Result<_>>()?
++                    fields
++                        .iter()
++                        .map(|f| Field::from(f))
++                        .collect::<Result<_>>()?
+                 } else {
+                     return Err(ArrowError::ParseError(
+                         "Schema fields should be an array".to_string(),
+                     ));
+                 };
+                 let metadata = if let Some(value) = schema.get("metadata") {
+                     Self::from_metadata(value)?
+                 } else {
+                     HashMap::default()
+                 };
+
+--- a/arrow/src/ffi.rs
++++ b/arrow/src/ffi.rs
+@@ -49,23 +49,23 @@
+     private_data: *mut c_void,
+ }
+ struct SchemaPrivateData {
+     children: Box<[*mut FFI_ArrowSchema]>,
+ }
+ unsafe extern "C" fn release_schema(schema: *mut FFI_ArrowSchema) {
+     if schema.is_null() {
+         return;
+     }
+     let schema = &mut *schema;
+-    drop(CString::from_raw(schema.format as *mut c_char));
++    CString::from_raw(schema.format as *mut c_char);
+     if !schema.name.is_null() {
+-        drop(CString::from_raw(schema.name as *mut c_char));
++        CString::from_raw(schema.name as *mut c_char);
+     }
+     if !schema.private_data.is_null() {
+         let private_data = Box::from_raw(schema.private_data as *mut SchemaPrivateData);
+         for child in private_data.children.iter() {
+             drop(Box::from_raw(*child))
+         }
+         drop(private_data);
+     }
+     schema.release = None;
+ }
+
+--- a/arrow/src/ipc/writer.rs
++++ b/arrow/src/ipc/writer.rs
+@@ -530,51 +530,51 @@
+             writer.write_all(&CONTINUATION_MARKER)?;
+             writer.write_all(&total_len.to_le_bytes()[..])?;
+         }
+         z => panic!("Unsupported ipc::MetadataVersion {:?}", z),
+     };
+     writer.flush()?;
+     Ok(written)
+ }
+ fn write_array_data(
+     array_data: &ArrayData,
+-    buffers: &mut Vec<ipc::Buffer>,
+-    arrow_data: &mut Vec<u8>,
+-    nodes: &mut Vec<ipc::FieldNode>,
++    mut buffers: &mut Vec<ipc::Buffer>,
++    mut arrow_data: &mut Vec<u8>,
++    mut nodes: &mut Vec<ipc::FieldNode>,
+     offset: i64,
+     num_rows: usize,
+     null_count: usize,
+ ) -> i64 {
+     let mut offset = offset;
+     nodes.push(ipc::FieldNode::new(num_rows as i64, null_count as i64));
+     if array_data.data_type() != &DataType::Null {
+         let null_buffer = match array_data.null_buffer() {
+             None => {
+                 let num_bytes = bit_util::ceil(num_rows, 8);
+                 let buffer = MutableBuffer::new(num_bytes);
+                 let buffer = buffer.with_bitset(num_bytes, true);
+                 buffer.into()
+             }
+             Some(buffer) => buffer.clone(),
+         };
+-        offset = write_buffer(&null_buffer, buffers, arrow_data, offset);
++        offset = write_buffer(&null_buffer, &mut buffers, &mut arrow_data, offset);
+     }
+     array_data.buffers().iter().for_each(|buffer| {
+-        offset = write_buffer(buffer, buffers, arrow_data, offset);
++        offset = write_buffer(buffer, &mut buffers, &mut arrow_data, offset);
+     });
+     if !matches!(array_data.data_type(), DataType::Dictionary(_, _)) {
+         array_data.child_data().iter().for_each(|data_ref| {
+             offset = write_array_data(
+                 data_ref,
+-                buffers,
+-                arrow_data,
+-                nodes,
++                &mut buffers,
++                &mut arrow_data,
++                &mut nodes,
+                 offset,
+                 data_ref.len(),
+                 data_ref.null_count(),
+             );
+         });
+     }
+     offset
+ }
+ fn write_buffer(
+     buffer: &Buffer,
+
+--- a/parquet/src/arrow/arrow_writer.rs
++++ b/parquet/src/arrow/arrow_writer.rs
+@@ -72,23 +72,23 @@
+ fn get_col_writer(
+     row_group_writer: &mut Box<dyn RowGroupWriter>,
+ ) -> Result<ColumnWriter> {
+     let col_writer = row_group_writer
+         .next_column()?
+         .expect("Unable to get column writer");
+     Ok(col_writer)
+ }
+ #[allow(clippy::borrowed_box)]
+ fn write_leaves(
+-    row_group_writer: &mut Box<dyn RowGroupWriter>,
++    mut row_group_writer: &mut Box<dyn RowGroupWriter>,
+     array: &arrow_array::ArrayRef,
+-    levels: &mut Vec<LevelInfo>,
++    mut levels: &mut Vec<LevelInfo>,
+ ) -> Result<()> {
+     match array.data_type() {
+         ArrowDataType::Null
+         | ArrowDataType::Boolean
+         | ArrowDataType::Int8
+         | ArrowDataType::Int16
+         | ArrowDataType::Int32
+         | ArrowDataType::Int64
+         | ArrowDataType::UInt8
+         | ArrowDataType::UInt16
+@@ -102,57 +102,57 @@
+         | ArrowDataType::Time32(_)
+         | ArrowDataType::Time64(_)
+         | ArrowDataType::Duration(_)
+         | ArrowDataType::Interval(_)
+         | ArrowDataType::LargeBinary
+         | ArrowDataType::Binary
+         | ArrowDataType::Utf8
+         | ArrowDataType::LargeUtf8
+         | ArrowDataType::Decimal(_, _)
+         | ArrowDataType::FixedSizeBinary(_) => {
+-            let mut col_writer = get_col_writer(row_group_writer)?;
++            let mut col_writer = get_col_writer(&mut row_group_writer)?;
+             write_leaf(
+                 &mut col_writer,
+                 array,
+                 levels.pop().expect("Levels exhausted"),
+             )?;
+             row_group_writer.close_column(col_writer)?;
+             Ok(())
+         }
+         ArrowDataType::List(_) | ArrowDataType::LargeList(_) => {
+             let data = array.data();
+             let child_array = arrow_array::make_array(data.child_data()[0].clone());
+-            write_leaves(row_group_writer, &child_array, levels)?;
++            write_leaves(&mut row_group_writer, &child_array, &mut levels)?;
+             Ok(())
+         }
+         ArrowDataType::Struct(_) => {
+             let struct_array: &arrow_array::StructArray = array
+                 .as_any()
+                 .downcast_ref::<arrow_array::StructArray>()
+                 .expect("Unable to get struct array");
+             for field in struct_array.columns() {
+-                write_leaves(row_group_writer, field, levels)?;
++                write_leaves(&mut row_group_writer, field, &mut levels)?;
+             }
+             Ok(())
+         }
+         ArrowDataType::Map(_, _) => {
+             let map_array: &arrow_array::MapArray = array
+                 .as_any()
+                 .downcast_ref::<arrow_array::MapArray>()
+                 .expect("Unable to get map array");
+-            write_leaves(row_group_writer, &map_array.keys(), levels)?;
+-            write_leaves(row_group_writer, &map_array.values(), levels)?;
++            write_leaves(&mut row_group_writer, &map_array.keys(), &mut levels)?;
++            write_leaves(&mut row_group_writer, &map_array.values(), &mut levels)?;
+             Ok(())
+         }
+         ArrowDataType::Dictionary(_, value_type) => {
+             let array = arrow::compute::cast(array, value_type)?;
+-            let mut col_writer = get_col_writer(row_group_writer)?;
++            let mut col_writer = get_col_writer(&mut row_group_writer)?;
+             write_leaf(
+                 &mut col_writer,
+                 &array,
+                 levels.pop().expect("Levels exhausted"),
+             )?;
+             row_group_writer.close_column(col_writer)?;
+             Ok(())
+         }
+         ArrowDataType::Float16 => Err(ParquetError::ArrowError(
+             "Float16 arrays not supported".to_string(),
+
+--- a/parquet/src/record/reader.rs
++++ b/parquet/src/record/reader.rs
+@@ -52,21 +52,21 @@
+         &self,
+         descr: SchemaDescPtr,
+         row_group_reader: &dyn RowGroupReader,
+     ) -> ReaderIter {
+         let num_records = row_group_reader.metadata().num_rows() as usize;
+         ReaderIter::new(self.build(descr, row_group_reader), num_records)
+     }
+     fn reader_tree(
+         &self,
+         field: TypePtr,
+-        path: &mut Vec<String>,
++        mut path: &mut Vec<String>,
+         mut curr_def_level: i16,
+         mut curr_rep_level: i16,
+         paths: &HashMap<ColumnPath, usize>,
+         row_group_reader: &dyn RowGroupReader,
+     ) -> Reader {
+         assert!(field.get_basic_info().has_repetition());
+         let repetition = field.get_basic_info().repetition();
+         match repetition {
+             Repetition::OPTIONAL => {
+                 curr_def_level += 1;
+@@ -100,38 +100,38 @@
+                     let repeated_field = field.get_fields()[0].clone();
+                     assert_eq!(
+                         repeated_field.get_basic_info().repetition(),
+                         Repetition::REPEATED,
+                         "Invalid list type {:?}",
+                         field
+                     );
+                     if Reader::is_element_type(&repeated_field) {
+                         let reader = self.reader_tree(
+                             repeated_field,
+-                            path,
++                            &mut path,
+                             curr_def_level,
+                             curr_rep_level,
+                             paths,
+                             row_group_reader,
+                         );
+                         Reader::RepeatedReader(
+                             field,
+                             curr_def_level,
+                             curr_rep_level,
+                             Box::new(reader),
+                         )
+                     } else {
+                         let child_field = repeated_field.get_fields()[0].clone();
+                         path.push(String::from(repeated_field.name()));
+                         let reader = self.reader_tree(
+                             child_field,
+-                            path,
++                            &mut path,
+                             curr_def_level + 1,
+                             curr_rep_level + 1,
+                             paths,
+                             row_group_reader,
+                         );
+                         path.pop();
+                         Reader::RepeatedReader(
+                             field,
+                             curr_def_level,
+                             curr_rep_level,
+@@ -166,30 +166,30 @@
+                     );
+                     path.push(String::from(key_value_type.name()));
+                     let key_type = &key_value_type.get_fields()[0];
+                     assert!(
+                         key_type.is_primitive(),
+                         "Map key type is expected to be a primitive type, but found {:?}",
+                         key_type
+                     );
+                     let key_reader = self.reader_tree(
+                         key_type.clone(),
+-                        path,
++                        &mut path,
+                         curr_def_level + 1,
+                         curr_rep_level + 1,
+                         paths,
+                         row_group_reader,
+                     );
+                     let value_type = &key_value_type.get_fields()[1];
+                     let value_reader = self.reader_tree(
+                         value_type.clone(),
+-                        path,
++                        &mut path,
+                         curr_def_level + 1,
+                         curr_rep_level + 1,
+                         paths,
+                         row_group_reader,
+                     );
+                     path.pop();
+                     Reader::KeyValueReader(
+                         field,
+                         curr_def_level,
+                         curr_rep_level,
+@@ -200,39 +200,39 @@
+                 _ if repetition == Repetition::REPEATED => {
+                     let required_field = Type::group_type_builder(field.name())
+                         .with_repetition(Repetition::REQUIRED)
+                         .with_converted_type(field.get_basic_info().converted_type())
+                         .with_fields(&mut Vec::from(field.get_fields()))
+                         .build()
+                         .unwrap();
+                     path.pop();
+                     let reader = self.reader_tree(
+                         Arc::new(required_field),
+-                        path,
++                        &mut path,
+                         curr_def_level,
+                         curr_rep_level,
+                         paths,
+                         row_group_reader,
+                     );
+                     Reader::RepeatedReader(
+                         field,
+                         curr_def_level - 1,
+                         curr_rep_level - 1,
+                         Box::new(reader),
+                     )
+                 }
+                 _ => {
+                     let mut readers = Vec::new();
+                     for child in field.get_fields() {
+                         let reader = self.reader_tree(
+                             child.clone(),
+-                            path,
++                            &mut path,
+                             curr_def_level,
+                             curr_rep_level,
+                             paths,
+                             row_group_reader,
+                         );
+                         readers.push(reader);
+                     }
+                     Reader::GroupReader(Some(field), curr_def_level, readers)
+                 }
+             }
+
+--- a/parquet/src/util/bit_util.rs
++++ b/parquet/src/util/bit_util.rs
+@@ -273,22 +273,22 @@
+         }
+         assert!(self.bit_offset < 64);
+         true
+     }
+     #[inline]
+     pub fn put_aligned<T: AsBytes>(&mut self, val: T, num_bytes: usize) -> bool {
+         let result = self.get_next_byte_ptr(num_bytes);
+         if result.is_err() {
+             return false;
+         }
+-        let ptr = result.unwrap();
+-        memcpy_value(&val, num_bytes, ptr);
++        let mut ptr = result.unwrap();
++        memcpy_value(&val, num_bytes, &mut ptr);
+         true
+     }
+     #[inline]
+     pub fn put_aligned_offset<T: AsBytes>(
+         &mut self,
+         val: T,
+         num_bytes: usize,
+         offset: usize,
+     ) -> bool {
+         if num_bytes + offset > self.max_bytes {
+
+--- a/parquet_derive/src/parquet_field.rs
++++ b/parquet_derive/src/parquet_field.rs
+@@ -601,21 +601,21 @@
+     }
+     #[test]
+     fn test_converting_to_column_writer_type() {
+         let snippet: proc_macro2::TokenStream = quote! {
+           struct ABasicStruct {
+             yes_no: bool,
+             name: String,
+           }
+         };
+         let fields = extract_fields(snippet);
+-        let processed: Vec<_> = fields.iter().map(Field::from).collect();
++        let processed: Vec<_> = fields.iter().map(|field| Field::from(field)).collect();
+         let column_writers: Vec<_> = processed
+             .iter()
+             .map(|field| field.ty.column_writer())
+             .collect();
+         assert_eq!(
+             column_writers,
+             vec![
+                 syn::parse_quote!(
+                     parquet::column::writer::ColumnWriter::BoolColumnWriter
+                 ),
+@@ -628,21 +628,21 @@
+     #[test]
+     fn convert_basic_struct() {
+         let snippet: proc_macro2::TokenStream = quote! {
+           struct ABasicStruct {
+             yes_no: bool,
+             name: String,
+             length: usize
+           }
+         };
+         let fields = extract_fields(snippet);
+-        let processed: Vec<_> = fields.iter().map(Field::from).collect();
++        let processed: Vec<_> = fields.iter().map(|field| Field::from(field)).collect();
+         assert_eq!(processed.len(), 3);
+         assert_eq!(
+             processed,
+             vec![
+                 Field {
+                     ident: syn::Ident::new("yes_no", proc_macro2::Span::call_site()),
+                     ty: Type::TypePath(syn::parse_quote!(bool)),
+                     is_a_byte_buf: false,
+                     third_party_type: None,
+                 },
+@@ -665,21 +665,22 @@
+     fn test_get_inner_type() {
+         let snippet: proc_macro2::TokenStream = quote! {
+           struct LotsOfInnerTypes {
+             a_vec: Vec<u8>,
+             a_option: std::option::Option<bool>,
+             a_silly_string: std::string::String,
+             a_complicated_thing: std::option::Option<std::result::Result<(),()>>,
+           }
+         };
+         let fields = extract_fields(snippet);
+-        let converted_fields: Vec<_> = fields.iter().map(Type::from).collect();
++        let converted_fields: Vec<_> =
++            fields.iter().map(|field| Type::from(field)).collect();
+         let inner_types: Vec<_> = converted_fields
+             .iter()
+             .map(|field| field.inner_type())
+             .collect();
+         let inner_types_strs: Vec<_> = inner_types
+             .iter()
+             .map(|ty| (quote! { #ty }).to_string())
+             .collect();
+         assert_eq!(
+             inner_types_strs,
+@@ -699,21 +700,22 @@
+             a_buf: Vec<u8>,
+             a_number: i32,
+             a_verbose_option: std::option::Option<bool>,
+             a_silly_string: std::string::String,
+             a_fix_byte_buf: [u8; 10],
+             a_complex_option: Option<&Vec<u8>>,
+             a_complex_vec: &Vec<&Option<u8>>,
+           }
+         };
+         let fields = extract_fields(snippet);
+-        let converted_fields: Vec<_> = fields.iter().map(Type::from).collect();
++        let converted_fields: Vec<_> =
++            fields.iter().map(|field| Type::from(field)).collect();
+         let physical_types: Vec<_> = converted_fields
+             .iter()
+             .map(|ty| ty.physical_type())
+             .collect();
+         assert_eq!(
+             physical_types,
+             vec![
+                 BasicType::BYTE_ARRAY,
+                 BasicType::INT32,
+                 BasicType::BOOLEAN,
+@@ -728,21 +730,22 @@
+     fn test_convert_comprehensive_owned_struct() {
+         let snippet: proc_macro2::TokenStream = quote! {
+           struct VecHolder {
+             a_vec: Vec<u8>,
+             a_option: std::option::Option<bool>,
+             a_silly_string: std::string::String,
+             a_complicated_thing: std::option::Option<std::result::Result<(),()>>,
+           }
+         };
+         let fields = extract_fields(snippet);
+-        let converted_fields: Vec<_> = fields.iter().map(Type::from).collect();
++        let converted_fields: Vec<_> =
++            fields.iter().map(|field| Type::from(field)).collect();
+         assert_eq!(
+             converted_fields,
+             vec![
+                 Type::Vec(Box::new(Type::TypePath(syn::parse_quote!(u8)))),
+                 Type::Option(Box::new(Type::TypePath(syn::parse_quote!(bool)))),
+                 Type::TypePath(syn::parse_quote!(std::string::String)),
+                 Type::Option(Box::new(Type::TypePath(
+                     syn::parse_quote!(std::result::Result<(),()>)
+                 ))),
+             ]
+@@ -751,21 +754,21 @@
+     #[test]
+     fn test_convert_borrowed_struct() {
+         let snippet: proc_macro2::TokenStream = quote! {
+           struct Borrower<'a> {
+             a_str: &'a str,
+             a_borrowed_option: &'a Option<bool>,
+             so_many_borrows: &'a Option<&'a str>,
+           }
+         };
+         let fields = extract_fields(snippet);
+-        let types: Vec<_> = fields.iter().map(Type::from).collect();
++        let types: Vec<_> = fields.iter().map(|field| Type::from(field)).collect();
+         assert_eq!(
+             types,
+             vec![
+                 Type::Reference(
+                     Some(syn::Lifetime::new("'a", proc_macro2::Span::call_site())),
+                     Box::new(Type::TypePath(syn::parse_quote!(str)))
+                 ),
+                 Type::Reference(
+                     Some(syn::Lifetime::new("'a", proc_macro2::Span::call_site())),
+                     Box::new(Type::Option(Box::new(Type::TypePath(syn::parse_quote!(

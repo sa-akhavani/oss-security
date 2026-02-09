@@ -1,0 +1,1061 @@
+--- a/conn_id_generator.go
++++ b/conn_id_generator.go
+@@ -121,20 +121,26 @@
+ 	})
+ 	m.highestSeq++
+ 	return nil
+ }
+ func (m *connIDGenerator) SetHandshakeComplete(connIDExpiry monotime.Time) {
+ 	if m.initialClientDestConnID != nil {
+ 		m.queueConnIDForRetiring(*m.initialClientDestConnID, connIDExpiry)
+ 		m.initialClientDestConnID = nil
+ 	}
+ }
++func (m *connIDGenerator) NextRetireTime() monotime.Time {
++	if len(m.connIDsToRetire) == 0 {
++		return 0
++	}
++	return m.connIDsToRetire[0].t
++}
+ func (m *connIDGenerator) RemoveRetiredConnIDs(now monotime.Time) {
+ 	if len(m.connIDsToRetire) == 0 {
+ 		return
+ 	}
+ 	for _, c := range m.connIDsToRetire {
+ 		if c.t.After(now) {
+ 			break
+ 		}
+ 		m.connRunners.RemoveConnectionID(c.connID)
+ 		m.connIDsToRetire = m.connIDsToRetire[1:]
+
+--- a/connection.go
++++ b/connection.go
+@@ -697,20 +697,23 @@
+ 	if t := c.receivedPacketHandler.GetAlarmTimeout(); !t.IsZero() && t.Before(deadline) {
+ 		deadline = t
+ 	}
+ 	if t := c.sentPacketHandler.GetLossDetectionTimeout(); !t.IsZero() && t.Before(deadline) {
+ 		deadline = t
+ 	}
+ 	if c.blocked == blockModeCongestionLimited {
+ 		c.timer.Reset(monotime.Until(deadline))
+ 		return
+ 	}
++	if t := c.connIDGenerator.NextRetireTime(); !t.IsZero() && t.Before(deadline) {
++		deadline = t
++	}
+ 	if !c.pacingDeadline.IsZero() && c.pacingDeadline.Before(deadline) {
+ 		deadline = c.pacingDeadline
+ 	}
+ 	c.timer.Reset(monotime.Until(deadline))
+ }
+ func (c *Conn) idleTimeoutStartTime() monotime.Time {
+ 	startTime := c.lastPacketReceivedTime
+ 	if t := c.firstAckElicitingPacketAfterIdleSentTime; !t.IsZero() && t.After(startTime) {
+ 		startTime = t
+ 	}
+
+--- a/http3/client.go
++++ b/http3/client.go
+@@ -28,49 +28,49 @@
+ func (e *errConnUnusable) Error() string { return fmt.Sprintf("http3: conn unusable: %s", e.e.Error()) }
+ const max1xxResponses = 5 // arbitrary bound on number of informational responses
+ var defaultQuicConfig = &quic.Config{
+ 	MaxIncomingStreams: -1, // don't allow the server to create bidirectional streams
+ 	KeepAlivePeriod:    10 * time.Second,
+ }
+ type ClientConn struct {
+ 	conn *Conn
+ 	enableDatagrams bool
+ 	additionalSettings map[uint64]uint64
+-	maxResponseHeaderBytes int
++	maxResponseHeaderBytes uint64
+ 	disableCompression bool
+ 	logger *slog.Logger
+ 	requestWriter *requestWriter
+ 	decoder       *qpack.Decoder
+ }
+ var _ http.RoundTripper = &ClientConn{}
+ func newClientConn(
+ 	conn *quic.Conn,
+ 	enableDatagrams bool,
+ 	additionalSettings map[uint64]uint64,
+ 	streamHijacker func(FrameType, quic.ConnectionTracingID, *quic.Stream, error) (hijacked bool, err error),
+ 	uniStreamHijacker func(StreamType, quic.ConnectionTracingID, *quic.ReceiveStream, error) (hijacked bool),
+-	maxResponseHeaderBytes int,
++	maxResponseHeaderBytes int64,
+ 	disableCompression bool,
+ 	logger *slog.Logger,
+ ) *ClientConn {
+ 	c := &ClientConn{
+ 		enableDatagrams:    enableDatagrams,
+ 		additionalSettings: additionalSettings,
+ 		disableCompression: disableCompression,
+ 		logger:             logger,
+ 	}
+ 	if maxResponseHeaderBytes <= 0 {
+ 		c.maxResponseHeaderBytes = defaultMaxResponseHeaderBytes
+ 	} else {
+-		c.maxResponseHeaderBytes = maxResponseHeaderBytes
+-	}
+-	c.decoder = qpack.NewDecoder()
++		c.maxResponseHeaderBytes = uint64(maxResponseHeaderBytes)
++	}
++	c.decoder = qpack.NewDecoder(func(hf qpack.HeaderField) {})
+ 	c.requestWriter = newRequestWriter()
+ 	c.conn = newConnection(
+ 		conn.Context(),
+ 		conn,
+ 		c.enableDatagrams,
+ 		false, // client
+ 		c.logger,
+ 		0,
+ 	)
+ 	go func() {
+@@ -90,29 +90,24 @@
+ func (c *ClientConn) OpenRequestStream(ctx context.Context) (*RequestStream, error) {
+ 	return c.conn.openRequestStream(ctx, c.requestWriter, nil, c.disableCompression, c.maxResponseHeaderBytes)
+ }
+ func (c *ClientConn) setupConn() error {
+ 	str, err := c.conn.OpenUniStream()
+ 	if err != nil {
+ 		return err
+ 	}
+ 	b := make([]byte, 0, 64)
+ 	b = quicvarint.Append(b, streamTypeControlStream)
+-	b = (&settingsFrame{
+-		Datagram:            c.enableDatagrams,
+-		Other:               c.additionalSettings,
+-		MaxFieldSectionSize: int64(c.maxResponseHeaderBytes),
+-	}).Append(b)
++	b = (&settingsFrame{Datagram: c.enableDatagrams, Other: c.additionalSettings}).Append(b)
+ 	if c.conn.qlogger != nil {
+ 		sf := qlog.SettingsFrame{
+-			MaxFieldSectionSize: int64(c.maxResponseHeaderBytes),
+-			Other:               maps.Clone(c.additionalSettings),
++			Other: maps.Clone(c.additionalSettings),
+ 		}
+ 		if c.enableDatagrams {
+ 			sf.Datagram = pointer(true)
+ 		}
+ 		c.conn.qlogger.RecordEvent(qlog.FrameCreated{
+ 			StreamID: str.StreamID(),
+ 			Raw:      qlog.RawInfo{Length: len(b)},
+ 			Frame:    qlog.Frame{Frame: sf},
+ 		})
+ 	}
+@@ -252,48 +247,42 @@
+ 	extra, err = io.CopyBuffer(io.Discard, sr, buf)
+ 	n += extra
+ 	if n > contentLength {
+ 		str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestCanceled))
+ 		return fmt.Errorf("http: ContentLength=%d with Body length %d", contentLength, n)
+ 	}
+ 	return err
+ }
+ func (c *ClientConn) doRequest(req *http.Request, str *RequestStream) (*http.Response, error) {
+ 	trace := httptrace.ContextClientTrace(req.Context())
+-	var sendingReqFailed bool
+ 	if err := str.sendRequestHeader(req); err != nil {
+ 		traceWroteRequest(trace, err)
+-		if c.logger != nil {
+-			c.logger.Debug("error writing request", "error", err)
+-		}
+-		sendingReqFailed = true
+-	}
+-	if !sendingReqFailed {
+-		if req.Body == nil {
+-			traceWroteRequest(trace, nil)
++		return nil, err
++	}
++	if req.Body == nil {
++		traceWroteRequest(trace, nil)
++		str.Close()
++	} else {
++		go func() {
++			contentLength := int64(-1)
++			if req.ContentLength > 0 {
++				contentLength = req.ContentLength
++			}
++			err := c.sendRequestBody(str, req.Body, contentLength)
++			traceWroteRequest(trace, err)
++			if err != nil {
++				if c.logger != nil {
++					c.logger.Debug("error writing request", "error", err)
++				}
++			}
+ 			str.Close()
+-		} else {
+-			go func() {
+-				contentLength := int64(-1)
+-				if req.ContentLength > 0 {
+-					contentLength = req.ContentLength
+-				}
+-				err := c.sendRequestBody(str, req.Body, contentLength)
+-				traceWroteRequest(trace, err)
+-				if err != nil {
+-					if c.logger != nil {
+-						c.logger.Debug("error writing request", "error", err)
+-					}
+-				}
+-				str.Close()
+-			}()
+-		}
++		}()
+ 	}
+ 	var num1xx int // number of informational 1xx headers received
+ 	var res *http.Response
+ 	for {
+ 		var err error
+ 		res, err = str.ReadResponse()
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		resCode := res.StatusCode
+
+--- a/http3/conn.go
++++ b/http3/conn.go
+@@ -49,21 +49,21 @@
+ 	if qlogTrace := quicConn.QlogTrace(); qlogTrace != nil && qlogTrace.SupportsSchemas(qlog.EventSchema) {
+ 		qlogger = qlogTrace.AddProducer()
+ 	}
+ 	c := &Conn{
+ 		ctx:              ctx,
+ 		conn:             quicConn,
+ 		isServer:         isServer,
+ 		logger:           logger,
+ 		idleTimeout:      idleTimeout,
+ 		enableDatagrams:  enableDatagrams,
+-		decoder:          qpack.NewDecoder(),
++		decoder:          qpack.NewDecoder(func(hf qpack.HeaderField) {}),
+ 		receivedSettings: make(chan struct{}),
+ 		streams:          make(map[quic.StreamID]*stateTrackingStream),
+ 		maxStreamID:      invalidStreamID,
+ 		lastStreamID:     invalidStreamID,
+ 		qlogger:          qlogger,
+ 	}
+ 	if idleTimeout > 0 {
+ 		c.idleTimer = time.AfterFunc(idleTimeout, c.onIdleTimer)
+ 	}
+ 	return c
+@@ -106,21 +106,21 @@
+ 		if len(c.streams) == 0 {
+ 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeNoError), "")
+ 		}
+ 	}
+ }
+ func (c *Conn) openRequestStream(
+ 	ctx context.Context,
+ 	requestWriter *requestWriter,
+ 	reqDone chan<- struct{},
+ 	disableCompression bool,
+-	maxHeaderBytes int,
++	maxHeaderBytes uint64,
+ ) (*RequestStream, error) {
+ 	c.streamMx.Lock()
+ 	maxStreamID := c.maxStreamID
+ 	var nextStreamID quic.StreamID
+ 	if c.lastStreamID == invalidStreamID {
+ 		nextStreamID = 0
+ 	} else {
+ 		nextStreamID = c.lastStreamID + 4
+ 	}
+ 	c.streamMx.Unlock()
+@@ -148,43 +148,38 @@
+ 			return nil
+ 		}, c.qlogger),
+ 		requestWriter,
+ 		reqDone,
+ 		c.decoder,
+ 		disableCompression,
+ 		maxHeaderBytes,
+ 		rsp,
+ 	), nil
+ }
+-func (c *Conn) decodeTrailers(r io.Reader, streamID quic.StreamID, hf *headersFrame, maxHeaderBytes int) (http.Header, error) {
+-	if hf.Length > uint64(maxHeaderBytes) {
++func (c *Conn) decodeTrailers(r io.Reader, streamID quic.StreamID, hf *headersFrame, maxHeaderBytes uint64) (http.Header, error) {
++	if hf.Length > maxHeaderBytes {
+ 		maybeQlogInvalidHeadersFrame(c.qlogger, streamID, hf.Length)
+-		return nil, fmt.Errorf("http3: HEADERS frame too large: %d bytes (max: %d)", hf.Length, maxHeaderBytes)
++		return nil, fmt.Errorf("HEADERS frame too large: %d bytes (max: %d)", hf.Length, maxHeaderBytes)
+ 	}
+ 	b := make([]byte, hf.Length)
+ 	if _, err := io.ReadFull(r, b); err != nil {
+ 		return nil, err
+ 	}
+-	decodeFn := c.decoder.Decode(b)
+-	var fields []qpack.HeaderField
+-	if c.qlogger != nil {
+-		fields = make([]qpack.HeaderField, 0, 16)
+-	}
+-	trailers, err := parseTrailers(decodeFn, &fields)
++	fields, err := c.decoder.DecodeFull(b)
+ 	if err != nil {
+ 		maybeQlogInvalidHeadersFrame(c.qlogger, streamID, hf.Length)
+ 		return nil, err
+ 	}
+ 	if c.qlogger != nil {
+ 		qlogParsedHeadersFrame(c.qlogger, streamID, hf, fields)
+ 	}
+-	return trailers, nil
++	return parseTrailers(fields)
+ }
+ func (c *Conn) acceptStream(ctx context.Context) (*stateTrackingStream, error) {
+ 	str, err := c.conn.AcceptStream(ctx)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	strID := str.StreamID()
+ 	hstr := newStateTrackingStream(str, c, func(b []byte) error { return c.sendDatagram(strID, b) })
+ 	c.streamMx.Lock()
+ 	c.streams[strID] = hstr
+
+--- a/http3/error_codes.go
++++ b/http3/error_codes.go
+@@ -1,36 +1,35 @@
+ package http3
+ import (
+ 	"fmt"
+ 	"github.com/quic-go/quic-go"
+ )
+ type ErrCode quic.ApplicationErrorCode
+ const (
+-	ErrCodeNoError                  ErrCode = 0x100
+-	ErrCodeGeneralProtocolError     ErrCode = 0x101
+-	ErrCodeInternalError            ErrCode = 0x102
+-	ErrCodeStreamCreationError      ErrCode = 0x103
+-	ErrCodeClosedCriticalStream     ErrCode = 0x104
+-	ErrCodeFrameUnexpected          ErrCode = 0x105
+-	ErrCodeFrameError               ErrCode = 0x106
+-	ErrCodeExcessiveLoad            ErrCode = 0x107
+-	ErrCodeIDError                  ErrCode = 0x108
+-	ErrCodeSettingsError            ErrCode = 0x109
+-	ErrCodeMissingSettings          ErrCode = 0x10a
+-	ErrCodeRequestRejected          ErrCode = 0x10b
+-	ErrCodeRequestCanceled          ErrCode = 0x10c
+-	ErrCodeRequestIncomplete        ErrCode = 0x10d
+-	ErrCodeMessageError             ErrCode = 0x10e
+-	ErrCodeConnectError             ErrCode = 0x10f
+-	ErrCodeVersionFallback          ErrCode = 0x110
+-	ErrCodeDatagramError            ErrCode = 0x33
+-	ErrCodeQPACKDecompressionFailed ErrCode = 0x200
++	ErrCodeNoError              ErrCode = 0x100
++	ErrCodeGeneralProtocolError ErrCode = 0x101
++	ErrCodeInternalError        ErrCode = 0x102
++	ErrCodeStreamCreationError  ErrCode = 0x103
++	ErrCodeClosedCriticalStream ErrCode = 0x104
++	ErrCodeFrameUnexpected      ErrCode = 0x105
++	ErrCodeFrameError           ErrCode = 0x106
++	ErrCodeExcessiveLoad        ErrCode = 0x107
++	ErrCodeIDError              ErrCode = 0x108
++	ErrCodeSettingsError        ErrCode = 0x109
++	ErrCodeMissingSettings      ErrCode = 0x10a
++	ErrCodeRequestRejected      ErrCode = 0x10b
++	ErrCodeRequestCanceled      ErrCode = 0x10c
++	ErrCodeRequestIncomplete    ErrCode = 0x10d
++	ErrCodeMessageError         ErrCode = 0x10e
++	ErrCodeConnectError         ErrCode = 0x10f
++	ErrCodeVersionFallback      ErrCode = 0x110
++	ErrCodeDatagramError        ErrCode = 0x33
+ )
+ func (e ErrCode) String() string {
+ 	s := e.string()
+ 	if s != "" {
+ 		return s
+ 	}
+ 	return fmt.Sprintf("unknown error code: %#x", uint16(e))
+ }
+ func (e ErrCode) string() string {
+ 	switch e {
+@@ -63,16 +62,14 @@
+ 	case ErrCodeRequestIncomplete:
+ 		return "H3_INCOMPLETE_REQUEST"
+ 	case ErrCodeMessageError:
+ 		return "H3_MESSAGE_ERROR"
+ 	case ErrCodeConnectError:
+ 		return "H3_CONNECT_ERROR"
+ 	case ErrCodeVersionFallback:
+ 		return "H3_VERSION_FALLBACK"
+ 	case ErrCodeDatagramError:
+ 		return "H3_DATAGRAM_ERROR"
+-	case ErrCodeQPACKDecompressionFailed:
+-		return "QPACK_DECOMPRESSION_FAILED"
+ 	default:
+ 		return ""
+ 	}
+ }
+
+--- a/http3/frames.go
++++ b/http3/frames.go
+@@ -148,65 +148,56 @@
+ }
+ type headersFrame struct {
+ 	Length    uint64
+ 	headerLen int // number of bytes read for type and length field
+ }
+ func (f *headersFrame) Append(b []byte) []byte {
+ 	b = quicvarint.Append(b, 0x1)
+ 	return quicvarint.Append(b, f.Length)
+ }
+ const (
+-	settingMaxFieldSectionSize = 0x6
+ 	settingExtendedConnect = 0x8
+ 	settingDatagram = 0x33
+ )
+ type settingsFrame struct {
+-	MaxFieldSectionSize int64 // SETTINGS_MAX_FIELD_SECTION_SIZE, -1 if not set
+-	Datagram        bool              // HTTP Datagrams, RFC 9297
+-	ExtendedConnect bool              // Extended CONNECT, RFC 9220
+-	Other           map[uint64]uint64 // all settings that we don't explicitly recognize
++	Datagram        bool // HTTP Datagrams, RFC 9297
++	ExtendedConnect bool // Extended CONNECT, RFC 9220
++	Other map[uint64]uint64 // all settings that we don't explicitly recognize
+ }
+ func pointer[T any](v T) *T {
+ 	return &v
+ }
+ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID, qlogger qlogwriter.Recorder) (*settingsFrame, error) {
+ 	if l > 8*(1<<10) {
+ 		return nil, fmt.Errorf("unexpected size for SETTINGS frame: %d", l)
+ 	}
+ 	buf := make([]byte, l)
+ 	if _, err := io.ReadFull(r, buf); err != nil {
+ 		if err == io.ErrUnexpectedEOF {
+ 			return nil, io.EOF
+ 		}
+ 		return nil, err
+ 	}
+-	frame := &settingsFrame{MaxFieldSectionSize: -1}
++	frame := &settingsFrame{}
+ 	b := bytes.NewReader(buf)
+-	settingsFrame := qlog.SettingsFrame{MaxFieldSectionSize: -1}
+-	var readMaxFieldSectionSize, readDatagram, readExtendedConnect bool
++	var settingsFrame qlog.SettingsFrame
++	var readDatagram, readExtendedConnect bool
+ 	for b.Len() > 0 {
+ 		id, err := quicvarint.Read(b)
+ 		if err != nil { // should not happen. We allocated the whole frame already.
+ 			return nil, err
+ 		}
+ 		val, err := quicvarint.Read(b)
+ 		if err != nil { // should not happen. We allocated the whole frame already.
+ 			return nil, err
+ 		}
+ 		switch id {
+-		case settingMaxFieldSectionSize:
+-			if readMaxFieldSectionSize {
+-				return nil, fmt.Errorf("duplicate setting: %d", id)
+-			}
+-			readMaxFieldSectionSize = true
+-			frame.MaxFieldSectionSize = int64(val)
+-			settingsFrame.MaxFieldSectionSize = int64(val)
+ 		case settingExtendedConnect:
+ 			if readExtendedConnect {
+ 				return nil, fmt.Errorf("duplicate setting: %d", id)
+ 			}
+ 			readExtendedConnect = true
+ 			if val != 0 && val != 1 {
+ 				return nil, fmt.Errorf("invalid value for SETTINGS_ENABLE_CONNECT_PROTOCOL: %d", val)
+ 			}
+ 			frame.ExtendedConnect = val == 1
+ 			if qlogger != nil {
+@@ -243,37 +234,30 @@
+ 				PayloadLength: int(l),
+ 			},
+ 			Frame: qlog.Frame{Frame: settingsFrame},
+ 		})
+ 	}
+ 	return frame, nil
+ }
+ func (f *settingsFrame) Append(b []byte) []byte {
+ 	b = quicvarint.Append(b, 0x4)
+ 	var l int
+-	if f.MaxFieldSectionSize >= 0 {
+-		l += quicvarint.Len(settingMaxFieldSectionSize) + quicvarint.Len(uint64(f.MaxFieldSectionSize))
+-	}
+ 	for id, val := range f.Other {
+ 		l += quicvarint.Len(id) + quicvarint.Len(val)
+ 	}
+ 	if f.Datagram {
+ 		l += quicvarint.Len(settingDatagram) + quicvarint.Len(1)
+ 	}
+ 	if f.ExtendedConnect {
+ 		l += quicvarint.Len(settingExtendedConnect) + quicvarint.Len(1)
+ 	}
+ 	b = quicvarint.Append(b, uint64(l))
+-	if f.MaxFieldSectionSize >= 0 {
+-		b = quicvarint.Append(b, settingMaxFieldSectionSize)
+-		b = quicvarint.Append(b, uint64(f.MaxFieldSectionSize))
+-	}
+ 	if f.Datagram {
+ 		b = quicvarint.Append(b, settingDatagram)
+ 		b = quicvarint.Append(b, 1)
+ 	}
+ 	if f.ExtendedConnect {
+ 		b = quicvarint.Append(b, settingExtendedConnect)
+ 		b = quicvarint.Append(b, 1)
+ 	}
+ 	for id, val := range f.Other {
+ 		b = quicvarint.Append(b, id)
+
+--- a/http3/headers.go
++++ b/http3/headers.go
+@@ -1,63 +1,44 @@
+ package http3
+ import (
+ 	"errors"
+ 	"fmt"
+-	"io"
+ 	"net/http"
+ 	"net/textproto"
+ 	"net/url"
+ 	"strconv"
+ 	"strings"
+ 	"golang.org/x/net/http/httpguts"
+ 	"github.com/quic-go/qpack"
+ )
+-type qpackError struct{ err error }
+-func (e *qpackError) Error() string { return fmt.Sprintf("qpack: %v", e.err) }
+-func (e *qpackError) Unwrap() error { return e.err }
+-var errHeaderTooLarge = errors.New("http3: headers too large")
+ type header struct {
+ 	Path      string
+ 	Method    string
+ 	Authority string
+ 	Scheme    string
+ 	Status    string
+ 	Protocol string
+ 	ContentLength int64
+ 	Headers http.Header
+ }
+ var invalidHeaderFields = [...]string{
+ 	"connection",
+ 	"keep-alive",
+ 	"proxy-connection",
+ 	"transfer-encoding",
+ 	"upgrade",
+ }
+-func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, headerFields *[]qpack.HeaderField) (header, error) {
+-	hdr := header{Headers: make(http.Header)}
++func parseHeaders(headers []qpack.HeaderField, isRequest bool) (header, error) {
++	hdr := header{Headers: make(http.Header, len(headers))}
+ 	var readFirstRegularHeader, readContentLength bool
+ 	var contentLengthStr string
+-	for {
+-		h, err := decodeFn()
+-		if err != nil {
+-			if err == io.EOF {
+-				break
+-			}
+-			return header{}, &qpackError{err}
+-		}
+-		if headerFields != nil {
+-			*headerFields = append(*headerFields, h)
+-		}
+-		sizeLimit -= len(h.Name) + len(h.Value) + 32
+-		if sizeLimit < 0 {
+-			return header{}, errHeaderTooLarge
+-		}
++	for _, h := range headers {
+ 		if strings.ToLower(h.Name) != h.Name {
+ 			return header{}, fmt.Errorf("header field is not lower-case: %s", h.Name)
+ 		}
+ 		if !httpguts.ValidHeaderFieldValue(h.Value) {
+ 			return header{}, fmt.Errorf("invalid header field value for %s: %q", h.Name, h.Value)
+ 		}
+ 		if h.IsPseudo() {
+ 			if readFirstRegularHeader {
+ 				return header{}, fmt.Errorf("received pseudo header %s after a regular header field", h.Name)
+ 			}
+@@ -125,42 +106,32 @@
+ 	if len(contentLengthStr) > 0 {
+ 		cl, err := strconv.ParseUint(contentLengthStr, 10, 63)
+ 		if err != nil {
+ 			return header{}, fmt.Errorf("invalid content length: %w", err)
+ 		}
+ 		hdr.Headers.Set("Content-Length", contentLengthStr)
+ 		hdr.ContentLength = int64(cl)
+ 	}
+ 	return hdr, nil
+ }
+-func parseTrailers(decodeFn qpack.DecodeFunc, headerFields *[]qpack.HeaderField) (http.Header, error) {
+-	h := make(http.Header)
+-	for {
+-		hf, err := decodeFn()
+-		if err != nil {
+-			if err == io.EOF {
+-				break
+-			}
+-			return nil, &qpackError{err}
+-		}
+-		if headerFields != nil {
+-			*headerFields = append(*headerFields, hf)
+-		}
+-		if hf.IsPseudo() {
+-			return nil, fmt.Errorf("http3: received pseudo header in trailer: %s", hf.Name)
+-		}
+-		h.Add(hf.Name, hf.Value)
++func parseTrailers(headers []qpack.HeaderField) (http.Header, error) {
++	h := make(http.Header, len(headers))
++	for _, field := range headers {
++		if field.IsPseudo() {
++			return nil, fmt.Errorf("http3: received pseudo header in trailer: %s", field.Name)
++		}
++		h.Add(field.Name, field.Value)
+ 	}
+ 	return h, nil
+ }
+-func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField) (*http.Request, error) {
+-	hdr, err := parseHeaders(decodeFn, true, sizeLimit, headerFields)
++func requestFromHeaders(headerFields []qpack.HeaderField) (*http.Request, error) {
++	hdr, err := parseHeaders(headerFields, true)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	if len(hdr.Headers["Cookie"]) > 0 {
+ 		hdr.Headers.Set("Cookie", strings.Join(hdr.Headers["Cookie"], "; "))
+ 	}
+ 	isConnect := hdr.Method == http.MethodConnect
+ 	isExtendedConnected := isConnect && hdr.Protocol != ""
+ 	if isExtendedConnected {
+ 		if hdr.Scheme == "" || hdr.Path == "" || hdr.Authority == "" {
+@@ -206,22 +177,22 @@
+ 		Proto:         protocol,
+ 		ProtoMajor:    3,
+ 		ProtoMinor:    0,
+ 		Header:        hdr.Headers,
+ 		Body:          nil,
+ 		ContentLength: hdr.ContentLength,
+ 		Host:          hdr.Authority,
+ 		RequestURI:    requestURI,
+ 	}, nil
+ }
+-func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField) error {
+-	hdr, err := parseHeaders(decodeFn, false, sizeLimit, headerFields)
++func updateResponseFromHeaders(rsp *http.Response, headerFields []qpack.HeaderField) error {
++	hdr, err := parseHeaders(headerFields, false)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	if hdr.Status == "" {
+ 		return errors.New("missing :status field")
+ 	}
+ 	rsp.Proto = "HTTP/3.0"
+ 	rsp.ProtoMajor = 3
+ 	rsp.Header = hdr.Headers
+ 	processTrailers(rsp)
+
+--- a/http3/qlog/frame.go
++++ b/http3/qlog/frame.go
+@@ -73,40 +73,31 @@
+ 	h := encoderHelper{enc: enc}
+ 	h.WriteToken(jsontext.BeginObject)
+ 	h.WriteToken(jsontext.String("frame_type"))
+ 	h.WriteToken(jsontext.String("goaway"))
+ 	h.WriteToken(jsontext.String("id"))
+ 	h.WriteToken(jsontext.Uint(uint64(f.StreamID)))
+ 	h.WriteToken(jsontext.EndObject)
+ 	return h.err
+ }
+ type SettingsFrame struct {
+-	MaxFieldSectionSize int64
+-	Datagram            *bool
+-	ExtendedConnect     *bool
+-	Other               map[uint64]uint64
++	Datagram        *bool
++	ExtendedConnect *bool
++	Other           map[uint64]uint64
+ }
+ func (f *SettingsFrame) encode(enc *jsontext.Encoder) error {
+ 	h := encoderHelper{enc: enc}
+ 	h.WriteToken(jsontext.BeginObject)
+ 	h.WriteToken(jsontext.String("frame_type"))
+ 	h.WriteToken(jsontext.String("settings"))
+ 	h.WriteToken(jsontext.String("settings"))
+ 	h.WriteToken(jsontext.BeginArray)
+-	if f.MaxFieldSectionSize >= 0 {
+-		h.WriteToken(jsontext.BeginObject)
+-		h.WriteToken(jsontext.String("name"))
+-		h.WriteToken(jsontext.String("settings_max_field_section_size"))
+-		h.WriteToken(jsontext.String("value"))
+-		h.WriteToken(jsontext.Uint(uint64(f.MaxFieldSectionSize)))
+-		h.WriteToken(jsontext.EndObject)
+-	}
+ 	if f.Datagram != nil {
+ 		h.WriteToken(jsontext.BeginObject)
+ 		h.WriteToken(jsontext.String("name"))
+ 		h.WriteToken(jsontext.String("settings_h3_datagram"))
+ 		h.WriteToken(jsontext.String("value"))
+ 		h.WriteToken(jsontext.Bool(*f.Datagram))
+ 		h.WriteToken(jsontext.EndObject)
+ 	}
+ 	if f.ExtendedConnect != nil {
+ 		h.WriteToken(jsontext.BeginObject)
+
+--- a/http3/server.go
++++ b/http3/server.go
+@@ -281,30 +281,28 @@
+ 	if qlogTrace := conn.QlogTrace(); qlogTrace != nil && qlogTrace.SupportsSchemas(qlog.EventSchema) {
+ 		qlogger = qlogTrace.AddProducer()
+ 	}
+ 	ctrlStr, err := conn.OpenUniStream()
+ 	if err != nil {
+ 		return fmt.Errorf("opening the control stream failed: %w", err)
+ 	}
+ 	b := make([]byte, 0, 64)
+ 	b = quicvarint.Append(b, streamTypeControlStream) // stream type
+ 	b = (&settingsFrame{
+-		MaxFieldSectionSize: int64(s.maxHeaderBytes()),
+-		Datagram:            s.EnableDatagrams,
+-		ExtendedConnect:     true,
+-		Other:               s.AdditionalSettings,
++		Datagram:        s.EnableDatagrams,
++		ExtendedConnect: true,
++		Other:           s.AdditionalSettings,
+ 	}).Append(b)
+ 	if qlogger != nil {
+ 		sf := qlog.SettingsFrame{
+-			MaxFieldSectionSize: int64(s.maxHeaderBytes()),
+-			ExtendedConnect:     pointer(true),
+-			Other:               maps.Clone(s.AdditionalSettings),
++			ExtendedConnect: pointer(true),
++			Other:           maps.Clone(s.AdditionalSettings),
+ 		}
+ 		if s.EnableDatagrams {
+ 			sf.Datagram = pointer(true)
+ 		}
+ 		qlogger.RecordEvent(qlog.FrameCreated{
+ 			StreamID: ctrlStr.StreamID(),
+ 			Raw:      qlog.RawInfo{Length: len(b)},
+ 			Frame:    qlog.Frame{Frame: sf},
+ 		})
+ 	}
+@@ -378,29 +376,29 @@
+ 		nextStreamID = str.StreamID() + 4
+ 		wg.Add(1)
+ 		go func() {
+ 			defer wg.Done()
+ 			s.handleRequest(hconn, str, hconn.decoder, qlogger)
+ 		}()
+ 	}
+ 	wg.Wait()
+ 	return handleErr
+ }
+-func (s *Server) maxHeaderBytes() int {
++func (s *Server) maxHeaderBytes() uint64 {
+ 	if s.MaxHeaderBytes <= 0 {
+ 		return http.DefaultMaxHeaderBytes
+ 	}
+-	return s.MaxHeaderBytes
++	return uint64(s.MaxHeaderBytes)
+ }
+ func (s *Server) handleRequest(
+ 	conn *Conn,
+-	str *stateTrackingStream,
++	str datagramStream,
+ 	decoder *qpack.Decoder,
+ 	qlogger qlogwriter.Recorder,
+ ) {
+ 	var ufh unknownFrameHandlerFunc
+ 	if s.StreamHijacker != nil {
+ 		ufh = func(ft FrameType, e error) (processed bool, err error) {
+ 			return s.StreamHijacker(
+ 				ft,
+ 				conn.Context().Value(quic.ConnectionTracingKey).(quic.ConnectionTracingID),
+ 				str.QUICStream(),
+@@ -415,55 +413,45 @@
+ 			str.CancelRead(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+ 			str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+ 		}
+ 		return
+ 	}
+ 	hf, ok := frame.(*headersFrame)
+ 	if !ok {
+ 		conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "expected first frame to be a HEADERS frame")
+ 		return
+ 	}
+-	if hf.Length > uint64(s.maxHeaderBytes()) {
++	if hf.Length > s.maxHeaderBytes() {
+ 		maybeQlogInvalidHeadersFrame(qlogger, str.StreamID(), hf.Length)
+-		str.CancelRead(quic.StreamErrorCode(ErrCodeExcessiveLoad))
+-		s.rejectWithHeaderFieldsTooLarge(str, conn, qlogger)
++		str.CancelRead(quic.StreamErrorCode(ErrCodeFrameError))
++		str.CancelWrite(quic.StreamErrorCode(ErrCodeFrameError))
+ 		return
+ 	}
+ 	headerBlock := make([]byte, hf.Length)
+ 	if _, err := io.ReadFull(str, headerBlock); err != nil {
+ 		maybeQlogInvalidHeadersFrame(qlogger, str.StreamID(), hf.Length)
+ 		str.CancelRead(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+ 		str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+ 		return
+ 	}
+-	decodeFn := decoder.Decode(headerBlock)
+-	var hfs []qpack.HeaderField
+-	if qlogger != nil {
+-		hfs = make([]qpack.HeaderField, 0, 16)
+-	}
+-	req, err := requestFromHeaders(decodeFn, s.maxHeaderBytes(), &hfs)
++	hfs, err := decoder.DecodeFull(headerBlock)
++	if err != nil {
++		conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeGeneralProtocolError), "expected first frame to be a HEADERS frame")
++		return
++	}
+ 	if qlogger != nil {
+ 		qlogParsedHeadersFrame(qlogger, str.StreamID(), hf, hfs)
+ 	}
+-	if err != nil {
+-		if errors.Is(err, errHeaderTooLarge) {
+-			str.CancelRead(quic.StreamErrorCode(ErrCodeExcessiveLoad))
+-			s.rejectWithHeaderFieldsTooLarge(str, conn, qlogger)
+-			return
+-		}
+-		errCode := ErrCodeMessageError
+-		var qpackErr *qpackError
+-		if errors.As(err, &qpackErr) {
+-			errCode = ErrCodeQPACKDecompressionFailed
+-		}
+-		str.CancelRead(quic.StreamErrorCode(errCode))
+-		str.CancelWrite(quic.StreamErrorCode(errCode))
++	req, err := requestFromHeaders(hfs)
++	if err != nil {
++		str.CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
++		str.CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
+ 		return
+ 	}
+ 	connState := conn.ConnectionState().TLS
+ 	req.TLS = &connState
+ 	req.RemoteAddr = conn.RemoteAddr().String()
+ 	contentLength := int64(-1)
+ 	if _, ok := req.Header["Content-Length"]; ok && req.ContentLength >= 0 {
+ 		contentLength = req.ContentLength
+ 	}
+ 	hstr := newStream(str, conn, nil, nil, qlogger)
+@@ -511,27 +499,20 @@
+ 	if !r.headerWritten {
+ 		if _, haveCL := r.header["Content-Length"]; !haveCL {
+ 			r.header.Set("Content-Length", strconv.FormatInt(r.numWritten, 10))
+ 		}
+ 	}
+ 	r.Flush()
+ 	r.flushTrailers()
+ 	str.CancelRead(quic.StreamErrorCode(ErrCodeNoError))
+ 	str.Close()
+ }
+-func (s *Server) rejectWithHeaderFieldsTooLarge(str *stateTrackingStream, conn *Conn, qlogger qlogwriter.Recorder) {
+-	hstr := newStream(str, conn, nil, nil, qlogger)
+-	defer hstr.Close()
+-	r := newResponseWriter(hstr, conn, false, s.Logger)
+-	r.WriteHeader(http.StatusRequestHeaderFieldsTooLarge)
+-	r.Flush()
+-}
+ func (s *Server) Close() error {
+ 	s.mutex.Lock()
+ 	defer s.mutex.Unlock()
+ 	s.closed = true
+ 	if s.closeCtx == nil {
+ 		return nil
+ 	}
+ 	s.closeCancel()
+ 	var err error
+ 	for _, l := range s.listeners {
+
+--- a/http3/stream.go
++++ b/http3/stream.go
+@@ -127,35 +127,35 @@
+ 	return s.datagramStream.SendDatagram(b)
+ }
+ func (s *Stream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+ 	return s.datagramStream.ReceiveDatagram(ctx)
+ }
+ type RequestStream struct {
+ 	str *Stream
+ 	responseBody io.ReadCloser // set by ReadResponse
+ 	decoder            *qpack.Decoder
+ 	requestWriter      *requestWriter
+-	maxHeaderBytes     int
++	maxHeaderBytes     uint64
+ 	reqDone            chan<- struct{}
+ 	disableCompression bool
+ 	response           *http.Response
+ 	sentRequest   bool
+ 	requestedGzip bool
+ 	isConnect     bool
+ }
+ func newRequestStream(
+ 	str *Stream,
+ 	requestWriter *requestWriter,
+ 	reqDone chan<- struct{},
+ 	decoder *qpack.Decoder,
+ 	disableCompression bool,
+-	maxHeaderBytes int,
++	maxHeaderBytes uint64,
+ 	rsp *http.Response,
+ ) *RequestStream {
+ 	return &RequestStream{
+ 		str:                str,
+ 		requestWriter:      requestWriter,
+ 		reqDone:            reqDone,
+ 		decoder:            decoder,
+ 		disableCompression: disableCompression,
+ 		maxHeaderBytes:     maxHeaderBytes,
+ 		response:           rsp,
+@@ -229,51 +229,46 @@
+ 	if err != nil {
+ 		s.str.CancelRead(quic.StreamErrorCode(ErrCodeFrameError))
+ 		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeFrameError))
+ 		return nil, fmt.Errorf("http3: parsing frame failed: %w", err)
+ 	}
+ 	hf, ok := frame.(*headersFrame)
+ 	if !ok {
+ 		s.str.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "expected first frame to be a HEADERS frame")
+ 		return nil, errors.New("http3: expected first frame to be a HEADERS frame")
+ 	}
+-	if hf.Length > uint64(s.maxHeaderBytes) {
++	if hf.Length > s.maxHeaderBytes {
+ 		maybeQlogInvalidHeadersFrame(s.str.qlogger, s.str.StreamID(), hf.Length)
+ 		s.str.CancelRead(quic.StreamErrorCode(ErrCodeFrameError))
+ 		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeFrameError))
+ 		return nil, fmt.Errorf("http3: HEADERS frame too large: %d bytes (max: %d)", hf.Length, s.maxHeaderBytes)
+ 	}
+ 	headerBlock := make([]byte, hf.Length)
+ 	if _, err := io.ReadFull(s.str.datagramStream, headerBlock); err != nil {
+ 		maybeQlogInvalidHeadersFrame(s.str.qlogger, s.str.StreamID(), hf.Length)
+ 		s.str.CancelRead(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+ 		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+ 		return nil, fmt.Errorf("http3: failed to read response headers: %w", err)
+ 	}
+-	decodeFn := s.decoder.Decode(headerBlock)
+-	var hfs []qpack.HeaderField
+-	if s.str.qlogger != nil {
+-		hfs = make([]qpack.HeaderField, 0, 16)
+-	}
+-	res := s.response
+-	err = updateResponseFromHeaders(res, decodeFn, s.maxHeaderBytes, &hfs)
++	hfs, err := s.decoder.DecodeFull(headerBlock)
++	if err != nil {
++		maybeQlogInvalidHeadersFrame(s.str.qlogger, s.str.StreamID(), hf.Length)
++		s.str.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeGeneralProtocolError), "")
++		return nil, fmt.Errorf("http3: failed to decode response headers: %w", err)
++	}
+ 	if s.str.qlogger != nil {
+ 		qlogParsedHeadersFrame(s.str.qlogger, s.str.StreamID(), hf, hfs)
+ 	}
+-	if err != nil {
+-		errCode := ErrCodeMessageError
+-		var qpackErr *qpackError
+-		if errors.As(err, &qpackErr) {
+-			errCode = ErrCodeQPACKDecompressionFailed
+-		}
+-		s.str.CancelRead(quic.StreamErrorCode(errCode))
+-		s.str.CancelWrite(quic.StreamErrorCode(errCode))
++	res := s.response
++	if err := updateResponseFromHeaders(res, hfs); err != nil {
++		s.str.CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
++		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
+ 		return nil, fmt.Errorf("http3: invalid response: %w", err)
+ 	}
+ 	respBody := newResponseBody(s.str, res.ContentLength, s.reqDone)
+ 	isInformational := res.StatusCode >= 100 && res.StatusCode < 200
+ 	isNoContent := res.StatusCode == http.StatusNoContent
+ 	isSuccessfulConnect := s.isConnect && res.StatusCode >= 200 && res.StatusCode < 300
+ 	if (isInformational || isNoContent || isSuccessfulConnect) && res.ContentLength == -1 {
+ 		res.ContentLength = 0
+ 	}
+ 	if s.requestedGzip && res.Header.Get("Content-Encoding") == "gzip" {
+
+--- a/http3/transport.go
++++ b/http3/transport.go
+@@ -43,21 +43,21 @@
+ 		return r.conn.CloseWithError(0, "")
+ 	}
+ 	return nil
+ }
+ type Transport struct {
+ 	TLSClientConfig *tls.Config
+ 	QUICConfig *quic.Config
+ 	Dial func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error)
+ 	EnableDatagrams bool
+ 	AdditionalSettings map[uint64]uint64
+-	MaxResponseHeaderBytes int
++	MaxResponseHeaderBytes int64
+ 	DisableCompression bool
+ 	StreamHijacker    func(FrameType, quic.ConnectionTracingID, *quic.Stream, error) (hijacked bool, err error)
+ 	UniStreamHijacker func(StreamType, quic.ConnectionTracingID, *quic.ReceiveStream, error) (hijacked bool)
+ 	Logger *slog.Logger
+ 	mutex sync.Mutex
+ 	initOnce sync.Once
+ 	initErr  error
+ 	newClientConn func(*quic.Conn) clientConn
+ 	clients   map[string]*roundTripperWithCount
+ 	transport *quic.Transport
+
+--- a/internal/ackhandler/received_packet_tracker.go
++++ b/internal/ackhandler/received_packet_tracker.go
+@@ -112,36 +112,37 @@
+ 		h.logger.Debugf("\tIgnoring all packets below %d.", pn)
+ 	}
+ }
+ func (h *appDataReceivedPacketTracker) isMissing(p protocol.PacketNumber) bool {
+ 	if h.lastAck == nil || p < h.ignoreBelow {
+ 		return false
+ 	}
+ 	return p < h.lastAck.LargestAcked() && !h.lastAck.AcksPacket(p)
+ }
+ func (h *appDataReceivedPacketTracker) hasNewMissingPackets() bool {
+-	if h.lastAck == nil {
+-		return false
+-	}
+ 	if h.largestObserved < reorderingThreshold {
+ 		return false
+ 	}
+ 	highestMissing := h.packetHistory.HighestMissingUpTo(h.largestObserved - reorderingThreshold)
+ 	if highestMissing == protocol.InvalidPacketNumber {
+ 		return false
+ 	}
+ 	if highestMissing < h.lastAck.LargestAcked() {
+ 		return false
+ 	}
+ 	return highestMissing > h.lastAck.LargestAcked()-reorderingThreshold
+ }
+ func (h *appDataReceivedPacketTracker) shouldQueueACK(pn protocol.PacketNumber, ecn protocol.ECN, wasMissing bool) bool {
++	if h.lastAck == nil {
++		h.logger.Debugf("\tQueueing ACK because the first packet should be acknowledged.")
++		return true
++	}
+ 	if wasMissing {
+ 		if h.logger.Debug() {
+ 			h.logger.Debugf("\tQueueing ACK because packet %d was missing before.", pn)
+ 		}
+ 		return true
+ 	}
+ 	if h.ackElicitingPacketsReceivedSinceLastAck >= packetsBeforeAck {
+ 		if h.logger.Debug() {
+ 			h.logger.Debugf("\tQueueing ACK because packet %d packets were received after the last ACK (using initial threshold: %d).", h.ackElicitingPacketsReceivedSinceLastAck, packetsBeforeAck)
+ 		}
+
+--- a/qlogwriter/writer.go
++++ b/qlogwriter/writer.go
+@@ -67,21 +67,20 @@
+ 		panic(fmt.Sprintf("qlog encoding into a bytes.Buffer failed: %s", err))
+ 	}
+ 	_, encodeErr := w.Write(buf.Bytes())
+ 	return &FileSeq{
+ 		w:             w,
+ 		referenceTime: now,
+ 		enc:           jsontext.NewEncoder(w),
+ 		runStopped:    make(chan struct{}),
+ 		encodeErr:     encodeErr,
+ 		events:        make(chan event, eventChanSize),
+-		eventSchemas:  eventSchemas,
+ 	}
+ }
+ func (t *FileSeq) SupportsSchemas(schema string) bool {
+ 	return slices.Contains(t.eventSchemas, schema)
+ }
+ func (t *FileSeq) AddProducer() Recorder {
+ 	t.mx.Lock()
+ 	defer t.mx.Unlock()
+ 	if t.closed {
+ 		return nil

@@ -1,0 +1,1241 @@
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/lookup/adapters/CSVFileDataAdapter.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 41-81 ---
+    41| import javax.validation.constraints.Min;
+    42| import javax.validation.constraints.NotEmpty;
+    43| import javax.validation.constraints.Size;
+    44| import java.io.IOException;
+    45| import java.io.InputStream;
+    46| import java.io.InputStreamReader;
+    47| import java.nio.charset.StandardCharsets;
+    48| import java.nio.file.Files;
+    49| import java.nio.file.Path;
+    50| import java.nio.file.Paths;
+    51| import java.util.Locale;
+    52| import java.util.Map;
+    53| import java.util.Optional;
+    54| import java.util.concurrent.atomic.AtomicReference;
+    55| import static com.google.common.base.Strings.isNullOrEmpty;
+    56| public class CSVFileDataAdapter extends LookupDataAdapter {
+    57|     private static final Logger LOG = LoggerFactory.getLogger(CSVFileDataAdapter.class);
+    58|     public static final String NAME = "csvfile";
+    59|     private final Config config;
+    60|     private final AtomicReference<Map<String, String>> lookupRef = new AtomicReference<>(ImmutableMap.of());
+    61|     private FileInfo fileInfo = FileInfo.empty();
+    62|     @Inject
+    63|     public CSVFileDataAdapter(@Assisted("id") String id,
+    64|                               @Assisted("name") String name,
+    65|                               @Assisted LookupDataAdapterConfiguration config,
+    66|                               MetricRegistry metricRegistry) {
+    67|         super(id, name, config, metricRegistry);
+    68|         this.config = (Config) config;
+    69|     }
+    70|     @Override
+    71|     public void doStart() throws Exception {
+    72|         LOG.debug("Starting CSV data adapter for file: {}", config.path());
+    73|         if (isNullOrEmpty(config.path())) {
+    74|             throw new IllegalStateException("File path needs to be set");
+    75|         }
+    76|         if (config.checkInterval() < 1) {
+    77|             throw new IllegalStateException("Check interval setting cannot be smaller than 1");
+    78|         }
+    79|         fileInfo = FileInfo.forPath(Paths.get(config.path()));
+    80|         lookupRef.set(parseCSVFile());
+    81|     }
+
+
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/periodical/ThrottleStateUpdaterThread.java
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 2-92 ---
+     2|  * This file is part of Graylog.
+     3|  *
+     4|  * Graylog is free software: you can redistribute it and/or modify
+     5|  * it under the terms of the GNU General Public License as published by
+     6|  * the Free Software Foundation, either version 3 of the License, or
+     7|  * (at your option) any later version.
+     8|  *
+     9|  * Graylog is distributed in the hope that it will be useful,
+    10|  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+    11|  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    12|  * GNU General Public License for more details.
+    13|  *
+    14|  * You should have received a copy of the GNU General Public License
+    15|  * along with Graylog.  If not, see <http://www.gnu.org/licenses/>.
+    16|  */
+    17| package org.graylog2.periodical;
+    18| import com.codahale.metrics.Gauge;
+    19| import com.codahale.metrics.MetricRegistry;
+    20| import com.codahale.metrics.RatioGauge;
+    21| import com.github.joschi.jadconfig.util.Size;
+    22| import com.google.common.eventbus.EventBus;
+    23| import org.graylog2.notifications.Notification;
+    24| import org.graylog2.notifications.NotificationService;
+    25| import org.graylog2.plugin.GlobalMetricNames;
+    26| import org.graylog2.plugin.ServerStatus;
+    27| import org.graylog2.plugin.ThrottleState;
+    28| import org.graylog2.plugin.periodical.Periodical;
+    29| import org.graylog2.shared.buffers.ProcessBuffer;
+    30| import org.graylog2.shared.journal.Journal;
+    31| import org.graylog2.shared.journal.KafkaJournal;
+    32| import org.slf4j.Logger;
+    33| import org.slf4j.LoggerFactory;
+    34| import javax.inject.Inject;
+    35| import javax.inject.Named;
+    36| import static org.graylog2.shared.metrics.MetricUtils.safelyRegister;
+    37| /**
+    38|  * The ThrottleStateUpdater publishes the current state buffer state of the journal to other interested parties,
+    39|  * chiefly the ThrottleableTransports.
+    40|  * <p/>
+    41|  * <p>
+    42|  * It only includes the necessary information to make a decision about whether to throttle parts of the system,
+    43|  * but does not send "throttle" commands. This allows for a flexible approach in picking a throttling strategy.
+    44|  * </p>
+    45|  * <p>
+    46|  * The implementation expects to be called once per second to have a rough estimate about the events per second,
+    47|  * over the last second.
+    48|  * </p>
+    49|  */
+    50| public class ThrottleStateUpdaterThread extends Periodical {
+    51|     private static final Logger log = LoggerFactory.getLogger(ThrottleStateUpdaterThread.class);
+    52|     private final KafkaJournal journal;
+    53|     private final ProcessBuffer processBuffer;
+    54|     private final EventBus eventBus;
+    55|     private final Size retentionSize;
+    56|     private final NotificationService notificationService;
+    57|     private final ServerStatus serverStatus;
+    58|     private boolean firstRun = true;
+    59|     private long logEndOffset;
+    60|     private long currentReadOffset;
+    61|     private long currentTs;
+    62|     private ThrottleState throttleState;
+    63|     @Inject
+    64|     public ThrottleStateUpdaterThread(final Journal journal,
+    65|                                       ProcessBuffer processBuffer,
+    66|                                       EventBus eventBus,
+    67|                                       NotificationService notificationService,
+    68|                                       ServerStatus serverStatus,
+    69|                                       MetricRegistry metricRegistry,
+    70|                                       @Named("message_journal_max_size") Size retentionSize) {
+    71|         this.processBuffer = processBuffer;
+    72|         this.eventBus = eventBus;
+    73|         this.retentionSize = retentionSize;
+    74|         this.notificationService = notificationService;
+    75|         this.serverStatus = serverStatus;
+    76|         if (journal instanceof KafkaJournal) {
+    77|             this.journal = (KafkaJournal) journal;
+    78|         } else {
+    79|             this.journal = null;
+    80|         }
+    81|         throttleState = new ThrottleState();
+    82|         safelyRegister(metricRegistry,
+    83|                        GlobalMetricNames.JOURNAL_APPEND_RATE,
+    84|                        new Gauge<Long>() {
+    85|                            @Override
+    86|                            public Long getValue() {
+    87|                                return throttleState.appendEventsPerSec;
+    88|                            }
+    89|                        });
+    90|         safelyRegister(metricRegistry,
+    91|                        GlobalMetricNames.JOURNAL_READ_RATE,
+    92|                        new Gauge<Long>() {
+
+# --- HUNK 2: Lines 182-220 ---
+   182|         long previousReadOffset = currentReadOffset;
+   183|         long logStartOffset = journal.getLogStartOffset();
+   184|         logEndOffset = journal.getLogEndOffset() - 1; // -1 because getLogEndOffset is the next offset that gets assigned
+   185|         currentReadOffset = journal.getNextReadOffset() - 1; // just to make it clear which field we read
+   186|         if (firstRun) {
+   187|             firstRun = false;
+   188|             return;
+   189|         }
+   190|         throttleState.appendEventsPerSec = (long) Math.floor((logEndOffset - previousLogEndOffset) / ((currentTs - prevTs) / 1.0E09));
+   191|         throttleState.readEventsPerSec = (long) Math.floor((currentReadOffset - previousReadOffset) / ((currentTs - prevTs) / 1.0E09));
+   192|         throttleState.journalSize = journal.size();
+   193|         throttleState.journalSizeLimit = retentionSize.toBytes();
+   194|         throttleState.processBufferCapacity = processBuffer.getRemainingCapacity();
+   195|         if (committedOffset == KafkaJournal.DEFAULT_COMMITTED_OFFSET) {
+   196|             throttleState.uncommittedJournalEntries = journal.size() == 0 ? 0 : logEndOffset - logStartOffset;
+   197|         } else {
+   198|             throttleState.uncommittedJournalEntries = logEndOffset - committedOffset;
+   199|         }
+   200|         log.debug("ThrottleState: {}", throttleState);
+   201|         journal.setThrottleState(throttleState);
+   202|         eventBus.post(throttleState);
+   203|         final double journalUtilizationPercentage = throttleState.journalSizeLimit > 0 ? (throttleState.journalSize * 100) / throttleState.journalSizeLimit : 0.0;
+   204|         if (journalUtilizationPercentage > KafkaJournal.NOTIFY_ON_UTILIZATION_PERCENTAGE) {
+   205|             Notification notification = notificationService.buildNow()
+   206|                     .addNode(serverStatus.getNodeId().toString())
+   207|                     .addType(Notification.Type.JOURNAL_UTILIZATION_TOO_HIGH)
+   208|                     .addSeverity(Notification.Severity.URGENT)
+   209|                     .addDetail("journal_utilization_percentage", journalUtilizationPercentage);
+   210|             notificationService.publishIfFirst(notification);
+   211|         }
+   212|         if (journal.getPurgedSegmentsInLastRetention() > 0) {
+   213|             Notification notification = notificationService.buildNow()
+   214|                     .addNode(serverStatus.getNodeId().toString())
+   215|                     .addType(Notification.Type.JOURNAL_UNCOMMITTED_MESSAGES_DELETED)
+   216|                     .addSeverity(Notification.Severity.URGENT);
+   217|             notificationService.publishIfFirst(notification);
+   218|         }
+   219|     }
+   220| }
+
+
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/plugin/BaseConfiguration.java
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 12-53 ---
+    12|  * GNU General Public License for more details.
+    13|  *
+    14|  * You should have received a copy of the GNU General Public License
+    15|  * along with Graylog.  If not, see <http://www.gnu.org/licenses/>.
+    16|  */
+    17| package org.graylog2.plugin;
+    18| import com.github.joschi.jadconfig.Parameter;
+    19| import com.github.joschi.jadconfig.ValidationException;
+    20| import com.github.joschi.jadconfig.ValidatorMethod;
+    21| import com.github.joschi.jadconfig.util.Duration;
+    22| import com.github.joschi.jadconfig.validators.PositiveDurationValidator;
+    23| import com.github.joschi.jadconfig.validators.PositiveIntegerValidator;
+    24| import com.github.joschi.jadconfig.validators.StringNotBlankValidator;
+    25| import com.github.joschi.jadconfig.validators.URIAbsoluteValidator;
+    26| import com.google.common.annotations.VisibleForTesting;
+    27| import com.lmax.disruptor.BlockingWaitStrategy;
+    28| import com.lmax.disruptor.BusySpinWaitStrategy;
+    29| import com.lmax.disruptor.SleepingWaitStrategy;
+    30| import com.lmax.disruptor.WaitStrategy;
+    31| import com.lmax.disruptor.YieldingWaitStrategy;
+    32| import org.graylog2.utilities.ProxyHostsPattern;
+    33| import org.graylog2.utilities.ProxyHostsPatternConverter;
+    34| import org.slf4j.Logger;
+    35| import org.slf4j.LoggerFactory;
+    36| import java.net.InetAddress;
+    37| import java.net.URI;
+    38| import java.net.URISyntaxException;
+    39| import java.net.UnknownHostException;
+    40| import java.nio.file.Files;
+    41| import java.nio.file.Path;
+    42| @SuppressWarnings("FieldMayBeFinal")
+    43| public abstract class BaseConfiguration {
+    44|     private static final Logger LOG = LoggerFactory.getLogger(BaseConfiguration.class);
+    45|     protected static final String WILDCARD_IP_ADDRESS = "0.0.0.0";
+    46|     protected static final int GRAYLOG_DEFAULT_PORT = 9000;
+    47|     protected static final int GRAYLOG_DEFAULT_WEB_PORT = 9000;
+    48|     @Parameter(value = "shutdown_timeout", validator = PositiveIntegerValidator.class)
+    49|     protected int shutdownTimeout = 30000;
+    50|     @Parameter(value = "rest_transport_uri", validator = URIAbsoluteValidator.class)
+    51|     private URI restTransportUri;
+    52|     @Parameter(value = "processbuffer_processors", required = true, validator = PositiveIntegerValidator.class)
+    53|     private int processBufferProcessors = 5;
+
+# --- HUNK 2: Lines 76-117 ---
+    76|     @Parameter(value = "rest_tls_key_file")
+    77|     private Path restTlsKeyFile;
+    78|     @Parameter(value = "rest_tls_key_password")
+    79|     private String restTlsKeyPassword;
+    80|     @Parameter(value = "plugin_dir")
+    81|     private String pluginDir = "plugin";
+    82|     @Parameter(value = "async_eventbus_processors")
+    83|     private int asyncEventbusProcessors = 2;
+    84|     @Parameter(value = "udp_recvbuffer_sizes", required = true, validator = PositiveIntegerValidator.class)
+    85|     private int udpRecvBufferSizes = 1048576;
+    86|     @Parameter("message_journal_enabled")
+    87|     private boolean messageJournalEnabled = true;
+    88|     @Parameter("inputbuffer_processors")
+    89|     private int inputbufferProcessors = 2;
+    90|     @Parameter("message_recordings_enable")
+    91|     private boolean messageRecordingsEnable = false;
+    92|     @Parameter("disable_sigar")
+    93|     private boolean disableSigar = false;
+    94|     @Parameter(value = "http_proxy_uri")
+    95|     private URI httpProxyUri;
+    96|     @Parameter(value = "http_non_proxy_hosts", converter = ProxyHostsPatternConverter.class)
+    97|     private ProxyHostsPattern httpNonProxyHostsPattern;
+    98|     @Parameter(value = "http_connect_timeout", validator = PositiveDurationValidator.class)
+    99|     private Duration httpConnectTimeout = Duration.seconds(5L);
+   100|     @Parameter(value = "http_write_timeout", validator = PositiveDurationValidator.class)
+   101|     private Duration httpWriteTimeout = Duration.seconds(10L);
+   102|     @Parameter(value = "http_read_timeout", validator = PositiveDurationValidator.class)
+   103|     private Duration httpReadTimeout = Duration.seconds(10L);
+   104|     @Parameter(value = "installation_source", validator = StringNotBlankValidator.class)
+   105|     private String installationSource = "unknown";
+   106|     @Parameter(value = "web_enable")
+   107|     private boolean webEnable = true;
+   108|     @Parameter(value = "web_endpoint_uri")
+   109|     private URI webEndpointUri;
+   110|     @Parameter(value = "web_enable_cors")
+   111|     private boolean webEnableCors = false;
+   112|     @Parameter(value = "web_enable_gzip")
+   113|     private boolean webEnableGzip = true;
+   114|     @Parameter(value = "web_max_header_size", required = true, validator = PositiveIntegerValidator.class)
+   115|     private int webMaxHeaderSize = 8192;
+   116|     @Parameter(value = "web_enable_tls")
+   117|     private boolean webEnableTls = false;
+
+# --- HUNK 3: Lines 258-300 ---
+   258|         this.messageJournalEnabled = messageJournalEnabled;
+   259|     }
+   260|     public int getInputbufferProcessors() {
+   261|         return inputbufferProcessors;
+   262|     }
+   263|     public int getShutdownTimeout() {
+   264|         return shutdownTimeout;
+   265|     }
+   266|     public int getUdpRecvBufferSizes() {
+   267|         return udpRecvBufferSizes;
+   268|     }
+   269|     public boolean isMessageRecordingsEnabled() {
+   270|         return messageRecordingsEnable;
+   271|     }
+   272|     public boolean isDisableSigar() {
+   273|         return disableSigar;
+   274|     }
+   275|     public URI getHttpProxyUri() {
+   276|         return httpProxyUri;
+   277|     }
+   278|     public ProxyHostsPattern getHttpNonProxyHostsPattern() {
+   279|         return httpNonProxyHostsPattern;
+   280|     }
+   281|     public Duration getHttpConnectTimeout() {
+   282|         return httpConnectTimeout;
+   283|     }
+   284|     public Duration getHttpWriteTimeout() {
+   285|         return httpWriteTimeout;
+   286|     }
+   287|     public Duration getHttpReadTimeout() {
+   288|         return httpReadTimeout;
+   289|     }
+   290|     public String getInstallationSource() {
+   291|         return installationSource;
+   292|     }
+   293|     public boolean isWebEnable() {
+   294|         return webEnable;
+   295|     }
+   296|     public boolean isRestAndWebOnSamePort() {
+   297|         final URI restListenUri = getRestListenUri();
+   298|         final URI webListenUri = getWebListenUri();
+   299|         try {
+   300|             final InetAddress restAddress = InetAddress.getByName(restListenUri.getHost());
+
+
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/plugin/utilities/FileInfo.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-99 ---
+     1| /**
+     2|  * This file is part of Graylog.
+     3|  *
+     4|  * Graylog is free software: you can redistribute it and/or modify
+     5|  * it under the terms of the GNU General Public License as published by
+     6|  * the Free Software Foundation, either version 3 of the License, or
+     7|  * (at your option) any later version.
+     8|  *
+     9|  * Graylog is distributed in the hope that it will be useful,
+    10|  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+    11|  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    12|  * GNU General Public License for more details.
+    13|  *
+    14|  * You should have received a copy of the GNU General Public License
+    15|  * along with Graylog.  If not, see <http://www.gnu.org/licenses/>.
+    16|  */
+    17| package org.graylog2.plugin.utilities;
+    18| import com.google.auto.value.AutoValue;
+    19| import org.slf4j.Logger;
+    20| import org.slf4j.LoggerFactory;
+    21| import javax.annotation.Nullable;
+    22| import javax.validation.constraints.NotNull;
+    23| import java.nio.file.Files;
+    24| import java.nio.file.Path;
+    25| import java.nio.file.Paths;
+    26| import java.nio.file.attribute.BasicFileAttributes;
+    27| import java.nio.file.attribute.FileTime;
+    28| import java.util.Objects;
+    29| /**
+    30|  * A {@code FileInfo} presents a concise way of checking for file modification based on its file system attributes.
+    31|  * <p>
+    32|  *     Construct it via its {@link FileInfo#forPath(Path)} method and later use the {@link #checkForChange()} method
+    33|  *     whenever you want to act if a modification has occurred. The returned {@link Change} object contains whether
+    34|  *     the file has actually changed and the new file info object to use in future checks.
+    35|  * </p>
+    36|  */
+    37| @AutoValue
+    38| public abstract class FileInfo {
+    39|     private static final Logger LOG = LoggerFactory.getLogger(FileInfo.class);
+    40|     private static final FileInfo EMPTY_FILE_INFO = FileInfo.builder()
+    41|             .key(null)
+    42|             .modificationTime(null)
+    43|             .size(-1L)
+    44|             .path(Paths.get(""))
+    45|             .build();
+    46|     @Nullable
+    47|     public abstract Object key();
+    48|     public abstract long size();
+    49|     @Nullable
+    50|     public abstract FileTime modificationTime();
+    51|     public abstract Path path();
+    52|     protected abstract Builder toBuilder();
+    53|     public static Builder builder() {
+    54|         return new AutoValue_FileInfo.Builder();
+    55|     }
+    56|     /**
+    57|      * Create a file info for the given path.
+    58|      *
+    59|      * @param path the path must exist, otherwise an IllegalArgumentException is thrown
+    60|      * @return the file info object
+    61|      */
+    62|     @NotNull
+    63|     public static FileInfo forPath(Path path) {
+    64|         try {
+    65|             final BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class);
+    66|             return FileInfo.builder()
+    67|                     .path(path)
+    68|                     .key(attributes.fileKey())
+    69|                     .size(attributes.size())
+    70|                     .modificationTime(attributes.lastModifiedTime())
+    71|                     .build();
+    72|         } catch (Exception e) {
+    73|             LOG.error("Couldn't get file info for path: {}", path, e);
+    74|             return EMPTY_FILE_INFO.toBuilder().path(path).build();
+    75|         }
+    76|     }
+    77|     @NotNull
+    78|     public static FileInfo empty() {
+    79|         return EMPTY_FILE_INFO;
+    80|     }
+    81|     @NotNull
+    82|     public FileInfo.Change checkForChange() {
+    83|         final FileInfo newFileInfo = forPath(path());
+    84|         if (newFileInfo.equals(this)) {
+    85|             return Change.none();
+    86|         }
+    87|         return new Change(newFileInfo);
+    88|     }
+    89|     @AutoValue.Builder
+    90|     public abstract static class Builder {
+    91|         public abstract Builder key(@Nullable Object key);
+    92|         public abstract Builder size(long size);
+    93|         public abstract Builder modificationTime(@Nullable FileTime modificationTime);
+    94|         public abstract Builder path(Path path);
+    95|         public abstract FileInfo build();
+    96|     }
+    97|     public static class Change {
+    98|         private static final Change NONE = new Change(null);
+    99|         private final FileInfo info;
+
+
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/rest/resources/system/inputs/InputsResource.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 123-163 ---
+   123|                     .path("{inputId}")
+   124|                     .build(newId);
+   125|             return Response.created(inputUri).entity(InputCreated.create(newId)).build();
+   126|         } catch (NoSuchInputTypeException e) {
+   127|             LOG.error("There is no such input type registered.", e);
+   128|             throw new NotFoundException("There is no such input type registered.", e);
+   129|         } catch (ConfigurationException e) {
+   130|             LOG.error("Missing or invalid input configuration.", e);
+   131|             throw new BadRequestException("Missing or invalid input configuration.", e);
+   132|         }
+   133|     }
+   134|     @DELETE
+   135|     @Timed
+   136|     @Path("/{inputId}")
+   137|     @ApiOperation(value = "Terminate input on this node")
+   138|     @ApiResponses(value = {
+   139|             @ApiResponse(code = 404, message = "No such input on this node.")
+   140|     })
+   141|     @AuditEvent(type = AuditEventTypes.MESSAGE_INPUT_DELETE)
+   142|     public void terminate(@ApiParam(name = "inputId", required = true) @PathParam("inputId") String inputId) throws org.graylog2.database.NotFoundException {
+   143|         checkPermission(RestPermissions.INPUTS_TERMINATE, inputId);
+   144|         final Input input = inputService.find(inputId);
+   145|         inputService.destroy(input);
+   146|     }
+   147|     @PUT
+   148|     @Timed
+   149|     @Path("/{inputId}")
+   150|     @ApiOperation(
+   151|             value = "Update input on this node",
+   152|             response = InputCreated.class
+   153|     )
+   154|     @ApiResponses(value = {
+   155|             @ApiResponse(code = 404, message = "No such input on this node."),
+   156|             @ApiResponse(code = 400, message = "Missing or invalid input configuration.")
+   157|     })
+   158|     @AuditEvent(type = AuditEventTypes.MESSAGE_INPUT_UPDATE)
+   159|     public Response update(@ApiParam(name = "JSON body", required = true) @Valid @NotNull InputCreateRequest lr,
+   160|                            @ApiParam(name = "inputId", required = true) @PathParam("inputId") String inputId) throws org.graylog2.database.NotFoundException, NoSuchInputTypeException, ConfigurationException, ValidationException {
+   161|         checkPermission(RestPermissions.INPUTS_EDIT, inputId);
+   162|         final Input input = inputService.find(inputId);
+   163|         final Map<String, Object> mergedInput = input.getFields();
+
+
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/rest/resources/system/logs/LoggersResource.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 17-57 ---
+    17| package org.graylog2.rest.resources.system.logs;
+    18| import com.codahale.metrics.annotation.Timed;
+    19| import com.google.common.annotations.VisibleForTesting;
+    20| import com.google.common.collect.ImmutableMap;
+    21| import com.google.common.collect.Maps;
+    22| import io.swagger.annotations.Api;
+    23| import io.swagger.annotations.ApiOperation;
+    24| import io.swagger.annotations.ApiParam;
+    25| import io.swagger.annotations.ApiResponse;
+    26| import io.swagger.annotations.ApiResponses;
+    27| import org.apache.logging.log4j.Level;
+    28| import org.apache.logging.log4j.LogManager;
+    29| import org.apache.logging.log4j.Marker;
+    30| import org.apache.logging.log4j.core.Appender;
+    31| import org.apache.logging.log4j.core.LogEvent;
+    32| import org.apache.logging.log4j.core.LoggerContext;
+    33| import org.apache.logging.log4j.core.config.Configuration;
+    34| import org.apache.logging.log4j.core.config.LoggerConfig;
+    35| import org.apache.logging.log4j.core.impl.ThrowableProxy;
+    36| import org.apache.shiro.authz.annotation.RequiresAuthentication;
+    37| import org.apache.shiro.authz.annotation.RequiresPermissions;
+    38| import org.graylog2.audit.AuditEventTypes;
+    39| import org.graylog2.audit.jersey.AuditEvent;
+    40| import org.graylog2.log4j.MemoryAppender;
+    41| import org.graylog2.rest.models.system.loggers.responses.InternalLogMessage;
+    42| import org.graylog2.rest.models.system.loggers.responses.LogMessagesSummary;
+    43| import org.graylog2.rest.models.system.loggers.responses.LoggersSummary;
+    44| import org.graylog2.rest.models.system.loggers.responses.SingleLoggerSummary;
+    45| import org.graylog2.rest.models.system.loggers.responses.SingleSubsystemSummary;
+    46| import org.graylog2.rest.models.system.loggers.responses.SubsystemSummary;
+    47| import org.graylog2.shared.rest.resources.RestResource;
+    48| import org.graylog2.shared.security.RestPermissions;
+    49| import org.joda.time.DateTime;
+    50| import org.joda.time.DateTimeZone;
+    51| import org.slf4j.LoggerFactory;
+    52| import javax.validation.constraints.Min;
+    53| import javax.validation.constraints.NotEmpty;
+    54| import javax.ws.rs.DefaultValue;
+    55| import javax.ws.rs.GET;
+    56| import javax.ws.rs.InternalServerErrorException;
+    57| import javax.ws.rs.NotFoundException;
+
+# --- HUNK 2: Lines 176-216 ---
+   176|             notes = "Provided level is falling back to DEBUG if it does not exist")
+   177|     @Path("/{loggerName}/level/{level}")
+   178|     @AuditEvent(type = AuditEventTypes.LOG_LEVEL_UPDATE)
+   179|     public void setSingleLoggerLevel(
+   180|         @ApiParam(name = "loggerName", required = true) @PathParam("loggerName") @NotEmpty String loggerName,
+   181|         @ApiParam(name = "level", required = true) @NotEmpty @PathParam("level") String level) {
+   182|         checkPermission(RestPermissions.LOGGERS_EDIT, loggerName);
+   183|         final Level newLevel = Level.toLevel(level.toUpperCase(Locale.ENGLISH));
+   184|         setLoggerLevel(loggerName, newLevel);
+   185|         LOG.debug("Successfully set log level for logger \"{}\" to \"{}\"", loggerName, newLevel);
+   186|     }
+   187|     @GET
+   188|     @Timed
+   189|     @ApiOperation(value = "Get recent internal log messages")
+   190|     @ApiResponses(value = {
+   191|             @ApiResponse(code = 404, message = "Memory appender is disabled."),
+   192|             @ApiResponse(code = 500, message = "Memory appender is broken.")
+   193|     })
+   194|     @Path("/messages/recent")
+   195|     @Produces(MediaType.APPLICATION_JSON)
+   196|     @RequiresPermissions(RestPermissions.LOGGERSMESSAGES_READ)
+   197|     public LogMessagesSummary messages(@ApiParam(name = "limit", value = "How many log messages should be returned", defaultValue = "500", allowableValues = "range[0, infinity]")
+   198|                                        @QueryParam("limit") @DefaultValue("500") @Min(0L) int limit,
+   199|                                        @ApiParam(name = "level", value = "Which log level (or higher) should the messages have", defaultValue = "ALL", allowableValues = "[OFF, FATAL, ERROR, WARN, INFO, DEBUG, TRACE, ALL]")
+   200|                                        @QueryParam("level") @DefaultValue("ALL") @NotEmpty String level) {
+   201|         final Appender appender = getAppender(MEMORY_APPENDER_NAME);
+   202|         if (appender == null) {
+   203|             throw new NotFoundException("Memory appender is disabled. Please refer to the example log4j.xml file.");
+   204|         }
+   205|         if (!(appender instanceof MemoryAppender)) {
+   206|             throw new InternalServerErrorException("Memory appender is not an instance of MemoryAppender. Please refer to the example log4j.xml file.");
+   207|         }
+   208|         final Level logLevel = Level.toLevel(level, Level.ALL);
+   209|         final MemoryAppender memoryAppender = (MemoryAppender) appender;
+   210|         final List<InternalLogMessage> messages = new ArrayList<>(limit);
+   211|         for (LogEvent event : memoryAppender.getLogMessages(limit)) {
+   212|             final Level eventLevel = event.getLevel();
+   213|             if (!eventLevel.isMoreSpecificThan(logLevel)) {
+   214|                 continue;
+   215|             }
+   216|             final ThrowableProxy thrownProxy = event.getThrownProxy();
+
+
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/shared/bindings/providers/OkHttpClientProvider.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 8-122 ---
+     8|  *
+     9|  * Graylog is distributed in the hope that it will be useful,
+    10|  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+    11|  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    12|  * GNU General Public License for more details.
+    13|  *
+    14|  * You should have received a copy of the GNU General Public License
+    15|  * along with Graylog.  If not, see <http://www.gnu.org/licenses/>.
+    16|  */
+    17| package org.graylog2.shared.bindings.providers;
+    18| import com.github.joschi.jadconfig.util.Duration;
+    19| import com.google.common.base.Splitter;
+    20| import com.google.common.collect.ImmutableList;
+    21| import okhttp3.Authenticator;
+    22| import okhttp3.Challenge;
+    23| import okhttp3.Credentials;
+    24| import okhttp3.OkHttpClient;
+    25| import okhttp3.Request;
+    26| import okhttp3.Response;
+    27| import okhttp3.Route;
+    28| import org.graylog2.utilities.ProxyHostsPattern;
+    29| import org.slf4j.Logger;
+    30| import org.slf4j.LoggerFactory;
+    31| import javax.annotation.Nonnull;
+    32| import javax.annotation.Nullable;
+    33| import javax.inject.Inject;
+    34| import javax.inject.Named;
+    35| import javax.inject.Provider;
+    36| import javax.inject.Singleton;
+    37| import java.io.IOException;
+    38| import java.net.InetAddress;
+    39| import java.net.InetSocketAddress;
+    40| import java.net.Proxy;
+    41| import java.net.ProxySelector;
+    42| import java.net.SocketAddress;
+    43| import java.net.URI;
+    44| import java.net.UnknownHostException;
+    45| import java.util.List;
+    46| import java.util.Locale;
+    47| import java.util.Set;
+    48| import java.util.stream.Collectors;
+    49| import static com.google.common.base.Strings.isNullOrEmpty;
+    50| import static com.google.common.net.HttpHeaders.PROXY_AUTHORIZATION;
+    51| import static java.util.Objects.requireNonNull;
+    52| /**
+    53|  * Provider for a configured {@link okhttp3.OkHttpClient}.
+    54|  *
+    55|  * @see org.graylog2.plugin.BaseConfiguration#getHttpConnectTimeout()
+    56|  * @see org.graylog2.plugin.BaseConfiguration#getHttpReadTimeout()
+    57|  * @see org.graylog2.plugin.BaseConfiguration#getHttpWriteTimeout()
+    58|  * @see org.graylog2.plugin.BaseConfiguration#getHttpProxyUri()
+    59|  */
+    60| @Singleton
+    61| public class OkHttpClientProvider implements Provider<OkHttpClient> {
+    62|     private static final Logger LOG = LoggerFactory.getLogger(OkHttpClientProvider.class);
+    63|     protected final Duration connectTimeout;
+    64|     protected final Duration readTimeout;
+    65|     protected final Duration writeTimeout;
+    66|     protected final URI httpProxyUri;
+    67|     protected final ProxyHostsPattern nonProxyHostsPattern;
+    68|     @Inject
+    69|     public OkHttpClientProvider(@Named("http_connect_timeout") Duration connectTimeout,
+    70|                                 @Named("http_read_timeout") Duration readTimeout,
+    71|                                 @Named("http_write_timeout") Duration writeTimeout,
+    72|                                 @Named("http_proxy_uri") @Nullable URI httpProxyUri,
+    73|                                 @Named("http_non_proxy_hosts") @Nullable ProxyHostsPattern nonProxyHostsPattern) {
+    74|         this.connectTimeout = requireNonNull(connectTimeout);
+    75|         this.readTimeout = requireNonNull(readTimeout);
+    76|         this.writeTimeout = requireNonNull(writeTimeout);
+    77|         this.httpProxyUri = httpProxyUri;
+    78|         this.nonProxyHostsPattern = nonProxyHostsPattern;
+    79|     }
+    80|     @Override
+    81|     public OkHttpClient get() {
+    82|         final OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
+    83|                 .retryOnConnectionFailure(true)
+    84|                 .connectTimeout(connectTimeout.getQuantity(), connectTimeout.getUnit())
+    85|                 .writeTimeout(writeTimeout.getQuantity(), writeTimeout.getUnit())
+    86|                 .readTimeout(readTimeout.getQuantity(), readTimeout.getUnit());
+    87|         if (httpProxyUri != null) {
+    88|             final Proxy proxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(httpProxyUri.getHost(), httpProxyUri.getPort()));
+    89|             final ProxySelector proxySelector = new ProxySelector() {
+    90|                 @Override
+    91|                 public List<Proxy> select(URI uri) {
+    92|                     final String host = uri.getHost();
+    93|                     if (nonProxyHostsPattern != null && nonProxyHostsPattern.matches(host)) {
+    94|                         LOG.debug("Bypassing proxy server for {}", host);
+    95|                         return ImmutableList.of(Proxy.NO_PROXY);
+    96|                     }
+    97|                     try {
+    98|                         final InetAddress targetAddress = InetAddress.getByName(host);
+    99|                         if (targetAddress.isLoopbackAddress()) {
+   100|                             return ImmutableList.of(Proxy.NO_PROXY);
+   101|                         } else if (nonProxyHostsPattern != null && nonProxyHostsPattern.matches(targetAddress.getHostAddress())) {
+   102|                             LOG.debug("Bypassing proxy server for {}", targetAddress.getHostAddress());
+   103|                             return ImmutableList.of(Proxy.NO_PROXY);
+   104|                         }
+   105|                     } catch (UnknownHostException e) {
+   106|                         LOG.debug("Unable to resolve host name for proxy selection: ", e);
+   107|                     }
+   108|                     return ImmutableList.of(proxy);
+   109|                 }
+   110|                 @Override
+   111|                 public void connectFailed(URI uri, SocketAddress sa, IOException ioe) {
+   112|                     LOG.warn("Unable to connect to proxy: ", ioe);
+   113|                 }
+   114|             };
+   115|             clientBuilder.proxySelector(proxySelector);
+   116|             if (!isNullOrEmpty(httpProxyUri.getUserInfo())) {
+   117|                 final List<String> list = Splitter.on(":")
+   118|                         .limit(2)
+   119|                         .splitToList(httpProxyUri.getUserInfo());
+   120|                 if (list.size() == 2) {
+   121|                     clientBuilder.proxyAuthenticator(new ProxyAuthenticator(list.get(0), list.get(1)));
+   122|                 }
+
+
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/shared/bindings/providers/SystemOkHttpClientProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 10-33 ---
+    10|  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+    11|  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    12|  * GNU General Public License for more details.
+    13|  *
+    14|  * You should have received a copy of the GNU General Public License
+    15|  * along with Graylog.  If not, see <http://www.gnu.org/licenses/>.
+    16|  */
+    17| package org.graylog2.shared.bindings.providers;
+    18| import com.github.joschi.jadconfig.util.Duration;
+    19| import javax.inject.Singleton;
+    20| /**
+    21|  * Provider for a configured {@link com.squareup.okhttp.OkHttpClient} used for system-level tasks.
+    22|  */
+    23| @Singleton
+    24| public class SystemOkHttpClientProvider extends OkHttpClientProvider {
+    25|     public SystemOkHttpClientProvider() {
+    26|         super(
+    27|                 Duration.seconds(2L),
+    28|                 Duration.seconds(5L),
+    29|                 Duration.seconds(5L),
+    30|                 null,
+    31|                 null);
+    32|     }
+    33| }
+
+
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/shared/events/DeadEventLoggingListener.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 6-30 ---
+     6|  * the Free Software Foundation, either version 3 of the License, or
+     7|  * (at your option) any later version.
+     8|  *
+     9|  * Graylog is distributed in the hope that it will be useful,
+    10|  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+    11|  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    12|  * GNU General Public License for more details.
+    13|  *
+    14|  * You should have received a copy of the GNU General Public License
+    15|  * along with Graylog.  If not, see <http://www.gnu.org/licenses/>.
+    16|  */
+    17| package org.graylog2.shared.events;
+    18| import com.google.common.eventbus.DeadEvent;
+    19| import com.google.common.eventbus.Subscribe;
+    20| import org.slf4j.Logger;
+    21| import org.slf4j.LoggerFactory;
+    22| public class DeadEventLoggingListener {
+    23|     private static final Logger LOGGER = LoggerFactory.getLogger(DeadEventLoggingListener.class);
+    24|     @Subscribe
+    25|     public void handleDeadEvent(DeadEvent event) {
+    26|         LOGGER.debug("Received unhandled event of type <{}> from event bus <{}>", event.getEvent().getClass().getCanonicalName(),
+    27|                 event.getSource().toString());
+    28|         LOGGER.debug("Dead event contents: {}", event.getEvent());
+    29|     }
+    30| }
+
+
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/shared/rest/resources/system/SystemPluginResource.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 2-58 ---
+     2|  * This file is part of Graylog.
+     3|  *
+     4|  * Graylog is free software: you can redistribute it and/or modify
+     5|  * it under the terms of the GNU General Public License as published by
+     6|  * the Free Software Foundation, either version 3 of the License, or
+     7|  * (at your option) any later version.
+     8|  *
+     9|  * Graylog is distributed in the hope that it will be useful,
+    10|  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+    11|  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    12|  * GNU General Public License for more details.
+    13|  *
+    14|  * You should have received a copy of the GNU General Public License
+    15|  * along with Graylog.  If not, see <http://www.gnu.org/licenses/>.
+    16|  */
+    17| package org.graylog2.shared.rest.resources.system;
+    18| import com.codahale.metrics.annotation.Timed;
+    19| import com.google.common.collect.Lists;
+    20| import io.swagger.annotations.Api;
+    21| import io.swagger.annotations.ApiOperation;
+    22| import org.apache.shiro.authz.annotation.RequiresAuthentication;
+    23| import org.graylog2.plugin.Capabilities;
+    24| import org.graylog2.plugin.PluginMetaData;
+    25| import org.graylog2.rest.models.system.plugins.responses.PluginList;
+    26| import org.graylog2.rest.models.system.plugins.responses.PluginMetaDataValue;
+    27| import org.graylog2.shared.rest.resources.RestResource;
+    28| import javax.inject.Inject;
+    29| import javax.ws.rs.GET;
+    30| import javax.ws.rs.Path;
+    31| import javax.ws.rs.Produces;
+    32| import javax.ws.rs.core.MediaType;
+    33| import java.util.List;
+    34| import java.util.Set;
+    35| @Api(value = "System/Plugins", description = "Plugin information")
+    36| @Path("/system/plugins")
+    37| @Produces(MediaType.APPLICATION_JSON)
+    38| @RequiresAuthentication
+    39| public class SystemPluginResource extends RestResource {
+    40|     private final Set<PluginMetaData> pluginMetaDataSet;
+    41|     @Inject
+    42|     public SystemPluginResource(Set<PluginMetaData> pluginMetaDataSet) {
+    43|         this.pluginMetaDataSet = pluginMetaDataSet;
+    44|     }
+    45|     @GET
+    46|     @Timed
+    47|     @ApiOperation(value = "List all installed plugins on this node.")
+    48|     public PluginList list() {
+    49|         final List<PluginMetaDataValue> pluginMetaDataValues = Lists.newArrayList();
+    50|         for (PluginMetaData pluginMetaData : pluginMetaDataSet) {
+    51|             pluginMetaDataValues.add(PluginMetaDataValue.create(
+    52|                     pluginMetaData.getUniqueId(),
+    53|                     pluginMetaData.getName(),
+    54|                     pluginMetaData.getAuthor(),
+    55|                     pluginMetaData.getURL(),
+    56|                     pluginMetaData.getVersion().toString(),
+    57|                     pluginMetaData.getDescription(),
+    58|                     pluginMetaData.getRequiredVersion().toString(),
+
+
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/shared/security/RestPermissions.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 66-106 ---
+    66|     public static final String INPUTS_CHANGESTATE = "inputs:changestate";
+    67|     public static final String INPUTS_CREATE = "inputs:create";
+    68|     public static final String INPUTS_EDIT = "inputs:edit";
+    69|     public static final String INPUTS_READ = "inputs:read";
+    70|     public static final String INPUTS_TERMINATE = "inputs:terminate";
+    71|     public static final String JOURNAL_EDIT = "journal:edit";
+    72|     public static final String JOURNAL_READ = "journal:read";
+    73|     public static final String JVMSTATS_READ = "jvmstats:read";
+    74|     public static final String LBSTATUS_CHANGE = "lbstatus:change";
+    75|     public static final String LDAP_EDIT = "ldap:edit";
+    76|     public static final String LDAPGROUPS_EDIT = "ldapgroups:edit";
+    77|     public static final String LDAPGROUPS_READ = "ldapgroups:read";
+    78|     public static final String LOOKUP_TABLES_CREATE = "lookuptables:create";
+    79|     public static final String LOOKUP_TABLES_DELETE = "lookuptables:delete";
+    80|     public static final String LOOKUP_TABLES_EDIT = "lookuptables:edit";
+    81|     public static final String LOOKUP_TABLES_READ = "lookuptables:read";
+    82|     public static final String LOGGERS_EDIT = "loggers:edit";
+    83|     public static final String LOGGERS_EDITSUBSYSTEM = "loggers:editsubsystem";
+    84|     public static final String LOGGERS_READ = "loggers:read";
+    85|     public static final String LOGGERS_READSUBSYSTEM = "loggers:readsubsystem";
+    86|     public static final String LOGGERSMESSAGES_READ = "loggersmessages:read";
+    87|     public static final String MESSAGECOUNT_READ = "messagecount:read";
+    88|     public static final String MESSAGES_ANALYZE = "messages:analyze";
+    89|     public static final String MESSAGES_READ = "messages:read";
+    90|     public static final String METRICS_ALLKEYS = "metrics:allkeys";
+    91|     public static final String METRICS_READ = "metrics:read";
+    92|     public static final String METRICS_READALL = "metrics:readall";
+    93|     public static final String METRICS_READHISTORY = "metrics:readhistory";
+    94|     public static final String NODE_SHUTDOWN = "node:shutdown";
+    95|     public static final String NOTIFICATIONS_DELETE = "notifications:delete";
+    96|     public static final String NOTIFICATIONS_READ = "notifications:read";
+    97|     public static final String OUTPUTS_CREATE = "outputs:create";
+    98|     public static final String OUTPUTS_EDIT = "outputs:edit";
+    99|     public static final String OUTPUTS_READ = "outputs:read";
+   100|     public static final String OUTPUTS_TERMINATE = "outputs:terminate";
+   101|     public static final String PROCESSING_CHANGESTATE = "processing:changestate";
+   102|     public static final String ROLES_CREATE = "roles:create";
+   103|     public static final String ROLES_DELETE = "roles:delete";
+   104|     public static final String ROLES_EDIT = "roles:edit";
+   105|     public static final String ROLES_READ = "roles:read";
+   106|     public static final String SAVEDSEARCHES_CREATE = "savedsearches:create";
+
+# --- HUNK 2: Lines 174-214 ---
+   174|         .add(create(INPUTS_CHANGESTATE, ""))
+   175|         .add(create(INPUTS_CREATE, ""))
+   176|         .add(create(INPUTS_EDIT, ""))
+   177|         .add(create(INPUTS_READ, ""))
+   178|         .add(create(INPUTS_TERMINATE, ""))
+   179|         .add(create(JOURNAL_EDIT, ""))
+   180|         .add(create(JOURNAL_READ, ""))
+   181|         .add(create(JVMSTATS_READ, ""))
+   182|         .add(create(LBSTATUS_CHANGE, ""))
+   183|         .add(create(LDAP_EDIT, ""))
+   184|         .add(create(LDAPGROUPS_EDIT, ""))
+   185|         .add(create(LDAPGROUPS_READ, ""))
+   186|         .add(create(LOOKUP_TABLES_CREATE, ""))
+   187|         .add(create(LOOKUP_TABLES_DELETE, ""))
+   188|         .add(create(LOOKUP_TABLES_EDIT, ""))
+   189|         .add(create(LOOKUP_TABLES_READ, ""))
+   190|         .add(create(LOGGERS_EDIT, ""))
+   191|         .add(create(LOGGERS_EDITSUBSYSTEM, ""))
+   192|         .add(create(LOGGERS_READ, ""))
+   193|         .add(create(LOGGERS_READSUBSYSTEM, ""))
+   194|         .add(create(LOGGERSMESSAGES_READ, ""))
+   195|         .add(create(MESSAGECOUNT_READ, ""))
+   196|         .add(create(MESSAGES_ANALYZE, ""))
+   197|         .add(create(MESSAGES_READ, ""))
+   198|         .add(create(METRICS_ALLKEYS, ""))
+   199|         .add(create(METRICS_READ, ""))
+   200|         .add(create(METRICS_READALL, ""))
+   201|         .add(create(METRICS_READHISTORY, ""))
+   202|         .add(create(NODE_SHUTDOWN, ""))
+   203|         .add(create(NOTIFICATIONS_DELETE, ""))
+   204|         .add(create(NOTIFICATIONS_READ, ""))
+   205|         .add(create(OUTPUTS_CREATE, ""))
+   206|         .add(create(OUTPUTS_EDIT, ""))
+   207|         .add(create(OUTPUTS_READ, ""))
+   208|         .add(create(OUTPUTS_TERMINATE, ""))
+   209|         .add(create(PROCESSING_CHANGESTATE, ""))
+   210|         .add(create(ROLES_CREATE, ""))
+   211|         .add(create(ROLES_DELETE, ""))
+   212|         .add(create(ROLES_EDIT, ""))
+   213|         .add(create(ROLES_READ, ""))
+   214|         .add(create(SAVEDSEARCHES_CREATE, ""))
+
+
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/utilities/ProxyHostsPattern.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-89 ---
+     1| /**
+     2|  * This file is part of Graylog.
+     3|  *
+     4|  * Graylog is free software: you can redistribute it and/or modify
+     5|  * it under the terms of the GNU General Public License as published by
+     6|  * the Free Software Foundation, either version 3 of the License, or
+     7|  * (at your option) any later version.
+     8|  *
+     9|  * Graylog is distributed in the hope that it will be useful,
+    10|  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+    11|  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    12|  * GNU General Public License for more details.
+    13|  *
+    14|  * You should have received a copy of the GNU General Public License
+    15|  * along with Graylog.  If not, see <http://www.gnu.org/licenses/>.
+    16|  */
+    17| package org.graylog2.utilities;
+    18| import com.google.common.base.Splitter;
+    19| import org.slf4j.Logger;
+    20| import org.slf4j.LoggerFactory;
+    21| import javax.annotation.Nullable;
+    22| import java.util.Locale;
+    23| import java.util.Set;
+    24| import java.util.regex.Pattern;
+    25| import java.util.stream.Collectors;
+    26| import static com.google.common.base.Strings.isNullOrEmpty;
+    27| /**
+    28|  * Hostname and IP address matcher implementation similar to what the JDK is using in the proxy server selector
+    29|  * to support the {@code http.nonProxyHosts} property.
+    30|  * <p>
+    31|  * The main difference to the implementation in the JDK is, that this one is using {@code ","} as delimiter.
+    32|  * <p>
+    33|  * See: <https://docs.oracle.com/javase/8/docs/technotes/guides/net/proxies.html>
+    34|  */
+    35| public class ProxyHostsPattern {
+    36|     private static final Logger LOG = LoggerFactory.getLogger(ProxyHostsPattern.class);
+    37|     private static final String DELIMITER = ",";
+    38|     private final String noProxyHosts;
+    39|     private final Pattern pattern;
+    40|     private ProxyHostsPattern(String noProxyHosts, Pattern pattern) {
+    41|         this.noProxyHosts = noProxyHosts;
+    42|         this.pattern = pattern;
+    43|     }
+    44|     public String getNoProxyHosts() {
+    45|         return noProxyHosts;
+    46|     }
+    47|     public boolean matches(@Nullable final String hostOrIp) {
+    48|         if (pattern == null) {
+    49|             LOG.debug("No proxy host pattern defined");
+    50|             return false;
+    51|         }
+    52|         if (isNullOrEmpty(hostOrIp)) {
+    53|             LOG.debug("Host or IP address <{}> doesn't match <{}>", hostOrIp, noProxyHosts);
+    54|             return false;
+    55|         }
+    56|         if (pattern.matcher(hostOrIp.toLowerCase(Locale.ROOT)).matches()) {
+    57|             LOG.debug("Host or IP address <{}> matches <{}>", hostOrIp, noProxyHosts);
+    58|             return true;
+    59|         } else {
+    60|             LOG.debug("Host or IP address <{}> doesn't match <{}>", hostOrIp, noProxyHosts);
+    61|             return false;
+    62|         }
+    63|     }
+    64|     public static ProxyHostsPattern create(final String noProxyHosts) {
+    65|         if (isNullOrEmpty(noProxyHosts)) {
+    66|             return new ProxyHostsPattern("", null);
+    67|         }
+    68|         final Set<String> patterns = Splitter.on(DELIMITER)
+    69|                 .trimResults()
+    70|                 .omitEmptyStrings()
+    71|                 .splitToList(noProxyHosts)
+    72|                 .stream()
+    73|                 .map(ProxyHostsPattern::toPattern)
+    74|                 .collect(Collectors.toSet());
+    75|         if (patterns.isEmpty()) {
+    76|             return new ProxyHostsPattern(noProxyHosts, null);
+    77|         }
+    78|         return new ProxyHostsPattern(noProxyHosts, Pattern.compile(String.join("|", patterns)));
+    79|     }
+    80|     private static String toPattern(String hostPattern) {
+    81|         if (hostPattern.startsWith("*")) {
+    82|             return ".*" + Pattern.quote(hostPattern.substring(1).toLowerCase(Locale.ROOT));
+    83|         } else if (hostPattern.endsWith("*")) {
+    84|             return Pattern.quote(hostPattern.substring(0, hostPattern.length() - 1).toLowerCase(Locale.ROOT)) + ".*";
+    85|         } else {
+    86|             return Pattern.quote(hostPattern);
+    87|         }
+    88|     }
+    89| }
+
+
+# ====================================================================
+# FILE: graylog2-server/src/main/java/org/graylog2/utilities/ProxyHostsPatternConverter.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-33 ---
+     1| /**
+     2|  * This file is part of Graylog.
+     3|  *
+     4|  * Graylog is free software: you can redistribute it and/or modify
+     5|  * it under the terms of the GNU General Public License as published by
+     6|  * the Free Software Foundation, either version 3 of the License, or
+     7|  * (at your option) any later version.
+     8|  *
+     9|  * Graylog is distributed in the hope that it will be useful,
+    10|  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+    11|  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    12|  * GNU General Public License for more details.
+    13|  *
+    14|  * You should have received a copy of the GNU General Public License
+    15|  * along with Graylog.  If not, see <http://www.gnu.org/licenses/>.
+    16|  */
+    17| package org.graylog2.utilities;
+    18| import com.github.joschi.jadconfig.Converter;
+    19| import com.github.joschi.jadconfig.ParameterException;
+    20| public class ProxyHostsPatternConverter implements Converter<ProxyHostsPattern> {
+    21|     @Override
+    22|     public ProxyHostsPattern convertFrom(String value) {
+    23|         try {
+    24|             return ProxyHostsPattern.create(value);
+    25|         } catch (IllegalArgumentException e) {
+    26|             throw new ParameterException("Invalid proxy hosts pattern: \"" + value + "\"", e);
+    27|         }
+    28|     }
+    29|     @Override
+    30|     public String convertTo(ProxyHostsPattern value) {
+    31|         return value.getNoProxyHosts();
+    32|     }
+    33| }
+
+
+# ====================================================================
+# FILE: graylog2-web-interface/src/components/common/Select.jsx
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 77-106 ---
+    77|   _formatInputValue(value) {
+    78|     const { options, displayKey, valueKey, delimiter } = this.props;
+    79|     return value.split(delimiter).map((v) => {
+    80|       const predicate = {};
+    81|       predicate[valueKey] = v;
+    82|       const option = lodash.find(options, predicate);
+    83|       predicate[displayKey] = v;
+    84|       return option || predicate;
+    85|     });
+    86|   },
+    87|   render() {
+    88|     const { allowCreate, size, onReactSelectChange, multi } = this.props;
+    89|     const value = this.state.value;
+    90|     const reactSelectProps = lodash.pick(this.props, acceptedReactSelectProps);
+    91|     const SelectComponent = allowCreate ? ReactSelect.Creatable : ReactSelect;
+    92|     let formattedValue = value;
+    93|     if (value && multi && allowCreate) {
+    94|       formattedValue = this._formatInputValue(value);
+    95|     }
+    96|     return (
+    97|       <div className={`${size === 'small' ? 'select-sm' : ''} ${this.reactSelectSmStyles.locals.increaseZIndex}`}>
+    98|         <SelectComponent ref={(c) => { this._select = c; }}
+    99|                          onChange={onReactSelectChange || this._onChange}
+   100|                          {...reactSelectProps}
+   101|                          value={formattedValue} />
+   102|       </div>
+   103|     );
+   104|   },
+   105| });
+   106| export default Select;
+
+
+# ====================================================================
+# FILE: graylog2-web-interface/src/components/common/TypeAheadInput.jsx
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-78 ---
+     1| import PropTypes from 'prop-types';
+     2| import React from 'react';
+     3| import ReactDOM from 'react-dom';
+     4| import { Input } from 'components/bootstrap';
+     5| import lodash from 'lodash';
+     6| import $ from 'jquery';
+     7| import UniversalSearch from 'logic/search/UniversalSearch';
+     8| import Typeahead from 'typeahead.js';
+     9| const TypeAheadInput = React.createClass({
+    10|   propTypes: {
+    11|     label: PropTypes.string.isRequired,
+    12|     onKeyPress: PropTypes.func,
+    13|     displayKey: PropTypes.string,
+    14|     suggestions: PropTypes.array, // [ "some string", "otherstring" ]
+    15|     suggestionText: PropTypes.string,
+    16|     onTypeaheadLoaded: PropTypes.func,
+    17|     onSuggestionSelected: PropTypes.func,
+    18|   },
+    19|   componentDidMount() {
+    20|     this._updateTypeahead(this.props);
+    21|   },
+    22|   componentWillReceiveProps(newProps) {
+    23|     this._destroyTypeahead();
+    24|     this._updateTypeahead(newProps);
+    25|   },
+    26|   componentWillUnmount() {
+    27|     this._destroyTypeahead();
+    28|   },
+    29|   getValue() {
+    30|     return $(this.fieldInput).typeahead('val');
+    31|   },
+    32|   clear() {
+    33|     $(this.fieldInput).typeahead('val', '');
+    34|   },
+    35|   _destroyTypeahead() {
+    36|     $(this.fieldInput).typeahead('destroy');
+    37|     $(this.fieldFormGroup).off('typeahead:select typeahead:autocomplete');
+    38|   },
+    39|   _updateTypeahead(props) {
+    40|     this.fieldInput = this.refs.fieldInput.getInputDOMNode();
+    41|     this.fieldFormGroup = ReactDOM.findDOMNode(this.refs.fieldInput);
+    42|     const $fieldInput = $(this.fieldInput);
+    43|     $fieldInput.typeahead({
+    44|       hint: true,
+    45|       highlight: true,
+    46|       minLength: 1,
+    47|     },
+    48|     {
+    49|       name: 'dataset-name',
+    50|       displayKey: props.displayKey,
+    51|       source: UniversalSearch.substringMatcher(props.suggestions, props.displayKey, 6),
+    52|       templates: {
+    53|         suggestion: (value) => {
+    54|           if (props.suggestionText) {
+    55|             return `<div><strong>${lodash.escape(props.suggestionText)}</strong> ${lodash.escape(value[props.displayKey])}</div>`;
+    56|           }
+    57|           return `<div>${lodash.escape(value[props.displayKey])}</div>`;
+    58|         },
+    59|       },
+    60|     });
+    61|     if (typeof props.onTypeaheadLoaded === 'function') {
+    62|       props.onTypeaheadLoaded();
+    63|       $fieldInput.typeahead('close');
+    64|     }
+    65|     $(this.fieldFormGroup).on('typeahead:select typeahead:autocomplete', (event, suggestion) => {
+    66|       if (props.onSuggestionSelected) {
+    67|         props.onSuggestionSelected(event, suggestion);
+    68|       }
+    69|     });
+    70|   },
+    71|   render() {
+    72|     return (<Input type="text" ref="fieldInput"
+    73|                    wrapperClassName="typeahead-wrapper"
+    74|                    label={this.props.label}
+    75|                    onKeyPress={this.props.onKeyPress} />);
+    76|   },
+    77| });
+    78| export default TypeAheadInput;
+
+
+# ====================================================================
+# FILE: graylog2-web-interface/src/components/search/QueryInput.ts
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-67 ---
+     1| 'use strict';
+     2| const StoreProvider = require('injection/StoreProvider');
+     3| const FieldsStore = StoreProvider.getStore('Fields');
+     4| import queryParser = require('../../logic/search/queryParser');
+     5| import SerializeVisitor = require('../../logic/search/visitors/SerializeVisitor');
+     6| import DumpVisitor = require('../../logic/search/visitors/DumpVisitor');
+     7| import lodash = require('lodash');
+     8| const $ = require('jquery');
+     9| const Typeahead = require('typeahead.js');
+    10| interface Match {
+    11|     match: string;
+    12|     currentSegment: string;
+    13|     prefix: string;
+    14|     value: string;
+    15| }
+    16| interface SplitQuery {
+    17|     current: string;
+    18|     prefix: string;
+    19| }
+    20| class QueryInput {
+    21|     private typeAheadConfig: any;
+    22|     private typeAheadSource: any;
+    23|     private fields: string[];
+    24|     private fieldsPromise: Promise<string[]>;
+    25|     private limit: number;
+    26|     private displayKey: string;
+    27|     constructor(private queryInputContainer: Element) {
+    28|         this.fieldsPromise = FieldsStore.loadFields();
+    29|         this.limit = 10;
+    30|         this.displayKey = 'value';
+    31|         this.typeAheadConfig = {
+    32|             hint: true,
+    33|             highlight: true,
+    34|             minLength: 1
+    35|         };
+    36|         this.typeAheadSource = {
+    37|             name: 'fields',
+    38|             displayKey: this.displayKey,
+    39|             source: this.codeCompletionProvider.bind(this),
+    40|             templates: {
+    41|               suggestion: (match: Match) => {
+    42|                 const previousTerms = match.prefix;
+    43|                 const matchPrefix = match.match.substring(0, match.match.indexOf(match.currentSegment));
+    44|                 const currentMatch = match.currentSegment;
+    45|                 const matchSuffix = match.match.substring(match.match.indexOf(match.currentSegment) + match.currentSegment.length);
+    46|                 return `<p><strong>${lodash.escape(previousTerms)}</strong>${lodash.escape(matchPrefix)}<strong>${lodash.escape(currentMatch)}</strong>${lodash.escape(matchSuffix)}</p>`;
+    47|               }
+    48|             }
+    49|         };
+    50|     }
+    51|     display() {
+    52|         this.fieldsPromise.then((fields) => {
+    53|             this.fields = fields;
+    54|             $(this.queryInputContainer).typeahead(this.typeAheadConfig, this.typeAheadSource);
+    55|         });
+    56|     }
+    57|     _value() {
+    58|         return $(this.queryInputContainer).typeahead('val');
+    59|     }
+    60|     update(newValue) {
+    61|         if (this._value() !== newValue) {
+    62|             $(this.queryInputContainer).typeahead('val', newValue);
+    63|         }
+    64|     }
+    65|     private codeCompletionProvider(query: string, callback: (matches: Array<any>) => void) {
+    66|         var prefix = "";
+    67|         var matches: Array<any> = [];
+

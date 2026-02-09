@@ -1,0 +1,182 @@
+# ====================================================================
+# FILE: extend.php
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-57 ---
+     1| <?php
+     2| /*
+     3|  * This file is part of fof/upload.
+     4|  *
+     5|  * Copyright (c) FriendsOfFlarum.
+     6|  * Copyright (c) Flagrow.
+     7|  *
+     8|  * For the full copyright and license information, please view the LICENSE
+     9|  * file that was distributed with this source code.
+    10|  */
+    11| namespace FoF\Upload;
+    12| use Flarum\Api\Serializer\CurrentUserSerializer;
+    13| use Flarum\Api\Serializer\ForumSerializer;
+    14| use Flarum\Api\Serializer\UserSerializer;
+    15| use Flarum\Extend;
+    16| use Flarum\Settings\Event\Deserializing;
+    17| use FoF\Upload\Events\File\WillBeUploaded;
+    18| return [
+    19|     (new Extend\Routes('api'))
+    20|         ->get('/fof/uploads', 'fof-upload.list', Api\Controllers\ListUploadsController::class)
+    21|         ->post('/fof/upload', 'fof-upload.upload', Api\Controllers\UploadController::class)
+    22|         ->post('/fof/watermark', 'fof-upload.watermark', Api\Controllers\WatermarkUploadController::class)
+    23|         ->get('/fof/download/{uuid}/{post}/{csrf}', 'fof-upload.download', Api\Controllers\DownloadController::class)
+    24|         ->post('/fof/upload/inspect-mime', 'fof-upload.inspect-mime', Api\Controllers\InspectMimeController::class)
+    25|         ->patch('/fof/upload/hide', 'fof-upload.hide', Api\Controllers\HideUploadFromMediaManagerController::class),
+    26|     (new Extend\Csrf())->exemptRoute('fof-upload.download'),
+    27|     (new Extend\Frontend('admin'))
+    28|         ->css(__DIR__.'/resources/less/admin.less')
+    29|         ->js(__DIR__.'/js/dist/admin.js'),
+    30|     (new Extend\Frontend('forum'))
+    31|         ->css(__DIR__.'/resources/less/forum/download.less')
+    32|         ->css(__DIR__.'/resources/less/forum/upload.less')
+    33|         ->css(__DIR__.'/resources/less/forum/fileManagerModal.less')
+    34|         ->css(__DIR__.'/resources/less/forum/fileList.less')
+    35|         ->css(__DIR__.'/resources/less/forum/textPreview.less')
+    36|         ->js(__DIR__.'/js/dist/forum.js'),
+    37|     new Extend\Locales(__DIR__.'/resources/locale'),
+    38|     new Extenders\AddPostDownloadTags(),
+    39|     new Extenders\CreateStorageFolder('tmp'),
+    40|     (new Extend\ApiSerializer(ForumSerializer::class))
+    41|         ->attributes(Extenders\AddForumAttributes::class),
+    42|     (new Extend\Event())
+    43|         ->listen(Deserializing::class, Listeners\AddAvailableOptionsInAdmin::class)
+    44|         ->listen(WillBeUploaded::class, Listeners\AddImageProcessor::class),
+    45|     (new Extend\ServiceProvider())
+    46|         ->register(Providers\UtilProvider::class)
+    47|         ->register(Providers\StorageServiceProvider::class)
+    48|         ->register(Providers\DownloadProvider::class),
+    49|     (new Extend\View())
+    50|         ->namespace('fof-upload.templates', __DIR__.'/resources/templates'),
+    51|     (new Extend\ApiSerializer(CurrentUserSerializer::class))
+    52|         ->attributes(Extenders\AddCurrentUserAttributes::class),
+    53|     (new Extend\ApiSerializer(UserSerializer::class))
+    54|         ->attributes(Extenders\AddUserAttributes::class),
+    55|     (new Extend\Formatter())
+    56|         ->render(Formatter\TextPreview\FormatTextPreview::class),
+    57| ];
+
+
+# ====================================================================
+# FILE: src/Commands/UploadHandler.php
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-112 ---
+     1| <?php
+     2| /*
+     3|  * This file is part of fof/upload.
+     4|  *
+     5|  * Copyright (c) FriendsOfFlarum.
+     6|  * Copyright (c) Flagrow.
+     7|  *
+     8|  * For the full copyright and license information, please view the LICENSE
+     9|  * file that was distributed with this source code.
+    10|  */
+    11| namespace FoF\Upload\Commands;
+    12| use Exception;
+    13| use Flarum\Foundation\Application;
+    14| use Flarum\Foundation\ValidationException;
+    15| use Flarum\Locale\Translator;
+    16| use FoF\Upload\Adapters\Manager;
+    17| use FoF\Upload\Contracts\UploadAdapter;
+    18| use FoF\Upload\Events;
+    19| use FoF\Upload\File;
+    20| use FoF\Upload\Helpers\Util;
+    21| use FoF\Upload\Repositories\FileRepository;
+    22| use Illuminate\Contracts\Events\Dispatcher;
+    23| use Illuminate\Support\Arr;
+    24| use Psr\Http\Message\UploadedFileInterface;
+    25| use SoftCreatR\MimeDetector\MimeDetector;
+    26| use SoftCreatR\MimeDetector\MimeDetectorException;
+    27| class UploadHandler
+    28| {
+    29|     /**
+    30|      * @var Application
+    31|      */
+    32|     protected $app;
+    33|     /**
+    34|      * @var Util
+    35|      */
+    36|     protected $util;
+    37|     /**
+    38|      * @var Dispatcher
+    39|      */
+    40|     protected $events;
+    41|     /**
+    42|      * @var FileRepository
+    43|      */
+    44|     protected $files;
+    45|     /**
+    46|      * @var MimeDetector
+    47|      */
+    48|     protected $mimeDetector;
+    49|     /**
+    50|      * @var Translator
+    51|      */
+    52|     protected $translator;
+    53|     public function __construct(
+    54|         Application $app,
+    55|         Dispatcher $events,
+    56|         Util $util,
+    57|         FileRepository $files,
+    58|         MimeDetector $mimeDetector,
+    59|         Translator $translator
+    60|     ) {
+    61|         $this->app = $app;
+    62|         $this->util = $util;
+    63|         $this->events = $events;
+    64|         $this->files = $files;
+    65|         $this->mimeDetector = $mimeDetector;
+    66|         $this->translator = $translator;
+    67|     }
+    68|     /**
+    69|      * @param Upload $command
+    70|      *
+    71|      * @throws \Flarum\User\Exception\PermissionDeniedException
+    72|      *
+    73|      * @return \Illuminate\Support\Collection
+    74|      */
+    75|     public function handle(Upload $command)
+    76|     {
+    77|         $command->actor->assertCan('fof-upload.upload');
+    78|         $savedFiles = $command->files->map(function (UploadedFileInterface $file) use ($command) {
+    79|             try {
+    80|                 $upload = $this->files->moveUploadedFileToTemp($file);
+    81|                 try {
+    82|                     $this->mimeDetector->setFile($upload->getPathname());
+    83|                 } catch (MimeDetectorException $e) {
+    84|                     throw new ValidationException(['upload' => $this->translator->trans('fof-upload.api.upload_errors.could_not_detect_mime')]);
+    85|                 }
+    86|                 $uploadFileData = $this->mimeDetector->getFileType();
+    87|                 if (!isset($uploadFileData['mime']) || $uploadFileData['mime'] === null) {
+    88|                     try {
+    89|                         $uploadFileData['mime'] = mime_content_type($upload->getPathname());
+    90|                     } catch (Exception $e) {
+    91|                         throw new ValidationException(['upload' => $this->translator->trans('fof-upload.api.upload_errors.could_not_detect_mime')]);
+    92|                     }
+    93|                 }
+    94|                 $mimeConfiguration = $this->getMimeConfiguration($uploadFileData['mime']);
+    95|                 $adapter = $this->getAdapter(Arr::get($mimeConfiguration, 'adapter'));
+    96|                 $template = $this->getTemplate(Arr::get($mimeConfiguration, 'template', 'file'));
+    97|                 $this->events->dispatch(
+    98|                     new Events\Adapter\Identified($command->actor, $upload, $adapter)
+    99|                 );
+   100|                 if (!$adapter) {
+   101|                     throw new ValidationException(['upload' => $this->translator->trans('fof-upload.api.upload_errors.forbidden_type')]);
+   102|                 }
+   103|                 if (!$adapter->forMime($uploadFileData['mime'])) {
+   104|                     throw new ValidationException(['upload' => resolve('translator')->trans('fof-upload.api.upload_errors.unsupported_type', ['mime' => $uploadFileData['mime']])]);
+   105|                 }
+   106|                 $file = $this->files->createFileFromUpload($upload, $command->actor, $uploadFileData['mime']);
+   107|                 $this->events->dispatch(
+   108|                     new Events\File\WillBeUploaded($command->actor, $file, $upload, $uploadFileData['mime'])
+   109|                 );
+   110|                 $response = $adapter->upload(
+   111|                     $file,
+   112|                     $upload,
+

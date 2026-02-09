@@ -1,0 +1,1438 @@
+# ====================================================================
+# FILE: conn_id_generator.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 111-150 ---
+   111| 	connID, err := m.generator.GenerateConnectionID()
+   112| 	if err != nil {
+   113| 		return err
+   114| 	}
+   115| 	m.activeSrcConnIDs[m.highestSeq+1] = connID
+   116| 	m.connRunners.AddConnectionID(connID)
+   117| 	m.queueControlFrame(&wire.NewConnectionIDFrame{
+   118| 		SequenceNumber:      m.highestSeq + 1,
+   119| 		ConnectionID:        connID,
+   120| 		StatelessResetToken: m.statelessResetter.GetStatelessResetToken(connID),
+   121| 	})
+   122| 	m.highestSeq++
+   123| 	return nil
+   124| }
+   125| func (m *connIDGenerator) SetHandshakeComplete(connIDExpiry monotime.Time) {
+   126| 	if m.initialClientDestConnID != nil {
+   127| 		m.queueConnIDForRetiring(*m.initialClientDestConnID, connIDExpiry)
+   128| 		m.initialClientDestConnID = nil
+   129| 	}
+   130| }
+   131| func (m *connIDGenerator) RemoveRetiredConnIDs(now monotime.Time) {
+   132| 	if len(m.connIDsToRetire) == 0 {
+   133| 		return
+   134| 	}
+   135| 	for _, c := range m.connIDsToRetire {
+   136| 		if c.t.After(now) {
+   137| 			break
+   138| 		}
+   139| 		m.connRunners.RemoveConnectionID(c.connID)
+   140| 		m.connIDsToRetire = m.connIDsToRetire[1:]
+   141| 	}
+   142| }
+   143| func (m *connIDGenerator) RemoveAll() {
+   144| 	if m.initialClientDestConnID != nil {
+   145| 		m.connRunners.RemoveConnectionID(*m.initialClientDestConnID)
+   146| 	}
+   147| 	for _, connID := range m.activeSrcConnIDs {
+   148| 		m.connRunners.RemoveConnectionID(connID)
+   149| 	}
+   150| 	for _, c := range m.connIDsToRetire {
+
+
+# ====================================================================
+# FILE: connection.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 687-726 ---
+   687| 				deadline = keepAliveTime
+   688| 			} else {
+   689| 				deadline = c.nextIdleTimeoutTime()
+   690| 			}
+   691| 		}
+   692| 	}
+   693| 	if c.blocked == blockModeHardBlocked {
+   694| 		c.timer.Reset(monotime.Until(deadline))
+   695| 		return
+   696| 	}
+   697| 	if t := c.receivedPacketHandler.GetAlarmTimeout(); !t.IsZero() && t.Before(deadline) {
+   698| 		deadline = t
+   699| 	}
+   700| 	if t := c.sentPacketHandler.GetLossDetectionTimeout(); !t.IsZero() && t.Before(deadline) {
+   701| 		deadline = t
+   702| 	}
+   703| 	if c.blocked == blockModeCongestionLimited {
+   704| 		c.timer.Reset(monotime.Until(deadline))
+   705| 		return
+   706| 	}
+   707| 	if !c.pacingDeadline.IsZero() && c.pacingDeadline.Before(deadline) {
+   708| 		deadline = c.pacingDeadline
+   709| 	}
+   710| 	c.timer.Reset(monotime.Until(deadline))
+   711| }
+   712| func (c *Conn) idleTimeoutStartTime() monotime.Time {
+   713| 	startTime := c.lastPacketReceivedTime
+   714| 	if t := c.firstAckElicitingPacketAfterIdleSentTime; !t.IsZero() && t.After(startTime) {
+   715| 		startTime = t
+   716| 	}
+   717| 	return startTime
+   718| }
+   719| func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
+   720| 	initialPacketSize := protocol.ByteCount(c.config.InitialPacketSize)
+   721| 	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
+   722| 	maxPacketSize := protocol.ByteCount(protocol.MaxPacketBufferSize)
+   723| 	if c.peerParams.MaxUDPPayloadSize > 0 && c.peerParams.MaxUDPPayloadSize < maxPacketSize {
+   724| 		maxPacketSize = c.peerParams.MaxUDPPayloadSize
+   725| 	}
+   726| 	c.mtuDiscoverer.Reset(now, initialPacketSize, maxPacketSize)
+
+
+# ====================================================================
+# FILE: http3/client.go
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 18-128 ---
+    18| const (
+    19| 	MethodGet0RTT = "GET_0RTT"
+    20| 	MethodHead0RTT = "HEAD_0RTT"
+    21| )
+    22| const (
+    23| 	defaultUserAgent              = "quic-go HTTP/3"
+    24| 	defaultMaxResponseHeaderBytes = 10 * 1 << 20 // 10 MB
+    25| )
+    26| type errConnUnusable struct{ e error }
+    27| func (e *errConnUnusable) Unwrap() error { return e.e }
+    28| func (e *errConnUnusable) Error() string { return fmt.Sprintf("http3: conn unusable: %s", e.e.Error()) }
+    29| const max1xxResponses = 5 // arbitrary bound on number of informational responses
+    30| var defaultQuicConfig = &quic.Config{
+    31| 	MaxIncomingStreams: -1, // don't allow the server to create bidirectional streams
+    32| 	KeepAlivePeriod:    10 * time.Second,
+    33| }
+    34| type ClientConn struct {
+    35| 	conn *Conn
+    36| 	enableDatagrams bool
+    37| 	additionalSettings map[uint64]uint64
+    38| 	maxResponseHeaderBytes int
+    39| 	disableCompression bool
+    40| 	logger *slog.Logger
+    41| 	requestWriter *requestWriter
+    42| 	decoder       *qpack.Decoder
+    43| }
+    44| var _ http.RoundTripper = &ClientConn{}
+    45| func newClientConn(
+    46| 	conn *quic.Conn,
+    47| 	enableDatagrams bool,
+    48| 	additionalSettings map[uint64]uint64,
+    49| 	streamHijacker func(FrameType, quic.ConnectionTracingID, *quic.Stream, error) (hijacked bool, err error),
+    50| 	uniStreamHijacker func(StreamType, quic.ConnectionTracingID, *quic.ReceiveStream, error) (hijacked bool),
+    51| 	maxResponseHeaderBytes int,
+    52| 	disableCompression bool,
+    53| 	logger *slog.Logger,
+    54| ) *ClientConn {
+    55| 	c := &ClientConn{
+    56| 		enableDatagrams:    enableDatagrams,
+    57| 		additionalSettings: additionalSettings,
+    58| 		disableCompression: disableCompression,
+    59| 		logger:             logger,
+    60| 	}
+    61| 	if maxResponseHeaderBytes <= 0 {
+    62| 		c.maxResponseHeaderBytes = defaultMaxResponseHeaderBytes
+    63| 	} else {
+    64| 		c.maxResponseHeaderBytes = maxResponseHeaderBytes
+    65| 	}
+    66| 	c.decoder = qpack.NewDecoder()
+    67| 	c.requestWriter = newRequestWriter()
+    68| 	c.conn = newConnection(
+    69| 		conn.Context(),
+    70| 		conn,
+    71| 		c.enableDatagrams,
+    72| 		false, // client
+    73| 		c.logger,
+    74| 		0,
+    75| 	)
+    76| 	go func() {
+    77| 		if err := c.setupConn(); err != nil {
+    78| 			if c.logger != nil {
+    79| 				c.logger.Debug("Setting up connection failed", "error", err)
+    80| 			}
+    81| 			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeInternalError), "")
+    82| 		}
+    83| 	}()
+    84| 	if streamHijacker != nil {
+    85| 		go c.handleBidirectionalStreams(streamHijacker)
+    86| 	}
+    87| 	go c.conn.handleUnidirectionalStreams(uniStreamHijacker)
+    88| 	return c
+    89| }
+    90| func (c *ClientConn) OpenRequestStream(ctx context.Context) (*RequestStream, error) {
+    91| 	return c.conn.openRequestStream(ctx, c.requestWriter, nil, c.disableCompression, c.maxResponseHeaderBytes)
+    92| }
+    93| func (c *ClientConn) setupConn() error {
+    94| 	str, err := c.conn.OpenUniStream()
+    95| 	if err != nil {
+    96| 		return err
+    97| 	}
+    98| 	b := make([]byte, 0, 64)
+    99| 	b = quicvarint.Append(b, streamTypeControlStream)
+   100| 	b = (&settingsFrame{
+   101| 		Datagram:            c.enableDatagrams,
+   102| 		Other:               c.additionalSettings,
+   103| 		MaxFieldSectionSize: int64(c.maxResponseHeaderBytes),
+   104| 	}).Append(b)
+   105| 	if c.conn.qlogger != nil {
+   106| 		sf := qlog.SettingsFrame{
+   107| 			MaxFieldSectionSize: int64(c.maxResponseHeaderBytes),
+   108| 			Other:               maps.Clone(c.additionalSettings),
+   109| 		}
+   110| 		if c.enableDatagrams {
+   111| 			sf.Datagram = pointer(true)
+   112| 		}
+   113| 		c.conn.qlogger.RecordEvent(qlog.FrameCreated{
+   114| 			StreamID: str.StreamID(),
+   115| 			Raw:      qlog.RawInfo{Length: len(b)},
+   116| 			Frame:    qlog.Frame{Frame: sf},
+   117| 		})
+   118| 	}
+   119| 	_, err = str.Write(b)
+   120| 	return err
+   121| }
+   122| func (c *ClientConn) handleBidirectionalStreams(streamHijacker func(FrameType, quic.ConnectionTracingID, *quic.Stream, error) (hijacked bool, err error)) {
+   123| 	for {
+   124| 		str, err := c.conn.conn.AcceptStream(context.Background())
+   125| 		if err != nil {
+   126| 			if c.logger != nil {
+   127| 				c.logger.Debug("accepting bidirectional stream failed", "error", err)
+   128| 			}
+
+# --- HUNK 2: Lines 242-309 ---
+   242| 	sr := &cancelingReader{str: str, r: body}
+   243| 	if contentLength == -1 {
+   244| 		_, err := io.CopyBuffer(str, sr, buf)
+   245| 		return err
+   246| 	}
+   247| 	n, err := io.CopyBuffer(str, io.LimitReader(sr, contentLength), buf)
+   248| 	if err != nil {
+   249| 		return err
+   250| 	}
+   251| 	var extra int64
+   252| 	extra, err = io.CopyBuffer(io.Discard, sr, buf)
+   253| 	n += extra
+   254| 	if n > contentLength {
+   255| 		str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestCanceled))
+   256| 		return fmt.Errorf("http: ContentLength=%d with Body length %d", contentLength, n)
+   257| 	}
+   258| 	return err
+   259| }
+   260| func (c *ClientConn) doRequest(req *http.Request, str *RequestStream) (*http.Response, error) {
+   261| 	trace := httptrace.ContextClientTrace(req.Context())
+   262| 	var sendingReqFailed bool
+   263| 	if err := str.sendRequestHeader(req); err != nil {
+   264| 		traceWroteRequest(trace, err)
+   265| 		if c.logger != nil {
+   266| 			c.logger.Debug("error writing request", "error", err)
+   267| 		}
+   268| 		sendingReqFailed = true
+   269| 	}
+   270| 	if !sendingReqFailed {
+   271| 		if req.Body == nil {
+   272| 			traceWroteRequest(trace, nil)
+   273| 			str.Close()
+   274| 		} else {
+   275| 			go func() {
+   276| 				contentLength := int64(-1)
+   277| 				if req.ContentLength > 0 {
+   278| 					contentLength = req.ContentLength
+   279| 				}
+   280| 				err := c.sendRequestBody(str, req.Body, contentLength)
+   281| 				traceWroteRequest(trace, err)
+   282| 				if err != nil {
+   283| 					if c.logger != nil {
+   284| 						c.logger.Debug("error writing request", "error", err)
+   285| 					}
+   286| 				}
+   287| 				str.Close()
+   288| 			}()
+   289| 		}
+   290| 	}
+   291| 	var num1xx int // number of informational 1xx headers received
+   292| 	var res *http.Response
+   293| 	for {
+   294| 		var err error
+   295| 		res, err = str.ReadResponse()
+   296| 		if err != nil {
+   297| 			return nil, err
+   298| 		}
+   299| 		resCode := res.StatusCode
+   300| 		is1xx := 100 <= resCode && resCode <= 199
+   301| 		is1xxNonTerminal := is1xx && resCode != http.StatusSwitchingProtocols
+   302| 		if is1xxNonTerminal {
+   303| 			num1xx++
+   304| 			if num1xx > max1xxResponses {
+   305| 				str.CancelRead(quic.StreamErrorCode(ErrCodeExcessiveLoad))
+   306| 				str.CancelWrite(quic.StreamErrorCode(ErrCodeExcessiveLoad))
+   307| 				return nil, errors.New("http3: too many 1xx informational responses")
+   308| 			}
+   309| 			traceGot1xxResponse(trace, resCode, textproto.MIMEHeader(res.Header))
+
+
+# ====================================================================
+# FILE: http3/conn.go
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 39-79 ---
+    39| }
+    40| func newConnection(
+    41| 	ctx context.Context,
+    42| 	quicConn *quic.Conn,
+    43| 	enableDatagrams bool,
+    44| 	isServer bool,
+    45| 	logger *slog.Logger,
+    46| 	idleTimeout time.Duration,
+    47| ) *Conn {
+    48| 	var qlogger qlogwriter.Recorder
+    49| 	if qlogTrace := quicConn.QlogTrace(); qlogTrace != nil && qlogTrace.SupportsSchemas(qlog.EventSchema) {
+    50| 		qlogger = qlogTrace.AddProducer()
+    51| 	}
+    52| 	c := &Conn{
+    53| 		ctx:              ctx,
+    54| 		conn:             quicConn,
+    55| 		isServer:         isServer,
+    56| 		logger:           logger,
+    57| 		idleTimeout:      idleTimeout,
+    58| 		enableDatagrams:  enableDatagrams,
+    59| 		decoder:          qpack.NewDecoder(),
+    60| 		receivedSettings: make(chan struct{}),
+    61| 		streams:          make(map[quic.StreamID]*stateTrackingStream),
+    62| 		maxStreamID:      invalidStreamID,
+    63| 		lastStreamID:     invalidStreamID,
+    64| 		qlogger:          qlogger,
+    65| 	}
+    66| 	if idleTimeout > 0 {
+    67| 		c.idleTimer = time.AfterFunc(idleTimeout, c.onIdleTimer)
+    68| 	}
+    69| 	return c
+    70| }
+    71| func (c *Conn) OpenStream() (*quic.Stream, error) {
+    72| 	return c.conn.OpenStream()
+    73| }
+    74| func (c *Conn) OpenStreamSync(ctx context.Context) (*quic.Stream, error) {
+    75| 	return c.conn.OpenStreamSync(ctx)
+    76| }
+    77| func (c *Conn) OpenUniStream() (*quic.SendStream, error) {
+    78| 	return c.conn.OpenUniStream()
+    79| }
+
+# --- HUNK 2: Lines 96-136 ---
+    96| 	c.CloseWithError(quic.ApplicationErrorCode(ErrCodeNoError), "idle timeout")
+    97| }
+    98| func (c *Conn) clearStream(id quic.StreamID) {
+    99| 	c.streamMx.Lock()
+   100| 	defer c.streamMx.Unlock()
+   101| 	delete(c.streams, id)
+   102| 	if c.idleTimeout > 0 && len(c.streams) == 0 {
+   103| 		c.idleTimer.Reset(c.idleTimeout)
+   104| 	}
+   105| 	if c.maxStreamID != invalidStreamID {
+   106| 		if len(c.streams) == 0 {
+   107| 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeNoError), "")
+   108| 		}
+   109| 	}
+   110| }
+   111| func (c *Conn) openRequestStream(
+   112| 	ctx context.Context,
+   113| 	requestWriter *requestWriter,
+   114| 	reqDone chan<- struct{},
+   115| 	disableCompression bool,
+   116| 	maxHeaderBytes int,
+   117| ) (*RequestStream, error) {
+   118| 	c.streamMx.Lock()
+   119| 	maxStreamID := c.maxStreamID
+   120| 	var nextStreamID quic.StreamID
+   121| 	if c.lastStreamID == invalidStreamID {
+   122| 		nextStreamID = 0
+   123| 	} else {
+   124| 		nextStreamID = c.lastStreamID + 4
+   125| 	}
+   126| 	c.streamMx.Unlock()
+   127| 	if maxStreamID != invalidStreamID && nextStreamID >= maxStreamID {
+   128| 		return nil, errGoAway
+   129| 	}
+   130| 	str, err := c.OpenStreamSync(ctx)
+   131| 	if err != nil {
+   132| 		return nil, err
+   133| 	}
+   134| 	hstr := newStateTrackingStream(str, c, func(b []byte) error { return c.sendDatagram(str.StreamID(), b) })
+   135| 	c.streamMx.Lock()
+   136| 	c.streams[str.StreamID()] = hstr
+
+# --- HUNK 3: Lines 138-200 ---
+   138| 	c.streamMx.Unlock()
+   139| 	rsp := &http.Response{}
+   140| 	trace := httptrace.ContextClientTrace(ctx)
+   141| 	return newRequestStream(
+   142| 		newStream(hstr, c, trace, func(r io.Reader, hf *headersFrame) error {
+   143| 			hdr, err := c.decodeTrailers(r, str.StreamID(), hf, maxHeaderBytes)
+   144| 			if err != nil {
+   145| 				return err
+   146| 			}
+   147| 			rsp.Trailer = hdr
+   148| 			return nil
+   149| 		}, c.qlogger),
+   150| 		requestWriter,
+   151| 		reqDone,
+   152| 		c.decoder,
+   153| 		disableCompression,
+   154| 		maxHeaderBytes,
+   155| 		rsp,
+   156| 	), nil
+   157| }
+   158| func (c *Conn) decodeTrailers(r io.Reader, streamID quic.StreamID, hf *headersFrame, maxHeaderBytes int) (http.Header, error) {
+   159| 	if hf.Length > uint64(maxHeaderBytes) {
+   160| 		maybeQlogInvalidHeadersFrame(c.qlogger, streamID, hf.Length)
+   161| 		return nil, fmt.Errorf("http3: HEADERS frame too large: %d bytes (max: %d)", hf.Length, maxHeaderBytes)
+   162| 	}
+   163| 	b := make([]byte, hf.Length)
+   164| 	if _, err := io.ReadFull(r, b); err != nil {
+   165| 		return nil, err
+   166| 	}
+   167| 	decodeFn := c.decoder.Decode(b)
+   168| 	var fields []qpack.HeaderField
+   169| 	if c.qlogger != nil {
+   170| 		fields = make([]qpack.HeaderField, 0, 16)
+   171| 	}
+   172| 	trailers, err := parseTrailers(decodeFn, &fields)
+   173| 	if err != nil {
+   174| 		maybeQlogInvalidHeadersFrame(c.qlogger, streamID, hf.Length)
+   175| 		return nil, err
+   176| 	}
+   177| 	if c.qlogger != nil {
+   178| 		qlogParsedHeadersFrame(c.qlogger, streamID, hf, fields)
+   179| 	}
+   180| 	return trailers, nil
+   181| }
+   182| func (c *Conn) acceptStream(ctx context.Context) (*stateTrackingStream, error) {
+   183| 	str, err := c.conn.AcceptStream(ctx)
+   184| 	if err != nil {
+   185| 		return nil, err
+   186| 	}
+   187| 	strID := str.StreamID()
+   188| 	hstr := newStateTrackingStream(str, c, func(b []byte) error { return c.sendDatagram(strID, b) })
+   189| 	c.streamMx.Lock()
+   190| 	c.streams[strID] = hstr
+   191| 	if c.idleTimeout > 0 {
+   192| 		if len(c.streams) == 1 {
+   193| 			c.idleTimer.Stop()
+   194| 		}
+   195| 	}
+   196| 	c.streamMx.Unlock()
+   197| 	return hstr, nil
+   198| }
+   199| func (c *Conn) CloseWithError(code quic.ApplicationErrorCode, msg string) error {
+   200| 	if c.idleTimer != nil {
+
+
+# ====================================================================
+# FILE: http3/error_codes.go
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-46 ---
+     1| package http3
+     2| import (
+     3| 	"fmt"
+     4| 	"github.com/quic-go/quic-go"
+     5| )
+     6| type ErrCode quic.ApplicationErrorCode
+     7| const (
+     8| 	ErrCodeNoError                  ErrCode = 0x100
+     9| 	ErrCodeGeneralProtocolError     ErrCode = 0x101
+    10| 	ErrCodeInternalError            ErrCode = 0x102
+    11| 	ErrCodeStreamCreationError      ErrCode = 0x103
+    12| 	ErrCodeClosedCriticalStream     ErrCode = 0x104
+    13| 	ErrCodeFrameUnexpected          ErrCode = 0x105
+    14| 	ErrCodeFrameError               ErrCode = 0x106
+    15| 	ErrCodeExcessiveLoad            ErrCode = 0x107
+    16| 	ErrCodeIDError                  ErrCode = 0x108
+    17| 	ErrCodeSettingsError            ErrCode = 0x109
+    18| 	ErrCodeMissingSettings          ErrCode = 0x10a
+    19| 	ErrCodeRequestRejected          ErrCode = 0x10b
+    20| 	ErrCodeRequestCanceled          ErrCode = 0x10c
+    21| 	ErrCodeRequestIncomplete        ErrCode = 0x10d
+    22| 	ErrCodeMessageError             ErrCode = 0x10e
+    23| 	ErrCodeConnectError             ErrCode = 0x10f
+    24| 	ErrCodeVersionFallback          ErrCode = 0x110
+    25| 	ErrCodeDatagramError            ErrCode = 0x33
+    26| 	ErrCodeQPACKDecompressionFailed ErrCode = 0x200
+    27| )
+    28| func (e ErrCode) String() string {
+    29| 	s := e.string()
+    30| 	if s != "" {
+    31| 		return s
+    32| 	}
+    33| 	return fmt.Sprintf("unknown error code: %#x", uint16(e))
+    34| }
+    35| func (e ErrCode) string() string {
+    36| 	switch e {
+    37| 	case ErrCodeNoError:
+    38| 		return "H3_NO_ERROR"
+    39| 	case ErrCodeGeneralProtocolError:
+    40| 		return "H3_GENERAL_PROTOCOL_ERROR"
+    41| 	case ErrCodeInternalError:
+    42| 		return "H3_INTERNAL_ERROR"
+    43| 	case ErrCodeStreamCreationError:
+    44| 		return "H3_STREAM_CREATION_ERROR"
+    45| 	case ErrCodeClosedCriticalStream:
+    46| 		return "H3_CLOSED_CRITICAL_STREAM"
+
+# --- HUNK 2: Lines 53-78 ---
+    53| 	case ErrCodeIDError:
+    54| 		return "H3_ID_ERROR"
+    55| 	case ErrCodeSettingsError:
+    56| 		return "H3_SETTINGS_ERROR"
+    57| 	case ErrCodeMissingSettings:
+    58| 		return "H3_MISSING_SETTINGS"
+    59| 	case ErrCodeRequestRejected:
+    60| 		return "H3_REQUEST_REJECTED"
+    61| 	case ErrCodeRequestCanceled:
+    62| 		return "H3_REQUEST_CANCELLED"
+    63| 	case ErrCodeRequestIncomplete:
+    64| 		return "H3_INCOMPLETE_REQUEST"
+    65| 	case ErrCodeMessageError:
+    66| 		return "H3_MESSAGE_ERROR"
+    67| 	case ErrCodeConnectError:
+    68| 		return "H3_CONNECT_ERROR"
+    69| 	case ErrCodeVersionFallback:
+    70| 		return "H3_VERSION_FALLBACK"
+    71| 	case ErrCodeDatagramError:
+    72| 		return "H3_DATAGRAM_ERROR"
+    73| 	case ErrCodeQPACKDecompressionFailed:
+    74| 		return "QPACK_DECOMPRESSION_FAILED"
+    75| 	default:
+    76| 		return ""
+    77| 	}
+    78| }
+
+
+# ====================================================================
+# FILE: http3/frames.go
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 138-222 ---
+   138| 		}
+   139| 		r.Reset()
+   140| 	}
+   141| }
+   142| type dataFrame struct {
+   143| 	Length uint64
+   144| }
+   145| func (f *dataFrame) Append(b []byte) []byte {
+   146| 	b = quicvarint.Append(b, 0x0)
+   147| 	return quicvarint.Append(b, f.Length)
+   148| }
+   149| type headersFrame struct {
+   150| 	Length    uint64
+   151| 	headerLen int // number of bytes read for type and length field
+   152| }
+   153| func (f *headersFrame) Append(b []byte) []byte {
+   154| 	b = quicvarint.Append(b, 0x1)
+   155| 	return quicvarint.Append(b, f.Length)
+   156| }
+   157| const (
+   158| 	settingMaxFieldSectionSize = 0x6
+   159| 	settingExtendedConnect = 0x8
+   160| 	settingDatagram = 0x33
+   161| )
+   162| type settingsFrame struct {
+   163| 	MaxFieldSectionSize int64 // SETTINGS_MAX_FIELD_SECTION_SIZE, -1 if not set
+   164| 	Datagram        bool              // HTTP Datagrams, RFC 9297
+   165| 	ExtendedConnect bool              // Extended CONNECT, RFC 9220
+   166| 	Other           map[uint64]uint64 // all settings that we don't explicitly recognize
+   167| }
+   168| func pointer[T any](v T) *T {
+   169| 	return &v
+   170| }
+   171| func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID, qlogger qlogwriter.Recorder) (*settingsFrame, error) {
+   172| 	if l > 8*(1<<10) {
+   173| 		return nil, fmt.Errorf("unexpected size for SETTINGS frame: %d", l)
+   174| 	}
+   175| 	buf := make([]byte, l)
+   176| 	if _, err := io.ReadFull(r, buf); err != nil {
+   177| 		if err == io.ErrUnexpectedEOF {
+   178| 			return nil, io.EOF
+   179| 		}
+   180| 		return nil, err
+   181| 	}
+   182| 	frame := &settingsFrame{MaxFieldSectionSize: -1}
+   183| 	b := bytes.NewReader(buf)
+   184| 	settingsFrame := qlog.SettingsFrame{MaxFieldSectionSize: -1}
+   185| 	var readMaxFieldSectionSize, readDatagram, readExtendedConnect bool
+   186| 	for b.Len() > 0 {
+   187| 		id, err := quicvarint.Read(b)
+   188| 		if err != nil { // should not happen. We allocated the whole frame already.
+   189| 			return nil, err
+   190| 		}
+   191| 		val, err := quicvarint.Read(b)
+   192| 		if err != nil { // should not happen. We allocated the whole frame already.
+   193| 			return nil, err
+   194| 		}
+   195| 		switch id {
+   196| 		case settingMaxFieldSectionSize:
+   197| 			if readMaxFieldSectionSize {
+   198| 				return nil, fmt.Errorf("duplicate setting: %d", id)
+   199| 			}
+   200| 			readMaxFieldSectionSize = true
+   201| 			frame.MaxFieldSectionSize = int64(val)
+   202| 			settingsFrame.MaxFieldSectionSize = int64(val)
+   203| 		case settingExtendedConnect:
+   204| 			if readExtendedConnect {
+   205| 				return nil, fmt.Errorf("duplicate setting: %d", id)
+   206| 			}
+   207| 			readExtendedConnect = true
+   208| 			if val != 0 && val != 1 {
+   209| 				return nil, fmt.Errorf("invalid value for SETTINGS_ENABLE_CONNECT_PROTOCOL: %d", val)
+   210| 			}
+   211| 			frame.ExtendedConnect = val == 1
+   212| 			if qlogger != nil {
+   213| 				settingsFrame.ExtendedConnect = pointer(frame.ExtendedConnect)
+   214| 			}
+   215| 		case settingDatagram:
+   216| 			if readDatagram {
+   217| 				return nil, fmt.Errorf("duplicate setting: %d", id)
+   218| 			}
+   219| 			readDatagram = true
+   220| 			if val != 0 && val != 1 {
+   221| 				return nil, fmt.Errorf("invalid value for SETTINGS_H3_DATAGRAM: %d", val)
+   222| 			}
+
+# --- HUNK 2: Lines 233-289 ---
+   233| 			}
+   234| 			frame.Other[id] = val
+   235| 		}
+   236| 	}
+   237| 	if qlogger != nil {
+   238| 		settingsFrame.Other = maps.Clone(frame.Other)
+   239| 		qlogger.RecordEvent(qlog.FrameParsed{
+   240| 			StreamID: streamID,
+   241| 			Raw: qlog.RawInfo{
+   242| 				Length:        r.NumRead,
+   243| 				PayloadLength: int(l),
+   244| 			},
+   245| 			Frame: qlog.Frame{Frame: settingsFrame},
+   246| 		})
+   247| 	}
+   248| 	return frame, nil
+   249| }
+   250| func (f *settingsFrame) Append(b []byte) []byte {
+   251| 	b = quicvarint.Append(b, 0x4)
+   252| 	var l int
+   253| 	if f.MaxFieldSectionSize >= 0 {
+   254| 		l += quicvarint.Len(settingMaxFieldSectionSize) + quicvarint.Len(uint64(f.MaxFieldSectionSize))
+   255| 	}
+   256| 	for id, val := range f.Other {
+   257| 		l += quicvarint.Len(id) + quicvarint.Len(val)
+   258| 	}
+   259| 	if f.Datagram {
+   260| 		l += quicvarint.Len(settingDatagram) + quicvarint.Len(1)
+   261| 	}
+   262| 	if f.ExtendedConnect {
+   263| 		l += quicvarint.Len(settingExtendedConnect) + quicvarint.Len(1)
+   264| 	}
+   265| 	b = quicvarint.Append(b, uint64(l))
+   266| 	if f.MaxFieldSectionSize >= 0 {
+   267| 		b = quicvarint.Append(b, settingMaxFieldSectionSize)
+   268| 		b = quicvarint.Append(b, uint64(f.MaxFieldSectionSize))
+   269| 	}
+   270| 	if f.Datagram {
+   271| 		b = quicvarint.Append(b, settingDatagram)
+   272| 		b = quicvarint.Append(b, 1)
+   273| 	}
+   274| 	if f.ExtendedConnect {
+   275| 		b = quicvarint.Append(b, settingExtendedConnect)
+   276| 		b = quicvarint.Append(b, 1)
+   277| 	}
+   278| 	for id, val := range f.Other {
+   279| 		b = quicvarint.Append(b, id)
+   280| 		b = quicvarint.Append(b, val)
+   281| 	}
+   282| 	return b
+   283| }
+   284| type goAwayFrame struct {
+   285| 	StreamID quic.StreamID
+   286| }
+   287| func parseGoAwayFrame(r *countingByteReader, l uint64, streamID quic.StreamID, qlogger qlogwriter.Recorder) (*goAwayFrame, error) {
+   288| 	frame := &goAwayFrame{}
+   289| 	startLen := r.NumRead
+
+
+# ====================================================================
+# FILE: http3/headers.go
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-73 ---
+     1| package http3
+     2| import (
+     3| 	"errors"
+     4| 	"fmt"
+     5| 	"io"
+     6| 	"net/http"
+     7| 	"net/textproto"
+     8| 	"net/url"
+     9| 	"strconv"
+    10| 	"strings"
+    11| 	"golang.org/x/net/http/httpguts"
+    12| 	"github.com/quic-go/qpack"
+    13| )
+    14| type qpackError struct{ err error }
+    15| func (e *qpackError) Error() string { return fmt.Sprintf("qpack: %v", e.err) }
+    16| func (e *qpackError) Unwrap() error { return e.err }
+    17| var errHeaderTooLarge = errors.New("http3: headers too large")
+    18| type header struct {
+    19| 	Path      string
+    20| 	Method    string
+    21| 	Authority string
+    22| 	Scheme    string
+    23| 	Status    string
+    24| 	Protocol string
+    25| 	ContentLength int64
+    26| 	Headers http.Header
+    27| }
+    28| var invalidHeaderFields = [...]string{
+    29| 	"connection",
+    30| 	"keep-alive",
+    31| 	"proxy-connection",
+    32| 	"transfer-encoding",
+    33| 	"upgrade",
+    34| }
+    35| func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, headerFields *[]qpack.HeaderField) (header, error) {
+    36| 	hdr := header{Headers: make(http.Header)}
+    37| 	var readFirstRegularHeader, readContentLength bool
+    38| 	var contentLengthStr string
+    39| 	for {
+    40| 		h, err := decodeFn()
+    41| 		if err != nil {
+    42| 			if err == io.EOF {
+    43| 				break
+    44| 			}
+    45| 			return header{}, &qpackError{err}
+    46| 		}
+    47| 		if headerFields != nil {
+    48| 			*headerFields = append(*headerFields, h)
+    49| 		}
+    50| 		sizeLimit -= len(h.Name) + len(h.Value) + 32
+    51| 		if sizeLimit < 0 {
+    52| 			return header{}, errHeaderTooLarge
+    53| 		}
+    54| 		if strings.ToLower(h.Name) != h.Name {
+    55| 			return header{}, fmt.Errorf("header field is not lower-case: %s", h.Name)
+    56| 		}
+    57| 		if !httpguts.ValidHeaderFieldValue(h.Value) {
+    58| 			return header{}, fmt.Errorf("invalid header field value for %s: %q", h.Name, h.Value)
+    59| 		}
+    60| 		if h.IsPseudo() {
+    61| 			if readFirstRegularHeader {
+    62| 				return header{}, fmt.Errorf("received pseudo header %s after a regular header field", h.Name)
+    63| 			}
+    64| 			var isResponsePseudoHeader bool  // pseudo headers are either valid for requests or for responses
+    65| 			var isDuplicatePseudoHeader bool // pseudo headers are allowed to appear exactly once
+    66| 			switch h.Name {
+    67| 			case ":path":
+    68| 				isDuplicatePseudoHeader = hdr.Path != ""
+    69| 				hdr.Path = h.Value
+    70| 			case ":method":
+    71| 				isDuplicatePseudoHeader = hdr.Method != ""
+    72| 				hdr.Method = h.Value
+    73| 			case ":authority":
+
+# --- HUNK 2: Lines 115-176 ---
+   115| 					contentLengthStr = h.Value
+   116| 				} else if contentLengthStr != h.Value {
+   117| 					return header{}, fmt.Errorf("contradicting content lengths (%s and %s)", contentLengthStr, h.Value)
+   118| 				}
+   119| 			default:
+   120| 				hdr.Headers.Add(h.Name, h.Value)
+   121| 			}
+   122| 		}
+   123| 	}
+   124| 	hdr.ContentLength = -1
+   125| 	if len(contentLengthStr) > 0 {
+   126| 		cl, err := strconv.ParseUint(contentLengthStr, 10, 63)
+   127| 		if err != nil {
+   128| 			return header{}, fmt.Errorf("invalid content length: %w", err)
+   129| 		}
+   130| 		hdr.Headers.Set("Content-Length", contentLengthStr)
+   131| 		hdr.ContentLength = int64(cl)
+   132| 	}
+   133| 	return hdr, nil
+   134| }
+   135| func parseTrailers(decodeFn qpack.DecodeFunc, headerFields *[]qpack.HeaderField) (http.Header, error) {
+   136| 	h := make(http.Header)
+   137| 	for {
+   138| 		hf, err := decodeFn()
+   139| 		if err != nil {
+   140| 			if err == io.EOF {
+   141| 				break
+   142| 			}
+   143| 			return nil, &qpackError{err}
+   144| 		}
+   145| 		if headerFields != nil {
+   146| 			*headerFields = append(*headerFields, hf)
+   147| 		}
+   148| 		if hf.IsPseudo() {
+   149| 			return nil, fmt.Errorf("http3: received pseudo header in trailer: %s", hf.Name)
+   150| 		}
+   151| 		h.Add(hf.Name, hf.Value)
+   152| 	}
+   153| 	return h, nil
+   154| }
+   155| func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField) (*http.Request, error) {
+   156| 	hdr, err := parseHeaders(decodeFn, true, sizeLimit, headerFields)
+   157| 	if err != nil {
+   158| 		return nil, err
+   159| 	}
+   160| 	if len(hdr.Headers["Cookie"]) > 0 {
+   161| 		hdr.Headers.Set("Cookie", strings.Join(hdr.Headers["Cookie"], "; "))
+   162| 	}
+   163| 	isConnect := hdr.Method == http.MethodConnect
+   164| 	isExtendedConnected := isConnect && hdr.Protocol != ""
+   165| 	if isExtendedConnected {
+   166| 		if hdr.Scheme == "" || hdr.Path == "" || hdr.Authority == "" {
+   167| 			return nil, errors.New("extended CONNECT: :scheme, :path and :authority must not be empty")
+   168| 		}
+   169| 	} else if isConnect {
+   170| 		if hdr.Path != "" || hdr.Authority == "" { // normal CONNECT
+   171| 			return nil, errors.New(":path must be empty and :authority must not be empty")
+   172| 		}
+   173| 	} else if len(hdr.Path) == 0 || len(hdr.Authority) == 0 || len(hdr.Method) == 0 {
+   174| 		return nil, errors.New(":path, :authority and :method must not be empty")
+   175| 	}
+   176| 	if !isExtendedConnected && len(hdr.Protocol) > 0 {
+
+# --- HUNK 3: Lines 196-237 ---
+   196| 	} else {
+   197| 		u, err = url.ParseRequestURI(hdr.Path)
+   198| 		if err != nil {
+   199| 			return nil, fmt.Errorf("invalid content length: %w", err)
+   200| 		}
+   201| 		requestURI = hdr.Path
+   202| 	}
+   203| 	return &http.Request{
+   204| 		Method:        hdr.Method,
+   205| 		URL:           u,
+   206| 		Proto:         protocol,
+   207| 		ProtoMajor:    3,
+   208| 		ProtoMinor:    0,
+   209| 		Header:        hdr.Headers,
+   210| 		Body:          nil,
+   211| 		ContentLength: hdr.ContentLength,
+   212| 		Host:          hdr.Authority,
+   213| 		RequestURI:    requestURI,
+   214| 	}, nil
+   215| }
+   216| func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField) error {
+   217| 	hdr, err := parseHeaders(decodeFn, false, sizeLimit, headerFields)
+   218| 	if err != nil {
+   219| 		return err
+   220| 	}
+   221| 	if hdr.Status == "" {
+   222| 		return errors.New("missing :status field")
+   223| 	}
+   224| 	rsp.Proto = "HTTP/3.0"
+   225| 	rsp.ProtoMajor = 3
+   226| 	rsp.Header = hdr.Headers
+   227| 	processTrailers(rsp)
+   228| 	rsp.ContentLength = hdr.ContentLength
+   229| 	status, err := strconv.Atoi(hdr.Status)
+   230| 	if err != nil {
+   231| 		return fmt.Errorf("invalid status code: %w", err)
+   232| 	}
+   233| 	rsp.StatusCode = status
+   234| 	rsp.Status = hdr.Status + " " + http.StatusText(status)
+   235| 	return nil
+   236| }
+   237| func processTrailers(rsp *http.Response) {
+
+
+# ====================================================================
+# FILE: http3/qlog/frame.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 63-122 ---
+    63| 		}
+    64| 		h.WriteToken(jsontext.EndArray)
+    65| 	}
+    66| 	h.WriteToken(jsontext.EndObject)
+    67| 	return h.err
+    68| }
+    69| type GoAwayFrame struct {
+    70| 	StreamID quic.StreamID
+    71| }
+    72| func (f *GoAwayFrame) encode(enc *jsontext.Encoder) error {
+    73| 	h := encoderHelper{enc: enc}
+    74| 	h.WriteToken(jsontext.BeginObject)
+    75| 	h.WriteToken(jsontext.String("frame_type"))
+    76| 	h.WriteToken(jsontext.String("goaway"))
+    77| 	h.WriteToken(jsontext.String("id"))
+    78| 	h.WriteToken(jsontext.Uint(uint64(f.StreamID)))
+    79| 	h.WriteToken(jsontext.EndObject)
+    80| 	return h.err
+    81| }
+    82| type SettingsFrame struct {
+    83| 	MaxFieldSectionSize int64
+    84| 	Datagram            *bool
+    85| 	ExtendedConnect     *bool
+    86| 	Other               map[uint64]uint64
+    87| }
+    88| func (f *SettingsFrame) encode(enc *jsontext.Encoder) error {
+    89| 	h := encoderHelper{enc: enc}
+    90| 	h.WriteToken(jsontext.BeginObject)
+    91| 	h.WriteToken(jsontext.String("frame_type"))
+    92| 	h.WriteToken(jsontext.String("settings"))
+    93| 	h.WriteToken(jsontext.String("settings"))
+    94| 	h.WriteToken(jsontext.BeginArray)
+    95| 	if f.MaxFieldSectionSize >= 0 {
+    96| 		h.WriteToken(jsontext.BeginObject)
+    97| 		h.WriteToken(jsontext.String("name"))
+    98| 		h.WriteToken(jsontext.String("settings_max_field_section_size"))
+    99| 		h.WriteToken(jsontext.String("value"))
+   100| 		h.WriteToken(jsontext.Uint(uint64(f.MaxFieldSectionSize)))
+   101| 		h.WriteToken(jsontext.EndObject)
+   102| 	}
+   103| 	if f.Datagram != nil {
+   104| 		h.WriteToken(jsontext.BeginObject)
+   105| 		h.WriteToken(jsontext.String("name"))
+   106| 		h.WriteToken(jsontext.String("settings_h3_datagram"))
+   107| 		h.WriteToken(jsontext.String("value"))
+   108| 		h.WriteToken(jsontext.Bool(*f.Datagram))
+   109| 		h.WriteToken(jsontext.EndObject)
+   110| 	}
+   111| 	if f.ExtendedConnect != nil {
+   112| 		h.WriteToken(jsontext.BeginObject)
+   113| 		h.WriteToken(jsontext.String("name"))
+   114| 		h.WriteToken(jsontext.String("settings_enable_connect_protocol"))
+   115| 		h.WriteToken(jsontext.String("value"))
+   116| 		h.WriteToken(jsontext.Bool(*f.ExtendedConnect))
+   117| 		h.WriteToken(jsontext.EndObject)
+   118| 	}
+   119| 	if len(f.Other) > 0 {
+   120| 		for k, v := range f.Other {
+   121| 			h.WriteToken(jsontext.BeginObject)
+   122| 			h.WriteToken(jsontext.String("name"))
+
+
+# ====================================================================
+# FILE: http3/server.go
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 271-320 ---
+   271| func (s *Server) removeListener(l *QUICListener) {
+   272| 	s.mutex.Lock()
+   273| 	defer s.mutex.Unlock()
+   274| 	s.listeners = slices.DeleteFunc(s.listeners, func(info listener) bool {
+   275| 		return info.ln == l
+   276| 	})
+   277| 	s.generateAltSvcHeader()
+   278| }
+   279| func (s *Server) handleConn(conn *quic.Conn) error {
+   280| 	var qlogger qlogwriter.Recorder
+   281| 	if qlogTrace := conn.QlogTrace(); qlogTrace != nil && qlogTrace.SupportsSchemas(qlog.EventSchema) {
+   282| 		qlogger = qlogTrace.AddProducer()
+   283| 	}
+   284| 	ctrlStr, err := conn.OpenUniStream()
+   285| 	if err != nil {
+   286| 		return fmt.Errorf("opening the control stream failed: %w", err)
+   287| 	}
+   288| 	b := make([]byte, 0, 64)
+   289| 	b = quicvarint.Append(b, streamTypeControlStream) // stream type
+   290| 	b = (&settingsFrame{
+   291| 		MaxFieldSectionSize: int64(s.maxHeaderBytes()),
+   292| 		Datagram:            s.EnableDatagrams,
+   293| 		ExtendedConnect:     true,
+   294| 		Other:               s.AdditionalSettings,
+   295| 	}).Append(b)
+   296| 	if qlogger != nil {
+   297| 		sf := qlog.SettingsFrame{
+   298| 			MaxFieldSectionSize: int64(s.maxHeaderBytes()),
+   299| 			ExtendedConnect:     pointer(true),
+   300| 			Other:               maps.Clone(s.AdditionalSettings),
+   301| 		}
+   302| 		if s.EnableDatagrams {
+   303| 			sf.Datagram = pointer(true)
+   304| 		}
+   305| 		qlogger.RecordEvent(qlog.FrameCreated{
+   306| 			StreamID: ctrlStr.StreamID(),
+   307| 			Raw:      qlog.RawInfo{Length: len(b)},
+   308| 			Frame:    qlog.Frame{Frame: sf},
+   309| 		})
+   310| 	}
+   311| 	ctrlStr.Write(b)
+   312| 	connCtx := conn.Context()
+   313| 	connCtx = context.WithValue(connCtx, ServerContextKey, s)
+   314| 	connCtx = context.WithValue(connCtx, http.LocalAddrContextKey, conn.LocalAddr())
+   315| 	connCtx = context.WithValue(connCtx, RemoteAddrContextKey, conn.RemoteAddr())
+   316| 	if s.ConnContext != nil {
+   317| 		connCtx = s.ConnContext(connCtx, conn)
+   318| 		if connCtx == nil {
+   319| 			panic("http3: ConnContext returned nil")
+   320| 		}
+
+# --- HUNK 2: Lines 368-479 ---
+   368| 				_, _ = ctrlStr.Write((&goAwayFrame{StreamID: nextStreamID}).Append(nil))
+   369| 			}()
+   370| 			ctx = s.closeCtx
+   371| 			continue
+   372| 		}
+   373| 		if inGracefulShutdown {
+   374| 			str.CancelRead(quic.StreamErrorCode(ErrCodeRequestRejected))
+   375| 			str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestRejected))
+   376| 			continue
+   377| 		}
+   378| 		nextStreamID = str.StreamID() + 4
+   379| 		wg.Add(1)
+   380| 		go func() {
+   381| 			defer wg.Done()
+   382| 			s.handleRequest(hconn, str, hconn.decoder, qlogger)
+   383| 		}()
+   384| 	}
+   385| 	wg.Wait()
+   386| 	return handleErr
+   387| }
+   388| func (s *Server) maxHeaderBytes() int {
+   389| 	if s.MaxHeaderBytes <= 0 {
+   390| 		return http.DefaultMaxHeaderBytes
+   391| 	}
+   392| 	return s.MaxHeaderBytes
+   393| }
+   394| func (s *Server) handleRequest(
+   395| 	conn *Conn,
+   396| 	str *stateTrackingStream,
+   397| 	decoder *qpack.Decoder,
+   398| 	qlogger qlogwriter.Recorder,
+   399| ) {
+   400| 	var ufh unknownFrameHandlerFunc
+   401| 	if s.StreamHijacker != nil {
+   402| 		ufh = func(ft FrameType, e error) (processed bool, err error) {
+   403| 			return s.StreamHijacker(
+   404| 				ft,
+   405| 				conn.Context().Value(quic.ConnectionTracingKey).(quic.ConnectionTracingID),
+   406| 				str.QUICStream(),
+   407| 				e,
+   408| 			)
+   409| 		}
+   410| 	}
+   411| 	fp := &frameParser{closeConn: conn.CloseWithError, r: str, unknownFrameHandler: ufh}
+   412| 	frame, err := fp.ParseNext(qlogger)
+   413| 	if err != nil {
+   414| 		if !errors.Is(err, errHijacked) {
+   415| 			str.CancelRead(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+   416| 			str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+   417| 		}
+   418| 		return
+   419| 	}
+   420| 	hf, ok := frame.(*headersFrame)
+   421| 	if !ok {
+   422| 		conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "expected first frame to be a HEADERS frame")
+   423| 		return
+   424| 	}
+   425| 	if hf.Length > uint64(s.maxHeaderBytes()) {
+   426| 		maybeQlogInvalidHeadersFrame(qlogger, str.StreamID(), hf.Length)
+   427| 		str.CancelRead(quic.StreamErrorCode(ErrCodeExcessiveLoad))
+   428| 		s.rejectWithHeaderFieldsTooLarge(str, conn, qlogger)
+   429| 		return
+   430| 	}
+   431| 	headerBlock := make([]byte, hf.Length)
+   432| 	if _, err := io.ReadFull(str, headerBlock); err != nil {
+   433| 		maybeQlogInvalidHeadersFrame(qlogger, str.StreamID(), hf.Length)
+   434| 		str.CancelRead(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+   435| 		str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+   436| 		return
+   437| 	}
+   438| 	decodeFn := decoder.Decode(headerBlock)
+   439| 	var hfs []qpack.HeaderField
+   440| 	if qlogger != nil {
+   441| 		hfs = make([]qpack.HeaderField, 0, 16)
+   442| 	}
+   443| 	req, err := requestFromHeaders(decodeFn, s.maxHeaderBytes(), &hfs)
+   444| 	if qlogger != nil {
+   445| 		qlogParsedHeadersFrame(qlogger, str.StreamID(), hf, hfs)
+   446| 	}
+   447| 	if err != nil {
+   448| 		if errors.Is(err, errHeaderTooLarge) {
+   449| 			str.CancelRead(quic.StreamErrorCode(ErrCodeExcessiveLoad))
+   450| 			s.rejectWithHeaderFieldsTooLarge(str, conn, qlogger)
+   451| 			return
+   452| 		}
+   453| 		errCode := ErrCodeMessageError
+   454| 		var qpackErr *qpackError
+   455| 		if errors.As(err, &qpackErr) {
+   456| 			errCode = ErrCodeQPACKDecompressionFailed
+   457| 		}
+   458| 		str.CancelRead(quic.StreamErrorCode(errCode))
+   459| 		str.CancelWrite(quic.StreamErrorCode(errCode))
+   460| 		return
+   461| 	}
+   462| 	connState := conn.ConnectionState().TLS
+   463| 	req.TLS = &connState
+   464| 	req.RemoteAddr = conn.RemoteAddr().String()
+   465| 	contentLength := int64(-1)
+   466| 	if _, ok := req.Header["Content-Length"]; ok && req.ContentLength >= 0 {
+   467| 		contentLength = req.ContentLength
+   468| 	}
+   469| 	hstr := newStream(str, conn, nil, nil, qlogger)
+   470| 	body := newRequestBody(hstr, contentLength, conn.Context(), conn.ReceivedSettings(), conn.Settings)
+   471| 	req.Body = body
+   472| 	if s.Logger != nil {
+   473| 		s.Logger.Debug("handling request", "method", req.Method, "host", req.Host, "uri", req.RequestURI)
+   474| 	}
+   475| 	ctx, cancel := context.WithCancel(conn.Context())
+   476| 	req = req.WithContext(ctx)
+   477| 	context.AfterFunc(str.Context(), cancel)
+   478| 	r := newResponseWriter(hstr, conn, req.Method == http.MethodHead, s.Logger)
+   479| 	handler := s.Handler
+
+# --- HUNK 3: Lines 501-547 ---
+   501| 		handler.ServeHTTP(r, req)
+   502| 	}()
+   503| 	if r.wasStreamHijacked() {
+   504| 		return
+   505| 	}
+   506| 	if panicked {
+   507| 		str.CancelRead(quic.StreamErrorCode(ErrCodeInternalError))
+   508| 		str.CancelWrite(quic.StreamErrorCode(ErrCodeInternalError))
+   509| 		return
+   510| 	}
+   511| 	if !r.headerWritten {
+   512| 		if _, haveCL := r.header["Content-Length"]; !haveCL {
+   513| 			r.header.Set("Content-Length", strconv.FormatInt(r.numWritten, 10))
+   514| 		}
+   515| 	}
+   516| 	r.Flush()
+   517| 	r.flushTrailers()
+   518| 	str.CancelRead(quic.StreamErrorCode(ErrCodeNoError))
+   519| 	str.Close()
+   520| }
+   521| func (s *Server) rejectWithHeaderFieldsTooLarge(str *stateTrackingStream, conn *Conn, qlogger qlogwriter.Recorder) {
+   522| 	hstr := newStream(str, conn, nil, nil, qlogger)
+   523| 	defer hstr.Close()
+   524| 	r := newResponseWriter(hstr, conn, false, s.Logger)
+   525| 	r.WriteHeader(http.StatusRequestHeaderFieldsTooLarge)
+   526| 	r.Flush()
+   527| }
+   528| func (s *Server) Close() error {
+   529| 	s.mutex.Lock()
+   530| 	defer s.mutex.Unlock()
+   531| 	s.closed = true
+   532| 	if s.closeCtx == nil {
+   533| 		return nil
+   534| 	}
+   535| 	s.closeCancel()
+   536| 	var err error
+   537| 	for _, l := range s.listeners {
+   538| 		if l.createdLocally {
+   539| 			if cerr := (*l.ln).Close(); cerr != nil && err == nil {
+   540| 				err = cerr
+   541| 			}
+   542| 		}
+   543| 	}
+   544| 	if s.connCount.Load() == 0 {
+   545| 		return err
+   546| 	}
+   547| 	<-s.connHandlingDone
+
+
+# ====================================================================
+# FILE: http3/stream.go
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 117-171 ---
+   117| 	}
+   118| 	return s.datagramStream.Write(b)
+   119| }
+   120| func (s *Stream) writeUnframed(b []byte) (int, error) {
+   121| 	return s.datagramStream.Write(b)
+   122| }
+   123| func (s *Stream) StreamID() quic.StreamID {
+   124| 	return s.datagramStream.StreamID()
+   125| }
+   126| func (s *Stream) SendDatagram(b []byte) error {
+   127| 	return s.datagramStream.SendDatagram(b)
+   128| }
+   129| func (s *Stream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+   130| 	return s.datagramStream.ReceiveDatagram(ctx)
+   131| }
+   132| type RequestStream struct {
+   133| 	str *Stream
+   134| 	responseBody io.ReadCloser // set by ReadResponse
+   135| 	decoder            *qpack.Decoder
+   136| 	requestWriter      *requestWriter
+   137| 	maxHeaderBytes     int
+   138| 	reqDone            chan<- struct{}
+   139| 	disableCompression bool
+   140| 	response           *http.Response
+   141| 	sentRequest   bool
+   142| 	requestedGzip bool
+   143| 	isConnect     bool
+   144| }
+   145| func newRequestStream(
+   146| 	str *Stream,
+   147| 	requestWriter *requestWriter,
+   148| 	reqDone chan<- struct{},
+   149| 	decoder *qpack.Decoder,
+   150| 	disableCompression bool,
+   151| 	maxHeaderBytes int,
+   152| 	rsp *http.Response,
+   153| ) *RequestStream {
+   154| 	return &RequestStream{
+   155| 		str:                str,
+   156| 		requestWriter:      requestWriter,
+   157| 		reqDone:            reqDone,
+   158| 		decoder:            decoder,
+   159| 		disableCompression: disableCompression,
+   160| 		maxHeaderBytes:     maxHeaderBytes,
+   161| 		response:           rsp,
+   162| 	}
+   163| }
+   164| func (s *RequestStream) Read(b []byte) (int, error) {
+   165| 	if s.responseBody == nil {
+   166| 		return 0, errors.New("http3: invalid use of RequestStream.Read before ReadResponse")
+   167| 	}
+   168| 	return s.responseBody.Read(b)
+   169| }
+   170| func (s *RequestStream) StreamID() quic.StreamID {
+   171| 	return s.str.StreamID()
+
+# --- HUNK 2: Lines 219-289 ---
+   219| 	}
+   220| 	s.isConnect = req.Method == http.MethodConnect
+   221| 	s.sentRequest = true
+   222| 	return s.requestWriter.WriteRequestHeader(s.str.datagramStream, req, s.requestedGzip, s.str.StreamID(), s.str.qlogger)
+   223| }
+   224| func (s *RequestStream) ReadResponse() (*http.Response, error) {
+   225| 	if !s.sentRequest {
+   226| 		return nil, errors.New("http3: invalid duplicate use of RequestStream.ReadResponse before SendRequestHeader")
+   227| 	}
+   228| 	frame, err := s.str.frameParser.ParseNext(s.str.qlogger)
+   229| 	if err != nil {
+   230| 		s.str.CancelRead(quic.StreamErrorCode(ErrCodeFrameError))
+   231| 		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeFrameError))
+   232| 		return nil, fmt.Errorf("http3: parsing frame failed: %w", err)
+   233| 	}
+   234| 	hf, ok := frame.(*headersFrame)
+   235| 	if !ok {
+   236| 		s.str.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "expected first frame to be a HEADERS frame")
+   237| 		return nil, errors.New("http3: expected first frame to be a HEADERS frame")
+   238| 	}
+   239| 	if hf.Length > uint64(s.maxHeaderBytes) {
+   240| 		maybeQlogInvalidHeadersFrame(s.str.qlogger, s.str.StreamID(), hf.Length)
+   241| 		s.str.CancelRead(quic.StreamErrorCode(ErrCodeFrameError))
+   242| 		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeFrameError))
+   243| 		return nil, fmt.Errorf("http3: HEADERS frame too large: %d bytes (max: %d)", hf.Length, s.maxHeaderBytes)
+   244| 	}
+   245| 	headerBlock := make([]byte, hf.Length)
+   246| 	if _, err := io.ReadFull(s.str.datagramStream, headerBlock); err != nil {
+   247| 		maybeQlogInvalidHeadersFrame(s.str.qlogger, s.str.StreamID(), hf.Length)
+   248| 		s.str.CancelRead(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+   249| 		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+   250| 		return nil, fmt.Errorf("http3: failed to read response headers: %w", err)
+   251| 	}
+   252| 	decodeFn := s.decoder.Decode(headerBlock)
+   253| 	var hfs []qpack.HeaderField
+   254| 	if s.str.qlogger != nil {
+   255| 		hfs = make([]qpack.HeaderField, 0, 16)
+   256| 	}
+   257| 	res := s.response
+   258| 	err = updateResponseFromHeaders(res, decodeFn, s.maxHeaderBytes, &hfs)
+   259| 	if s.str.qlogger != nil {
+   260| 		qlogParsedHeadersFrame(s.str.qlogger, s.str.StreamID(), hf, hfs)
+   261| 	}
+   262| 	if err != nil {
+   263| 		errCode := ErrCodeMessageError
+   264| 		var qpackErr *qpackError
+   265| 		if errors.As(err, &qpackErr) {
+   266| 			errCode = ErrCodeQPACKDecompressionFailed
+   267| 		}
+   268| 		s.str.CancelRead(quic.StreamErrorCode(errCode))
+   269| 		s.str.CancelWrite(quic.StreamErrorCode(errCode))
+   270| 		return nil, fmt.Errorf("http3: invalid response: %w", err)
+   271| 	}
+   272| 	respBody := newResponseBody(s.str, res.ContentLength, s.reqDone)
+   273| 	isInformational := res.StatusCode >= 100 && res.StatusCode < 200
+   274| 	isNoContent := res.StatusCode == http.StatusNoContent
+   275| 	isSuccessfulConnect := s.isConnect && res.StatusCode >= 200 && res.StatusCode < 300
+   276| 	if (isInformational || isNoContent || isSuccessfulConnect) && res.ContentLength == -1 {
+   277| 		res.ContentLength = 0
+   278| 	}
+   279| 	if s.requestedGzip && res.Header.Get("Content-Encoding") == "gzip" {
+   280| 		res.Header.Del("Content-Encoding")
+   281| 		res.Header.Del("Content-Length")
+   282| 		res.ContentLength = -1
+   283| 		s.responseBody = newGzipReader(respBody)
+   284| 		res.Uncompressed = true
+   285| 	} else {
+   286| 		s.responseBody = respBody
+   287| 	}
+   288| 	res.Body = s.responseBody
+   289| 	return res, nil
+
+
+# ====================================================================
+# FILE: http3/transport.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 33-73 ---
+    33| 	dialing    chan struct{} // closed as soon as quic.Dial(Early) returned
+    34| 	dialErr    error
+    35| 	conn       *quic.Conn
+    36| 	clientConn clientConn
+    37| 	useCount atomic.Int64
+    38| }
+    39| func (r *roundTripperWithCount) Close() error {
+    40| 	r.cancel()
+    41| 	<-r.dialing
+    42| 	if r.conn != nil {
+    43| 		return r.conn.CloseWithError(0, "")
+    44| 	}
+    45| 	return nil
+    46| }
+    47| type Transport struct {
+    48| 	TLSClientConfig *tls.Config
+    49| 	QUICConfig *quic.Config
+    50| 	Dial func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error)
+    51| 	EnableDatagrams bool
+    52| 	AdditionalSettings map[uint64]uint64
+    53| 	MaxResponseHeaderBytes int
+    54| 	DisableCompression bool
+    55| 	StreamHijacker    func(FrameType, quic.ConnectionTracingID, *quic.Stream, error) (hijacked bool, err error)
+    56| 	UniStreamHijacker func(StreamType, quic.ConnectionTracingID, *quic.ReceiveStream, error) (hijacked bool)
+    57| 	Logger *slog.Logger
+    58| 	mutex sync.Mutex
+    59| 	initOnce sync.Once
+    60| 	initErr  error
+    61| 	newClientConn func(*quic.Conn) clientConn
+    62| 	clients   map[string]*roundTripperWithCount
+    63| 	transport *quic.Transport
+    64| 	closed    bool
+    65| }
+    66| var (
+    67| 	_ http.RoundTripper = &Transport{}
+    68| 	_ io.Closer         = &Transport{}
+    69| )
+    70| var (
+    71| 	ErrNoCachedConn = errors.New("http3: no cached connection was available")
+    72| 	ErrTransportClosed = errors.New("http3: transport is closed")
+    73| )
+
+
+# ====================================================================
+# FILE: internal/ackhandler/received_packet_tracker.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 102-157 ---
+   102| 	}
+   103| 	return nil
+   104| }
+   105| func (h *appDataReceivedPacketTracker) IgnoreBelow(pn protocol.PacketNumber) {
+   106| 	if pn <= h.ignoreBelow {
+   107| 		return
+   108| 	}
+   109| 	h.ignoreBelow = pn
+   110| 	h.packetHistory.DeleteBelow(pn)
+   111| 	if h.logger.Debug() {
+   112| 		h.logger.Debugf("\tIgnoring all packets below %d.", pn)
+   113| 	}
+   114| }
+   115| func (h *appDataReceivedPacketTracker) isMissing(p protocol.PacketNumber) bool {
+   116| 	if h.lastAck == nil || p < h.ignoreBelow {
+   117| 		return false
+   118| 	}
+   119| 	return p < h.lastAck.LargestAcked() && !h.lastAck.AcksPacket(p)
+   120| }
+   121| func (h *appDataReceivedPacketTracker) hasNewMissingPackets() bool {
+   122| 	if h.lastAck == nil {
+   123| 		return false
+   124| 	}
+   125| 	if h.largestObserved < reorderingThreshold {
+   126| 		return false
+   127| 	}
+   128| 	highestMissing := h.packetHistory.HighestMissingUpTo(h.largestObserved - reorderingThreshold)
+   129| 	if highestMissing == protocol.InvalidPacketNumber {
+   130| 		return false
+   131| 	}
+   132| 	if highestMissing < h.lastAck.LargestAcked() {
+   133| 		return false
+   134| 	}
+   135| 	return highestMissing > h.lastAck.LargestAcked()-reorderingThreshold
+   136| }
+   137| func (h *appDataReceivedPacketTracker) shouldQueueACK(pn protocol.PacketNumber, ecn protocol.ECN, wasMissing bool) bool {
+   138| 	if wasMissing {
+   139| 		if h.logger.Debug() {
+   140| 			h.logger.Debugf("\tQueueing ACK because packet %d was missing before.", pn)
+   141| 		}
+   142| 		return true
+   143| 	}
+   144| 	if h.ackElicitingPacketsReceivedSinceLastAck >= packetsBeforeAck {
+   145| 		if h.logger.Debug() {
+   146| 			h.logger.Debugf("\tQueueing ACK because packet %d packets were received after the last ACK (using initial threshold: %d).", h.ackElicitingPacketsReceivedSinceLastAck, packetsBeforeAck)
+   147| 		}
+   148| 		return true
+   149| 	}
+   150| 	if h.hasNewMissingPackets() {
+   151| 		h.logger.Debugf("\tQueuing ACK because there's a new missing packet to report.")
+   152| 		return true
+   153| 	}
+   154| 	if ecn == protocol.ECNCE {
+   155| 		h.logger.Debugf("\tQueuing ACK because the packet was ECN-CE marked.")
+   156| 		return true
+   157| 	}
+
+
+# ====================================================================
+# FILE: qlogwriter/writer.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 57-97 ---
+    57| 	enc := jsontext.NewEncoder(buf)
+    58| 	if _, err := buf.Write(recordSeparator); err != nil {
+    59| 		panic(fmt.Sprintf("qlog encoding into a bytes.Buffer failed: %s", err))
+    60| 	}
+    61| 	if err := (&traceHeader{
+    62| 		VantagePointType: pers,
+    63| 		GroupID:          odcid,
+    64| 		ReferenceTime:    now,
+    65| 		EventSchemas:     eventSchemas,
+    66| 	}).Encode(enc); err != nil {
+    67| 		panic(fmt.Sprintf("qlog encoding into a bytes.Buffer failed: %s", err))
+    68| 	}
+    69| 	_, encodeErr := w.Write(buf.Bytes())
+    70| 	return &FileSeq{
+    71| 		w:             w,
+    72| 		referenceTime: now,
+    73| 		enc:           jsontext.NewEncoder(w),
+    74| 		runStopped:    make(chan struct{}),
+    75| 		encodeErr:     encodeErr,
+    76| 		events:        make(chan event, eventChanSize),
+    77| 		eventSchemas:  eventSchemas,
+    78| 	}
+    79| }
+    80| func (t *FileSeq) SupportsSchemas(schema string) bool {
+    81| 	return slices.Contains(t.eventSchemas, schema)
+    82| }
+    83| func (t *FileSeq) AddProducer() Recorder {
+    84| 	t.mx.Lock()
+    85| 	defer t.mx.Unlock()
+    86| 	if t.closed {
+    87| 		return nil
+    88| 	}
+    89| 	t.producers++
+    90| 	return &Writer{t: t}
+    91| }
+    92| func (t *FileSeq) record(eventTime time.Time, details Event) {
+    93| 	t.mx.Lock()
+    94| 	if t.closed {
+    95| 		t.mx.Unlock()
+    96| 		return
+    97| 	}
+

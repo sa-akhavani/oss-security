@@ -1,0 +1,1305 @@
+# ====================================================================
+# FILE: features/step_definitions/download_steps.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-7 ---
+     1| When /^I download the file '([^']+)'/ do |url|
+     2|   unless ENV['REMOTE'] == 'true'
+     3|     stub_request(:get, %r{/Monkey/testfile.txt}).
+     4|       to_return(body: "S3 Remote File", headers: { "Content-Type" => "text/plain" })
+     5|   end
+     6|   @uploader.download!(url)
+     7| end
+
+
+# ====================================================================
+# FILE: lib/carrierwave/processing/rmagick.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 115-156 ---
+   115|         frame = yield(*[frame, index, options].take(block.arity)) if block_given?
+   116|         frames << frame if frame
+   117|       end
+   118|       frames.append(true) if block_given?
+   119|       write_block = create_info_block(options[:write])
+   120|       if options[:format] || @format
+   121|         frames.write("#{options[:format] || @format}:#{current_path}", &write_block)
+   122|         move_to = current_path.chomp(File.extname(current_path)) + ".#{options[:format] || @format}"
+   123|         file.content_type = ::MIME::Types.type_for(move_to).first.to_s
+   124|         file.move_to(move_to, permissions, directory_permissions)
+   125|       else
+   126|         frames.write(current_path, &write_block)
+   127|       end
+   128|       destroy_image(frames)
+   129|     rescue ::Magick::ImageMagickError => e
+   130|       raise CarrierWave::ProcessingError, I18n.translate(:"errors.messages.rmagick_processing_error", :e => e)
+   131|     end
+   132|   private
+   133|     def create_info_block(options)
+   134|       return nil unless options
+   135|       proc do |img|
+   136|         options.each do |k, v|
+   137|           if v.is_a?(String) && (matches = v.match(/^["'](.+)["']/))
+   138|             ActiveSupport::Deprecation.warn "Passing quoted strings like #{v} to #manipulate! is deprecated, pass them without quoting."
+   139|             v = matches[1]
+   140|           end
+   141|           img.public_send(:"#{k}=", v)
+   142|         end
+   143|       end
+   144|     end
+   145|     def destroy_image(image)
+   146|       image.try(:destroy!)
+   147|     end
+   148|     def dimension_from(value)
+   149|       return value unless value.instance_of?(Proc)
+   150|       value.arity >= 1 ? value.call(self) : value.call
+   151|     end
+   152|     def rmagick_image
+   153|       ::Magick::Image.from_blob(self.read).first
+   154|     end
+   155|   end # RMagick
+   156| end # CarrierWave
+
+
+# ====================================================================
+# FILE: lib/carrierwave/sanitized_file.rb
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 31-75 ---
+    31|     end
+    32|     alias_method :identifier, :filename
+    33|     def basename
+    34|       split_extension(filename)[0] if filename
+    35|     end
+    36|     def extension
+    37|       split_extension(filename)[1] if filename
+    38|     end
+    39|     def size
+    40|       if is_path?
+    41|         exists? ? File.size(path) : 0
+    42|       elsif @file.respond_to?(:size)
+    43|         @file.size
+    44|       elsif path
+    45|         exists? ? File.size(path) : 0
+    46|       else
+    47|         0
+    48|       end
+    49|     end
+    50|     def path
+    51|       return if @file.blank?
+    52|       if is_path?
+    53|         File.expand_path(@file)
+    54|       elsif @file.respond_to?(:path) && !@file.path.blank?
+    55|         File.expand_path(@file.path)
+    56|       end
+    57|     end
+    58|     def is_path?
+    59|       !!((@file.is_a?(String) || @file.is_a?(Pathname)) && !@file.blank?)
+    60|     end
+    61|     def empty?
+    62|       @file.nil? || self.size.nil? || (self.size.zero? && ! self.exists?)
+    63|     end
+    64|     def exists?
+    65|       self.path.present? && File.exist?(self.path)
+    66|     end
+    67|     def read
+    68|       if @content
+    69|         @content
+    70|       elsif is_path?
+    71|         File.open(@file, "rb") {|file| file.read}
+    72|       else
+    73|         @file.try(:rewind)
+    74|         @content = @file.read
+    75|         @file.try(:close) unless @file.try(:closed?)
+
+# --- HUNK 2: Lines 130-170 ---
+   130|       @content_type = type
+   131|     end
+   132|     def sanitize_regexp
+   133|       CarrierWave::SanitizedFile.sanitize_regexp
+   134|     end
+   135|   private
+   136|     def file=(file)
+   137|       if file.is_a?(Hash)
+   138|         @file = file["tempfile"] || file[:tempfile]
+   139|         @original_filename = file["filename"] || file[:filename]
+   140|         @content_type = file["content_type"] || file[:content_type] || file["type"] || file[:type]
+   141|       else
+   142|         @file = file
+   143|         @original_filename = nil
+   144|         @content_type = nil
+   145|       end
+   146|     end
+   147|     def mkdir!(path, directory_permissions)
+   148|       options = {}
+   149|       options[:mode] = directory_permissions if directory_permissions
+   150|       FileUtils.mkdir_p(File.dirname(path), **options) unless File.exist?(File.dirname(path))
+   151|     end
+   152|     def chmod!(path, permissions)
+   153|       File.chmod(permissions, path) if permissions
+   154|     end
+   155|     def sanitize(name)
+   156|       name = name.tr("\\", "/") # work-around for IE
+   157|       name = File.basename(name)
+   158|       name = name.gsub(sanitize_regexp,"_")
+   159|       name = "_#{name}" if name =~ /\A\.+\z/
+   160|       name = "unnamed" if name.size == 0
+   161|       return name.mb_chars.to_s
+   162|     end
+   163|     def split_extension(filename)
+   164|       extension_matchers = [
+   165|         /\A(.+)\.(tar\.([glx]?z|bz2))\z/, # matches "something.tar.gz"
+   166|         /\A(.+)\.([^\.]+)\z/ # matches "something.jpg"
+   167|       ]
+   168|       extension_matchers.each do |regexp|
+   169|         if filename =~ regexp
+   170|           return $1, $2
+
+
+# ====================================================================
+# FILE: lib/carrierwave/storage/fog.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 30-83 ---
+    30|           :public => uploader.fog_public
+    31|         ).files.all(:prefix => uploader.cache_dir).each do |file|
+    32|           time = file.key.scan(/(\d+)-\d+-\d+-\d+/).first.map { |t| t.to_i }
+    33|           time = Time.at(*time)
+    34|           file.destroy if time < (Time.now.utc - seconds)
+    35|         end
+    36|       end
+    37|       def connection
+    38|         @connection ||= begin
+    39|           options = credentials = uploader.fog_credentials
+    40|           self.class.connection_cache[credentials] ||= ::Fog::Storage.new(options)
+    41|         end
+    42|       end
+    43|       class File
+    44|         include CarrierWave::Utilities::Uri
+    45|         attr_reader :path
+    46|         def attributes
+    47|           file.attributes
+    48|         end
+    49|         def authenticated_url(options = {})
+    50|           if ['AWS', 'Google', 'Rackspace', 'OpenStack', 'AzureRM'].include?(@uploader.fog_credentials[:provider])
+    51|             local_directory = connection.directories.new(:key => @uploader.fog_directory)
+    52|             local_file = local_directory.files.new(:key => path)
+    53|             expire_at = ::Fog::Time.now + @uploader.fog_authenticated_url_expiration
+    54|             case @uploader.fog_credentials[:provider]
+    55|               when 'AWS', 'Google'
+    56|                 if url_options_supported?(local_file)
+    57|                   local_file.url(expire_at, options)
+    58|                 else
+    59|                   warn "Options hash not supported in #{local_file.class}. You may need to upgrade your Fog provider."
+    60|                   local_file.url(expire_at)
+    61|                 end
+    62|               when 'Rackspace', 'OpenStack'
+    63|                 connection.get_object_https_url(@uploader.fog_directory, path, expire_at, options)
+    64|               else
+    65|                 local_file.url(expire_at)
+    66|             end
+    67|           end
+    68|         end
+    69|         def content_type
+    70|           @content_type || !file.nil? && file.content_type
+    71|         end
+    72|         def content_type=(new_content_type)
+    73|           @content_type = new_content_type
+    74|         end
+    75|         def delete
+    76|           directory.files.new(:key => path).destroy
+    77|         end
+    78|         def extension
+    79|           path_elements = path.split('.')
+    80|           path_elements.last if path_elements.size > 1
+    81|         end
+    82|         def headers
+    83|           location = caller.first
+
+
+# ====================================================================
+# FILE: lib/carrierwave/uploader/download.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-95 ---
+     1| require 'open-uri'
+     2| require 'ssrf_filter'
+     3| module CarrierWave
+     4|   module Uploader
+     5|     module Download
+     6|       extend ActiveSupport::Concern
+     7|       include CarrierWave::Uploader::Callbacks
+     8|       include CarrierWave::Uploader::Configuration
+     9|       include CarrierWave::Uploader::Cache
+    10|       class RemoteFile
+    11|         attr_reader :uri
+    12|         def initialize(uri, remote_headers = {}, skip_ssrf_protection: false)
+    13|           @uri = uri
+    14|           @remote_headers = remote_headers.reverse_merge('User-Agent' => "CarrierWave/#{CarrierWave::VERSION}")
+    15|           @file, @content_type, @headers = nil
+    16|           @skip_ssrf_protection = skip_ssrf_protection
+    17|         end
+    18|         def original_filename
+    19|           filename = filename_from_header || filename_from_uri
+    20|           mime_type = MIME::Types[content_type].first
+    21|           unless File.extname(filename).present? || mime_type.blank?
+    22|             filename = "#{filename}.#{mime_type.extensions.first}"
+    23|           end
+    24|           filename
+    25|         end
+    26|         def respond_to?(*args)
+    27|           super or file.respond_to?(*args)
+    28|         end
+    29|         def http?
+    30|           @uri.scheme =~ /^https?$/
+    31|         end
+    32|         def content_type
+    33|           @content_type || 'application/octet-stream'
+    34|         end
+    35|         def headers
+    36|           @headers || {}
+    37|         end
+    38|         private
+    39|         def file
+    40|           if @file.blank?
+    41|             if @skip_ssrf_protection
+    42|               @file = (URI.respond_to?(:open) ? URI : Kernel).open(@uri.to_s, @remote_headers)
+    43|               @file = @file.is_a?(String) ? StringIO.new(@file) : @file
+    44|               @content_type = @file.content_type
+    45|               @headers = @file.meta
+    46|               @uri = @file.base_uri
+    47|             else
+    48|               request = nil
+    49|               response = SsrfFilter.get(@uri, headers: @remote_headers) do |req|
+    50|                 request = req
+    51|               end
+    52|               response.value
+    53|               @file = StringIO.new(response.body)
+    54|               @content_type = response.content_type
+    55|               @headers = response
+    56|               @uri = request.uri
+    57|             end
+    58|           end
+    59|           @file
+    60|         rescue StandardError => e
+    61|           raise CarrierWave::DownloadError, "could not download file: #{e.message}"
+    62|         end
+    63|         def filename_from_header
+    64|           if headers['content-disposition']
+    65|             match = headers['content-disposition'].match(/filename="?([^"]+)/)
+    66|             return match[1] unless match.nil? || match[1].empty?
+    67|           end
+    68|         end
+    69|         def filename_from_uri
+    70|           URI::DEFAULT_PARSER.unescape(File.basename(@uri.path))
+    71|         end
+    72|         def method_missing(*args, &block)
+    73|           file.send(*args, &block)
+    74|         end
+    75|       end
+    76|       def download!(uri, remote_headers = {})
+    77|         processed_uri = process_uri(uri)
+    78|         file = RemoteFile.new(processed_uri, remote_headers, skip_ssrf_protection: skip_ssrf_protection?(processed_uri))
+    79|         raise CarrierWave::DownloadError, "trying to download a file which is not served over HTTP" unless file.http?
+    80|         cache!(file)
+    81|       end
+    82|       def process_uri(uri)
+    83|         URI.parse(uri)
+    84|       rescue URI::InvalidURIError
+    85|         uri_parts = uri.split('?')
+    86|         encoded_uri = URI::DEFAULT_PARSER.escape(uri_parts.shift, /[^\-_.!~*'()a-zA-Z\d;\/?:@&=+$,]/)
+    87|         encoded_uri << '?' << URI::DEFAULT_PARSER.escape(uri_parts.join('?')) if uri_parts.any?
+    88|         URI.parse(encoded_uri) rescue raise CarrierWave::DownloadError, "couldn't parse URL"
+    89|       end
+    90|       def skip_ssrf_protection?(uri)
+    91|         false
+    92|       end
+    93|     end # Download
+    94|   end # Uploader
+    95| end # CarrierWave
+
+
+# ====================================================================
+# FILE: lib/carrierwave/version.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-3 ---
+     1| module CarrierWave
+     2|   VERSION = "1.3.2"
+     3| end
+
+
+# ====================================================================
+# FILE: spec/mount_multiple_spec.rb
+# Total hunks: 5
+# ====================================================================
+# --- HUNK 1: Lines 263-315 ---
+   263|       context "does nothing when nil is assigned" do
+   264|         let(:images_cache) { nil }
+   265|         it { expect(instance.images).to be_empty }
+   266|       end
+   267|       context "does nothing when an empty string is assigned" do
+   268|         let(:images_cache) { '' }
+   269|         it { expect(instance.images).to be_empty }
+   270|       end
+   271|       context "retrieve from cache when a cache name is assigned" do
+   272|         let(:images_cache) { ['1369894322-123-0123-1234/test.jpg'].to_json }
+   273|         it { expect(instance.images[0].current_path).to eq(public_path('uploads/tmp/1369894322-123-0123-1234/test.jpg')) }
+   274|       end
+   275|       context "doesn't write over a previously assigned file" do
+   276|         let(:images_cache) { ['1369894322-123-0123-1234/monkey.jpg'].to_json }
+   277|         before { instance.images = [test_file_stub] }
+   278|         it { expect(instance.images[0].current_path).to match(/test.jpg$/) }
+   279|       end
+   280|     end
+   281|     describe "#remote_images_urls" do
+   282|       subject { instance.remote_images_urls }
+   283|       before { stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub)) }
+   284|       context "returns nil" do
+   285|         it { is_expected.to be_nil }
+   286|       end
+   287|       context "returns previously cached URL" do
+   288|         before { instance.remote_images_urls = ["http://www.example.com/test.jpg"] }
+   289|         it { is_expected.to eq(["http://www.example.com/test.jpg"]) }
+   290|       end
+   291|     end
+   292|     describe "#remote_images_urls=" do
+   293|       subject(:images) { instance.images }
+   294|       before do
+   295|         stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub))
+   296|         instance.remote_images_urls = remote_images_url
+   297|       end
+   298|       context "does nothing when nil is assigned" do
+   299|         let(:remote_images_url) { nil }
+   300|         it { is_expected.to be_empty }
+   301|       end
+   302|       context "does nothing when an empty string is assigned" do
+   303|         let(:remote_images_url) { '' }
+   304|         it { is_expected.to be_empty }
+   305|       end
+   306|       context "retrieves from cache when a cache name is assigned" do
+   307|         subject { images[0].current_path }
+   308|         let(:remote_images_url) { ["http://www.example.com/test.jpg"] }
+   309|         it { is_expected.to match(/test.jpg$/) }
+   310|       end
+   311|       context "writes over a previously assigned file" do
+   312|         subject { images[0].current_path }
+   313|         let(:remote_images_url) { ["http://www.example.com/test.jpg"] }
+   314|         before do
+   315|           instance.images = [stub_file("portrait.jpg")]
+
+# --- HUNK 2: Lines 405-445 ---
+   405|         before { instance.images = test_file_stub }
+   406|         it { is_expected.to be_nil }
+   407|       end
+   408|       describe "when an integrity check fails" do
+   409|         before do
+   410|           uploader.class_eval do
+   411|             def extension_whitelist
+   412|               %w(txt)
+   413|             end
+   414|           end
+   415|         end
+   416|         context "when file is cached" do
+   417|           before { instance.images = [test_file_stub] }
+   418|           it { is_expected.to be_an_instance_of(CarrierWave::IntegrityError) }
+   419|           it "has an error message" do
+   420|             expect(images_integrity_error.message.lines.grep(/^You are not allowed to upload/)).to be_truthy
+   421|           end
+   422|         end
+   423|         context "when file was downloaded" do
+   424|           before do
+   425|             stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub))
+   426|             instance.remote_images_urls = ["http://www.example.com/#{test_file_name}"]
+   427|           end
+   428|           it { is_expected.to be_an_instance_of(CarrierWave::IntegrityError) }
+   429|           it "has an error message" do
+   430|             expect(images_integrity_error.message.lines.grep(/^You are not allowed to upload/)).to be_truthy
+   431|           end
+   432|         end
+   433|         context "when file is assigned and remote_iamges_url is blank" do
+   434|           before do
+   435|             instance.images = [test_file_stub]
+   436|             instance.remote_images_urls = ""
+   437|           end
+   438|           it { is_expected.to be_an_instance_of(CarrierWave::IntegrityError) }
+   439|           it "has an error message" do
+   440|             expect(images_integrity_error.message.lines.grep(/^You are not allowed to upload/)).to be_truthy
+   441|           end
+   442|         end
+   443|       end
+   444|     end
+   445|     describe '#images_processing_error' do
+
+# --- HUNK 3: Lines 449-500 ---
+   449|       end
+   450|       context "when file is cached" do
+   451|         before { instance.images = [test_file_stub] }
+   452|         it { is_expected.to be_nil }
+   453|       end
+   454|       describe "when an processing error occurs" do
+   455|         before do
+   456|           uploader.class_eval do
+   457|             process :monkey
+   458|             def monkey
+   459|               raise CarrierWave::ProcessingError, "Ohh noez!"
+   460|             end
+   461|           end
+   462|         end
+   463|         context "when file is cached" do
+   464|           before { instance.images = [test_file_stub] }
+   465|           it { is_expected.to be_an_instance_of(CarrierWave::ProcessingError) }
+   466|         end
+   467|         context "when file was downloaded" do
+   468|           before do
+   469|             stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub))
+   470|             instance.remote_images_urls = ["http://www.example.com/#{test_file_name}"]
+   471|           end
+   472|           it { is_expected.to be_an_instance_of(CarrierWave::ProcessingError) }
+   473|         end
+   474|       end
+   475|     end
+   476|     describe '#images_download_error' do
+   477|       subject(:images_download_error) { instance.images_download_error }
+   478|       before do
+   479|         stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub))
+   480|         stub_request(:get, "http://www.example.com/missing.jpg").to_return(status: 404)
+   481|       end
+   482|       describe "default behaviour" do
+   483|         it { expect(instance.images_download_error).to be_nil }
+   484|       end
+   485|       context "when file download was successful" do
+   486|         before { instance.remote_images_urls = ["http://www.example.com/#{test_file_name}"] }
+   487|         it { is_expected.to be_nil }
+   488|       end
+   489|       context "when file couldn't be found" do
+   490|         before { instance.remote_images_urls = ["http://www.example.com/missing.jpg"] }
+   491|         it { is_expected.to be_an_instance_of(CarrierWave::DownloadError) }
+   492|       end
+   493|     end
+   494|     describe '#write_images_identifier' do
+   495|       after { instance.write_images_identifier }
+   496|       it "writes to the column" do
+   497|         expect(instance).to receive(:write_uploader).with(:images, [test_file_name]).at_least(:once)
+   498|         instance.images = [test_file_stub]
+   499|         instance.write_images_identifier
+   500|       end
+
+# --- HUNK 4: Lines 598-665 ---
+   598|     let(:klass) do
+   599|       Class.new.tap do |k|
+   600|         k.send(:extend, CarrierWave::Mount)
+   601|         k.mount_uploaders(:images, uploader, :ignore_integrity_errors => false)
+   602|       end
+   603|     end
+   604|     let(:uploader) do
+   605|       Class.new(CarrierWave::Uploader::Base).tap do |u|
+   606|         u.class_eval do
+   607|           def extension_whitelist
+   608|             %w(txt)
+   609|           end
+   610|         end
+   611|       end
+   612|     end
+   613|     context "when a cached image fails an integrity check" do
+   614|       it { expect(running { instance.images = [test_file_stub] }).to raise_error(CarrierWave::IntegrityError) }
+   615|     end
+   616|     context "when a downloaded image fails an integity check" do
+   617|       before do
+   618|         stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: test_file_stub)
+   619|       end
+   620|       it { expect(running {instance.remote_images_urls = ["http://www.example.com/#{test_file_name}"]}).to raise_error(CarrierWave::IntegrityError) }
+   621|     end
+   622|   end
+   623|   describe '#mount_uploaders with :ignore_processing_errors => false' do
+   624|     let(:klass) do
+   625|       Class.new.tap do |k|
+   626|         k.send(:extend, CarrierWave::Mount)
+   627|         k.mount_uploaders(:images, uploader, :ignore_processing_errors => false)
+   628|       end
+   629|     end
+   630|     let(:uploader) do
+   631|       Class.new(CarrierWave::Uploader::Base).tap do |u|
+   632|         u.class_eval do
+   633|           process :monkey
+   634|           def monkey
+   635|             raise CarrierWave::ProcessingError, "Ohh noez!"
+   636|           end
+   637|         end
+   638|       end
+   639|     end
+   640|     context "when a cached image fails an integrity check" do
+   641|       it { expect(running { instance.images = [test_file_stub] }).to raise_error(CarrierWave::ProcessingError) }
+   642|     end
+   643|     context "when a downloaded image fails an integity check" do
+   644|       before do
+   645|         stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: test_file_stub)
+   646|       end
+   647|       it { expect(running {instance.remote_images_urls = ["http://www.example.com/#{test_file_name}"]}).to raise_error(CarrierWave::ProcessingError) }
+   648|     end
+   649|   end
+   650|   describe '#mount_uploaders with :ignore_download_errors => false' do
+   651|     let(:klass) do
+   652|       Class.new.tap do |k|
+   653|         k.send(:extend, CarrierWave::Mount)
+   654|         k.mount_uploaders(:images, uploader, ignore_download_errors: false)
+   655|       end
+   656|     end
+   657|     let(:uploader) { Class.new(CarrierWave::Uploader::Base) }
+   658|     before do
+   659|       uploader.class_eval do
+   660|         def download! uri, headers = {}
+   661|           raise CarrierWave::DownloadError
+   662|         end
+   663|       end
+   664|     end
+   665|     context "when the image fail to be processed" do
+
+
+# ====================================================================
+# FILE: spec/mount_single_spec.rb
+# Total hunks: 6
+# ====================================================================
+# --- HUNK 1: Lines 218-286 ---
+   218|       it "should do nothing when nil is assigned" do
+   219|         @instance.image_cache = nil
+   220|         expect(@instance.image).to be_blank
+   221|       end
+   222|       it "should do nothing when an empty string is assigned" do
+   223|         @instance.image_cache = ''
+   224|         expect(@instance.image).to be_blank
+   225|       end
+   226|       it "retrieve from cache when a cache name is assigned" do
+   227|         @instance.image_cache = '1369894322-123-0123-1234/test.jpg'
+   228|         expect(@instance.image.current_path).to eq(public_path('uploads/tmp/1369894322-123-0123-1234/test.jpg'))
+   229|       end
+   230|       it "should not write over a previously assigned file" do
+   231|         @instance.image = stub_file('test.jpg')
+   232|         @instance.image_cache = '1369894322-123-0123-1234/monkey.jpg'
+   233|         expect(@instance.image.current_path).to match(/test.jpg$/)
+   234|       end
+   235|     end
+   236|     describe "#remote_image_url" do
+   237|       before do
+   238|         stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+   239|       end
+   240|       it "returns nil" do
+   241|         expect(@instance.remote_image_url).to be_nil
+   242|       end
+   243|       it "returns previously cached URL" do
+   244|         @instance.remote_image_url = "http://www.example.com/test.jpg"
+   245|         expect(@instance.remote_image_url).to eq("http://www.example.com/test.jpg")
+   246|       end
+   247|       describe "URI with unicode symbols" do
+   248|         before do
+   249|           stub_request(
+   250|             :get,
+   251|             "http://www.example.com/%D1%8E%D0%BD%D0%B8%D0%BA%D0%BE%D0%B4.jpg"
+   252|           ).to_return(body: File.read(file_path("юникод.jpg")))
+   253|         end
+   254|         it "works correctly" do
+   255|           @instance.remote_image_url = "http://www.example.com/%D1%8E%D0%BD%D0%B8%D0%BA%D0%BE%D0%B4.jpg"
+   256|           expect(@instance.remote_image_url).to eq("http://www.example.com/%D1%8E%D0%BD%D0%B8%D0%BA%D0%BE%D0%B4.jpg")
+   257|         end
+   258|         it "decodes it correctly" do
+   259|           @instance.remote_image_url = "http://www.example.com/%D1%8E%D0%BD%D0%B8%D0%BA%D0%BE%D0%B4.jpg"
+   260|           expect(@instance.image.current_path).to match(/юникод.jpg$/)
+   261|         end
+   262|       end
+   263|     end
+   264|     describe "#remote_image_url=" do
+   265|       before do
+   266|         stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+   267|       end
+   268|       it "does nothing when nil is assigned" do
+   269|         @instance.remote_image_url = nil
+   270|         expect(@instance.image).to be_blank
+   271|       end
+   272|       it "does nothing when an empty string is assigned" do
+   273|         @instance.remote_image_url = ""
+   274|         expect(@instance.image).to be_blank
+   275|       end
+   276|       it "retrieves from cache when a cache name is assigned" do
+   277|         @instance.remote_image_url = "http://www.example.com/test.jpg"
+   278|         expect(@instance.image.current_path).to match(/test.jpg$/)
+   279|       end
+   280|       it "writes over a previously assigned file" do
+   281|         @instance.image = stub_file("portrait.jpg")
+   282|         @instance.remote_image_url = "http://www.example.com/test.jpg"
+   283|         expect(@instance.image.current_path).to match(/test.jpg$/)
+   284|       end
+   285|     end
+   286|     describe '#store_image!' do
+
+# --- HUNK 2: Lines 357-460 ---
+   357|       end
+   358|       it "should be nil after a file is cached" do
+   359|         @instance.image = stub_file('test.jpg')
+   360|         expect(@instance.image_integrity_error).to be_nil
+   361|       end
+   362|       describe "when an integrity check fails" do
+   363|         before do
+   364|           @uploader.class_eval do
+   365|             def extension_whitelist
+   366|               %w(txt)
+   367|             end
+   368|           end
+   369|         end
+   370|         it "should be an error instance if file was cached" do
+   371|           @instance.image = stub_file('test.jpg')
+   372|           e = @instance.image_integrity_error
+   373|           expect(e).to be_an_instance_of(CarrierWave::IntegrityError)
+   374|           expect(e.message.lines.grep(/^You are not allowed to upload/)).to be_truthy
+   375|         end
+   376|         it "should be an error instance if file was downloaded" do
+   377|           stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+   378|           @instance.remote_image_url = "http://www.example.com/test.jpg"
+   379|           e = @instance.image_integrity_error
+   380|           expect(e).to be_an_instance_of(CarrierWave::IntegrityError)
+   381|           expect(e.message.lines.grep(/^You are not allowed to upload/)).to be_truthy
+   382|         end
+   383|         it "should be an error instance when image file is assigned and remote_image_url is blank" do
+   384|           @instance.image = stub_file('test.jpg')
+   385|           @instance.remote_image_url = ""
+   386|           e = @instance.image_integrity_error
+   387|           expect(e).to be_an_instance_of(CarrierWave::IntegrityError)
+   388|           expect(e.message.lines.grep(/^You are not allowed to upload/)).to be_truthy
+   389|         end
+   390|       end
+   391|     end
+   392|     describe '#image_processing_error' do
+   393|       it "should be nil by default" do
+   394|         expect(@instance.image_processing_error).to be_nil
+   395|       end
+   396|       it "should be nil after a file is cached" do
+   397|         @instance.image = stub_file('test.jpg')
+   398|         expect(@instance.image_processing_error).to be_nil
+   399|       end
+   400|       describe "when an processing error occurs" do
+   401|         before do
+   402|           @uploader.class_eval do
+   403|             process :monkey
+   404|             def monkey
+   405|               raise CarrierWave::ProcessingError, "Ohh noez!"
+   406|             end
+   407|           end
+   408|         end
+   409|         it "should be an error instance if file was cached" do
+   410|           @instance.image = stub_file('test.jpg')
+   411|           expect(@instance.image_processing_error).to be_an_instance_of(CarrierWave::ProcessingError)
+   412|         end
+   413|         it "should be an error instance if file was downloaded" do
+   414|           stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+   415|           @instance.remote_image_url = "http://www.example.com/test.jpg"
+   416|           expect(@instance.image_processing_error).to be_an_instance_of(CarrierWave::ProcessingError)
+   417|         end
+   418|       end
+   419|     end
+   420|     describe '#image_download_error' do
+   421|       before do
+   422|         stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+   423|         stub_request(:get, "http://www.example.com/missing.jpg").to_return(status: 404)
+   424|       end
+   425|       it "should be nil by default" do
+   426|         expect(@instance.image_download_error).to be_nil
+   427|       end
+   428|       it "should be nil if file download was successful" do
+   429|         @instance.remote_image_url = "http://www.example.com/test.jpg"
+   430|         expect(@instance.image_download_error).to be_nil
+   431|       end
+   432|       it "should be an error instance if file could not be found" do
+   433|         @instance.remote_image_url = "http://www.example.com/missing.jpg"
+   434|         expect(@instance.image_download_error).to be_an_instance_of(CarrierWave::DownloadError)
+   435|       end
+   436|     end
+   437|     describe '#image_download_error' do
+   438|       before do
+   439|         stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+   440|         stub_request(:get, "http://www.example.com/missing.jpg").to_return(status: 404)
+   441|       end
+   442|       it "should be nil by default" do
+   443|         expect(@instance.image_download_error).to be_nil
+   444|       end
+   445|       it "should be nil if file download was successful" do
+   446|         @instance.remote_image_url = "http://www.example.com/test.jpg"
+   447|         expect(@instance.image_download_error).to be_nil
+   448|       end
+   449|       it "should be an error instance if file could not be found" do
+   450|         @instance.remote_image_url = "http://www.example.com/missing.jpg"
+   451|         expect(@instance.image_download_error).to be_an_instance_of(CarrierWave::DownloadError)
+   452|       end
+   453|     end
+   454|     describe '#write_image_identifier' do
+   455|       it "should write to the column" do
+   456|         expect(@instance).to receive(:write_uploader).with(:image, "test.jpg")
+   457|         @instance.image = stub_file('test.jpg')
+   458|         @instance.write_image_identifier
+   459|       end
+   460|       it "should remove from the column when remove_image is true" do
+
+# --- HUNK 3: Lines 544-610 ---
+   544|   end
+   545|   describe '#mount_uploader with :ignore_integrity_errors => false' do
+   546|     before do
+   547|       @class = Class.new
+   548|       @class.send(:extend, CarrierWave::Mount)
+   549|       @uploader = Class.new(CarrierWave::Uploader::Base)
+   550|       @class.mount_uploader(:image, @uploader, :ignore_integrity_errors => false)
+   551|       @instance = @class.new
+   552|       @uploader.class_eval do
+   553|         def extension_whitelist
+   554|           %w(txt)
+   555|         end
+   556|       end
+   557|     end
+   558|     it "should raise an error if the image fails an integrity check when cached" do
+   559|       expect(running {
+   560|         @instance.image = stub_file('test.jpg')
+   561|       }).to raise_error(CarrierWave::IntegrityError)
+   562|     end
+   563|     it "should raise an error if the image fails an integrity check when downloaded" do
+   564|       stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+   565|       expect(running {
+   566|         @instance.remote_image_url = "http://www.example.com/test.jpg"
+   567|       }).to raise_error(CarrierWave::IntegrityError)
+   568|     end
+   569|   end
+   570|   describe '#mount_uploader with :ignore_processing_errors => false' do
+   571|     before do
+   572|       @class = Class.new
+   573|       @class.send(:extend, CarrierWave::Mount)
+   574|       @uploader = Class.new(CarrierWave::Uploader::Base)
+   575|       @class.mount_uploader(:image, @uploader, :ignore_processing_errors => false)
+   576|       @instance = @class.new
+   577|       @uploader.class_eval do
+   578|         process :monkey
+   579|         def monkey
+   580|           raise CarrierWave::ProcessingError, "Ohh noez!"
+   581|         end
+   582|       end
+   583|     end
+   584|     it "should raise an error if the image fails to be processed when cached" do
+   585|       expect(running {
+   586|         @instance.image = stub_file('test.jpg')
+   587|       }).to raise_error(CarrierWave::ProcessingError)
+   588|     end
+   589|     it "should raise an error if the image fails to be processed when downloaded" do
+   590|       stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+   591|       expect(running {
+   592|         @instance.remote_image_url = "http://www.example.com/test.jpg"
+   593|       }).to raise_error(CarrierWave::ProcessingError)
+   594|     end
+   595|   end
+   596|   describe '#mount_uploader with :ignore_download_errors => false' do
+   597|     before do
+   598|       @class = Class.new
+   599|       @class.send(:extend, CarrierWave::Mount)
+   600|       @uploader = Class.new(CarrierWave::Uploader::Base)
+   601|       @class.mount_uploader(:image, @uploader, :ignore_download_errors => false)
+   602|       @instance = @class.new
+   603|     end
+   604|     it "should raise an error if the image fails to be processed" do
+   605|       @uploader.class_eval do
+   606|         def download! uri, headers = {}
+   607|           raise CarrierWave::DownloadError
+   608|         end
+   609|       end
+   610|       expect(running {
+
+
+# ====================================================================
+# FILE: spec/orm/activerecord_spec.rb
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 384-424 ---
+   384|       end
+   385|       it "resets remove_image? to false" do
+   386|         @event.remove_image = true
+   387|         expect {
+   388|           @event.remove_image!
+   389|         }.to change {
+   390|           @event.remove_image?
+   391|         }.from(true).to(false)
+   392|       end
+   393|     end
+   394|     describe "remove_image=" do
+   395|       it "should mark the image as changed if changed" do
+   396|         expect(@event.image_changed?).to be_falsey
+   397|         expect(@event.remove_image).to be_nil
+   398|         @event.remove_image = "1"
+   399|         expect(@event.image_changed?).to be_truthy
+   400|       end
+   401|     end
+   402|     describe "#remote_image_url=" do
+   403|       before do
+   404|         stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+   405|       end
+   406|       it "should mark image as changed when setting remote_image_url" do
+   407|         expect(@event.image_changed?).to be_falsey
+   408|         @event.remote_image_url = 'http://www.example.com/test.jpg'
+   409|         expect(@event.image_changed?).to be_truthy
+   410|         @event.save!
+   411|         @event.reload
+   412|         expect(@event.image_changed?).to be_falsey
+   413|       end
+   414|       context 'when validating download' do
+   415|         before do
+   416|           @uploader.class_eval do
+   417|             def download! file, headers = {}
+   418|               raise CarrierWave::DownloadError
+   419|             end
+   420|           end
+   421|           @event.remote_image_url = 'http://www.example.com/missing.jpg'
+   422|         end
+   423|         it "should make the record invalid when a download error occurs" do
+   424|           expect(@event).to_not be_valid
+
+# --- HUNK 2: Lines 976-1016 ---
+   976|       end
+   977|       it "should clear the serialization column" do
+   978|         expect(@event.attributes['images']).to be_blank
+   979|       end
+   980|       it "should return to false after being saved" do
+   981|         @event.save!
+   982|         expect(@event.remove_images).to eq(false)
+   983|         expect(@event.remove_images?).to eq(false)
+   984|       end
+   985|     end
+   986|     describe "remove_images=" do
+   987|       it "should mark the images as changed if changed" do
+   988|         expect(@event.images_changed?).to be_falsey
+   989|         expect(@event.remove_images).to be_nil
+   990|         @event.remove_images = "1"
+   991|         expect(@event.images_changed?).to be_truthy
+   992|       end
+   993|     end
+   994|     describe "#remote_images_urls=" do
+   995|       before do
+   996|         stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+   997|       end
+   998|       it "should mark images as changed when setting remote_images_urls" do
+   999|         expect(@event.images_changed?).to be_falsey
+  1000|         @event.remote_images_urls = ['http://www.example.com/test.jpg']
+  1001|         expect(@event.images_changed?).to be_truthy
+  1002|         @event.save!
+  1003|         @event.reload
+  1004|         expect(@event.images_changed?).to be_falsey
+  1005|       end
+  1006|       context 'when validating download' do
+  1007|         before do
+  1008|           @uploader.class_eval do
+  1009|             def download! file, headers = {}
+  1010|               raise CarrierWave::DownloadError
+  1011|             end
+  1012|           end
+  1013|           @event.remote_images_urls = ['http://www.example.com/missing.jpg']
+  1014|         end
+  1015|         it "should make the record invalid when a download error occurs" do
+  1016|           expect(@event).to_not be_valid
+
+
+# ====================================================================
+# FILE: spec/processing/rmagick_spec.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 144-214 ---
+   144|   end
+   145|   describe "#manipulate!" do
+   146|     let(:image) { ::Magick::Image.read(landscape_file_path) }
+   147|     it 'supports passing write options to RMagick' do
+   148|       allow(::Magick::Image).to receive_messages(:read => image)
+   149|       expect_any_instance_of(::Magick::Image::Info).to receive(:quality=).with(50)
+   150|       expect_any_instance_of(::Magick::Image::Info).to receive(:depth=).with(8)
+   151|       instance.manipulate! do |image, index, options|
+   152|         options[:write] = {
+   153|           :quality => 50,
+   154|           :depth => 8
+   155|         }
+   156|         image
+   157|       end
+   158|     end
+   159|     it 'supports passing read options to RMagick' do
+   160|       expect_any_instance_of(::Magick::Image::Info).to receive(:density=).with(10)
+   161|       expect_any_instance_of(::Magick::Image::Info).to receive(:size=).with("200x200")
+   162|       instance.manipulate! :read => {
+   163|           :density => 10,
+   164|           :size => "200x200"
+   165|         }
+   166|     end
+   167|     it 'shows deprecation but still accepts strings enclosed with double quotes' do
+   168|       expect_any_instance_of(::Magick::Image::Info).to receive(:size=).once.with("200x200")
+   169|       expect(ActiveSupport::Deprecation).to receive(:warn).with(any_args)
+   170|       instance.manipulate! :read => {:size => %{"200x200"}}
+   171|     end
+   172|     it 'shows deprecation but still accepts strings enclosed with single quotes' do
+   173|       expect_any_instance_of(::Magick::Image::Info).to receive(:size=).once.with("200x200")
+   174|       expect(ActiveSupport::Deprecation).to receive(:warn).with(any_args)
+   175|       instance.manipulate! :read => {:size => %{'200x200'}}
+   176|     end
+   177|     it 'does not allow arbitrary code execution' do
+   178|       expect_any_instance_of(Kernel).not_to receive(:puts)
+   179|       expect do
+   180|         instance.manipulate! :read => {
+   181|             :density => "1 }; raise; {"
+   182|         }
+   183|       end.to raise_error ArgumentError, /invalid density geometry/
+   184|     end
+   185|     it 'does not allow invocation of non-public methods' do
+   186|       module Kernel
+   187|         private
+   188|         def foo=(value); raise; end
+   189|       end
+   190|       expect do
+   191|         instance.manipulate! :read => {
+   192|             :foo => "1"
+   193|         }
+   194|       end.to raise_error NoMethodError, /private method `foo=' called/
+   195|     end
+   196|   end
+   197|   describe "#width and #height" do
+   198|     it "returns the width and height of the image" do
+   199|       instance.resize_to_fill(200, 300)
+   200|       expect(instance.width).to eq(200)
+   201|       expect(instance.height).to eq(300)
+   202|     end
+   203|   end
+   204|   describe '#dimension_from' do
+   205|     it 'evaluates procs' do
+   206|       instance.resize_to_fill(Proc.new { 200 }, Proc.new { 200 })
+   207|       expect(instance).to have_dimensions(200, 200)
+   208|     end
+   209|     it 'evaluates procs with uploader instance' do
+   210|       width_argument = nil
+   211|       width = Proc.new do |uploader|
+   212|         width_argument = uploader
+   213|         200
+   214|       end
+
+
+# ====================================================================
+# FILE: spec/spec_helper.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 72-111 ---
+    72|         current_enforce_available_locales_value = I18n.enforce_available_locales
+    73|         current_locale = I18n.locale
+    74|         begin
+    75|           I18n.available_locales = [:nl]
+    76|           I18n.enforce_available_locales = true
+    77|           I18n.locale = :nl
+    78|           yield
+    79|         ensure
+    80|           I18n.available_locales = current_available_locales
+    81|           I18n.enforce_available_locales = current_enforce_available_locales_value
+    82|           I18n.locale = current_locale
+    83|         end
+    84|       end
+    85|     end
+    86|     module ManipulationHelpers
+    87|       def color_of_pixel(path, x, y)
+    88|         image = ::MiniMagick::Image.open(path)
+    89|         image.run_command("convert", "#{image.path}[1x1+#{x}+#{y}]", "-depth", "8", "txt:").split("\n")[1]
+    90|       end
+    91|     end
+    92|     module SsrfProtectionAwareWebMock
+    93|       def stub_request(method, uri)
+    94|         uri = URI.parse(uri) if uri.is_a?(String)
+    95|         uri.hostname = Resolv.getaddress(uri.hostname) if uri.is_a?(URI)
+    96|         super
+    97|       end
+    98|     end
+    99|   end
+   100| end
+   101| RSpec.configure do |config|
+   102|   config.include CarrierWave::Test::Matchers
+   103|   config.include CarrierWave::Test::MockFiles
+   104|   config.include CarrierWave::Test::MockStorage
+   105|   config.include CarrierWave::Test::I18nHelpers
+   106|   config.include CarrierWave::Test::ManipulationHelpers
+   107|   config.prepend CarrierWave::Test::SsrfProtectionAwareWebMock
+   108|   if RUBY_ENGINE == 'jruby'
+   109|     config.filter_run_excluding :rmagick => true
+   110|   end
+   111| end
+
+
+# ====================================================================
+# FILE: spec/storage/fog_helper.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 335-375 ---
+   335|         context "false" do
+   336|           before do
+   337|             directory_key = "#{CARRIERWAVE_DIRECTORY}private"
+   338|             @directory = @storage.connection.directories.create(:key => directory_key, :public => true)
+   339|             allow(@uploader).to receive(:fog_directory).and_return(directory_key)
+   340|             allow(@uploader).to receive(:fog_public).and_return(false)
+   341|             allow(@uploader).to receive(:store_path).and_return('uploads/private.txt')
+   342|             @fog_file = @storage.store!(file)
+   343|           end
+   344|           after do
+   345|             @directory.files.new(:key => 'uploads/private.txt').destroy
+   346|             @directory.files.new(:key => 'test.jpg').destroy
+   347|             @directory.destroy
+   348|           end
+   349|           it "should not be available at public URL" do
+   350|             unless Fog.mocking? || fog_credentials[:provider] == 'Local'
+   351|               expect(running{ open(@fog_file.public_url) }).to raise_error OpenURI::HTTPError
+   352|             end
+   353|           end
+   354|           it "should have an authenticated_url" do
+   355|             if ['AWS', 'Rackspace', 'Google', 'OpenStack', 'AzureRM'].include?(@provider)
+   356|               expect(@fog_file.authenticated_url).not_to be_nil
+   357|             end
+   358|           end
+   359|           it 'should generate correct filename' do
+   360|             expect(@fog_file.filename).to eq('private.txt')
+   361|           end
+   362|           it "should handle query params" do
+   363|             if ['AWS', 'Google'].include?(@provider)
+   364|               url = @fog_file.url(:query => {"response-content-disposition" => "attachment"})
+   365|               expect(url).to match(/response-content-disposition=attachment/)
+   366|               unless Fog.mocking?
+   367|                 Excon.defaults[:omit_default_port] = true
+   368|                 response = Excon.get(url)
+   369|                 expect(response.status).to be 200
+   370|                 expect(response.headers["Content-Disposition"]).to eq("attachment")
+   371|               end
+   372|             end
+   373|           end
+   374|           it "should not use #file to get signed url" do
+   375|             if ['AWS', 'Google'].include?(@provider)
+
+
+# ====================================================================
+# FILE: spec/uploader/download_spec.rb
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 2-126 ---
+     2| describe CarrierWave::Uploader::Download do
+     3|   let(:uploader_class) { Class.new(CarrierWave::Uploader::Base) }
+     4|   let(:uploader) { uploader_class.new }
+     5|   let(:cache_id) { '1369894322-345-1234-2255' }
+     6|   let(:base_url) { "http://www.example.com" }
+     7|   let(:url) { base_url + "/test.jpg" }
+     8|   let(:test_file) { File.read(file_path(test_file_name)) }
+     9|   let(:test_file_name) { "test.jpg" }
+    10|   let(:unicode_named_file) { File.read(file_path(unicode_filename)) }
+    11|   let(:unicode_URL) { URI.encode(base_url + "/#{unicode_filename}") }
+    12|   let(:unicode_filename) { "юникод.jpg" }
+    13|   let(:authentication_headers) do
+    14|     {
+    15|       'Accept'=>'*/*',
+    16|       'Accept-Encoding'=>'gzip;q=1.0,deflate;q=0.6,identity;q=0.3',
+    17|       'User-Agent'=>"CarrierWave/#{CarrierWave::VERSION}",
+    18|       'Authorization'=>'Bearer QWE'
+    19|     }
+    20|   end
+    21|   after { FileUtils.rm_rf(public_path) }
+    22|   describe 'RemoteFile' do
+    23|     context 'when skip_ssrf_protection is false' do
+    24|       subject do
+    25|         CarrierWave::Uploader::Download::RemoteFile.new(url, {}, skip_ssrf_protection: false)
+    26|       end
+    27|       before do
+    28|         stub_request(:get, "http://www.example.com/#{test_file_name}")
+    29|             .to_return(body: test_file, headers: {"Content-Type" =>  'image/jpeg', "Vary" => 'Accept-Encoding'})
+    30|         subject.read
+    31|       end
+    32|       it 'returns content type' do
+    33|         expect(subject.content_type).to eq 'image/jpeg'
+    34|       end
+    35|       it 'returns header' do
+    36|         expect(subject.headers['vary']).to eq 'Accept-Encoding'
+    37|       end
+    38|       it 'returns resolved URI' do
+    39|         expect(subject.uri.to_s).to match %r{http://[^/]+/test.jpg}
+    40|       end
+    41|     end
+    42|     context 'when skip_ssrf_protection is true' do
+    43|       subject do
+    44|         CarrierWave::Uploader::Download::RemoteFile.new(url, {}, skip_ssrf_protection: true)
+    45|       end
+    46|       before do
+    47|         WebMock.stub_request(:get, "http://www.example.com/#{test_file_name}")
+    48|           .to_return(body: test_file, headers: {"Content-Type" => 'image/jpeg', "Vary" => 'Accept-Encoding'})
+    49|         subject.read
+    50|       end
+    51|       it 'returns content type' do
+    52|         expect(subject.content_type).to eq 'image/jpeg'
+    53|       end
+    54|       it 'returns header' do
+    55|         expect(subject.headers['vary']).to eq 'Accept-Encoding'
+    56|       end
+    57|       it 'returns URI' do
+    58|         expect(subject.uri.to_s).to eq 'http://www.example.com/test.jpg'
+    59|       end
+    60|     end
+    61|   end
+    62|   describe '#download!' do
+    63|     before do
+    64|       allow(CarrierWave).to receive(:generate_cache_id).and_return(cache_id)
+    65|       stub_request(:get, "http://www.example.com/#{test_file_name}").
+    66|         to_return(body: test_file, headers: { "Content-Type" => 'image/jpeg' })
+    67|       stub_request(:get, "http://www.example.com/test-with-no-extension/test").
+    68|         to_return(body: test_file, headers: { "Content-Type" => "image/jpeg" })
+    69|       stub_request(:get, "http://www.example.com/test%20with%20spaces/#{test_file_name}").
+    70|         to_return(body: test_file)
+    71|       stub_request(:get, "http://www.example.com/content-disposition").
+    72|         to_return(body: test_file, headers: { "Content-Disposition" => 'filename="another_test.jpg"' })
+    73|       stub_request(:get, "http://www.redirect.com").
+    74|         to_return(status: 301, body: "Redirecting", headers: { "Location" => url })
+    75|       stub_request(:get, "http://www.example.com/missing.jpg").
+    76|         to_return(status: 404)
+    77|       stub_request(:get, "http://www.example.com/authorization_required.jpg").
+    78|         with(:headers => authentication_headers).
+    79|         to_return(body: test_file)
+    80|       stub_request(:get, unicode_URL).to_return(body: unicode_named_file)
+    81|     end
+    82|     context "when a file was downloaded" do
+    83|       before do
+    84|         uploader.download!(url)
+    85|       end
+    86|       it "caches a file" do
+    87|         expect(uploader.file).to be_an_instance_of(CarrierWave::SanitizedFile)
+    88|       end
+    89|       it "'s cached" do
+    90|         expect(uploader).to be_cached
+    91|       end
+    92|       it "stores the cache name" do
+    93|         expect(uploader.cache_name).to eq("#{cache_id}/#{test_file_name}")
+    94|       end
+    95|       it "sets the filename to the file's sanitized filename" do
+    96|         expect(uploader.filename).to eq("#{test_file_name}")
+    97|       end
+    98|       it "moves it to the tmp dir" do
+    99|         expect(uploader.file.path).to eq(public_path("uploads/tmp/#{cache_id}/#{test_file_name}"))
+   100|         expect(uploader.file.exists?).to be_truthy
+   101|       end
+   102|       it "sets the url" do
+   103|         expect(uploader.url).to eq("/uploads/tmp/#{cache_id}/#{test_file_name}")
+   104|       end
+   105|       it "sets the content type" do
+   106|         expect(uploader.content_type).to eq("image/jpeg")
+   107|       end
+   108|     end
+   109|     context "with unicode sybmols in URL" do
+   110|       before do
+   111|         uploader.download!(unicode_URL)
+   112|       end
+   113|       it "caches a file" do
+   114|         expect(uploader.file).to be_an_instance_of(CarrierWave::SanitizedFile)
+   115|       end
+   116|       it "sets the filename to the file's decoded sanitized filename" do
+   117|         expect(uploader.filename).to eq("#{unicode_filename}")
+   118|       end
+   119|       it "moves it to the tmp dir" do
+   120|         expect(uploader.file.path).to eq(public_path("uploads/tmp/#{cache_id}/#{unicode_filename}"))
+   121|         expect(uploader.file.exists?).to be_truthy
+   122|       end
+   123|     end
+   124|     context "with directory permissions set" do
+   125|       let(:permissions) { 0777 }
+   126|       it "sets permissions" do
+
+# --- HUNK 2: Lines 179-243 ---
+   179|       end
+   180|       it "reads content-disposition header but still respect the extension_whitelist" do
+   181|         expect { uploader.download!("#{base_url}/content-disposition") }.to raise_error(CarrierWave::IntegrityError)
+   182|       end
+   183|     end
+   184|     describe '#download! with an extension_blacklist' do
+   185|       before do
+   186|         uploader_class.class_eval do
+   187|           def extension_blacklist
+   188|             %w(jpg)
+   189|           end
+   190|         end
+   191|       end
+   192|       it "follows redirects but still respect the extension_blacklist" do
+   193|         expect { uploader.download!('http://www.redirect.com/') }.to raise_error(CarrierWave::IntegrityError)
+   194|       end
+   195|       it "reads content-disposition header but still respect the extension_blacklist" do
+   196|         expect { uploader.download!("#{base_url}/content-disposition") }.to raise_error(CarrierWave::IntegrityError)
+   197|       end
+   198|     end
+   199|     context "with server error" do
+   200|       before do
+   201|         stub_request(:get, url).to_return(status: 500)
+   202|       end
+   203|       it "raises an error when trying to download" do
+   204|         expect{ uploader.download!(url) }.to raise_error(CarrierWave::DownloadError)
+   205|       end
+   206|       it "doesn't obscure original exception message" do
+   207|         expect { uploader.download!(url) }.to raise_error(CarrierWave::DownloadError, /could not download file: 500/)
+   208|       end
+   209|     end
+   210|     context "with SSRF prevention" do
+   211|       before do
+   212|         stub_request(:get, 'http://169.254.169.254/').to_return(body: test_file)
+   213|         stub_request(:get, 'http://127.0.0.1/').to_return(body: test_file)
+   214|       end
+   215|       it "prevents accessing local files" do
+   216|         expect { uploader.download!('/etc/passwd') }.to raise_error(CarrierWave::DownloadError)
+   217|         expect { uploader.download!('file:///etc/passwd') }.to raise_error(CarrierWave::DownloadError)
+   218|       end
+   219|       it "prevents accessing internal addresses" do
+   220|         expect { uploader.download!("http://169.254.169.254/") }.to raise_error CarrierWave::DownloadError
+   221|         expect { uploader.download!("http://lvh.me/") }.to raise_error CarrierWave::DownloadError
+   222|       end
+   223|     end
+   224|   end
+   225|   describe '#download! with an overridden process_uri method' do
+   226|     before do
+   227|       uploader_class.class_eval do
+   228|         def process_uri(uri)
+   229|           raise CarrierWave::DownloadError
+   230|         end
+   231|       end
+   232|     end
+   233|     it "allows overriding the process_uri method" do
+   234|       expect { uploader.download!(url) }.to raise_error(CarrierWave::DownloadError)
+   235|     end
+   236|   end
+   237|   describe '#process_uri' do
+   238|     it "parses but not escape already escaped uris" do
+   239|       uri = 'http://example.com/%5B.jpg'
+   240|       processed = uploader.process_uri(uri)
+   241|       expect(processed.class).to eq(URI::HTTP)
+   242|       expect(processed.to_s).to eq(uri)
+   243|     end
+
+# --- HUNK 3: Lines 247-278 ---
+   247|       expect(processed.class).to eq(URI::HTTP)
+   248|       expect(processed.to_s).to eq(uri)
+   249|     end
+   250|     it "escapes and parse unescaped uris" do
+   251|       uri = 'http://example.com/ %[].jpg'
+   252|       processed = uploader.process_uri(uri)
+   253|       expect(processed.class).to eq(URI::HTTP)
+   254|       expect(processed.to_s).to eq('http://example.com/%20%25%5B%5D.jpg')
+   255|     end
+   256|     it "escapes and parse brackets in uri paths without harming the query string" do
+   257|       uri = 'http://example.com/].jpg?test[]'
+   258|       processed = uploader.process_uri(uri)
+   259|       expect(processed.class).to eq(URI::HTTP)
+   260|       expect(processed.to_s).to eq('http://example.com/%5D.jpg?test[]')
+   261|     end
+   262|     it "throws an exception on bad uris" do
+   263|       uri = '~http:'
+   264|       expect { uploader.process_uri(uri) }.to raise_error(CarrierWave::DownloadError)
+   265|     end
+   266|   end
+   267|   describe "#skip_ssrf_protection?" do
+   268|     let(:uri) { 'http://localhost/test.jpg' }
+   269|     before do
+   270|       WebMock.stub_request(:get, uri).to_return(body: test_file)
+   271|       allow(uploader).to receive(:skip_ssrf_protection?).and_return(true)
+   272|     end
+   273|     it "allows local request to be made" do
+   274|       uploader.download!(uri)
+   275|       expect(uploader.file.read).to eq 'this is stuff'
+   276|     end
+   277|   end
+   278| end
+

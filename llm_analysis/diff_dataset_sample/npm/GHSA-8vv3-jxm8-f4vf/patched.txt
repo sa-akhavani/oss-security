@@ -1,0 +1,151 @@
+# ====================================================================
+# FILE: lib/connie-lang.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-145 ---
+     1| var vm = require('vm');
+     2| var isPlainObject = require('lodash.isplainobject');
+     3| var getValue = function (obj, key) {
+     4|   var o = obj;
+     5|   var keys = Array.isArray(key) ? key : key.split('.');
+     6|   for (var x = 0; x < keys.length - 1; ++x) {
+     7|     var k = keys[x];
+     8|     if (!o[k]) return;
+     9|     o = o[k];
+    10|   }
+    11|   return o[keys[keys.length - 1]];
+    12| };
+    13| var setValue = function (obj, key, value) {
+    14|   var o = obj;
+    15|   var keys = Array.isArray(key) ? key : key.split('.');
+    16|   for (var x = 1; x < keys.length; ++x) {
+    17|     var currentKey = keys[x];
+    18|     var lastKey = keys[x - 1];
+    19|     if (typeof currentKey === 'number') {
+    20|       if (!o[lastKey]) {
+    21|         o[lastKey] = [];
+    22|       }
+    23|       o = o[lastKey];
+    24|     } else if (typeof currentKey === 'string') {
+    25|       if (!o[lastKey]) {
+    26|         o[lastKey] = {};
+    27|       }
+    28|       o = o[lastKey];
+    29|     } else {
+    30|       throw new Error('Oopsy, key arrays should only be strings and numbers:', keys);
+    31|     }
+    32|   }
+    33|   o[keys[keys.length - 1]] = value;
+    34|   return obj;
+    35| };
+    36| var PARSE_RX = /([^\}:]+)(:([^\}]+))?/;
+    37| var EnvVarInterpreter = {
+    38|   type: '$',
+    39|   replace: function (value, context, parseContext) {
+    40|     var m = PARSE_RX.exec(parseContext.value);
+    41|     if (!m) {
+    42|       return value;
+    43|     }
+    44|     var newValue = context.env[m[1]] || m[3] || '';
+    45|     return value.slice(0, parseContext.start) + newValue + value.slice(parseContext.end);
+    46|   },
+    47| };
+    48| var ReferenceInterpreter = {
+    49|   type: '@',
+    50|   replace: function (value, context, parseContext) {
+    51|     var m = PARSE_RX.exec(parseContext.value);
+    52|     if (!m) {
+    53|       return value;
+    54|     }
+    55|     var newValue = getValue(context.config, m[1]) || m[3];
+    56|     if (value === parseContext.match) {
+    57|       return newValue;
+    58|     }
+    59|     return value.slice(0, parseContext.start) + newValue + value.slice(parseContext.end);
+    60|   },
+    61| };
+    62| var Interpreters = [ReferenceInterpreter, EnvVarInterpreter];
+    63| var ConnieLang = {
+    64|   Interpreters: Interpreters,
+    65|   InterpretersByType: Interpreters.reduce(function (o, i) {
+    66|     o[i.type] = i;
+    67|     return o;
+    68|   }, {}),
+    69|   getEntries: function (config) {
+    70|     var entries = [];
+    71|     var iter = function (value, prefix) {
+    72|       if (!prefix) prefix = [];
+    73|       if (Array.isArray(value)) {
+    74|         value.forEach(function (arrValue, idx) {
+    75|           iter(arrValue, prefix.concat(idx));
+    76|         });
+    77|       } else if (isPlainObject(value)) {
+    78|         var keys = Object.keys(value);
+    79|         if (keys.includes('__proto__') || keys.includes('constructor')) {
+    80|           return;
+    81|         }
+    82|         keys.forEach(function (key) {
+    83|           iter(value[key], prefix.concat(key));
+    84|         });
+    85|       } else {
+    86|         entries.push({ key: prefix, value: value });
+    87|       }
+    88|     };
+    89|     iter(config);
+    90|     return entries;
+    91|   },
+    92|   firstInnermostInterpreterFromValue: function (value) {
+    93|     if (value === null || value === undefined) {
+    94|       return null;
+    95|     }
+    96|     var start = -1;
+    97|     var interpreterTypes = Object.keys(ConnieLang.InterpretersByType);
+    98|     for (var idx = 1; idx < value.length; ++idx) {
+    99|       if (value[idx] === '{' && interpreterTypes.indexOf(value[idx - 1]) !== -1) {
+   100|         start = idx - 1;
+   101|       } else if (value[idx] === '}' && start !== -1) {
+   102|         var interpreter = ConnieLang.InterpretersByType[value[start]];
+   103|         var parseContext = {
+   104|           type: interpreter.type,
+   105|           match: value.slice(start, idx + 1),
+   106|           value: value.slice(start + 2, idx),
+   107|           start: start,
+   108|           end: idx + 1,
+   109|           replaceInValue: function (value, context) {
+   110|             return interpreter.replace(value, context, parseContext);
+   111|           },
+   112|         };
+   113|         return parseContext;
+   114|       }
+   115|     }
+   116|     return null;
+   117|   },
+   118|   parse: function (configObj, envObj) {
+   119|     var context = {
+   120|       config: Object.assign(Object.create(null), configObj),
+   121|       env: envObj || process.env,
+   122|     };
+   123|     var entries = ConnieLang.getEntries(context.config);
+   124|     var digest = function () {
+   125|       var updated = false;
+   126|       entries.forEach(function (e) {
+   127|         var interpreter = ConnieLang.firstInnermostInterpreterFromValue(e.value, context);
+   128|         if (!interpreter) return;
+   129|         var newValue = interpreter.replaceInValue(e.value, context);
+   130|         if (newValue !== e.value) {
+   131|           e.value = newValue;
+   132|           updated = true;
+   133|         }
+   134|       });
+   135|       return updated;
+   136|     };
+   137|     while (digest());
+   138|     var result = {};
+   139|     entries.forEach(function (e) {
+   140|       setValue(result, e.key, e.value);
+   141|     });
+   142|     return result;
+   143|   },
+   144| };
+   145| module.exports = ConnieLang;
+

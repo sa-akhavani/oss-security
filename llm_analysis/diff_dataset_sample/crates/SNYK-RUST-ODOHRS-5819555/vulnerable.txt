@@ -1,0 +1,199 @@
+# ====================================================================
+# FILE: examples/cli.rs
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-21 ---
+     1| use anyhow::{Context, Result};
+     2| use clap::Parser;
+     3| use domain::base::{Dname as DnameO, Message, MessageBuilder, ParsedDname, Rtype};
+     4| use domain::rdata::AllRecordData;
+     5| use log::{info, trace};
+     6| use odoh_rs::*;
+     7| use rand::rngs::StdRng;
+     8| use rand::{Rng, SeedableRng};
+     9| use reqwest::{Client, RequestBuilder, Url};
+    10| type Dname = DnameO<Vec<u8>>;
+    11| const WELL_KNOWN_CONF_PATH: &str = "/.well-known/odohconfigs";
+    12| #[derive(Parser, Debug)]
+    13| #[clap(version)]
+    14| struct Opts {
+    15|     #[clap(
+    16|         short,
+    17|         long,
+    18|         help = "Specific query domain",
+    19|         default_value = "cloudflare.com"
+    20|     )]
+    21|     domain: Dname,
+
+# --- HUNK 2: Lines 23-66 ---
+    23|         name = "type",
+    24|         short,
+    25|         long,
+    26|         help = "Specific query type",
+    27|         default_value = "AAAA"
+    28|     )]
+    29|     rtype: Rtype,
+    30|     #[clap(
+    31|         short,
+    32|         long,
+    33|         help = "Target base URL",
+    34|         default_value = "https://odoh.cloudflare-dns.com"
+    35|     )]
+    36|     service: Url,
+    37|     #[clap(short, long, help = "Use user provided config, encoded in hexstring")]
+    38|     configs: Option<String>,
+    39|     #[clap(
+    40|         name = "header",
+    41|         long,
+    42|         help = "Extra header to add, in \"key:value\" format, can appear multiple times",
+    43|         long_help = "foo",
+    44|         value_parser
+    45|     )]
+    46|     headers: Vec<String>,
+    47| }
+    48| #[tokio::main]
+    49| async fn main() -> Result<()> {
+    50|     env_logger::init();
+    51|     let opts: Opts = Opts::parse();
+    52|     let cli = Client::new();
+    53|     let configs_bytes = if let Some(s) = opts.configs {
+    54|         info!("Use user provided configs");
+    55|         hex::decode(s).context("Invalid hex value of configs")?
+    56|     } else {
+    57|         trace!("Retrieving ODoH configs");
+    58|         let conf_url = opts
+    59|             .service
+    60|             .join(WELL_KNOWN_CONF_PATH)
+    61|             .context("Failed to compose well-known config path")?;
+    62|         let mut req_builder = cli.get(conf_url);
+    63|         req_builder = add_headers(req_builder, &opts.headers);
+    64|         let body = req_builder
+    65|             .send()
+    66|             .await
+
+# --- HUNK 3: Lines 79-132 ---
+    79|         .into();
+    80|     trace!("Creating DNS message");
+    81|     let mut msg = MessageBuilder::new_vec();
+    82|     msg.header_mut().set_rd(true);
+    83|     let mut msg = msg.question();
+    84|     msg.push((opts.domain, opts.rtype))
+    85|         .context("failed to push question")?;
+    86|     let msg = msg.finish();
+    87|     let mut rng = StdRng::from_entropy();
+    88|     let padding_len = rng.gen_range(0..10);
+    89|     let query = ObliviousDoHMessagePlaintext::new(&msg, padding_len);
+    90|     trace!(
+    91|         "Encrypting DNS message with {} bytes of padding",
+    92|         padding_len
+    93|     );
+    94|     let (query_enc, cli_secret) =
+    95|         encrypt_query(&query, &config, &mut rng).context("failed to encrypt query")?;
+    96|     let query_body = compose(&query_enc)
+    97|         .context("failed to compose query body")?
+    98|         .freeze();
+    99|     trace!("Exchanging with server");
+   100|     let mut req_builder = cli
+   101|         .post(opts.service.join("/dns-query")?)
+   102|         .header("content-type", ODOH_HTTP_HEADER)
+   103|         .header("accept", ODOH_HTTP_HEADER);
+   104|     req_builder = add_headers(req_builder, &opts.headers);
+   105|     let mut resp_body = req_builder
+   106|         .body(query_body)
+   107|         .send()
+   108|         .await
+   109|         .context("failed to query target server")?
+   110|         .bytes()
+   111|         .await
+   112|         .context("failed to get response body")?;
+   113|     trace!("Decrypting DNS message");
+   114|     let response_enc = parse(&mut resp_body).context("failed to parse response body")?;
+   115|     let response_dec = decrypt_response(&query, &response_enc, cli_secret)
+   116|         .context("failed to decrypt resopnse")?;
+   117|     let msg_bytes = response_dec.into_msg();
+   118|     let msg =
+   119|         Message::from_octets(msg_bytes.as_ref()).context("failed to parse response message")?;
+   120|     trace!("Printing DNS response");
+   121|     for (rr, _) in msg.for_slice().iter().filter_map(|r| r.ok()) {
+   122|         if rr.rtype() == Rtype::Opt {
+   123|             return Ok(());
+   124|         }
+   125|         if let Ok(Some(rr)) = rr.to_record::<AllRecordData<_, ParsedDname<_>>>() {
+   126|             println!(
+   127|                 "{}\t{}\t{}\t{}\t{}",
+   128|                 rr.owner(),
+   129|                 rr.ttl(),
+   130|                 rr.class(),
+   131|                 rr.rtype(),
+   132|                 rr.data()
+
+
+# ====================================================================
+# FILE: src/protocol.rs
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 404-443 ---
+   404|     let mut data = response.encrypted_msg.to_vec();
+   405|     let aad = build_aad(ObliviousDoHMessageType::Response, &response.key_id)?;
+   406|     cipher.decrypt_in_place(GenericArray::from_slice(&nonce), &aad, &mut data)?;
+   407|     let response_decrypted = parse(&mut Bytes::from(data))?;
+   408|     Ok(response_decrypted)
+   409| }
+   410| pub fn decrypt_query(
+   411|     query: &ObliviousDoHMessage,
+   412|     key_pair: &ObliviousDoHKeyPair,
+   413| ) -> Result<(ObliviousDoHMessagePlaintext, OdohSecret)> {
+   414|     if query.msg_type != ObliviousDoHMessageType::Query {
+   415|         return Err(Error::InvalidMessageType);
+   416|     }
+   417|     let key_id = key_pair.public().identifier()?;
+   418|     let key_id_recv = &query.key_id;
+   419|     if !key_id_recv.eq(&key_id) {
+   420|         return Err(Error::KeyIdMismatch);
+   421|     }
+   422|     let server_sk = key_pair.private();
+   423|     let key_size = <Kem as KemTrait>::PublicKey::size();
+   424|     let (enc, ct) = query.encrypted_msg.split_at(key_size);
+   425|     let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(enc)?;
+   426|     let mut recv_ctx = hpke::setup_receiver::<Aead, Kdf, Kem>(
+   427|         &OpModeR::Base,
+   428|         server_sk,
+   429|         &encapped_key,
+   430|         LABEL_QUERY,
+   431|     )?;
+   432|     let aad = build_aad(ObliviousDoHMessageType::Query, &key_id)?;
+   433|     let plaintext = recv_ctx.open(ct, &aad)?;
+   434|     let mut odoh_secret = OdohSecret::default();
+   435|     recv_ctx.export(LABEL_RESPONSE, &mut odoh_secret)?;
+   436|     let query_decrypted = parse(&mut Bytes::from(plaintext))?;
+   437|     Ok((query_decrypted, odoh_secret))
+   438| }
+   439| pub fn encrypt_response(
+   440|     query: &ObliviousDoHMessagePlaintext,
+   441|     response: &ObliviousDoHMessagePlaintext,
+   442|     secret: OdohSecret,
+   443|     response_nonce: ResponseNonce,
+
+# --- HUNK 2: Lines 609-629 ---
+   609|             }
+   610|         }
+   611|     }
+   612|     #[test]
+   613|     fn padding() {
+   614|         let query = ObliviousDoHMessagePlaintext::new(&[], 0);
+   615|         assert_eq!(query.padding_len(), 0);
+   616|         let query = ObliviousDoHMessagePlaintext::new(&[], 2);
+   617|         assert_eq!(query.padding_len(), 2);
+   618|         let mut query_bytes = compose(&query).unwrap();
+   619|         let last = query_bytes.len() - 1;
+   620|         query_bytes[last] = 0x01;
+   621|         assert_eq!(
+   622|             Error::InvalidPadding,
+   623|             parse::<ObliviousDoHMessagePlaintext, _>(&mut query_bytes.freeze()).unwrap_err()
+   624|         );
+   625|         let mut query = query;
+   626|         query.padding = vec![1, 2].into();
+   627|         assert_eq!(Error::InvalidPadding, compose(&query).unwrap_err());
+   628|     }
+   629| }
+

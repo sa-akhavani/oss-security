@@ -1,0 +1,204 @@
+# ====================================================================
+# FILE: app/models/spree/user.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-36 ---
+     1| module Spree
+     2|   class User < Spree::Base
+     3|     include UserMethods
+     4|     devise :database_authenticatable, :registerable, :recoverable,
+     5|            :rememberable, :trackable, :validatable, :encryptable
+     6|     devise :confirmable if Spree::Auth::Config[:confirmable]
+     7|     if defined?(Spree::SoftDeletable)
+     8|       include Spree::SoftDeletable
+     9|     else
+    10|       acts_as_paranoid
+    11|       include Spree::ParanoiaDeprecations
+    12|       include Discard::Model
+    13|       self.discard_column = :deleted_at
+    14|     end
+    15|     after_destroy :scramble_email_and_password
+    16|     after_discard :scramble_email_and_password
+    17|     def password=(new_password)
+    18|       generate_spree_api_key if new_password.present? && spree_api_key.present?
+    19|       super
+    20|     end
+    21|     before_validation :set_login
+    22|     scope :admin, -> { includes(:spree_roles).where("#{Role.table_name}.name" => "admin") }
+    23|     def self.admin_created?
+    24|       User.admin.count > 0
+    25|     end
+    26|     def admin?
+    27|       has_spree_role?('admin')
+    28|     end
+    29|     def confirmed?
+    30|       !!confirmed_at
+    31|     end
+    32|     protected
+    33|     def password_required?
+    34|       !persisted? || password.present? || password_confirmation.present?
+    35|     end
+    36|     private
+
+
+# ====================================================================
+# FILE: lib/controllers/frontend/spree/users_controller.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-43 ---
+     1| class Spree::UsersController < Spree::StoreController
+     2|   skip_before_action :set_current_order, only: :show, raise: false
+     3|   prepend_before_action :authorize_actions, only: :new
+     4|   def show
+     5|     load_object
+     6|     @orders = @user.orders.complete.order('completed_at desc')
+     7|   end
+     8|   def create
+     9|     @user = Spree::User.new(user_params)
+    10|     if @user.save
+    11|       if current_order
+    12|         session[:guest_token] = nil
+    13|       end
+    14|       redirect_back_or_default(root_url)
+    15|     else
+    16|       render :new
+    17|     end
+    18|   end
+    19|   def edit
+    20|     load_object
+    21|   end
+    22|   def update
+    23|     load_object
+    24|     if @user.update(user_params)
+    25|       spree_current_user.reload
+    26|       redirect_url = spree.account_url
+    27|       if params[:user][:password].present?
+    28|         if Spree::Auth::Config[:signout_after_password_change]
+    29|           redirect_url = spree.login_url
+    30|         else
+    31|           bypass_sign_in(@user)
+    32|         end
+    33|       end
+    34|       redirect_to redirect_url, notice: I18n.t('spree.account_updated')
+    35|     else
+    36|       render :edit
+    37|     end
+    38|   end
+    39|   private
+    40|   def user_params
+    41|     params.require(:user).permit(Spree::PermittedAttributes.user_attributes | [:email])
+    42|   end
+    43|   def load_object
+
+
+# ====================================================================
+# FILE: lib/spree/auth/version.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-5 ---
+     1| module Spree
+     2|   module Auth
+     3|     VERSION = '2.5.4'
+     4|   end
+     5| end
+
+
+# ====================================================================
+# FILE: spec/models/user_spec.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 22-81 ---
+    22|     it "does not generate a spree api key if password is empty" do
+    23|       user.generate_spree_api_key!
+    24|       expect {
+    25|         user.password = ""
+    26|         user.password_confirmation = ""
+    27|         user.save!
+    28|       }.not_to change(user, :spree_api_key)
+    29|     end
+    30|     it "does not generate a spree api key on password change if no key existed previously" do
+    31|       user.clear_spree_api_key!
+    32|       expect {
+    33|         user.password = "123456678"
+    34|         user.password_confirmation = "123456678"
+    35|         user.save!
+    36|       }.not_to change(user, :spree_api_key)
+    37|       expect(user.reload.spree_api_key).to be_nil
+    38|     end
+    39|   end
+    40|   describe '#destroy' do
+    41|     let(:user) { create(:user) }
+    42|     context 'with same email address as previously deleted account' do
+    43|       it 'will allow users to register later' do
+    44|         user1 = build(:user)
+    45|         user1.save
+    46|         user2 = build(:user)
+    47|         user2.email = user1.email
+    48|         expect(user2.save).to be false
+    49|         expect(user2.errors.messages[:email].first).to eq "has already been taken"
+    50|         user1.discard
+    51|         expect(user2.save).to be true
+    52|       end
+    53|     end
+    54|   end
+    55|   describe '#destroy' do
+    56|     let(:user) { create(:user) }
+    57|     it 'removes the record from the database' do
+    58|       user.destroy
+    59|       if defined?(Spree::ParanoiaDeprecations)
+    60|         expect(Spree::User.with_discarded.exists?(id: user.id)).to eql true
+    61|       else
+    62|         expect(Spree::User.with_discarded.exists?(id: user.id)).to eql false
+    63|       end
+    64|     end
+    65|   end
+    66|   describe '#really_destroy!', if: defined?(Spree::ParanoiaDeprecations) do
+    67|     let(:user) { create(:user) }
+    68|     it 'removes the record from the database' do
+    69|       user.really_destroy!
+    70|       expect(Spree::User.with_deleted.exists?(id: user.id)).to eql false
+    71|     end
+    72|   end
+    73|   describe "confirmable" do
+    74|     it "loads Devise's :confirmable module when :confirmable is true", confirmable: true do
+    75|       expect(Spree::User.ancestors).to include(Devise::Models::Confirmable)
+    76|     end
+    77|     it "does not load Devise's :confirmable module when :confirmable is false", confirmable: false do
+    78|       expect(Spree::User.ancestors).not_to include(Devise::Models::Confirmable)
+    79|     end
+    80|   end
+    81| end
+
+
+# ====================================================================
+# FILE: spec/requests/spree/frontend/user_update_spec.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-26 ---
+     1| RSpec.feature 'User update', type: :request do
+     2|   context 'CSRF protection' do
+     3|     %i[exception reset_session null_session].each do |strategy|
+     4|       around do |example|
+     5|         controller = Spree::UsersController
+     6|         old_allow_forgery_protection_value = controller.allow_forgery_protection
+     7|         old_forgery_protection_strategy = controller.forgery_protection_strategy
+     8|         controller.skip_forgery_protection
+     9|         controller.allow_forgery_protection = true
+    10|         controller.protect_from_forgery with: strategy
+    11|         example.run
+    12|         controller.allow_forgery_protection = old_allow_forgery_protection_value
+    13|         controller.forgery_protection_strategy = old_forgery_protection_strategy
+    14|       end
+    15|       it "is not possible to take account over with the #{strategy} forgery protection strategy" do
+    16|         user = create(:user, email: 'legit@mail.com', password: 'password')
+    17|         post '/login', params: "spree_user[email]=legit@mail.com&spree_user[password]=password"
+    18|         begin
+    19|           put '/users/123456', params: 'user[email]=hacked@example.com'
+    20|         rescue
+    21|         end
+    22|         expect(user.reload.email).to eq('legit@mail.com')
+    23|       end
+    24|     end
+    25|   end
+    26| end
+

@@ -1,0 +1,3671 @@
+# ====================================================================
+# FILE: libs/experimental/langchain_experimental/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-6 ---
+     1| from importlib import metadata
+     2| try:
+     3|     __version__ = metadata.version(__package__)
+     4| except metadata.PackageNotFoundError:
+     5|     __version__ = ""
+     6| del metadata  # optional, avoids polluting the results of dir(__package__)
+
+
+# ====================================================================
+# FILE: libs/experimental/langchain_experimental/data_anonymizer/base.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-42 ---
+     1| from abc import ABC, abstractmethod
+     2| from typing import Callable, Optional
+     3| from langchain_experimental.data_anonymizer.deanonymizer_mapping import MappingDataType
+     4| from langchain_experimental.data_anonymizer.deanonymizer_matching_strategies import (
+     5|     exact_matching_strategy,
+     6| )
+     7| DEFAULT_DEANONYMIZER_MATCHING_STRATEGY = exact_matching_strategy
+     8| class AnonymizerBase(ABC):
+     9|     """
+    10|     Base abstract class for anonymizers.
+    11|     It is public and non-virtual because it allows
+    12|         wrapping the behavior for all methods in a base class.
+    13|     """
+    14|     def anonymize(self, text: str, language: Optional[str] = None) -> str:
+    15|         """Anonymize text"""
+    16|         return self._anonymize(text, language)
+    17|     @abstractmethod
+    18|     def _anonymize(self, text: str, language: Optional[str]) -> str:
+    19|         """Abstract method to anonymize text"""
+    20| class ReversibleAnonymizerBase(AnonymizerBase):
+    21|     """
+    22|     Base abstract class for reversible anonymizers.
+    23|     """
+    24|     def deanonymize(
+    25|         self,
+    26|         text_to_deanonymize: str,
+    27|         deanonymizer_matching_strategy: Callable[
+    28|             [str, MappingDataType], str
+    29|         ] = DEFAULT_DEANONYMIZER_MATCHING_STRATEGY,
+    30|     ) -> str:
+    31|         """Deanonymize text"""
+    32|         return self._deanonymize(text_to_deanonymize, deanonymizer_matching_strategy)
+    33|     @abstractmethod
+    34|     def _deanonymize(
+    35|         self,
+    36|         text_to_deanonymize: str,
+    37|         deanonymizer_matching_strategy: Callable[[str, MappingDataType], str],
+    38|     ) -> str:
+    39|         """Abstract method to deanonymize text"""
+    40|     @abstractmethod
+    41|     def reset_deanonymizer_mapping(self) -> None:
+    42|         """Abstract method to reset deanonymizer mapping"""
+
+
+# ====================================================================
+# FILE: libs/experimental/langchain_experimental/data_anonymizer/deanonymizer_matching_strategies.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-144 ---
+     1| import re
+     2| from typing import List
+     3| from langchain_experimental.data_anonymizer.deanonymizer_mapping import MappingDataType
+     4| def exact_matching_strategy(text: str, deanonymizer_mapping: MappingDataType) -> str:
+     5|     """
+     6|     Exact matching strategy for deanonymization.
+     7|     It replaces all the anonymized entities with the original ones.
+     8|     Args:
+     9|         text: text to deanonymize
+    10|         deanonymizer_mapping: mapping between anonymized entities and original ones"""
+    11|     for entity_type in deanonymizer_mapping:
+    12|         for anonymized, original in deanonymizer_mapping[entity_type].items():
+    13|             text = text.replace(anonymized, original)
+    14|     return text
+    15| def case_insensitive_matching_strategy(
+    16|     text: str, deanonymizer_mapping: MappingDataType
+    17| ) -> str:
+    18|     """
+    19|     Case insensitive matching strategy for deanonymization.
+    20|     It replaces all the anonymized entities with the original ones
+    21|         irrespective of their letter case.
+    22|     Args:
+    23|         text: text to deanonymize
+    24|         deanonymizer_mapping: mapping between anonymized entities and original ones
+    25|     Examples of matching:
+    26|         keanu reeves -> Keanu Reeves
+    27|         JOHN F. KENNEDY -> John F. Kennedy
+    28|     """
+    29|     for entity_type in deanonymizer_mapping:
+    30|         for anonymized, original in deanonymizer_mapping[entity_type].items():
+    31|             text = re.sub(anonymized, original, text, flags=re.IGNORECASE)
+    32|     return text
+    33| def fuzzy_matching_strategy(
+    34|     text: str, deanonymizer_mapping: MappingDataType, max_l_dist: int = 3
+    35| ) -> str:
+    36|     """
+    37|     Fuzzy matching strategy for deanonymization.
+    38|     It uses fuzzy matching to find the position of the anonymized entity in the text.
+    39|     It replaces all the anonymized entities with the original ones.
+    40|     Args:
+    41|         text: text to deanonymize
+    42|         deanonymizer_mapping: mapping between anonymized entities and original ones
+    43|         max_l_dist: maximum Levenshtein distance between the anonymized entity and the
+    44|             text segment to consider it a match
+    45|     Examples of matching:
+    46|         Kaenu Reves -> Keanu Reeves
+    47|         John F. Kennedy -> John Kennedy
+    48|     """
+    49|     try:
+    50|         from fuzzysearch import find_near_matches
+    51|     except ImportError as e:
+    52|         raise ImportError(
+    53|             "Could not import fuzzysearch, please install with "
+    54|             "`pip install fuzzysearch`."
+    55|         ) from e
+    56|     for entity_type in deanonymizer_mapping:
+    57|         for anonymized, original in deanonymizer_mapping[entity_type].items():
+    58|             matches = find_near_matches(anonymized, text, max_l_dist=max_l_dist)
+    59|             new_text = ""
+    60|             last_end = 0
+    61|             for m in matches:
+    62|                 new_text += text[last_end : m.start]
+    63|                 new_text += original
+    64|                 last_end = m.end
+    65|             new_text += text[last_end:]
+    66|             text = new_text
+    67|     return text
+    68| def combined_exact_fuzzy_matching_strategy(
+    69|     text: str, deanonymizer_mapping: MappingDataType, max_l_dist: int = 3
+    70| ) -> str:
+    71|     """
+    72|     RECOMMENDED STRATEGY.
+    73|     Combined exact and fuzzy matching strategy for deanonymization.
+    74|     Args:
+    75|         text: text to deanonymize
+    76|         deanonymizer_mapping: mapping between anonymized entities and original ones
+    77|         max_l_dist: maximum Levenshtein distance between the anonymized entity and the
+    78|             text segment to consider it a match
+    79|     Examples of matching:
+    80|         Kaenu Reves -> Keanu Reeves
+    81|         John F. Kennedy -> John Kennedy
+    82|     """
+    83|     text = exact_matching_strategy(text, deanonymizer_mapping)
+    84|     text = fuzzy_matching_strategy(text, deanonymizer_mapping, max_l_dist)
+    85|     return text
+    86| def ngram_fuzzy_matching_strategy(
+    87|     text: str,
+    88|     deanonymizer_mapping: MappingDataType,
+    89|     fuzzy_threshold: int = 85,
+    90|     use_variable_length: bool = True,
+    91| ) -> str:
+    92|     """
+    93|     N-gram fuzzy matching strategy for deanonymization.
+    94|     It replaces all the anonymized entities with the original ones.
+    95|     It uses fuzzy matching to find the position of the anonymized entity in the text.
+    96|     It generates n-grams of the same length as the anonymized entity from the text and
+    97|     uses fuzzy matching to find the position of the anonymized entity in the text.
+    98|     Args:
+    99|         text: text to deanonymize
+   100|         deanonymizer_mapping: mapping between anonymized entities and original ones
+   101|         fuzzy_threshold: fuzzy matching threshold
+   102|         use_variable_length: whether to use (n-1, n, n+1)-grams or just n-grams
+   103|     """
+   104|     def generate_ngrams(words_list: List[str], n: int) -> list:
+   105|         """Generate n-grams from a list of words"""
+   106|         return [
+   107|             " ".join(words_list[i : i + n]) for i in range(len(words_list) - (n - 1))
+   108|         ]
+   109|     try:
+   110|         from fuzzywuzzy import fuzz
+   111|     except ImportError as e:
+   112|         raise ImportError(
+   113|             "Could not import fuzzywuzzy, please install with "
+   114|             "`pip install fuzzywuzzy`."
+   115|         ) from e
+   116|     text_words = text.split()
+   117|     replacements = []
+   118|     matched_indices: List[int] = []
+   119|     for entity_type in deanonymizer_mapping:
+   120|         for anonymized, original in deanonymizer_mapping[entity_type].items():
+   121|             anonymized_words = anonymized.split()
+   122|             if use_variable_length:
+   123|                 gram_lengths = [
+   124|                     len(anonymized_words) - 1,
+   125|                     len(anonymized_words),
+   126|                     len(anonymized_words) + 1,
+   127|                 ]
+   128|             else:
+   129|                 gram_lengths = [len(anonymized_words)]
+   130|             for n in gram_lengths:
+   131|                 if n > 0:  # Take only positive values
+   132|                     segments = generate_ngrams(text_words, n)
+   133|                     for i, segment in enumerate(segments):
+   134|                         if (
+   135|                             fuzz.ratio(anonymized.lower(), segment.lower())
+   136|                             > fuzzy_threshold
+   137|                             and i not in matched_indices
+   138|                         ):
+   139|                             replacements.append((i, n, original))
+   140|                             matched_indices.extend(range(i, i + n))
+   141|     replacements.sort(key=lambda x: x[0], reverse=True)
+   142|     for start, length, replacement in replacements:
+   143|         text_words[start : start + length] = replacement.split()
+   144|     return " ".join(text_words)
+
+
+# ====================================================================
+# FILE: libs/experimental/langchain_experimental/data_anonymizer/faker_presidio_mapping.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 13-47 ---
+    13|         "PERSON": lambda _: fake.name(),
+    14|         "EMAIL_ADDRESS": lambda _: fake.email(),
+    15|         "PHONE_NUMBER": lambda _: fake.phone_number(),
+    16|         "IBAN_CODE": lambda _: fake.iban(),
+    17|         "CREDIT_CARD": lambda _: fake.credit_card_number(),
+    18|         "CRYPTO": lambda _: "bc1"
+    19|         + "".join(
+    20|             fake.random_choices(string.ascii_lowercase + string.digits, length=26)
+    21|         ),
+    22|         "IP_ADDRESS": lambda _: fake.ipv4_public(),
+    23|         "LOCATION": lambda _: fake.city(),
+    24|         "DATE_TIME": lambda _: fake.date(),
+    25|         "NRP": lambda _: str(fake.random_number(digits=8, fix_len=True)),
+    26|         "MEDICAL_LICENSE": lambda _: fake.bothify(text="??######").upper(),
+    27|         "URL": lambda _: fake.url(),
+    28|         "US_BANK_NUMBER": lambda _: fake.bban(),
+    29|         "US_DRIVER_LICENSE": lambda _: str(fake.random_number(digits=9, fix_len=True)),
+    30|         "US_ITIN": lambda _: fake.bothify(text="9##-7#-####"),
+    31|         "US_PASSPORT": lambda _: fake.bothify(text="#####??").upper(),
+    32|         "US_SSN": lambda _: fake.ssn(),
+    33|         "UK_NHS": lambda _: str(fake.random_number(digits=10, fix_len=True)),
+    34|         "ES_NIF": lambda _: fake.bothify(text="########?").upper(),
+    35|         "IT_FISCAL_CODE": lambda _: fake.bothify(text="??????##?##?###?").upper(),
+    36|         "IT_DRIVER_LICENSE": lambda _: fake.bothify(text="?A#######?").upper(),
+    37|         "IT_VAT_CODE": lambda _: fake.bothify(text="IT???????????"),
+    38|         "IT_PASSPORT": lambda _: str(fake.random_number(digits=9, fix_len=True)),
+    39|         "IT_IDENTITY_CARD": lambda _: lambda _: str(
+    40|             fake.random_number(digits=7, fix_len=True)
+    41|         ),
+    42|         "SG_NRIC_FIN": lambda _: fake.bothify(text="????####?").upper(),
+    43|         "AU_ABN": lambda _: str(fake.random_number(digits=11, fix_len=True)),
+    44|         "AU_ACN": lambda _: str(fake.random_number(digits=9, fix_len=True)),
+    45|         "AU_TFN": lambda _: str(fake.random_number(digits=9, fix_len=True)),
+    46|         "AU_MEDICARE": lambda _: str(fake.random_number(digits=10, fix_len=True)),
+    47|     }
+
+
+# ====================================================================
+# FILE: libs/experimental/langchain_experimental/data_anonymizer/presidio.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-37 ---
+     1| from __future__ import annotations
+     2| import json
+     3| from pathlib import Path
+     4| from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
+     5| import yaml
+     6| from langchain_experimental.data_anonymizer.base import (
+     7|     DEFAULT_DEANONYMIZER_MATCHING_STRATEGY,
+     8|     AnonymizerBase,
+     9|     ReversibleAnonymizerBase,
+    10| )
+    11| from langchain_experimental.data_anonymizer.deanonymizer_mapping import (
+    12|     DeanonymizerMapping,
+    13|     MappingDataType,
+    14|     create_anonymizer_mapping,
+    15| )
+    16| from langchain_experimental.data_anonymizer.deanonymizer_matching_strategies import (
+    17|     exact_matching_strategy,
+    18| )
+    19| from langchain_experimental.data_anonymizer.faker_presidio_mapping import (
+    20|     get_pseudoanonymizer_mapping,
+    21| )
+    22| try:
+    23|     from presidio_analyzer import AnalyzerEngine
+    24|     from presidio_analyzer.nlp_engine import NlpEngineProvider
+    25| except ImportError as e:
+    26|     raise ImportError(
+    27|         "Could not import presidio_analyzer, please install with "
+    28|         "`pip install presidio-analyzer`. You will also need to download a "
+    29|         "spaCy model to use the analyzer, e.g. "
+    30|         "`python -m spacy download en_core_web_lg`."
+    31|     ) from e
+    32| try:
+    33|     from presidio_anonymizer import AnonymizerEngine
+    34|     from presidio_anonymizer.entities import OperatorConfig
+    35| except ImportError as e:
+    36|     raise ImportError(
+    37|         "Could not import presidio_anonymizer, please install with "
+
+# --- HUNK 2: Lines 138-178 ---
+   138|         analyzer_results = self._analyzer.analyze(
+   139|             text,
+   140|             entities=self.analyzed_fields,
+   141|             language=language,
+   142|         )
+   143|         filtered_analyzer_results = (
+   144|             self._anonymizer._remove_conflicts_and_get_text_manipulation_data(
+   145|                 analyzer_results
+   146|             )
+   147|         )
+   148|         anonymizer_results = self._anonymizer.anonymize(
+   149|             text,
+   150|             analyzer_results=analyzer_results,
+   151|             operators=self.operators,
+   152|         )
+   153|         anonymizer_mapping = create_anonymizer_mapping(
+   154|             text,
+   155|             filtered_analyzer_results,
+   156|             anonymizer_results,
+   157|         )
+   158|         return exact_matching_strategy(text, anonymizer_mapping)
+   159| class PresidioReversibleAnonymizer(PresidioAnonymizerBase, ReversibleAnonymizerBase):
+   160|     def __init__(
+   161|         self,
+   162|         analyzed_fields: Optional[List[str]] = None,
+   163|         operators: Optional[Dict[str, OperatorConfig]] = None,
+   164|         languages_config: Dict = DEFAULT_LANGUAGES_CONFIG,
+   165|         add_default_faker_operators: bool = True,
+   166|         faker_seed: Optional[int] = None,
+   167|     ):
+   168|         super().__init__(
+   169|             analyzed_fields,
+   170|             operators,
+   171|             languages_config,
+   172|             add_default_faker_operators,
+   173|             faker_seed,
+   174|         )
+   175|         self._deanonymizer_mapping = DeanonymizerMapping()
+   176|     @property
+   177|     def deanonymizer_mapping(self) -> MappingDataType:
+   178|         """Return the deanonymizer mapping"""
+
+# --- HUNK 3: Lines 217-284 ---
+   217|             entities=self.analyzed_fields,
+   218|             language=language,
+   219|         )
+   220|         filtered_analyzer_results = (
+   221|             self._anonymizer._remove_conflicts_and_get_text_manipulation_data(
+   222|                 analyzer_results
+   223|             )
+   224|         )
+   225|         anonymizer_results = self._anonymizer.anonymize(
+   226|             text,
+   227|             analyzer_results=analyzer_results,
+   228|             operators=self.operators,
+   229|         )
+   230|         new_deanonymizer_mapping = create_anonymizer_mapping(
+   231|             text,
+   232|             filtered_analyzer_results,
+   233|             anonymizer_results,
+   234|             is_reversed=True,
+   235|         )
+   236|         self._deanonymizer_mapping.update(new_deanonymizer_mapping)
+   237|         return exact_matching_strategy(text, self.anonymizer_mapping)
+   238|     def _deanonymize(
+   239|         self,
+   240|         text_to_deanonymize: str,
+   241|         deanonymizer_matching_strategy: Callable[
+   242|             [str, MappingDataType], str
+   243|         ] = DEFAULT_DEANONYMIZER_MATCHING_STRATEGY,
+   244|     ) -> str:
+   245|         """Deanonymize text.
+   246|         Each anonymized entity is replaced with its original value.
+   247|         This method exploits the mapping created during the anonymization process.
+   248|         Args:
+   249|             text_to_deanonymize: text to deanonymize
+   250|             deanonymizer_matching_strategy: function to use to match
+   251|                 anonymized entities with their original values and replace them.
+   252|         """
+   253|         if not self._deanonymizer_mapping:
+   254|             raise ValueError(
+   255|                 "Deanonymizer mapping is empty.",
+   256|                 "Please call anonymize() and anonymize some text first.",
+   257|             )
+   258|         text_to_deanonymize = deanonymizer_matching_strategy(
+   259|             text_to_deanonymize, self.deanonymizer_mapping
+   260|         )
+   261|         return text_to_deanonymize
+   262|     def reset_deanonymizer_mapping(self) -> None:
+   263|         """Reset the deanonymizer mapping"""
+   264|         self._deanonymizer_mapping = DeanonymizerMapping()
+   265|     def save_deanonymizer_mapping(self, file_path: Union[Path, str]) -> None:
+   266|         """Save the deanonymizer mapping to a JSON or YAML file.
+   267|         Args:
+   268|             file_path: Path to file to save the mapping to.
+   269|         Example:
+   270|         .. code-block:: python
+   271|             anonymizer.save_deanonymizer_mapping(file_path="path/mapping.json")
+   272|         """
+   273|         save_path = Path(file_path)
+   274|         if save_path.suffix not in [".json", ".yaml"]:
+   275|             raise ValueError(f"{save_path} must have an extension of .json or .yaml")
+   276|         save_path.parent.mkdir(parents=True, exist_ok=True)
+   277|         if save_path.suffix == ".json":
+   278|             with open(save_path, "w") as f:
+   279|                 json.dump(self.deanonymizer_mapping, f, indent=2)
+   280|         elif save_path.suffix == ".yaml":
+   281|             with open(save_path, "w") as f:
+   282|                 yaml.dump(self.deanonymizer_mapping, f, default_flow_style=False)
+   283|     def load_deanonymizer_mapping(self, file_path: Union[Path, str]) -> None:
+   284|         """Load the deanonymizer mapping from a JSON or YAML file.
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 26-73 ---
+    26|     )
+    27| surface_langchain_deprecation_warnings()
+    28| def __getattr__(name: str) -> Any:
+    29|     if name == "MRKLChain":
+    30|         from langchain.agents import MRKLChain
+    31|         _warn_on_import(name)
+    32|         return MRKLChain
+    33|     elif name == "ReActChain":
+    34|         from langchain.agents import ReActChain
+    35|         _warn_on_import(name)
+    36|         return ReActChain
+    37|     elif name == "SelfAskWithSearchChain":
+    38|         from langchain.agents import SelfAskWithSearchChain
+    39|         _warn_on_import(name)
+    40|         return SelfAskWithSearchChain
+    41|     elif name == "ConversationChain":
+    42|         from langchain.chains import ConversationChain
+    43|         _warn_on_import(name)
+    44|         return ConversationChain
+    45|     elif name == "LLMBashChain":
+    46|         raise ImportError(
+    47|             "This module has been moved to langchain-experimental. "
+    48|             "For more details: "
+    49|             "https://github.com/langchain-ai/langchain/discussions/11352."
+    50|             "To access this code, install it with `pip install langchain-experimental`."
+    51|             "`from langchain_experimental.llm_bash.base "
+    52|             "import LLMBashChain`"
+    53|         )
+    54|     elif name == "LLMChain":
+    55|         from langchain.chains import LLMChain
+    56|         _warn_on_import(name)
+    57|         return LLMChain
+    58|     elif name == "LLMCheckerChain":
+    59|         from langchain.chains import LLMCheckerChain
+    60|         _warn_on_import(name)
+    61|         return LLMCheckerChain
+    62|     elif name == "LLMMathChain":
+    63|         from langchain.chains import LLMMathChain
+    64|         _warn_on_import(name)
+    65|         return LLMMathChain
+    66|     elif name == "QAWithSourcesChain":
+    67|         from langchain.chains import QAWithSourcesChain
+    68|         _warn_on_import(name)
+    69|         return QAWithSourcesChain
+    70|     elif name == "VectorDBQA":
+    71|         from langchain.chains import VectorDBQA
+    72|         _warn_on_import(name)
+    73|         return VectorDBQA
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/agents/agent_toolkits/sql/toolkit.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 23-62 ---
+    23|         """Configuration for this pydantic object."""
+    24|         arbitrary_types_allowed = True
+    25|     def get_tools(self) -> List[BaseTool]:
+    26|         """Get the tools in the toolkit."""
+    27|         list_sql_database_tool = ListSQLDatabaseTool(db=self.db)
+    28|         info_sql_database_tool_description = (
+    29|             "Input to this tool is a comma-separated list of tables, output is the "
+    30|             "schema and sample rows for those tables. "
+    31|             "Be sure that the tables actually exist by calling "
+    32|             f"{list_sql_database_tool.name} first! "
+    33|             "Example Input: 'table1, table2, table3'"
+    34|         )
+    35|         info_sql_database_tool = InfoSQLDatabaseTool(
+    36|             db=self.db, description=info_sql_database_tool_description
+    37|         )
+    38|         query_sql_database_tool_description = (
+    39|             "Input to this tool is a detailed and correct SQL query, output is a "
+    40|             "result from the database. If the query is not correct, an error message "
+    41|             "will be returned. If an error is returned, rewrite the query, check the "
+    42|             "query, and try again. If you encounter an issue with Unknown column "
+    43|             f"'xxxx' in 'field list', use {info_sql_database_tool.name} "
+    44|             "to query the correct table fields."
+    45|         )
+    46|         query_sql_database_tool = QuerySQLDataBaseTool(
+    47|             db=self.db, description=query_sql_database_tool_description
+    48|         )
+    49|         query_sql_checker_tool_description = (
+    50|             "Use this tool to double check if your query is correct before executing "
+    51|             "it. Always use this tool before executing a query with "
+    52|             f"{query_sql_database_tool.name}!"
+    53|         )
+    54|         query_sql_checker_tool = QuerySQLCheckerTool(
+    55|             db=self.db, llm=self.llm, description=query_sql_checker_tool_description
+    56|         )
+    57|         return [
+    58|             query_sql_database_tool,
+    59|             info_sql_database_tool,
+    60|             list_sql_database_tool,
+    61|             query_sql_checker_tool,
+    62|         ]
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/agents/conversational_chat/prompt.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-39 ---
+     1| PREFIX = """Assistant is a large language model trained by OpenAI.
+     2| Assistant is designed to be able to assist with a wide range of tasks, from answering simple questions to providing in-depth explanations and discussions on a wide range of topics. As a language model, Assistant is able to generate human-like text based on the input it receives, allowing it to engage in natural-sounding conversations and provide responses that are coherent and relevant to the topic at hand.
+     3| Assistant is constantly learning and improving, and its capabilities are constantly evolving. It is able to process and understand large amounts of text, and can use this knowledge to provide accurate and informative responses to a wide range of questions. Additionally, Assistant is able to generate its own text based on the input it receives, allowing it to engage in discussions and provide explanations and descriptions on a wide range of topics.
+     4| Overall, Assistant is a powerful system that can help with a wide range of tasks and provide valuable insights and information on a wide range of topics. Whether you need help with a specific question or just want to have a conversation about a particular topic, Assistant is here to assist."""
+     5| FORMAT_INSTRUCTIONS = """RESPONSE FORMAT INSTRUCTIONS
+     6| ----------------------------
+     7| When responding to me, please output a response in one of two formats:
+     8| **Option 1:**
+     9| Use this if you want the human to use a tool.
+    10| Markdown code snippet formatted in the following schema:
+    11| ```json
+    12| {{{{
+    13|     "action": string, \\\\ The action to take. Must be one of {tool_names}
+    14|     "action_input": string \\\\ The input to the action
+    15| }}}}
+    16| ```
+    17| **Option #2:**
+    18| Use this if you want to respond directly to the human. Markdown code snippet formatted in the following schema:
+    19| ```json
+    20| {{{{
+    21|     "action": "Final Answer",
+    22|     "action_input": string \\\\ You should put what you want to return to use here
+    23| }}}}
+    24| ```"""
+    25| SUFFIX = """TOOLS
+    26| ------
+    27| Assistant can ask the user to use tools to look up information that may be helpful in answering the users original question. The tools the human can use are:
+    28| {{tools}}
+    29| {format_instructions}
+    30| USER'S INPUT
+    31| --------------------
+    32| Here is the user's input (remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else):
+    33| {{{{input}}}}"""
+    34| TEMPLATE_TOOL_RESPONSE = """TOOL RESPONSE: 
+    35| ---------------------
+    36| {observation}
+    37| USER'S INPUT
+    38| --------------------
+    39| Okay, so what is the response to my last comment? If using information obtained from the tools you must mention it explicitly without mentioning the tool names - I have forgotten all TOOL RESPONSES! Remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else."""
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/cache.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 521-579 ---
+   521|         except ImportError:
+   522|             raise ImportError(
+   523|                 "Could not import momento python package. "
+   524|                 "Please install it with `pip install momento`."
+   525|             )
+   526|         if not isinstance(cache_client, CacheClient):
+   527|             raise TypeError("cache_client must be a momento.CacheClient object.")
+   528|         _validate_ttl(ttl)
+   529|         if ensure_cache_exists:
+   530|             _ensure_cache_exists(cache_client, cache_name)
+   531|         self.cache_client = cache_client
+   532|         self.cache_name = cache_name
+   533|         self.ttl = ttl
+   534|     @classmethod
+   535|     def from_client_params(
+   536|         cls,
+   537|         cache_name: str,
+   538|         ttl: timedelta,
+   539|         *,
+   540|         configuration: Optional[momento.config.Configuration] = None,
+   541|         api_key: Optional[str] = None,
+   542|         auth_token: Optional[str] = None,  # for backwards compatibility
+   543|         **kwargs: Any,
+   544|     ) -> MomentoCache:
+   545|         """Construct cache from CacheClient parameters."""
+   546|         try:
+   547|             from momento import CacheClient, Configurations, CredentialProvider
+   548|         except ImportError:
+   549|             raise ImportError(
+   550|                 "Could not import momento python package. "
+   551|                 "Please install it with `pip install momento`."
+   552|             )
+   553|         if configuration is None:
+   554|             configuration = Configurations.Laptop.v1()
+   555|         try:
+   556|             api_key = auth_token or get_from_env("auth_token", "MOMENTO_AUTH_TOKEN")
+   557|         except ValueError:
+   558|             api_key = api_key or get_from_env("api_key", "MOMENTO_API_KEY")
+   559|         credentials = CredentialProvider.from_string(api_key)
+   560|         cache_client = CacheClient(configuration, credentials, default_ttl=ttl)
+   561|         return cls(cache_client, cache_name, ttl=ttl, **kwargs)
+   562|     def __key(self, prompt: str, llm_string: str) -> str:
+   563|         """Compute cache key from prompt and associated model and settings.
+   564|         Args:
+   565|             prompt (str): The prompt run through the language model.
+   566|             llm_string (str): The language model version and settings.
+   567|         Returns:
+   568|             str: The cache key.
+   569|         """
+   570|         return _hash(prompt + llm_string)
+   571|     def lookup(self, prompt: str, llm_string: str) -> Optional[RETURN_VAL_TYPE]:
+   572|         """Lookup llm generations in cache by prompt and associated model and settings.
+   573|         Args:
+   574|             prompt (str): The prompt run through the language model.
+   575|             llm_string (str): The language model version and settings.
+   576|         Raises:
+   577|             SdkException: Momento service or network error
+   578|         Returns:
+   579|             Optional[RETURN_VAL_TYPE]: A list of language model generations.
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/callbacks/llmonitor_callback.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-21 ---
+     1| import logging
+     2| import os
+     3| import traceback
+     4| from contextvars import ContextVar
+     5| from datetime import datetime
+     6| from typing import Any, Dict, List, Literal, Union
+     7| from uuid import UUID
+     8| import requests
+     9| from langchain.callbacks.base import BaseCallbackHandler
+    10| from langchain.schema.agent import AgentAction, AgentFinish
+    11| from langchain.schema.messages import BaseMessage
+    12| from langchain.schema.output import LLMResult
+    13| DEFAULT_API_URL = "https://app.llmonitor.com"
+    14| user_ctx = ContextVar[Union[str, None]]("user_ctx", default=None)
+    15| user_props_ctx = ContextVar[Union[str, None]]("user_props_ctx", default=None)
+    16| class UserContextManager:
+    17|     """Context manager for LLMonitor user context."""
+    18|     def __init__(self, user_id: str, user_props: Any = None) -> None:
+    19|         user_ctx.set(user_id)
+    20|         user_props_ctx.set(user_props)
+    21|     def __enter__(self) -> Any:
+
+# --- HUNK 2: Lines 160-480 ---
+   160|                 f"Could not connect to the LLMonitor API at {self.__api_url}"
+   161|             ) from e
+   162|     def __send_event(self, event: Dict[str, Any]) -> None:
+   163|         headers = {"Content-Type": "application/json"}
+   164|         event = {**event, "app": self.__app_id, "timestamp": str(datetime.utcnow())}
+   165|         if self.__verbose:
+   166|             print("llmonitor_callback", event)
+   167|         data = {"events": event}
+   168|         requests.post(headers=headers, url=f"{self.__api_url}/api/report", json=data)
+   169|     def on_llm_start(
+   170|         self,
+   171|         serialized: Dict[str, Any],
+   172|         prompts: List[str],
+   173|         *,
+   174|         run_id: UUID,
+   175|         parent_run_id: Union[UUID, None] = None,
+   176|         tags: Union[List[str], None] = None,
+   177|         metadata: Union[Dict[str, Any], None] = None,
+   178|         **kwargs: Any,
+   179|     ) -> None:
+   180|         try:
+   181|             user_id = _get_user_id(metadata)
+   182|             user_props = _get_user_props(metadata)
+   183|             event = {
+   184|                 "event": "start",
+   185|                 "type": "llm",
+   186|                 "userId": user_id,
+   187|                 "runId": str(run_id),
+   188|                 "parentRunId": str(parent_run_id) if parent_run_id else None,
+   189|                 "input": _parse_input(prompts),
+   190|                 "name": kwargs.get("invocation_params", {}).get("model_name"),
+   191|                 "tags": tags,
+   192|                 "metadata": metadata,
+   193|             }
+   194|             if user_props:
+   195|                 event["userProps"] = user_props
+   196|             self.__send_event(event)
+   197|         except Exception as e:
+   198|             logging.warning(f"[LLMonitor] An error occurred in on_llm_start: {e}")
+   199|     def on_chat_model_start(
+   200|         self,
+   201|         serialized: Dict[str, Any],
+   202|         messages: List[List[BaseMessage]],
+   203|         *,
+   204|         run_id: UUID,
+   205|         parent_run_id: Union[UUID, None] = None,
+   206|         tags: Union[List[str], None] = None,
+   207|         metadata: Union[Dict[str, Any], None] = None,
+   208|         **kwargs: Any,
+   209|     ) -> Any:
+   210|         try:
+   211|             user_id = _get_user_id(metadata)
+   212|             user_props = _get_user_props(metadata)
+   213|             event = {
+   214|                 "event": "start",
+   215|                 "type": "llm",
+   216|                 "userId": user_id,
+   217|                 "runId": str(run_id),
+   218|                 "parentRunId": str(parent_run_id) if parent_run_id else None,
+   219|                 "input": _parse_lc_messages(messages[0]),
+   220|                 "name": kwargs.get("invocation_params", {}).get("model_name"),
+   221|                 "tags": tags,
+   222|                 "metadata": metadata,
+   223|             }
+   224|             if user_props:
+   225|                 event["userProps"] = user_props
+   226|             self.__send_event(event)
+   227|         except Exception as e:
+   228|             logging.warning(
+   229|                 f"[LLMonitor] An error occurred in on_chat_model_start: " f"{e}"
+   230|             )
+   231|     def on_llm_end(
+   232|         self,
+   233|         response: LLMResult,
+   234|         *,
+   235|         run_id: UUID,
+   236|         parent_run_id: Union[UUID, None] = None,
+   237|         **kwargs: Any,
+   238|     ) -> None:
+   239|         try:
+   240|             token_usage = (response.llm_output or {}).get("token_usage", {})
+   241|             parsed_output = [
+   242|                 {
+   243|                     "text": generation.text,
+   244|                     "role": "ai",
+   245|                     **(
+   246|                         {
+   247|                             "functionCall": generation.message.additional_kwargs[
+   248|                                 "function_call"
+   249|                             ]
+   250|                         }
+   251|                         if hasattr(generation, "message")
+   252|                         and hasattr(generation.message, "additional_kwargs")
+   253|                         and "function_call" in generation.message.additional_kwargs
+   254|                         else {}
+   255|                     ),
+   256|                 }
+   257|                 for generation in response.generations[0]
+   258|             ]
+   259|             event = {
+   260|                 "event": "end",
+   261|                 "type": "llm",
+   262|                 "runId": str(run_id),
+   263|                 "parent_run_id": str(parent_run_id) if parent_run_id else None,
+   264|                 "output": parsed_output,
+   265|                 "tokensUsage": {
+   266|                     "prompt": token_usage.get("prompt_tokens"),
+   267|                     "completion": token_usage.get("completion_tokens"),
+   268|                 },
+   269|             }
+   270|             self.__send_event(event)
+   271|         except Exception as e:
+   272|             logging.warning(f"[LLMonitor] An error occurred in on_llm_end: {e}")
+   273|     def on_tool_start(
+   274|         self,
+   275|         serialized: Dict[str, Any],
+   276|         input_str: str,
+   277|         *,
+   278|         run_id: UUID,
+   279|         parent_run_id: Union[UUID, None] = None,
+   280|         tags: Union[List[str], None] = None,
+   281|         metadata: Union[Dict[str, Any], None] = None,
+   282|         **kwargs: Any,
+   283|     ) -> None:
+   284|         try:
+   285|             user_id = _get_user_id(metadata)
+   286|             user_props = _get_user_props(metadata)
+   287|             event = {
+   288|                 "event": "start",
+   289|                 "type": "tool",
+   290|                 "userId": user_id,
+   291|                 "runId": str(run_id),
+   292|                 "parentRunId": str(parent_run_id) if parent_run_id else None,
+   293|                 "name": serialized.get("name"),
+   294|                 "input": input_str,
+   295|                 "tags": tags,
+   296|                 "metadata": metadata,
+   297|             }
+   298|             if user_props:
+   299|                 event["userProps"] = user_props
+   300|             self.__send_event(event)
+   301|         except Exception as e:
+   302|             logging.warning(f"[LLMonitor] An error occurred in on_tool_start: {e}")
+   303|     def on_tool_end(
+   304|         self,
+   305|         output: str,
+   306|         *,
+   307|         run_id: UUID,
+   308|         parent_run_id: Union[UUID, None] = None,
+   309|         tags: Union[List[str], None] = None,
+   310|         **kwargs: Any,
+   311|     ) -> None:
+   312|         try:
+   313|             event = {
+   314|                 "event": "end",
+   315|                 "type": "tool",
+   316|                 "runId": str(run_id),
+   317|                 "parent_run_id": str(parent_run_id) if parent_run_id else None,
+   318|                 "output": output,
+   319|             }
+   320|             self.__send_event(event)
+   321|         except Exception as e:
+   322|             logging.warning(f"[LLMonitor] An error occurred in on_tool_end: {e}")
+   323|     def on_chain_start(
+   324|         self,
+   325|         serialized: Dict[str, Any],
+   326|         inputs: Dict[str, Any],
+   327|         *,
+   328|         run_id: UUID,
+   329|         parent_run_id: Union[UUID, None] = None,
+   330|         tags: Union[List[str], None] = None,
+   331|         metadata: Union[Dict[str, Any], None] = None,
+   332|         **kwargs: Any,
+   333|     ) -> Any:
+   334|         try:
+   335|             name = serialized.get("id", [None, None, None, None])[3]
+   336|             type = "chain"
+   337|             metadata = metadata or {}
+   338|             agentName = metadata.get("agent_name")
+   339|             if agentName is None:
+   340|                 agentName = metadata.get("agentName")
+   341|             if agentName is not None:
+   342|                 type = "agent"
+   343|                 name = agentName
+   344|             if name == "AgentExecutor" or name == "PlanAndExecute":
+   345|                 type = "agent"
+   346|             if parent_run_id is not None:
+   347|                 type = "chain"
+   348|             user_id = _get_user_id(metadata)
+   349|             user_props = _get_user_props(metadata)
+   350|             event = {
+   351|                 "event": "start",
+   352|                 "type": type,
+   353|                 "userId": user_id,
+   354|                 "runId": str(run_id),
+   355|                 "parentRunId": str(parent_run_id) if parent_run_id else None,
+   356|                 "input": _parse_input(inputs),
+   357|                 "tags": tags,
+   358|                 "metadata": metadata,
+   359|                 "name": name,
+   360|             }
+   361|             if user_props:
+   362|                 event["userProps"] = user_props
+   363|             self.__send_event(event)
+   364|         except Exception as e:
+   365|             logging.warning(f"[LLMonitor] An error occurred in on_chain_start: {e}")
+   366|     def on_chain_end(
+   367|         self,
+   368|         outputs: Dict[str, Any],
+   369|         *,
+   370|         run_id: UUID,
+   371|         parent_run_id: Union[UUID, None] = None,
+   372|         **kwargs: Any,
+   373|     ) -> Any:
+   374|         try:
+   375|             event = {
+   376|                 "event": "end",
+   377|                 "type": "chain",
+   378|                 "runId": str(run_id),
+   379|                 "output": _parse_output(outputs),
+   380|             }
+   381|             self.__send_event(event)
+   382|         except Exception as e:
+   383|             logging.warning(f"[LLMonitor] An error occurred in on_chain_end: {e}")
+   384|     def on_agent_action(
+   385|         self,
+   386|         action: AgentAction,
+   387|         *,
+   388|         run_id: UUID,
+   389|         parent_run_id: Union[UUID, None] = None,
+   390|         **kwargs: Any,
+   391|     ) -> Any:
+   392|         try:
+   393|             event = {
+   394|                 "event": "start",
+   395|                 "type": "tool",
+   396|                 "runId": str(run_id),
+   397|                 "parentRunId": str(parent_run_id) if parent_run_id else None,
+   398|                 "name": action.tool,
+   399|                 "input": _parse_input(action.tool_input),
+   400|             }
+   401|             self.__send_event(event)
+   402|         except Exception as e:
+   403|             logging.warning(f"[LLMonitor] An error occurred in on_agent_action: {e}")
+   404|     def on_agent_finish(
+   405|         self,
+   406|         finish: AgentFinish,
+   407|         *,
+   408|         run_id: UUID,
+   409|         parent_run_id: Union[UUID, None] = None,
+   410|         **kwargs: Any,
+   411|     ) -> Any:
+   412|         try:
+   413|             event = {
+   414|                 "event": "end",
+   415|                 "type": "agent",
+   416|                 "runId": str(run_id),
+   417|                 "parentRunId": str(parent_run_id) if parent_run_id else None,
+   418|                 "output": _parse_output(finish.return_values),
+   419|             }
+   420|             self.__send_event(event)
+   421|         except Exception as e:
+   422|             logging.warning(f"[LLMonitor] An error occurred in on_agent_finish: {e}")
+   423|     def on_chain_error(
+   424|         self,
+   425|         error: BaseException,
+   426|         *,
+   427|         run_id: UUID,
+   428|         parent_run_id: Union[UUID, None] = None,
+   429|         **kwargs: Any,
+   430|     ) -> Any:
+   431|         try:
+   432|             event = {
+   433|                 "event": "error",
+   434|                 "type": "chain",
+   435|                 "runId": str(run_id),
+   436|                 "parent_run_id": str(parent_run_id) if parent_run_id else None,
+   437|                 "error": {"message": str(error), "stack": traceback.format_exc()},
+   438|             }
+   439|             self.__send_event(event)
+   440|         except Exception as e:
+   441|             logging.warning(f"[LLMonitor] An error occurred in on_chain_error: {e}")
+   442|     def on_tool_error(
+   443|         self,
+   444|         error: BaseException,
+   445|         *,
+   446|         run_id: UUID,
+   447|         parent_run_id: Union[UUID, None] = None,
+   448|         **kwargs: Any,
+   449|     ) -> Any:
+   450|         try:
+   451|             event = {
+   452|                 "event": "error",
+   453|                 "type": "tool",
+   454|                 "runId": str(run_id),
+   455|                 "parent_run_id": str(parent_run_id) if parent_run_id else None,
+   456|                 "error": {"message": str(error), "stack": traceback.format_exc()},
+   457|             }
+   458|             self.__send_event(event)
+   459|         except Exception as e:
+   460|             logging.warning(f"[LLMonitor] An error occurred in on_tool_error: {e}")
+   461|     def on_llm_error(
+   462|         self,
+   463|         error: BaseException,
+   464|         *,
+   465|         run_id: UUID,
+   466|         parent_run_id: Union[UUID, None] = None,
+   467|         **kwargs: Any,
+   468|     ) -> Any:
+   469|         try:
+   470|             event = {
+   471|                 "event": "error",
+   472|                 "type": "llm",
+   473|                 "runId": str(run_id),
+   474|                 "parent_run_id": str(parent_run_id) if parent_run_id else None,
+   475|                 "error": {"message": str(error), "stack": traceback.format_exc()},
+   476|             }
+   477|             self.__send_event(event)
+   478|         except Exception as e:
+   479|             logging.warning(f"[LLMonitor] An error occurred in on_llm_error: {e}")
+   480| __all__ = ["LLMonitorCallbackHandler", "identify"]
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/callbacks/manager.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1622-1668 ---
+  1622|         inheritable_tags (Optional[List[str]], optional): The inheritable tags.
+  1623|             Defaults to None.
+  1624|         local_tags (Optional[List[str]], optional): The local tags. Defaults to None.
+  1625|         inheritable_metadata (Optional[Dict[str, Any]], optional): The inheritable
+  1626|             metadata. Defaults to None.
+  1627|         local_metadata (Optional[Dict[str, Any]], optional): The local metadata.
+  1628|             Defaults to None.
+  1629|     Returns:
+  1630|         T: The configured callback manager.
+  1631|     """
+  1632|     callback_manager = callback_manager_cls(handlers=[])
+  1633|     if inheritable_callbacks or local_callbacks:
+  1634|         if isinstance(inheritable_callbacks, list) or inheritable_callbacks is None:
+  1635|             inheritable_callbacks_ = inheritable_callbacks or []
+  1636|             callback_manager = callback_manager_cls(
+  1637|                 handlers=inheritable_callbacks_.copy(),
+  1638|                 inheritable_handlers=inheritable_callbacks_.copy(),
+  1639|             )
+  1640|         else:
+  1641|             callback_manager = callback_manager_cls(
+  1642|                 handlers=inheritable_callbacks.handlers.copy(),
+  1643|                 inheritable_handlers=inheritable_callbacks.inheritable_handlers.copy(),
+  1644|                 parent_run_id=inheritable_callbacks.parent_run_id,
+  1645|                 tags=inheritable_callbacks.tags.copy(),
+  1646|                 inheritable_tags=inheritable_callbacks.inheritable_tags.copy(),
+  1647|                 metadata=inheritable_callbacks.metadata.copy(),
+  1648|                 inheritable_metadata=inheritable_callbacks.inheritable_metadata.copy(),
+  1649|             )
+  1650|         local_handlers_ = (
+  1651|             local_callbacks
+  1652|             if isinstance(local_callbacks, list)
+  1653|             else (local_callbacks.handlers if local_callbacks else [])
+  1654|         )
+  1655|         for handler in local_handlers_:
+  1656|             callback_manager.add_handler(handler, False)
+  1657|     if inheritable_tags or local_tags:
+  1658|         callback_manager.add_tags(inheritable_tags or [])
+  1659|         callback_manager.add_tags(local_tags or [], False)
+  1660|     if inheritable_metadata or local_metadata:
+  1661|         callback_manager.add_metadata(inheritable_metadata or {})
+  1662|         callback_manager.add_metadata(local_metadata or {}, False)
+  1663|     tracer = tracing_callback_var.get()
+  1664|     wandb_tracer = wandb_tracing_callback_var.get()
+  1665|     open_ai = openai_callback_var.get()
+  1666|     tracing_enabled_ = (
+  1667|         env_var_is_set("LANGCHAIN_TRACING")
+  1668|         or tracer is not None
+
+# --- HUNK 2: Lines 1720-1749 ---
+  1720|                 handler = WandbTracer()
+  1721|                 callback_manager.add_handler(handler, True)
+  1722|         if tracing_v2_enabled_ and not any(
+  1723|             isinstance(handler, LangChainTracer)
+  1724|             for handler in callback_manager.handlers
+  1725|         ):
+  1726|             if tracer_v2:
+  1727|                 callback_manager.add_handler(tracer_v2, True)
+  1728|             else:
+  1729|                 try:
+  1730|                     handler = LangChainTracer(project_name=tracer_project)
+  1731|                     callback_manager.add_handler(handler, True)
+  1732|                 except Exception as e:
+  1733|                     logger.warning(
+  1734|                         "Unable to load requested LangChainTracer."
+  1735|                         " To disable this warning,"
+  1736|                         " unset the  LANGCHAIN_TRACING_V2 environment variables.",
+  1737|                         e,
+  1738|                     )
+  1739|         if open_ai is not None and not any(
+  1740|             handler is open_ai  # direct pointer comparison
+  1741|             for handler in callback_manager.handlers
+  1742|         ):
+  1743|             callback_manager.add_handler(open_ai, True)
+  1744|     if run_collector_ is not None and not any(
+  1745|         handler is run_collector_  # direct pointer comparison
+  1746|         for handler in callback_manager.handlers
+  1747|     ):
+  1748|         callback_manager.add_handler(run_collector_, False)
+  1749|     return callback_manager
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/chains/__init__.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 20-59 ---
+    20| from langchain.chains.combine_documents.stuff import StuffDocumentsChain
+    21| from langchain.chains.constitutional_ai.base import ConstitutionalChain
+    22| from langchain.chains.conversation.base import ConversationChain
+    23| from langchain.chains.conversational_retrieval.base import (
+    24|     ChatVectorDBChain,
+    25|     ConversationalRetrievalChain,
+    26| )
+    27| from langchain.chains.example_generator import generate_example
+    28| from langchain.chains.flare.base import FlareChain
+    29| from langchain.chains.graph_qa.arangodb import ArangoGraphQAChain
+    30| from langchain.chains.graph_qa.base import GraphQAChain
+    31| from langchain.chains.graph_qa.cypher import GraphCypherQAChain
+    32| from langchain.chains.graph_qa.falkordb import FalkorDBQAChain
+    33| from langchain.chains.graph_qa.hugegraph import HugeGraphQAChain
+    34| from langchain.chains.graph_qa.kuzu import KuzuQAChain
+    35| from langchain.chains.graph_qa.nebulagraph import NebulaGraphQAChain
+    36| from langchain.chains.graph_qa.neptune_cypher import NeptuneOpenCypherQAChain
+    37| from langchain.chains.graph_qa.sparql import GraphSparqlQAChain
+    38| from langchain.chains.hyde.base import HypotheticalDocumentEmbedder
+    39| from langchain.chains.llm import LLMChain
+    40| from langchain.chains.llm_checker.base import LLMCheckerChain
+    41| from langchain.chains.llm_math.base import LLMMathChain
+    42| from langchain.chains.llm_requests import LLMRequestsChain
+    43| from langchain.chains.llm_summarization_checker.base import LLMSummarizationCheckerChain
+    44| from langchain.chains.loading import load_chain
+    45| from langchain.chains.mapreduce import MapReduceChain
+    46| from langchain.chains.moderation import OpenAIModerationChain
+    47| from langchain.chains.natbot.base import NatBotChain
+    48| from langchain.chains.openai_functions import (
+    49|     create_citation_fuzzy_match_chain,
+    50|     create_extraction_chain,
+    51|     create_extraction_chain_pydantic,
+    52|     create_qa_with_sources_chain,
+    53|     create_qa_with_structure_chain,
+    54|     create_tagging_chain,
+    55|     create_tagging_chain_pydantic,
+    56| )
+    57| from langchain.chains.qa_generation.base import QAGenerationChain
+    58| from langchain.chains.qa_with_sources.base import QAWithSourcesChain
+    59| from langchain.chains.qa_with_sources.retrieval import RetrievalQAWithSourcesChain
+
+# --- HUNK 2: Lines 68-107 ---
+    68| )
+    69| from langchain.chains.sequential import SequentialChain, SimpleSequentialChain
+    70| from langchain.chains.sql_database.query import create_sql_query_chain
+    71| from langchain.chains.transform import TransformChain
+    72| __all__ = [
+    73|     "APIChain",
+    74|     "AnalyzeDocumentChain",
+    75|     "ArangoGraphQAChain",
+    76|     "ChatVectorDBChain",
+    77|     "ConstitutionalChain",
+    78|     "ConversationChain",
+    79|     "ConversationalRetrievalChain",
+    80|     "FalkorDBQAChain",
+    81|     "FlareChain",
+    82|     "GraphCypherQAChain",
+    83|     "GraphQAChain",
+    84|     "GraphSparqlQAChain",
+    85|     "HugeGraphQAChain",
+    86|     "HypotheticalDocumentEmbedder",
+    87|     "KuzuQAChain",
+    88|     "LLMChain",
+    89|     "LLMCheckerChain",
+    90|     "LLMMathChain",
+    91|     "LLMRequestsChain",
+    92|     "LLMRouterChain",
+    93|     "LLMSummarizationCheckerChain",
+    94|     "MapReduceChain",
+    95|     "MapReduceDocumentsChain",
+    96|     "MapRerankDocumentsChain",
+    97|     "MultiPromptChain",
+    98|     "MultiRetrievalQAChain",
+    99|     "MultiRouteChain",
+   100|     "NatBotChain",
+   101|     "NebulaGraphQAChain",
+   102|     "NeptuneOpenCypherQAChain",
+   103|     "OpenAIModerationChain",
+   104|     "OpenAPIEndpointChain",
+   105|     "QAGenerationChain",
+   106|     "QAWithSourcesChain",
+   107|     "ReduceDocumentsChain",
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/chains/llm_bash/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-10 ---
+     1| def raise_on_import() -> None:
+     2|     """Raise an error on import since is deprecated."""
+     3|     raise ImportError(
+     4|         "This module has been moved to langchain-experimental. "
+     5|         "For more details: https://github.com/langchain-ai/langchain/discussions/11352."
+     6|         "To access this code, install it with `pip install langchain-experimental`."
+     7|         "`from langchain_experimental.llm_bash.base "
+     8|         "import LLMBashChain`"
+     9|     )
+    10| raise_on_import()
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/chains/llm_symbolic_math/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-10 ---
+     1| def raise_on_import() -> None:
+     2|     """Raise an error on import since is deprecated."""
+     3|     raise ImportError(
+     4|         "This module has been moved to langchain-experimental. "
+     5|         "For more details: https://github.com/langchain-ai/langchain/discussions/11352."
+     6|         "To access this code, install it with `pip install langchain-experimental`."
+     7|         "`from langchain_experimental.llm_symbolic_math.base "
+     8|         "import LLMSymbolicMathChain`"
+     9|     )
+    10| raise_on_import()
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/chains/loading.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-35 ---
+     1| """Functionality for loading chains."""
+     2| import json
+     3| from pathlib import Path
+     4| from typing import Any, Union
+     5| import yaml
+     6| from langchain.chains import ReduceDocumentsChain
+     7| from langchain.chains.api.base import APIChain
+     8| from langchain.chains.base import Chain
+     9| from langchain.chains.combine_documents.map_reduce import MapReduceDocumentsChain
+    10| from langchain.chains.combine_documents.map_rerank import MapRerankDocumentsChain
+    11| from langchain.chains.combine_documents.refine import RefineDocumentsChain
+    12| from langchain.chains.combine_documents.stuff import StuffDocumentsChain
+    13| from langchain.chains.graph_qa.cypher import GraphCypherQAChain
+    14| from langchain.chains.hyde.base import HypotheticalDocumentEmbedder
+    15| from langchain.chains.llm import LLMChain
+    16| from langchain.chains.llm_checker.base import LLMCheckerChain
+    17| from langchain.chains.llm_math.base import LLMMathChain
+    18| from langchain.chains.llm_requests import LLMRequestsChain
+    19| from langchain.chains.qa_with_sources.base import QAWithSourcesChain
+    20| from langchain.chains.qa_with_sources.retrieval import RetrievalQAWithSourcesChain
+    21| from langchain.chains.qa_with_sources.vector_db import VectorDBQAWithSourcesChain
+    22| from langchain.chains.retrieval_qa.base import RetrievalQA, VectorDBQA
+    23| from langchain.llms.loading import load_llm, load_llm_from_config
+    24| from langchain.prompts.loading import (
+    25|     _load_output_parser,
+    26|     load_prompt,
+    27|     load_prompt_from_config,
+    28| )
+    29| from langchain.utilities.loading import try_load_from_hub
+    30| URL_BASE = "https://raw.githubusercontent.com/hwchase17/langchain-hub/master/chains/"
+    31| def _load_llm_chain(config: dict, **kwargs: Any) -> LLMChain:
+    32|     """Load LLM chain from config dict."""
+    33|     if "llm" in config:
+    34|         llm_config = config.pop("llm")
+    35|         llm = load_llm_from_config(llm_config)
+
+# --- HUNK 2: Lines 139-180 ---
+   139|         collapse_documents_chain = load_chain(
+   140|             config.pop("collapse_documents_chain_path")
+   141|         )
+   142|     elif "collapse_document_chain" in config:
+   143|         collapse_document_chain_config = config.pop("collapse_document_chain")
+   144|         if collapse_document_chain_config is None:
+   145|             collapse_documents_chain = None
+   146|         else:
+   147|             collapse_documents_chain = load_chain_from_config(
+   148|                 collapse_document_chain_config
+   149|             )
+   150|     elif "collapse_document_chain_path" in config:
+   151|         collapse_documents_chain = load_chain(
+   152|             config.pop("collapse_document_chain_path")
+   153|         )
+   154|     return ReduceDocumentsChain(
+   155|         combine_documents_chain=combine_documents_chain,
+   156|         collapse_documents_chain=collapse_documents_chain,
+   157|         **config,
+   158|     )
+   159| def _load_llm_bash_chain(config: dict, **kwargs: Any) -> Any:
+   160|     from langchain_experimental.llm_bash.base import LLMBashChain
+   161|     llm_chain = None
+   162|     if "llm_chain" in config:
+   163|         llm_chain_config = config.pop("llm_chain")
+   164|         llm_chain = load_chain_from_config(llm_chain_config)
+   165|     elif "llm_chain_path" in config:
+   166|         llm_chain = load_chain(config.pop("llm_chain_path"))
+   167|     elif "llm" in config:
+   168|         llm_config = config.pop("llm")
+   169|         llm = load_llm_from_config(llm_config)
+   170|     elif "llm_path" in config:
+   171|         llm = load_llm(config.pop("llm_path"))
+   172|     else:
+   173|         raise ValueError("One of `llm_chain` or `llm_chain_path` must be present.")
+   174|     if "prompt" in config:
+   175|         prompt_config = config.pop("prompt")
+   176|         prompt = load_prompt_from_config(prompt_config)
+   177|     elif "prompt_path" in config:
+   178|         prompt = load_prompt(config.pop("prompt_path"))
+   179|     if llm_chain:
+   180|         return LLMBashChain(llm_chain=llm_chain, prompt=prompt, **config)
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/cli/cli.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-35 ---
+     1| """A CLI for creating a new project with LangChain."""
+     2| from pathlib import Path
+     3| from typing import Optional
+     4| from typing_extensions import Annotated
+     5| try:
+     6|     import typer
+     7| except ImportError:
+     8|     raise ImportError(
+     9|         "Typer must be installed to use the CLI. "
+    10|         "You can install it with `pip install typer` or install LangChain "
+    11|         'with the [cli] extra like `pip install "langchain[cli]"`.'
+    12|     )
+    13| from langchain.cli.create_repo.base import create, is_poetry_installed
+    14| from langchain.cli.create_repo.pypi_name import is_name_taken, lint_name
+    15| from langchain.cli.create_repo.user_info import get_git_user_email, get_git_user_name
+    16| app = typer.Typer(no_args_is_help=False, add_completion=False)
+    17| def _select_project_name(suggested_project_name: str) -> str:
+    18|     """Help the user select a valid project name."""
+    19|     while True:
+    20|         project_name = typer.prompt("Project Name", default=suggested_project_name)
+    21|         project_name_diagnostics = lint_name(project_name)
+    22|         if project_name_diagnostics:
+    23|             typer.echo(
+    24|                 f"{typer.style('Warning:', fg=typer.colors.MAGENTA)}"
+    25|                 f" The project name"
+    26|                 f" {typer.style(project_name, fg=typer.colors.BRIGHT_CYAN)}"
+    27|                 f" is not valid.",
+    28|                 err=True,
+    29|             )
+    30|             for diagnostic in project_name_diagnostics:
+    31|                 typer.echo(f"  - {diagnostic}")
+    32|             if typer.confirm(
+    33|                 "Select another name?",
+    34|                 default=True,
+    35|             ):
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/cli/create_repo/base.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 65-159 ---
+    65|                 raise typer.Exit(code=1)
+    66| def _copy_template_files(
+    67|     template_directories: Sequence[Path],
+    68|     project_directory_path: Path,
+    69|     project_name: str,
+    70|     project_name_identifier: str,
+    71|     author_name: str,
+    72|     author_email: str,
+    73| ) -> None:
+    74|     """Copy template files to project directory and substitute variables.
+    75|     Args:
+    76|         template_directories: The directories containing the templates.
+    77|         project_directory_path: The destination directory.
+    78|         project_name: The name of the project.
+    79|         project_name_identifier: The identifier of the project name.
+    80|         author_name: The name of the author.
+    81|         author_email: The email of the author.
+    82|     """
+    83|     for template_directory_path in template_directories:
+    84|         for template_file_path in template_directory_path.glob("**/*"):
+    85|             if "__pycache__" in template_file_path.parts:
+    86|                 continue
+    87|             relative_template_file_path = UnderscoreTemplate(
+    88|                 str(template_file_path.relative_to(template_directory_path))
+    89|             ).substitute(project_name_identifier=project_name_identifier)
+    90|             project_file_path = project_directory_path / relative_template_file_path
+    91|             if template_file_path.is_dir():
+    92|                 project_file_path.mkdir(parents=True, exist_ok=True)
+    93|             else:
+    94|                 try:
+    95|                     content = template_file_path.read_text(encoding="utf-8")
+    96|                 except UnicodeDecodeError as e:
+    97|                     raise RuntimeError(
+    98|                         "Encountered an error while reading a "
+    99|                         f"template file {template_file_path}"
+   100|                     ) from e
+   101|                 project_file_path.write_text(
+   102|                     UnderscoreTemplate(content).substitute(
+   103|                         project_name=project_name,
+   104|                         project_name_identifier=project_name_identifier,
+   105|                         author_name=author_name,
+   106|                         author_email=author_email,
+   107|                         langchain_version=langchain.__version__,
+   108|                     )
+   109|                 )
+   110| def _poetry_install(project_directory_path: Path) -> None:
+   111|     """Install dependencies with Poetry."""
+   112|     typer.echo(
+   113|         f"\n{typer.style('2.', bold=True, fg=typer.colors.GREEN)}"
+   114|         f" Installing dependencies with Poetry..."
+   115|     )
+   116|     subprocess.run(["pwd"], cwd=project_directory_path)
+   117|     subprocess.run(
+   118|         ["poetry", "install"],
+   119|         cwd=project_directory_path,
+   120|         env={**os.environ.copy(), "VIRTUAL_ENV": ""},
+   121|     )
+   122| def _pip_install(project_directory_path: Path) -> None:
+   123|     """Create virtual environment and install dependencies."""
+   124|     typer.echo(
+   125|         f"\n{typer.style('2.', bold=True, fg=typer.colors.GREEN)}"
+   126|         f" Creating virtual environment..."
+   127|     )
+   128|     subprocess.run(["pwd"], cwd=project_directory_path)
+   129|     subprocess.run(["python", "-m", "venv", ".venv"], cwd=project_directory_path)
+   130| def _init_git(project_directory_path: Path) -> None:
+   131|     """Initialize git repository."""
+   132|     typer.echo(
+   133|         f"\n{typer.style('Initializing git...', bold=True, fg=typer.colors.GREEN)}"
+   134|     )
+   135|     try:
+   136|         subprocess.run(["git", "init"], cwd=project_directory_path)
+   137|     except FileNotFoundError:
+   138|         typer.echo("Git not found. Skipping git initialization.")
+   139|         return
+   140|     subprocess.run(["git", "add", "."], cwd=project_directory_path)
+   141|     subprocess.run(
+   142|         ["git", "commit", "-m", "Initial commit"],
+   143|         cwd=project_directory_path,
+   144|     )
+   145| def create(
+   146|     project_directory: pathlib.Path,
+   147|     project_name: str,
+   148|     author_name: str,
+   149|     author_email: str,
+   150|     use_poetry: bool,
+   151| ) -> None:
+   152|     """Create a new LangChain project.
+   153|     Args:
+   154|         project_directory (str): The directory to create the project in.
+   155|         project_name: The name of the project.
+   156|         author_name (str): The name of the author.
+   157|         author_email (str): The email of the author.
+   158|         use_poetry (bool): Whether to use Poetry to manage the project.
+   159|     """
+
+# --- HUNK 2: Lines 176-200 ---
+   176|         raise typer.Exit(code=0)
+   177|     _create_project_dir(
+   178|         project_directory_path,
+   179|         use_poetry,
+   180|         project_name,
+   181|         project_name_identifier,
+   182|         author_name,
+   183|         author_email,
+   184|     )
+   185|     _init_git(project_directory_path)
+   186|     typer.echo(
+   187|         f"\n{typer.style('Done!🙌', bold=True, fg=typer.colors.GREEN)}"
+   188|         f" Your new LangChain project"
+   189|         f" {typer.style(project_name, fg=typer.colors.BRIGHT_CYAN)}"
+   190|         f" has been created in"
+   191|         f" {typer.style(project_directory_path.resolve(), fg=typer.colors.BRIGHT_CYAN)}"
+   192|         f"."
+   193|     )
+   194| def is_poetry_installed() -> bool:
+   195|     """Check if Poetry is installed."""
+   196|     try:
+   197|         result = subprocess.run(["poetry", "--version"], capture_output=True)
+   198|         return result.returncode == 0
+   199|     except FileNotFoundError:
+   200|         return False
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/document_loaders/csv_loader.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-120 ---
+     1| import csv
+     2| from io import TextIOWrapper
+     3| from typing import Any, Dict, List, Optional, Sequence
+     4| from langchain.docstore.document import Document
+     5| from langchain.document_loaders.base import BaseLoader
+     6| from langchain.document_loaders.helpers import detect_file_encodings
+     7| from langchain.document_loaders.unstructured import (
+     8|     UnstructuredFileLoader,
+     9|     validate_unstructured_version,
+    10| )
+    11| class CSVLoader(BaseLoader):
+    12|     """Load a `CSV` file into a list of Documents.
+    13|     Each document represents one row of the CSV file. Every row is converted into a
+    14|     key/value pair and outputted to a new line in the document's page_content.
+    15|     The source for each document loaded from csv is set to the value of the
+    16|     `file_path` argument for all documents by default.
+    17|     You can override this by setting the `source_column` argument to the
+    18|     name of a column in the CSV file.
+    19|     The source of each document will then be set to the value of the column
+    20|     with the name specified in `source_column`.
+    21|     Output Example:
+    22|         .. code-block:: txt
+    23|             column1: value1
+    24|             column2: value2
+    25|             column3: value3
+    26|     """
+    27|     def __init__(
+    28|         self,
+    29|         file_path: str,
+    30|         source_column: Optional[str] = None,
+    31|         metadata_columns: Sequence[str] = (),
+    32|         csv_args: Optional[Dict] = None,
+    33|         encoding: Optional[str] = None,
+    34|         autodetect_encoding: bool = False,
+    35|     ):
+    36|         """
+    37|         Args:
+    38|             file_path: The path to the CSV file.
+    39|             source_column: The name of the column in the CSV file to use as the source.
+    40|               Optional. Defaults to None.
+    41|             metadata_columns: A sequence of column names to use as metadata. Optional.
+    42|             csv_args: A dictionary of arguments to pass to the csv.DictReader.
+    43|               Optional. Defaults to None.
+    44|             encoding: The encoding of the CSV file. Optional. Defaults to None.
+    45|             autodetect_encoding: Whether to try to autodetect the file encoding.
+    46|         """
+    47|         self.file_path = file_path
+    48|         self.source_column = source_column
+    49|         self.metadata_columns = metadata_columns
+    50|         self.encoding = encoding
+    51|         self.csv_args = csv_args or {}
+    52|         self.autodetect_encoding = autodetect_encoding
+    53|     def load(self) -> List[Document]:
+    54|         """Load data into document objects."""
+    55|         docs = []
+    56|         try:
+    57|             with open(self.file_path, newline="", encoding=self.encoding) as csvfile:
+    58|                 docs = self.__read_file(csvfile)
+    59|         except UnicodeDecodeError as e:
+    60|             if self.autodetect_encoding:
+    61|                 detected_encodings = detect_file_encodings(self.file_path)
+    62|                 for encoding in detected_encodings:
+    63|                     try:
+    64|                         with open(
+    65|                             self.file_path, newline="", encoding=encoding.encoding
+    66|                         ) as csvfile:
+    67|                             docs = self.__read_file(csvfile)
+    68|                             break
+    69|                     except UnicodeDecodeError:
+    70|                         continue
+    71|             else:
+    72|                 raise RuntimeError(f"Error loading {self.file_path}") from e
+    73|         except Exception as e:
+    74|             raise RuntimeError(f"Error loading {self.file_path}") from e
+    75|         return docs
+    76|     def __read_file(self, csvfile: TextIOWrapper) -> List[Document]:
+    77|         docs = []
+    78|         csv_reader = csv.DictReader(csvfile, **self.csv_args)  # type: ignore
+    79|         for i, row in enumerate(csv_reader):
+    80|             try:
+    81|                 source = (
+    82|                     row[self.source_column]
+    83|                     if self.source_column is not None
+    84|                     else self.file_path
+    85|                 )
+    86|             except KeyError:
+    87|                 raise ValueError(
+    88|                     f"Source column '{self.source_column}' not found in CSV file."
+    89|                 )
+    90|             content = "\n".join(
+    91|                 f"{k.strip()}: {v.strip()}"
+    92|                 for k, v in row.items()
+    93|                 if k not in self.metadata_columns
+    94|             )
+    95|             metadata = {"source": source, "row": i}
+    96|             for col in self.metadata_columns:
+    97|                 try:
+    98|                     metadata[col] = row[col]
+    99|                 except KeyError:
+   100|                     raise ValueError(f"Metadata column '{col}' not found in CSV file.")
+   101|             doc = Document(page_content=content, metadata=metadata)
+   102|             docs.append(doc)
+   103|         return docs
+   104| class UnstructuredCSVLoader(UnstructuredFileLoader):
+   105|     """Load `CSV` files using `Unstructured`.
+   106|     Like other
+   107|     Unstructured loaders, UnstructuredCSVLoader can be used in both
+   108|     "single" and "elements" mode. If you use the loader in "elements"
+   109|     mode, the CSV file will be a single Unstructured Table element.
+   110|     If you use the loader in "elements" mode, an HTML representation
+   111|     of the table will be available in the "text_as_html" key in the
+   112|     document metadata.
+   113|     Examples
+   114|     --------
+   115|     from langchain.document_loaders.csv_loader import UnstructuredCSVLoader
+   116|     loader = UnstructuredCSVLoader("stanley-cups.csv", mode="elements")
+   117|     docs = loader.load()
+   118|     """
+   119|     def __init__(
+   120|         self, file_path: str, mode: str = "single", **unstructured_kwargs: Any
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/llms/__init__.py
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 11-53 ---
+    11|     CallbackManager, AsyncCallbackManager,
+    12|     AIMessage, BaseMessage
+    13| """  # noqa: E501
+    14| from typing import Any, Callable, Dict, Type
+    15| from langchain.llms.base import BaseLLM
+    16| def _import_ai21() -> Any:
+    17|     from langchain.llms.ai21 import AI21
+    18|     return AI21
+    19| def _import_aleph_alpha() -> Any:
+    20|     from langchain.llms.aleph_alpha import AlephAlpha
+    21|     return AlephAlpha
+    22| def _import_amazon_api_gateway() -> Any:
+    23|     from langchain.llms.amazon_api_gateway import AmazonAPIGateway
+    24|     return AmazonAPIGateway
+    25| def _import_anthropic() -> Any:
+    26|     from langchain.llms.anthropic import Anthropic
+    27|     return Anthropic
+    28| def _import_anyscale() -> Any:
+    29|     from langchain.llms.anyscale import Anyscale
+    30|     return Anyscale
+    31| def _import_arcee() -> Any:
+    32|     from langchain.llms.arcee import Arcee
+    33|     return Arcee
+    34| def _import_aviary() -> Any:
+    35|     from langchain.llms.aviary import Aviary
+    36|     return Aviary
+    37| def _import_azureml_endpoint() -> Any:
+    38|     from langchain.llms.azureml_endpoint import AzureMLOnlineEndpoint
+    39|     return AzureMLOnlineEndpoint
+    40| def _import_baidu_qianfan_endpoint() -> Any:
+    41|     from langchain.llms.baidu_qianfan_endpoint import QianfanLLMEndpoint
+    42|     return QianfanLLMEndpoint
+    43| def _import_bananadev() -> Any:
+    44|     from langchain.llms.bananadev import Banana
+    45|     return Banana
+    46| def _import_baseten() -> Any:
+    47|     from langchain.llms.baseten import Baseten
+    48|     return Baseten
+    49| def _import_beam() -> Any:
+    50|     from langchain.llms.beam import Beam
+    51|     return Beam
+    52| def _import_bedrock() -> Any:
+    53|     from langchain.llms.bedrock import Bedrock
+
+# --- HUNK 2: Lines 234-275 ---
+   234| def _import_vllm_openai() -> Any:
+   235|     from langchain.llms.vllm import VLLMOpenAI
+   236|     return VLLMOpenAI
+   237| def _import_writer() -> Any:
+   238|     from langchain.llms.writer import Writer
+   239|     return Writer
+   240| def _import_xinference() -> Any:
+   241|     from langchain.llms.xinference import Xinference
+   242|     return Xinference
+   243| def __getattr__(name: str) -> Any:
+   244|     if name == "AI21":
+   245|         return _import_ai21()
+   246|     elif name == "AlephAlpha":
+   247|         return _import_aleph_alpha()
+   248|     elif name == "AmazonAPIGateway":
+   249|         return _import_amazon_api_gateway()
+   250|     elif name == "Anthropic":
+   251|         return _import_anthropic()
+   252|     elif name == "Anyscale":
+   253|         return _import_anyscale()
+   254|     elif name == "Arcee":
+   255|         return _import_arcee()
+   256|     elif name == "Aviary":
+   257|         return _import_aviary()
+   258|     elif name == "AzureMLOnlineEndpoint":
+   259|         return _import_azureml_endpoint()
+   260|     elif name == "QianfanLLMEndpoint":
+   261|         return _import_baidu_qianfan_endpoint()
+   262|     elif name == "Banana":
+   263|         return _import_bananadev()
+   264|     elif name == "Baseten":
+   265|         return _import_baseten()
+   266|     elif name == "Beam":
+   267|         return _import_beam()
+   268|     elif name == "Bedrock":
+   269|         return _import_bedrock()
+   270|     elif name == "NIBittensorLLM":
+   271|         return _import_bittensor()
+   272|     elif name == "CerebriumAI":
+   273|         return _import_cerebriumai()
+   274|     elif name == "ChatGLM":
+   275|         return _import_chatglm()
+
+# --- HUNK 3: Lines 387-427 ---
+   387|         return _import_vllm()
+   388|     elif name == "VLLMOpenAI":
+   389|         return _import_vllm_openai()
+   390|     elif name == "Writer":
+   391|         return _import_writer()
+   392|     elif name == "Xinference":
+   393|         return _import_xinference()
+   394|     elif name == "type_to_cls_dict":
+   395|         type_to_cls_dict: Dict[str, Type[BaseLLM]] = {
+   396|             k: v() for k, v in get_type_to_cls_dict().items()
+   397|         }
+   398|         return type_to_cls_dict
+   399|     else:
+   400|         raise AttributeError(f"Could not find: {name}")
+   401| __all__ = [
+   402|     "AI21",
+   403|     "AlephAlpha",
+   404|     "AmazonAPIGateway",
+   405|     "Anthropic",
+   406|     "Anyscale",
+   407|     "Arcee",
+   408|     "Aviary",
+   409|     "AzureMLOnlineEndpoint",
+   410|     "AzureOpenAI",
+   411|     "Banana",
+   412|     "Baseten",
+   413|     "Beam",
+   414|     "Bedrock",
+   415|     "CTransformers",
+   416|     "CTranslate2",
+   417|     "CerebriumAI",
+   418|     "ChatGLM",
+   419|     "Clarifai",
+   420|     "Cohere",
+   421|     "Databricks",
+   422|     "DeepInfra",
+   423|     "DeepSparse",
+   424|     "EdenAI",
+   425|     "FakeListLLM",
+   426|     "Fireworks",
+   427|     "ForefrontAI",
+
+# --- HUNK 4: Lines 466-506 ---
+   466|     "TitanTakeoff",
+   467|     "Tongyi",
+   468|     "VertexAI",
+   469|     "VertexAIModelGarden",
+   470|     "VLLM",
+   471|     "VLLMOpenAI",
+   472|     "Writer",
+   473|     "OctoAIEndpoint",
+   474|     "Xinference",
+   475|     "JavelinAIGateway",
+   476|     "QianfanLLMEndpoint",
+   477| ]
+   478| def get_type_to_cls_dict() -> Dict[str, Callable[[], Type[BaseLLM]]]:
+   479|     return {
+   480|         "ai21": _import_ai21,
+   481|         "aleph_alpha": _import_aleph_alpha,
+   482|         "amazon_api_gateway": _import_amazon_api_gateway,
+   483|         "amazon_bedrock": _import_bedrock,
+   484|         "anthropic": _import_anthropic,
+   485|         "anyscale": _import_anyscale,
+   486|         "arcee": _import_arcee,
+   487|         "aviary": _import_aviary,
+   488|         "azure": _import_azure_openai,
+   489|         "azureml_endpoint": _import_azureml_endpoint,
+   490|         "bananadev": _import_bananadev,
+   491|         "baseten": _import_baseten,
+   492|         "beam": _import_beam,
+   493|         "cerebriumai": _import_cerebriumai,
+   494|         "chat_glm": _import_chatglm,
+   495|         "clarifai": _import_clarifai,
+   496|         "cohere": _import_cohere,
+   497|         "ctransformers": _import_ctransformers,
+   498|         "ctranslate2": _import_ctranslate2,
+   499|         "databricks": _import_databricks,
+   500|         "deepinfra": _import_deepinfra,
+   501|         "deepsparse": _import_deepsparse,
+   502|         "edenai": _import_edenai,
+   503|         "fake-list": _import_fake,
+   504|         "forefrontai": _import_forefrontai,
+   505|         "google_palm": _import_google_palm,
+   506|         "gooseai": _import_gooseai,
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/llms/arcee.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-109 ---
+     1| from typing import Any, Dict, List, Optional
+     2| from langchain.callbacks.manager import CallbackManagerForLLMRun
+     3| from langchain.llms.base import LLM
+     4| from langchain.pydantic_v1 import Extra, root_validator
+     5| from langchain.utilities.arcee import ArceeWrapper, DALMFilter
+     6| from langchain.utils import get_from_dict_or_env
+     7| class Arcee(LLM):
+     8|     """Arcee's Domain Adapted Language Models (DALMs).
+     9|     To use, set the ``ARCEE_API_KEY`` environment variable with your Arcee API key,
+    10|     or pass ``arcee_api_key`` as a named parameter.
+    11|     Example:
+    12|         .. code-block:: python
+    13|             from langchain.llms import Arcee
+    14|             arcee = Arcee(
+    15|                 model="DALM-PubMed",
+    16|                 arcee_api_key="ARCEE-API-KEY"
+    17|             )
+    18|             response = arcee("AI-driven music therapy")
+    19|     """
+    20|     _client: Optional[ArceeWrapper] = None  #: :meta private:
+    21|     """Arcee _client."""
+    22|     arcee_api_key: str = ""
+    23|     """Arcee API Key"""
+    24|     model: str
+    25|     """Arcee DALM name"""
+    26|     arcee_api_url: str = "https://api.arcee.ai"
+    27|     """Arcee API URL"""
+    28|     arcee_api_version: str = "v2"
+    29|     """Arcee API Version"""
+    30|     arcee_app_url: str = "https://app.arcee.ai"
+    31|     """Arcee App URL"""
+    32|     model_id: str = ""
+    33|     """Arcee Model ID"""
+    34|     model_kwargs: Optional[Dict[str, Any]] = None
+    35|     """Keyword arguments to pass to the model."""
+    36|     class Config:
+    37|         """Configuration for this pydantic object."""
+    38|         extra = Extra.forbid
+    39|         underscore_attrs_are_private = True
+    40|     @property
+    41|     def _llm_type(self) -> str:
+    42|         """Return type of llm."""
+    43|         return "arcee"
+    44|     def __init__(self, **data: Any) -> None:
+    45|         """Initializes private fields."""
+    46|         super().__init__(**data)
+    47|         self._client = None
+    48|         self._client = ArceeWrapper(
+    49|             arcee_api_key=self.arcee_api_key,
+    50|             arcee_api_url=self.arcee_api_url,
+    51|             arcee_api_version=self.arcee_api_version,
+    52|             model_kwargs=self.model_kwargs,
+    53|             model_name=self.model,
+    54|         )
+    55|         self._client.validate_model_training_status()
+    56|     @root_validator()
+    57|     def validate_environments(cls, values: Dict) -> Dict:
+    58|         """Validate Arcee environment variables."""
+    59|         values["arcee_api_key"] = get_from_dict_or_env(
+    60|             values,
+    61|             "arcee_api_key",
+    62|             "ARCEE_API_KEY",
+    63|         )
+    64|         values["arcee_api_url"] = get_from_dict_or_env(
+    65|             values,
+    66|             "arcee_api_url",
+    67|             "ARCEE_API_URL",
+    68|         )
+    69|         values["arcee_app_url"] = get_from_dict_or_env(
+    70|             values,
+    71|             "arcee_app_url",
+    72|             "ARCEE_APP_URL",
+    73|         )
+    74|         values["arcee_api_version"] = get_from_dict_or_env(
+    75|             values,
+    76|             "arcee_api_version",
+    77|             "ARCEE_API_VERSION",
+    78|         )
+    79|         if values["model_kwargs"]:
+    80|             kw = values["model_kwargs"]
+    81|             if kw.get("size") is not None:
+    82|                 if not kw.get("size") >= 0:
+    83|                     raise ValueError("`size` must be positive")
+    84|             if kw.get("filters") is not None:
+    85|                 if not isinstance(kw.get("filters"), List):
+    86|                     raise ValueError("`filters` must be a list")
+    87|                 for f in kw.get("filters"):
+    88|                     DALMFilter(**f)
+    89|         return values
+    90|     def _call(
+    91|         self,
+    92|         prompt: str,
+    93|         stop: Optional[List[str]] = None,
+    94|         run_manager: Optional[CallbackManagerForLLMRun] = None,
+    95|         **kwargs: Any,
+    96|     ) -> str:
+    97|         """Generate text from Arcee DALM.
+    98|         Args:
+    99|             prompt: Prompt to generate text from.
+   100|             size: The max number of context results to retrieve.
+   101|             Defaults to 3. (Can be less if filters are provided).
+   102|             filters: Filters to apply to the context dataset.
+   103|         """
+   104|         try:
+   105|             if not self._client:
+   106|                 raise ValueError("Client is not initialized.")
+   107|             return self._client.generate(prompt=prompt, **kwargs)
+   108|         except Exception as e:
+   109|             raise Exception(f"Failed to generate text: {e}") from e
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/memory/chat_message_histories/momento.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 65-123 ---
+    65|             )
+    66|         if not isinstance(cache_client, CacheClient):
+    67|             raise TypeError("cache_client must be a momento.CacheClient object.")
+    68|         if ensure_cache_exists:
+    69|             _ensure_cache_exists(cache_client, cache_name)
+    70|         self.key = key_prefix + session_id
+    71|         self.cache_client = cache_client
+    72|         self.cache_name = cache_name
+    73|         if ttl is not None:
+    74|             self.ttl = CollectionTtl.of(ttl)
+    75|         else:
+    76|             self.ttl = CollectionTtl.from_cache_ttl()
+    77|     @classmethod
+    78|     def from_client_params(
+    79|         cls,
+    80|         session_id: str,
+    81|         cache_name: str,
+    82|         ttl: timedelta,
+    83|         *,
+    84|         configuration: Optional[momento.config.Configuration] = None,
+    85|         api_key: Optional[str] = None,
+    86|         auth_token: Optional[str] = None,  # for backwards compatibility
+    87|         **kwargs: Any,
+    88|     ) -> MomentoChatMessageHistory:
+    89|         """Construct cache from CacheClient parameters."""
+    90|         try:
+    91|             from momento import CacheClient, Configurations, CredentialProvider
+    92|         except ImportError:
+    93|             raise ImportError(
+    94|                 "Could not import momento python package. "
+    95|                 "Please install it with `pip install momento`."
+    96|             )
+    97|         if configuration is None:
+    98|             configuration = Configurations.Laptop.v1()
+    99|         try:
+   100|             api_key = auth_token or get_from_env("auth_token", "MOMENTO_AUTH_TOKEN")
+   101|         except ValueError:
+   102|             api_key = api_key or get_from_env("api_key", "MOMENTO_API_KEY")
+   103|         credentials = CredentialProvider.from_string(api_key)
+   104|         cache_client = CacheClient(configuration, credentials, default_ttl=ttl)
+   105|         return cls(session_id, cache_client, cache_name, ttl=ttl, **kwargs)
+   106|     @property
+   107|     def messages(self) -> list[BaseMessage]:  # type: ignore[override]
+   108|         """Retrieve the messages from Momento.
+   109|         Raises:
+   110|             SdkException: Momento service or network error
+   111|             Exception: Unexpected response
+   112|         Returns:
+   113|             list[BaseMessage]: List of cached messages
+   114|         """
+   115|         from momento.responses import CacheListFetch
+   116|         fetch_response = self.cache_client.list_fetch(self.cache_name, self.key)
+   117|         if isinstance(fetch_response, CacheListFetch.Hit):
+   118|             items = [json.loads(m) for m in fetch_response.value_list_string]
+   119|             return messages_from_dict(items)
+   120|         elif isinstance(fetch_response, CacheListFetch.Miss):
+   121|             return []
+   122|         elif isinstance(fetch_response, CacheListFetch.Error):
+   123|             raise fetch_response.inner_exception
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/prompts/base.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-35 ---
+     1| """BasePrompt schema definition."""
+     2| from __future__ import annotations
+     3| import warnings
+     4| from abc import ABC
+     5| from typing import Any, Callable, Dict, List, Set
+     6| from langchain.schema.messages import BaseMessage, HumanMessage
+     7| from langchain.schema.prompt import PromptValue
+     8| from langchain.schema.prompt_template import BasePromptTemplate
+     9| from langchain.utils.formatting import formatter
+    10| def jinja2_formatter(template: str, **kwargs: Any) -> str:
+    11|     """Format a template using jinja2.
+    12|     *Security warning*: jinja2 templates are not sandboxed and may lead
+    13|     to arbitrary Python code execution. Do not expand jinja2 templates
+    14|     using unverified or user-controlled inputs!
+    15|     """
+    16|     try:
+    17|         from jinja2 import Template
+    18|     except ImportError:
+    19|         raise ImportError(
+    20|             "jinja2 not installed, which is needed to use the jinja2_formatter. "
+    21|             "Please install it with `pip install jinja2`."
+    22|         )
+    23|     return Template(template).render(**kwargs)
+    24| def validate_jinja2(template: str, input_variables: List[str]) -> None:
+    25|     """
+    26|     Validate that the input variables are valid for the template.
+    27|     Issues a warning if missing or extra variables are found.
+    28|     Args:
+    29|         template: The template string.
+    30|         input_variables: The input variables.
+    31|     """
+    32|     input_variables_set = set(input_variables)
+    33|     valid_variables = _get_jinja2_variables_from_template(template)
+    34|     missing_variables = valid_variables - input_variables_set
+    35|     extra_variables = input_variables_set - valid_variables
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/prompts/loading.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 69-115 ---
+    69| def _load_few_shot_prompt(config: dict) -> FewShotPromptTemplate:
+    70|     """Load the "few shot" prompt from the config."""
+    71|     config = _load_template("suffix", config)
+    72|     config = _load_template("prefix", config)
+    73|     if "example_prompt_path" in config:
+    74|         if "example_prompt" in config:
+    75|             raise ValueError(
+    76|                 "Only one of example_prompt and example_prompt_path should "
+    77|                 "be specified."
+    78|             )
+    79|         config["example_prompt"] = load_prompt(config.pop("example_prompt_path"))
+    80|     else:
+    81|         config["example_prompt"] = load_prompt_from_config(config["example_prompt"])
+    82|     config = _load_examples(config)
+    83|     config = _load_output_parser(config)
+    84|     return FewShotPromptTemplate(**config)
+    85| def _load_prompt(config: dict) -> PromptTemplate:
+    86|     """Load the prompt template from config."""
+    87|     config = _load_template("template", config)
+    88|     config = _load_output_parser(config)
+    89|     template_format = config.get("template_format", "f-string")
+    90|     if template_format == "jinja2":
+    91|         raise ValueError(
+    92|             f"Loading templates with '{template_format}' format is no longer supported "
+    93|             f"since it can lead to arbitrary code execution. Please migrate to using "
+    94|             f"the 'f-string' template format, which does not suffer from this issue."
+    95|         )
+    96|     return PromptTemplate(**config)
+    97| def load_prompt(path: Union[str, Path]) -> BasePromptTemplate:
+    98|     """Unified method for loading a prompt from LangChainHub or local fs."""
+    99|     if hub_result := try_load_from_hub(
+   100|         path, _load_prompt_from_file, "prompts", {"py", "json", "yaml"}
+   101|     ):
+   102|         return hub_result
+   103|     else:
+   104|         return _load_prompt_from_file(path)
+   105| def _load_prompt_from_file(file: Union[str, Path]) -> BasePromptTemplate:
+   106|     """Load prompt from file."""
+   107|     if isinstance(file, str):
+   108|         file_path = Path(file)
+   109|     else:
+   110|         file_path = file
+   111|     if file_path.suffix == ".json":
+   112|         with open(file_path) as f:
+   113|             config = json.load(f)
+   114|     elif file_path.suffix == ".yaml":
+   115|         with open(file_path, "r") as f:
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/prompts/prompt.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-41 ---
+     1| """Prompt schema definition."""
+     2| from __future__ import annotations
+     3| from pathlib import Path
+     4| from string import Formatter
+     5| from typing import Any, Dict, List, Optional, Union
+     6| from langchain.prompts.base import (
+     7|     DEFAULT_FORMATTER_MAPPING,
+     8|     StringPromptTemplate,
+     9|     _get_jinja2_variables_from_template,
+    10|     check_valid_template,
+    11| )
+    12| from langchain.pydantic_v1 import root_validator
+    13| class PromptTemplate(StringPromptTemplate):
+    14|     """A prompt template for a language model.
+    15|     A prompt template consists of a string template. It accepts a set of parameters
+    16|     from the user that can be used to generate a prompt for a language model.
+    17|     The template can be formatted using either f-strings (default) or jinja2 syntax.
+    18|     *Security warning*: Prefer using `template_format="f-string"` instead of
+    19|     `template_format="jinja2"`, since jinja2 templates are not sandboxed and may
+    20|     lead to arbitrary Python code execution. Do not construct a jinja2 `PromptTemplate`
+    21|     from unverified or user-controlled inputs!
+    22|     Example:
+    23|         .. code-block:: python
+    24|             from langchain.prompts import PromptTemplate
+    25|             prompt = PromptTemplate.from_template("Say {foo}")
+    26|             prompt.format(foo="bar")
+    27|             prompt = PromptTemplate(input_variables=["foo"], template="Say {foo}")
+    28|     """
+    29|     @property
+    30|     def lc_attributes(self) -> Dict[str, Any]:
+    31|         return {
+    32|             "template_format": self.template_format,
+    33|         }
+    34|     input_variables: List[str]
+    35|     """A list of the names of the variables the prompt template expects."""
+    36|     template: str
+    37|     """The prompt template."""
+    38|     template_format: str = "f-string"
+    39|     """The format of the prompt template. Options are: 'f-string', 'jinja2'."""
+    40|     validate_template: bool = True
+    41|     """Whether or not to try validating the template."""
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/retrievers/__init__.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-33 ---
+     1| """**Retriever** class returns Documents given a text **query**.
+     2| It is more general than a vector store. A retriever does not need to be able to
+     3| store documents, only to return (or retrieve) it. Vector stores can be used as
+     4| the backbone of a retriever, but there are other types of retrievers as well.
+     5| **Class hierarchy:**
+     6| .. code-block::
+     7|     BaseRetriever --> <name>Retriever  # Examples: ArxivRetriever, MergerRetriever
+     8| **Main helpers:**
+     9| .. code-block::
+    10|     Document, Serializable, Callbacks,
+    11|     CallbackManagerForRetrieverRun, AsyncCallbackManagerForRetrieverRun
+    12| """
+    13| from langchain.retrievers.arcee import ArceeRetriever
+    14| from langchain.retrievers.arxiv import ArxivRetriever
+    15| from langchain.retrievers.azure_cognitive_search import AzureCognitiveSearchRetriever
+    16| from langchain.retrievers.bm25 import BM25Retriever
+    17| from langchain.retrievers.chaindesk import ChaindeskRetriever
+    18| from langchain.retrievers.chatgpt_plugin_retriever import ChatGPTPluginRetriever
+    19| from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
+    20| from langchain.retrievers.docarray import DocArrayRetriever
+    21| from langchain.retrievers.elastic_search_bm25 import ElasticSearchBM25Retriever
+    22| from langchain.retrievers.ensemble import EnsembleRetriever
+    23| from langchain.retrievers.google_cloud_enterprise_search import (
+    24|     GoogleCloudEnterpriseSearchRetriever,
+    25| )
+    26| from langchain.retrievers.google_vertex_ai_search import (
+    27|     GoogleVertexAISearchRetriever,
+    28| )
+    29| from langchain.retrievers.kay import KayAiRetriever
+    30| from langchain.retrievers.kendra import AmazonKendraRetriever
+    31| from langchain.retrievers.knn import KNNRetriever
+    32| from langchain.retrievers.llama_index import (
+    33|     LlamaIndexGraphRetriever,
+
+# --- HUNK 2: Lines 41-81 ---
+    41| from langchain.retrievers.parent_document_retriever import ParentDocumentRetriever
+    42| from langchain.retrievers.pinecone_hybrid_search import PineconeHybridSearchRetriever
+    43| from langchain.retrievers.pubmed import PubMedRetriever
+    44| from langchain.retrievers.re_phraser import RePhraseQueryRetriever
+    45| from langchain.retrievers.remote_retriever import RemoteLangChainRetriever
+    46| from langchain.retrievers.self_query.base import SelfQueryRetriever
+    47| from langchain.retrievers.svm import SVMRetriever
+    48| from langchain.retrievers.tavily_search_api import TavilySearchAPIRetriever
+    49| from langchain.retrievers.tfidf import TFIDFRetriever
+    50| from langchain.retrievers.time_weighted_retriever import (
+    51|     TimeWeightedVectorStoreRetriever,
+    52| )
+    53| from langchain.retrievers.vespa_retriever import VespaRetriever
+    54| from langchain.retrievers.weaviate_hybrid_search import WeaviateHybridSearchRetriever
+    55| from langchain.retrievers.web_research import WebResearchRetriever
+    56| from langchain.retrievers.wikipedia import WikipediaRetriever
+    57| from langchain.retrievers.zep import ZepRetriever
+    58| from langchain.retrievers.zilliz import ZillizRetriever
+    59| __all__ = [
+    60|     "AmazonKendraRetriever",
+    61|     "ArceeRetriever",
+    62|     "ArxivRetriever",
+    63|     "AzureCognitiveSearchRetriever",
+    64|     "ChatGPTPluginRetriever",
+    65|     "ContextualCompressionRetriever",
+    66|     "ChaindeskRetriever",
+    67|     "ElasticSearchBM25Retriever",
+    68|     "GoogleCloudEnterpriseSearchRetriever",
+    69|     "GoogleVertexAISearchRetriever",
+    70|     "KayAiRetriever",
+    71|     "KNNRetriever",
+    72|     "LlamaIndexGraphRetriever",
+    73|     "LlamaIndexRetriever",
+    74|     "MergerRetriever",
+    75|     "MetalRetriever",
+    76|     "MilvusRetriever",
+    77|     "MultiQueryRetriever",
+    78|     "PineconeHybridSearchRetriever",
+    79|     "PubMedRetriever",
+    80|     "RemoteLangChainRetriever",
+    81|     "SVMRetriever",
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/retrievers/arcee.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-99 ---
+     1| from typing import Any, Dict, List, Optional
+     2| from langchain.callbacks.manager import CallbackManagerForRetrieverRun
+     3| from langchain.docstore.document import Document
+     4| from langchain.pydantic_v1 import Extra, root_validator
+     5| from langchain.schema import BaseRetriever
+     6| from langchain.utilities.arcee import ArceeWrapper, DALMFilter
+     7| from langchain.utils import get_from_dict_or_env
+     8| class ArceeRetriever(BaseRetriever):
+     9|     """Document retriever for Arcee's Domain Adapted Language Models (DALMs).
+    10|     To use, set the ``ARCEE_API_KEY`` environment variable with your Arcee API key,
+    11|     or pass ``arcee_api_key`` as a named parameter.
+    12|     Example:
+    13|         .. code-block:: python
+    14|             from langchain.retrievers import ArceeRetriever
+    15|             retriever = ArceeRetriever(
+    16|                 model="DALM-PubMed",
+    17|                 arcee_api_key="ARCEE-API-KEY"
+    18|             )
+    19|             documents = retriever.get_relevant_documents("AI-driven music therapy")
+    20|     """
+    21|     _client: Optional[ArceeWrapper] = None  #: :meta private:
+    22|     """Arcee client."""
+    23|     arcee_api_key: str = ""
+    24|     """Arcee API Key"""
+    25|     model: str
+    26|     """Arcee DALM name"""
+    27|     arcee_api_url: str = "https://api.arcee.ai"
+    28|     """Arcee API URL"""
+    29|     arcee_api_version: str = "v2"
+    30|     """Arcee API Version"""
+    31|     arcee_app_url: str = "https://app.arcee.ai"
+    32|     """Arcee App URL"""
+    33|     model_kwargs: Optional[Dict[str, Any]] = None
+    34|     """Keyword arguments to pass to the model."""
+    35|     class Config:
+    36|         """Configuration for this pydantic object."""
+    37|         extra = Extra.forbid
+    38|         underscore_attrs_are_private = True
+    39|     def __init__(self, **data: Any) -> None:
+    40|         """Initializes private fields."""
+    41|         super().__init__(**data)
+    42|         self._client = ArceeWrapper(
+    43|             arcee_api_key=self.arcee_api_key,
+    44|             arcee_api_url=self.arcee_api_url,
+    45|             arcee_api_version=self.arcee_api_version,
+    46|             model_kwargs=self.model_kwargs,
+    47|             model_name=self.model,
+    48|         )
+    49|         self._client.validate_model_training_status()
+    50|     @root_validator()
+    51|     def validate_environments(cls, values: Dict) -> Dict:
+    52|         """Validate Arcee environment variables."""
+    53|         values["arcee_api_key"] = get_from_dict_or_env(
+    54|             values,
+    55|             "arcee_api_key",
+    56|             "ARCEE_API_KEY",
+    57|         )
+    58|         values["arcee_api_url"] = get_from_dict_or_env(
+    59|             values,
+    60|             "arcee_api_url",
+    61|             "ARCEE_API_URL",
+    62|         )
+    63|         values["arcee_app_url"] = get_from_dict_or_env(
+    64|             values,
+    65|             "arcee_app_url",
+    66|             "ARCEE_APP_URL",
+    67|         )
+    68|         values["arcee_api_version"] = get_from_dict_or_env(
+    69|             values,
+    70|             "arcee_api_version",
+    71|             "ARCEE_API_VERSION",
+    72|         )
+    73|         if values["model_kwargs"]:
+    74|             kw = values["model_kwargs"]
+    75|             if kw.get("size") is not None:
+    76|                 if not kw.get("size") >= 0:
+    77|                     raise ValueError("`size` must not be negative.")
+    78|             if kw.get("filters") is not None:
+    79|                 if not isinstance(kw.get("filters"), List):
+    80|                     raise ValueError("`filters` must be a list.")
+    81|                 for f in kw.get("filters"):
+    82|                     DALMFilter(**f)
+    83|         return values
+    84|     def _get_relevant_documents(
+    85|         self, query: str, run_manager: CallbackManagerForRetrieverRun, **kwargs: Any
+    86|     ) -> List[Document]:
+    87|         """Retrieve {size} contexts with your retriever for a given query
+    88|         Args:
+    89|             query: Query to submit to the model
+    90|             size: The max number of context results to retrieve.
+    91|             Defaults to 3. (Can be less if filters are provided).
+    92|             filters: Filters to apply to the context dataset.
+    93|         """
+    94|         try:
+    95|             if not self._client:
+    96|                 raise ValueError("Client is not initialized.")
+    97|             return self._client.retrieve(query=query, **kwargs)
+    98|         except Exception as e:
+    99|             raise ValueError(f"Error while retrieving documents: {e}") from e
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/retrievers/document_compressors/cohere_rerank.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 3-43 ---
+     3| from langchain.callbacks.manager import Callbacks
+     4| from langchain.pydantic_v1 import Extra, root_validator
+     5| from langchain.retrievers.document_compressors.base import BaseDocumentCompressor
+     6| from langchain.schema import Document
+     7| from langchain.utils import get_from_dict_or_env
+     8| if TYPE_CHECKING:
+     9|     from cohere import Client
+    10| else:
+    11|     try:
+    12|         from cohere import Client
+    13|     except ImportError:
+    14|         pass
+    15| class CohereRerank(BaseDocumentCompressor):
+    16|     """Document compressor that uses `Cohere Rerank API`."""
+    17|     client: Client
+    18|     """Cohere client to use for compressing documents."""
+    19|     top_n: int = 3
+    20|     """Number of documents to return."""
+    21|     model: str = "rerank-english-v2.0"
+    22|     """Model to use for reranking."""
+    23|     cohere_api_key: Optional[str] = None
+    24|     class Config:
+    25|         """Configuration for this pydantic object."""
+    26|         extra = Extra.forbid
+    27|         arbitrary_types_allowed = True
+    28|     @root_validator(pre=True)
+    29|     def validate_environment(cls, values: Dict) -> Dict:
+    30|         """Validate that api key and python package exists in environment."""
+    31|         cohere_api_key = get_from_dict_or_env(
+    32|             values, "cohere_api_key", "COHERE_API_KEY"
+    33|         )
+    34|         try:
+    35|             import cohere
+    36|             values["client"] = cohere.Client(cohere_api_key)
+    37|         except ImportError:
+    38|             raise ImportError(
+    39|                 "Could not import cohere python package. "
+    40|                 "Please install it with `pip install cohere`."
+    41|             )
+    42|         return values
+    43|     def compress_documents(
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/schema/runnable/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-31 ---
+     1| """LangChain Runnables and the LangChain Expression Language (LCEL).
+     2| The LangChain Expression Language (LCEL) offers a declarative method to build
+     3| production-grade programs that harness the power of LLMs.
+     4| Programs created using LCEL and LangChain Runnables inherently support
+     5| synchronous, asynchronous, batch, and streaming operations.
+     6| Support for async allows servers hosting LCEL based programs to scale better
+     7| for higher concurrent loads.
+     8| Streaming of intermediate outputs as they're being generated allows for
+     9| creating more responsive UX.
+    10| This module contains schema and implementation of LangChain Runnables primitives.
+    11| """
+    12| from langchain.schema.runnable._locals import GetLocalVar, PutLocalVar
+    13| from langchain.schema.runnable.base import (
+    14|     Runnable,
+    15|     RunnableBinding,
+    16|     RunnableGenerator,
+    17|     RunnableLambda,
+    18|     RunnableMap,
+    19|     RunnableParallel,
+    20|     RunnableSequence,
+    21|     RunnableSerializable,
+    22| )
+    23| from langchain.schema.runnable.branch import RunnableBranch
+    24| from langchain.schema.runnable.config import RunnableConfig, patch_config
+    25| from langchain.schema.runnable.fallbacks import RunnableWithFallbacks
+    26| from langchain.schema.runnable.passthrough import RunnablePassthrough
+    27| from langchain.schema.runnable.router import RouterInput, RouterRunnable
+    28| from langchain.schema.runnable.utils import ConfigurableField
+    29| __all__ = [
+    30|     "ConfigurableField",
+    31|     "GetLocalVar",
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/schema/runnable/base.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1643-1791 ---
+  1643|     def astream(
+  1644|         self,
+  1645|         input: Input,
+  1646|         config: Optional[RunnableConfig] = None,
+  1647|         **kwargs: Any,
+  1648|     ) -> AsyncIterator[Output]:
+  1649|         async def input_aiter() -> AsyncIterator[Input]:
+  1650|             yield input
+  1651|         return self.atransform(input_aiter(), config, **kwargs)
+  1652|     async def ainvoke(
+  1653|         self, input: Input, config: Optional[RunnableConfig] = None, **kwargs: Any
+  1654|     ) -> Output:
+  1655|         final = None
+  1656|         async for output in self.astream(input, config, **kwargs):
+  1657|             if final is None:
+  1658|                 final = output
+  1659|             else:
+  1660|                 final = final + output
+  1661|         return cast(Output, final)
+  1662| class RunnableLambda(Runnable[Input, Output]):
+  1663|     """RunnableLambda converts a python callable into a Runnable.
+  1664|     Wrapping a callable in a RunnableLambda makes the callable usable
+  1665|     within either a sync or async context.
+  1666|     RunnableLambda can be composed as any other Runnable and provides
+  1667|     seamless integration with LangChain tracing.
+  1668|     Examples:
+  1669|         .. code-block:: python
+  1670|             from langchain.schema.runnable import RunnableLambda
+  1671|             def add_one(x: int) -> int:
+  1672|                 return x + 1
+  1673|             runnable = RunnableLambda(add_one)
+  1674|             runnable.invoke(1) # returns 2
+  1675|             runnable.batch([1, 2, 3]) # returns [2, 3, 4]
+  1676|             await runnable.ainvoke(1) # returns 2
+  1677|             await runnable.abatch([1, 2, 3]) # returns [2, 3, 4]
+  1678|             async def add_one_async(x: int) -> int:
+  1679|                 return x + 1
+  1680|             runnable = RunnableLambda(add_one, afunc=add_one_async)
+  1681|             runnable.invoke(1) # Uses add_one
+  1682|             await runnable.ainvoke(1) # Uses add_one_async
+  1683|     """
+  1684|     def __init__(
+  1685|         self,
+  1686|         func: Union[Callable[[Input], Output], Callable[[Input], Awaitable[Output]]],
+  1687|         afunc: Optional[Callable[[Input], Awaitable[Output]]] = None,
+  1688|     ) -> None:
+  1689|         """Create a RunnableLambda from a callable, and async callable or both.
+  1690|         Accepts both sync and async variants to allow providing efficient
+  1691|         implementations for sync and async execution.
+  1692|         Args:
+  1693|             func: Either sync or async callable
+  1694|             afunc: An async callable that takes an input and returns an output.
+  1695|         """
+  1696|         if afunc is not None:
+  1697|             self.afunc = afunc
+  1698|         if inspect.iscoroutinefunction(func):
+  1699|             if afunc is not None:
+  1700|                 raise TypeError(
+  1701|                     "Func was provided as a coroutine function, but afunc was "
+  1702|                     "also provided. If providing both, func should be a regular "
+  1703|                     "function to avoid ambiguity."
+  1704|                 )
+  1705|             self.afunc = func
+  1706|         elif callable(func):
+  1707|             self.func = cast(Callable[[Input], Output], func)
+  1708|         else:
+  1709|             raise TypeError(
+  1710|                 "Expected a callable type for `func`."
+  1711|                 f"Instead got an unsupported type: {type(func)}"
+  1712|             )
+  1713|     @property
+  1714|     def InputType(self) -> Any:
+  1715|         """The type of the input to this runnable."""
+  1716|         func = getattr(self, "func", None) or getattr(self, "afunc")
+  1717|         try:
+  1718|             params = inspect.signature(func).parameters
+  1719|             first_param = next(iter(params.values()), None)
+  1720|             if first_param and first_param.annotation != inspect.Parameter.empty:
+  1721|                 return first_param.annotation
+  1722|             else:
+  1723|                 return Any
+  1724|         except ValueError:
+  1725|             return Any
+  1726|     @property
+  1727|     def input_schema(self) -> Type[BaseModel]:
+  1728|         """The pydantic schema for the input to this runnable."""
+  1729|         func = getattr(self, "func", None) or getattr(self, "afunc")
+  1730|         if isinstance(func, itemgetter):
+  1731|             items = str(func).replace("operator.itemgetter(", "")[:-1].split(", ")
+  1732|             if all(
+  1733|                 item[0] == "'" and item[-1] == "'" and len(item) > 2 for item in items
+  1734|             ):
+  1735|                 return create_model(
+  1736|                     "RunnableLambdaInput",
+  1737|                     **{item[1:-1]: (Any, None) for item in items},  # type: ignore
+  1738|                 )
+  1739|             else:
+  1740|                 return create_model("RunnableLambdaInput", __root__=(List[Any], None))
+  1741|         if dict_keys := get_function_first_arg_dict_keys(func):
+  1742|             return create_model(
+  1743|                 "RunnableLambdaInput",
+  1744|                 **{key: (Any, None) for key in dict_keys},  # type: ignore
+  1745|             )
+  1746|         return super().input_schema
+  1747|     @property
+  1748|     def OutputType(self) -> Any:
+  1749|         """The type of the output of this runnable as a type annotation."""
+  1750|         func = getattr(self, "func", None) or getattr(self, "afunc")
+  1751|         try:
+  1752|             sig = inspect.signature(func)
+  1753|             return (
+  1754|                 sig.return_annotation
+  1755|                 if sig.return_annotation != inspect.Signature.empty
+  1756|                 else Any
+  1757|             )
+  1758|         except ValueError:
+  1759|             return Any
+  1760|     def __eq__(self, other: Any) -> bool:
+  1761|         if isinstance(other, RunnableLambda):
+  1762|             if hasattr(self, "func") and hasattr(other, "func"):
+  1763|                 return self.func == other.func
+  1764|             elif hasattr(self, "afunc") and hasattr(other, "afunc"):
+  1765|                 return self.afunc == other.afunc
+  1766|             else:
+  1767|                 return False
+  1768|         else:
+  1769|             return False
+  1770|     def __repr__(self) -> str:
+  1771|         """A string representation of this runnable."""
+  1772|         return f"RunnableLambda({get_lambda_source(self.func) or '...'})"
+  1773|     def _invoke(
+  1774|         self,
+  1775|         input: Input,
+  1776|         run_manager: CallbackManagerForChainRun,
+  1777|         config: RunnableConfig,
+  1778|     ) -> Output:
+  1779|         output = call_func_with_variable_args(self.func, input, run_manager, config)
+  1780|         if isinstance(output, Runnable):
+  1781|             recursion_limit = config["recursion_limit"]
+  1782|             if recursion_limit <= 0:
+  1783|                 raise RecursionError(
+  1784|                     f"Recursion limit reached when invoking {self} with input {input}."
+  1785|                 )
+  1786|             output = output.invoke(
+  1787|                 input,
+  1788|                 patch_config(
+  1789|                     config,
+  1790|                     callbacks=run_manager.get_child(),
+  1791|                     recursion_limit=recursion_limit - 1,
+
+# --- HUNK 2: Lines 1817-1875 ---
+  1817|             )
+  1818|         return output
+  1819|     def _config(
+  1820|         self, config: Optional[RunnableConfig], callable: Callable[..., Any]
+  1821|     ) -> RunnableConfig:
+  1822|         config = config or {}
+  1823|         if config.get("run_name") is None:
+  1824|             try:
+  1825|                 run_name = callable.__name__
+  1826|             except AttributeError:
+  1827|                 run_name = None
+  1828|             if run_name is not None:
+  1829|                 return patch_config(config, run_name=run_name)
+  1830|         return config
+  1831|     def invoke(
+  1832|         self,
+  1833|         input: Input,
+  1834|         config: Optional[RunnableConfig] = None,
+  1835|         **kwargs: Optional[Any],
+  1836|     ) -> Output:
+  1837|         """Invoke this runnable synchronously."""
+  1838|         if hasattr(self, "func"):
+  1839|             return self._call_with_config(
+  1840|                 self._invoke,
+  1841|                 input,
+  1842|                 self._config(config, self.func),
+  1843|             )
+  1844|         else:
+  1845|             raise TypeError(
+  1846|                 "Cannot invoke a coroutine function synchronously."
+  1847|                 "Use `ainvoke` instead."
+  1848|             )
+  1849|     async def ainvoke(
+  1850|         self,
+  1851|         input: Input,
+  1852|         config: Optional[RunnableConfig] = None,
+  1853|         **kwargs: Optional[Any],
+  1854|     ) -> Output:
+  1855|         """Invoke this runnable asynchronously."""
+  1856|         if hasattr(self, "afunc"):
+  1857|             return await self._acall_with_config(
+  1858|                 self._ainvoke,
+  1859|                 input,
+  1860|                 self._config(config, self.afunc),
+  1861|             )
+  1862|         else:
+  1863|             return await super().ainvoke(input, config)
+  1864| class RunnableEach(RunnableSerializable[List[Input], List[Output]]):
+  1865|     """
+  1866|     A runnable that delegates calls to another runnable
+  1867|     with each element of the input sequence.
+  1868|     """
+  1869|     bound: Runnable[Input, Output]
+  1870|     class Config:
+  1871|         arbitrary_types_allowed = True
+  1872|     @property
+  1873|     def InputType(self) -> Any:
+  1874|         return List[self.bound.InputType]  # type: ignore[name-defined]
+  1875|     @property
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/schema/runnable/passthrough.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-119 ---
+     1| """Implementation of the RunnablePassthrough."""
+     2| from __future__ import annotations
+     3| import asyncio
+     4| import threading
+     5| from typing import (
+     6|     Any,
+     7|     AsyncIterator,
+     8|     Callable,
+     9|     Dict,
+    10|     Iterator,
+    11|     List,
+    12|     Mapping,
+    13|     Optional,
+    14|     Sequence,
+    15|     Type,
+    16|     Union,
+    17|     cast,
+    18| )
+    19| from langchain.pydantic_v1 import BaseModel, create_model
+    20| from langchain.schema.runnable.base import (
+    21|     Input,
+    22|     Runnable,
+    23|     RunnableParallel,
+    24|     RunnableSerializable,
+    25| )
+    26| from langchain.schema.runnable.config import RunnableConfig, get_executor_for_config
+    27| from langchain.schema.runnable.utils import AddableDict, ConfigurableFieldSpec
+    28| from langchain.utils.aiter import atee, py_anext
+    29| from langchain.utils.iter import safetee
+    30| def identity(x: Input) -> Input:
+    31|     """An identity function"""
+    32|     return x
+    33| async def aidentity(x: Input) -> Input:
+    34|     """An async identity function"""
+    35|     return x
+    36| class RunnablePassthrough(RunnableSerializable[Input, Input]):
+    37|     """A runnable to passthrough inputs unchanged or with additional keys.
+    38|     This runnable behaves almost like the identity function, except that it
+    39|     can be configured to add additional keys to the output, if the input is a
+    40|     dict.
+    41|     The examples below demonstrate this runnable works using a few simple
+    42|     chains. The chains rely on simple lambdas to make the examples easy to execute
+    43|     and experiment with.
+    44|     Examples:
+    45|         .. code-block:: python
+    46|             from langchain.schema.runnable import RunnablePassthrough, RunnableParallel
+    47|             runnable = RunnableParallel(
+    48|                 origin=RunnablePassthrough(),
+    49|                 modified=lambda x: x+1
+    50|             )
+    51|             runnable.invoke(1) # {'origin': 1, 'modified': 2}
+    52|              def fake_llm(prompt: str) -> str: # Fake LLM for the example
+    53|                 return "completion"
+    54|             chain = RunnableLambda(fake_llm) | {
+    55|                 'original': RunnablePassthrough(), # Original LLM output
+    56|                 'parsed': lambda text: text[::-1] # Parsing logic
+    57|             }
+    58|             chain.invoke('hello') # {'original': 'completion', 'parsed': 'noitelpmoc'}
+    59|     In some cases, it may be useful to pass the input through while adding some
+    60|     keys to the output. In this case, you can use the `assign` method:
+    61|         .. code-block:: python
+    62|             from langchain.schema.runnable import RunnablePassthrough, RunnableParallel
+    63|              def fake_llm(prompt: str) -> str: # Fake LLM for the example
+    64|                 return "completion"
+    65|             runnable = {
+    66|                 'llm1':  fake_llm,
+    67|                 'llm2':  fake_llm,
+    68|             }
+    69|             | RunnablePassthrough.assign(
+    70|                 total_chars=lambda inputs: len(inputs['llm1'] + inputs['llm2'])
+    71|               )
+    72|             runnable.invoke('hello')
+    73|     """
+    74|     input_type: Optional[Type[Input]] = None
+    75|     @classmethod
+    76|     def is_lc_serializable(cls) -> bool:
+    77|         return True
+    78|     @classmethod
+    79|     def get_lc_namespace(cls) -> List[str]:
+    80|         return cls.__module__.split(".")[:-1]
+    81|     @property
+    82|     def InputType(self) -> Any:
+    83|         return self.input_type or Any
+    84|     @property
+    85|     def OutputType(self) -> Any:
+    86|         return self.input_type or Any
+    87|     @classmethod
+    88|     def assign(
+    89|         cls,
+    90|         **kwargs: Union[
+    91|             Runnable[Dict[str, Any], Any],
+    92|             Callable[[Dict[str, Any]], Any],
+    93|             Mapping[
+    94|                 str,
+    95|                 Union[Runnable[Dict[str, Any], Any], Callable[[Dict[str, Any]], Any]],
+    96|             ],
+    97|         ],
+    98|     ) -> RunnableAssign:
+    99|         """Merge the Dict input with the output produced by the mapping argument.
+   100|         Args:
+   101|             mapping: A mapping from keys to runnables or callables.
+   102|         Returns:
+   103|             A runnable that merges the Dict input with the output produced by the
+   104|             mapping argument.
+   105|         """
+   106|         return RunnableAssign(RunnableParallel(kwargs))
+   107|     def invoke(self, input: Input, config: Optional[RunnableConfig] = None) -> Input:
+   108|         return self._call_with_config(identity, input, config)
+   109|     async def ainvoke(
+   110|         self,
+   111|         input: Input,
+   112|         config: Optional[RunnableConfig] = None,
+   113|         **kwargs: Optional[Any],
+   114|     ) -> Input:
+   115|         return await self._acall_with_config(aidentity, input, config)
+   116|     def transform(
+   117|         self,
+   118|         input: Iterator[Input],
+   119|         config: Optional[RunnableConfig] = None,
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/tools/shell/tool.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-67 ---
+     1| import asyncio
+     2| import platform
+     3| import warnings
+     4| from typing import Any, List, Optional, Type, Union
+     5| from langchain.callbacks.manager import (
+     6|     AsyncCallbackManagerForToolRun,
+     7|     CallbackManagerForToolRun,
+     8| )
+     9| from langchain.pydantic_v1 import BaseModel, Field, root_validator
+    10| from langchain.tools.base import BaseTool
+    11| class ShellInput(BaseModel):
+    12|     """Commands for the Bash Shell tool."""
+    13|     commands: Union[str, List[str]] = Field(
+    14|         ...,
+    15|         description="List of shell commands to run. Deserialized using json.loads",
+    16|     )
+    17|     """List of shell commands to run."""
+    18|     @root_validator
+    19|     def _validate_commands(cls, values: dict) -> dict:
+    20|         """Validate commands."""
+    21|         commands = values.get("commands")
+    22|         if not isinstance(commands, list):
+    23|             values["commands"] = [commands]
+    24|         warnings.warn(
+    25|             "The shell tool has no safeguards by default. Use at your own risk."
+    26|         )
+    27|         return values
+    28| def _get_default_bash_process() -> Any:
+    29|     """Get default bash process."""
+    30|     try:
+    31|         from langchain_experimental.llm_bash.bash import BashProcess
+    32|     except ImportError:
+    33|         raise ImportError(
+    34|             "BashProcess has been moved to langchain experimental."
+    35|             "To use this tool, install langchain-experimental "
+    36|             "with `pip install langchain-experimental`."
+    37|         )
+    38|     return BashProcess(return_err_output=True)
+    39| def _get_platform() -> str:
+    40|     """Get platform."""
+    41|     system = platform.system()
+    42|     if system == "Darwin":
+    43|         return "MacOS"
+    44|     return system
+    45| class ShellTool(BaseTool):
+    46|     """Tool to run shell commands."""
+    47|     process: Any = Field(default_factory=_get_default_bash_process)
+    48|     """Bash process to run commands."""
+    49|     name: str = "terminal"
+    50|     """Name of tool."""
+    51|     description: str = f"Run shell commands on this {_get_platform()} machine."
+    52|     """Description of tool."""
+    53|     args_schema: Type[BaseModel] = ShellInput
+    54|     """Schema for input arguments."""
+    55|     def _run(
+    56|         self,
+    57|         commands: Union[str, List[str]],
+    58|         run_manager: Optional[CallbackManagerForToolRun] = None,
+    59|     ) -> str:
+    60|         """Run commands and return final output."""
+    61|         return self.process.run(commands)
+    62|     async def _arun(
+    63|         self,
+    64|         commands: Union[str, List[str]],
+    65|         run_manager: Optional[AsyncCallbackManagerForToolRun] = None,
+    66|     ) -> str:
+    67|         """Run commands asynchronously and return final output."""
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/utilities/__init__.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-63 ---
+     1| """**Utilities** are the integrations with third-part systems and packages.
+     2| Other LangChain classes use **Utilities** to interact with third-part systems
+     3| and packages.
+     4| """
+     5| from langchain.utilities.alpha_vantage import AlphaVantageAPIWrapper
+     6| from langchain.utilities.apify import ApifyWrapper
+     7| from langchain.utilities.arcee import ArceeWrapper
+     8| from langchain.utilities.arxiv import ArxivAPIWrapper
+     9| from langchain.utilities.awslambda import LambdaWrapper
+    10| from langchain.utilities.bibtex import BibtexparserWrapper
+    11| from langchain.utilities.bing_search import BingSearchAPIWrapper
+    12| from langchain.utilities.brave_search import BraveSearchWrapper
+    13| from langchain.utilities.duckduckgo_search import DuckDuckGoSearchAPIWrapper
+    14| from langchain.utilities.golden_query import GoldenQueryAPIWrapper
+    15| from langchain.utilities.google_places_api import GooglePlacesAPIWrapper
+    16| from langchain.utilities.google_search import GoogleSearchAPIWrapper
+    17| from langchain.utilities.google_serper import GoogleSerperAPIWrapper
+    18| from langchain.utilities.graphql import GraphQLAPIWrapper
+    19| from langchain.utilities.jira import JiraAPIWrapper
+    20| from langchain.utilities.max_compute import MaxComputeAPIWrapper
+    21| from langchain.utilities.metaphor_search import MetaphorSearchAPIWrapper
+    22| from langchain.utilities.openweathermap import OpenWeatherMapAPIWrapper
+    23| from langchain.utilities.portkey import Portkey
+    24| from langchain.utilities.powerbi import PowerBIDataset
+    25| from langchain.utilities.pubmed import PubMedAPIWrapper
+    26| from langchain.utilities.python import PythonREPL
+    27| from langchain.utilities.requests import Requests, RequestsWrapper, TextRequestsWrapper
+    28| from langchain.utilities.scenexplain import SceneXplainAPIWrapper
+    29| from langchain.utilities.searchapi import SearchApiAPIWrapper
+    30| from langchain.utilities.searx_search import SearxSearchWrapper
+    31| from langchain.utilities.serpapi import SerpAPIWrapper
+    32| from langchain.utilities.spark_sql import SparkSQL
+    33| from langchain.utilities.sql_database import SQLDatabase
+    34| from langchain.utilities.tensorflow_datasets import TensorflowDatasets
+    35| from langchain.utilities.twilio import TwilioAPIWrapper
+    36| from langchain.utilities.wikipedia import WikipediaAPIWrapper
+    37| from langchain.utilities.wolfram_alpha import WolframAlphaAPIWrapper
+    38| from langchain.utilities.zapier import ZapierNLAWrapper
+    39| __all__ = [
+    40|     "AlphaVantageAPIWrapper",
+    41|     "ApifyWrapper",
+    42|     "ArceeWrapper",
+    43|     "ArxivAPIWrapper",
+    44|     "BibtexparserWrapper",
+    45|     "BingSearchAPIWrapper",
+    46|     "BraveSearchWrapper",
+    47|     "DuckDuckGoSearchAPIWrapper",
+    48|     "GoldenQueryAPIWrapper",
+    49|     "GooglePlacesAPIWrapper",
+    50|     "GoogleSearchAPIWrapper",
+    51|     "GoogleSerperAPIWrapper",
+    52|     "GraphQLAPIWrapper",
+    53|     "JiraAPIWrapper",
+    54|     "LambdaWrapper",
+    55|     "MaxComputeAPIWrapper",
+    56|     "MetaphorSearchAPIWrapper",
+    57|     "OpenWeatherMapAPIWrapper",
+    58|     "Portkey",
+    59|     "PowerBIDataset",
+    60|     "PubMedAPIWrapper",
+    61|     "PythonREPL",
+    62|     "Requests",
+    63|     "RequestsWrapper",
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/utilities/arcee.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-157 ---
+     1| from enum import Enum
+     2| from typing import Any, Dict, List, Literal, Mapping, Optional, Union
+     3| import requests
+     4| from langchain.pydantic_v1 import BaseModel, root_validator
+     5| from langchain.schema.retriever import Document
+     6| class ArceeRoute(str, Enum):
+     7|     generate = "models/generate"
+     8|     retrieve = "models/retrieve"
+     9|     model_training_status = "models/status/{id_or_name}"
+    10| class DALMFilterType(str, Enum):
+    11|     fuzzy_search = "fuzzy_search"
+    12|     strict_search = "strict_search"
+    13| class DALMFilter(BaseModel):
+    14|     """Filters available for a dalm retrieval and generation
+    15|     Arguments:
+    16|         field_name: The field to filter on. Can be 'document' or 'name' to filter
+    17|             on your document's raw text or title. Any other field will be presumed
+    18|             to be a metadata field you included when uploading your context data
+    19|         filter_type: Currently 'fuzzy_search' and 'strict_search' are supported.
+    20|             'fuzzy_search' means a fuzzy search on the provided field is performed.
+    21|             The exact strict doesn't need to exist in the document
+    22|             for this to find a match.
+    23|             Very useful for scanning a document for some keyword terms.
+    24|             'strict_search' means that the exact string must appear
+    25|             in the provided field.
+    26|             This is NOT an exact eq filter. ie a document with content
+    27|             "the happy dog crossed the street" will match on a strict_search of
+    28|             "dog" but won't match on "the dog".
+    29|             Python equivalent of `return search_string in full_string`.
+    30|         value: The actual value to search for in the context data/metadata
+    31|     """
+    32|     field_name: str
+    33|     filter_type: DALMFilterType
+    34|     value: str
+    35|     _is_metadata: bool = False
+    36|     @root_validator()
+    37|     def set_meta(cls, values: Dict) -> Dict:
+    38|         """document and name are reserved arcee keys. Anything else is metadata"""
+    39|         values["_is_meta"] = values.get("field_name") not in ["document", "name"]
+    40|         return values
+    41| class ArceeWrapper:
+    42|     def __init__(
+    43|         self,
+    44|         arcee_api_key: str,
+    45|         arcee_api_url: str,
+    46|         arcee_api_version: str,
+    47|         model_kwargs: Optional[Dict[str, Any]],
+    48|         model_name: str,
+    49|     ):
+    50|         self.arcee_api_key = arcee_api_key
+    51|         self.model_kwargs = model_kwargs
+    52|         self.arcee_api_url = arcee_api_url
+    53|         self.arcee_api_version = arcee_api_version
+    54|         try:
+    55|             route = ArceeRoute.model_training_status.value.format(id_or_name=model_name)
+    56|             response = self._make_request("get", route)
+    57|             self.model_id = response.get("model_id")
+    58|             self.model_training_status = response.get("status")
+    59|         except Exception as e:
+    60|             raise ValueError(
+    61|                 f"Error while validating model training status for '{model_name}': {e}"
+    62|             ) from e
+    63|     def validate_model_training_status(self) -> None:
+    64|         if self.model_training_status != "training_complete":
+    65|             raise Exception(
+    66|                 f"Model {self.model_id} is not ready. "
+    67|                 "Please wait for training to complete."
+    68|             )
+    69|     def _make_request(
+    70|         self,
+    71|         method: Literal["post", "get"],
+    72|         route: Union[ArceeRoute, str],
+    73|         body: Optional[Mapping[str, Any]] = None,
+    74|         params: Optional[dict] = None,
+    75|         headers: Optional[dict] = None,
+    76|     ) -> dict:
+    77|         """Make a request to the Arcee API
+    78|         Args:
+    79|             method: The HTTP method to use
+    80|             route: The route to call
+    81|             body: The body of the request
+    82|             params: The query params of the request
+    83|             headers: The headers of the request
+    84|         """
+    85|         headers = self._make_request_headers(headers=headers)
+    86|         url = self._make_request_url(route=route)
+    87|         req_type = getattr(requests, method)
+    88|         response = req_type(url, json=body, params=params, headers=headers)
+    89|         if response.status_code not in (200, 201):
+    90|             raise Exception(f"Failed to make request. Response: {response.text}")
+    91|         return response.json()
+    92|     def _make_request_headers(self, headers: Optional[Dict] = None) -> Dict:
+    93|         headers = headers or {}
+    94|         internal_headers = {
+    95|             "X-Token": self.arcee_api_key,
+    96|             "Content-Type": "application/json",
+    97|         }
+    98|         headers.update(internal_headers)
+    99|         return headers
+   100|     def _make_request_url(self, route: Union[ArceeRoute, str]) -> str:
+   101|         return f"{self.arcee_api_url}/{self.arcee_api_version}/{route}"
+   102|     def _make_request_body_for_models(
+   103|         self, prompt: str, **kwargs: Mapping[str, Any]
+   104|     ) -> Mapping[str, Any]:
+   105|         """Make the request body for generate/retrieve models endpoint"""
+   106|         _model_kwargs = self.model_kwargs or {}
+   107|         _params = {**_model_kwargs, **kwargs}
+   108|         filters = [DALMFilter(**f) for f in _params.get("filters", [])]
+   109|         return dict(
+   110|             model_id=self.model_id,
+   111|             query=prompt,
+   112|             size=_params.get("size", 3),
+   113|             filters=filters,
+   114|             id=self.model_id,
+   115|         )
+   116|     def generate(
+   117|         self,
+   118|         prompt: str,
+   119|         **kwargs: Any,
+   120|     ) -> str:
+   121|         """Generate text from Arcee DALM.
+   122|         Args:
+   123|             prompt: Prompt to generate text from.
+   124|             size: The max number of context results to retrieve. Defaults to 3.
+   125|             (Can be less if filters are provided).
+   126|             filters: Filters to apply to the context dataset.
+   127|         """
+   128|         response = self._make_request(
+   129|             method="post",
+   130|             route=ArceeRoute.generate,
+   131|             body=self._make_request_body_for_models(
+   132|                 prompt=prompt,
+   133|                 **kwargs,
+   134|             ),
+   135|         )
+   136|         return response["text"]
+   137|     def retrieve(
+   138|         self,
+   139|         query: str,
+   140|         **kwargs: Any,
+   141|     ) -> List[Document]:
+   142|         """Retrieve {size} contexts with your retriever for a given query
+   143|         Args:
+   144|             query: Query to submit to the model
+   145|             size: The max number of context results to retrieve. Defaults to 3.
+   146|             (Can be less if filters are provided).
+   147|             filters: Filters to apply to the context dataset.
+   148|         """
+   149|         response = self._make_request(
+   150|             method="post",
+   151|             route=ArceeRoute.retrieve,
+   152|             body=self._make_request_body_for_models(
+   153|                 prompt=query,
+   154|                 **kwargs,
+   155|             ),
+   156|         )
+   157|         return [Document(**doc) for doc in response["documents"]]
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/utils/math.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-56 ---
+     1| """Math utils."""
+     2| import logging
+     3| from typing import List, Optional, Tuple, Union
+     4| import numpy as np
+     5| logger = logging.getLogger(__name__)
+     6| Matrix = Union[List[List[float]], List[np.ndarray], np.ndarray]
+     7| def cosine_similarity(X: Matrix, Y: Matrix) -> np.ndarray:
+     8|     """Row-wise cosine similarity between two equal-width matrices."""
+     9|     if len(X) == 0 or len(Y) == 0:
+    10|         return np.array([])
+    11|     X = np.array(X)
+    12|     Y = np.array(Y)
+    13|     if X.shape[1] != Y.shape[1]:
+    14|         raise ValueError(
+    15|             f"Number of columns in X and Y must be the same. X has shape {X.shape} "
+    16|             f"and Y has shape {Y.shape}."
+    17|         )
+    18|     try:
+    19|         import simsimd as simd
+    20|         X = np.array(X, dtype=np.float32)
+    21|         Y = np.array(Y, dtype=np.float32)
+    22|         Z = 1 - simd.cdist(X, Y, metric="cosine")
+    23|         if isinstance(Z, float):
+    24|             return np.array([Z])
+    25|         return Z
+    26|     except ImportError:
+    27|         logger.info(
+    28|             "Unable to import simsimd, defaulting to NumPy implementation. If you want "
+    29|             "to use simsimd please install with `pip install simsimd`."
+    30|         )
+    31|         X_norm = np.linalg.norm(X, axis=1)
+    32|         Y_norm = np.linalg.norm(Y, axis=1)
+    33|         with np.errstate(divide="ignore", invalid="ignore"):
+    34|             similarity = np.dot(X, Y.T) / np.outer(X_norm, Y_norm)
+    35|         similarity[np.isnan(similarity) | np.isinf(similarity)] = 0.0
+    36|         return similarity
+    37| def cosine_similarity_top_k(
+    38|     X: Matrix,
+    39|     Y: Matrix,
+    40|     top_k: Optional[int] = 5,
+    41|     score_threshold: Optional[float] = None,
+    42| ) -> Tuple[List[Tuple[int, int]], List[float]]:
+    43|     """Row-wise cosine similarity with optional top-k and score threshold filtering.
+    44|     Args:
+    45|         X: Matrix.
+    46|         Y: Matrix, same width as X.
+    47|         top_k: Max number of results to return.
+    48|         score_threshold: Minimum cosine similarity of results.
+    49|     Returns:
+    50|         Tuple of two lists. First contains two-tuples of indices (X_idx, Y_idx),
+    51|             second contains corresponding cosine similarities.
+    52|     """
+    53|     if len(X) == 0 or len(Y) == 0:
+    54|         return [], []
+    55|     score_array = cosine_similarity(X, Y)
+    56|     score_threshold = score_threshold or -1.0
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/vectorstores/__init__.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 87-129 ---
+    87|     from langchain.vectorstores.hologres import Hologres
+    88|     return Hologres
+    89| def _import_lancedb() -> Any:
+    90|     from langchain.vectorstores.lancedb import LanceDB
+    91|     return LanceDB
+    92| def _import_llm_rails() -> Any:
+    93|     from langchain.vectorstores.llm_rails import LLMRails
+    94|     return LLMRails
+    95| def _import_marqo() -> Any:
+    96|     from langchain.vectorstores.marqo import Marqo
+    97|     return Marqo
+    98| def _import_matching_engine() -> Any:
+    99|     from langchain.vectorstores.matching_engine import MatchingEngine
+   100|     return MatchingEngine
+   101| def _import_meilisearch() -> Any:
+   102|     from langchain.vectorstores.meilisearch import Meilisearch
+   103|     return Meilisearch
+   104| def _import_milvus() -> Any:
+   105|     from langchain.vectorstores.milvus import Milvus
+   106|     return Milvus
+   107| def _import_momento_vector_index() -> Any:
+   108|     from langchain.vectorstores.momento_vector_index import MomentoVectorIndex
+   109|     return MomentoVectorIndex
+   110| def _import_mongodb_atlas() -> Any:
+   111|     from langchain.vectorstores.mongodb_atlas import MongoDBAtlasVectorSearch
+   112|     return MongoDBAtlasVectorSearch
+   113| def _import_myscale() -> Any:
+   114|     from langchain.vectorstores.myscale import MyScale
+   115|     return MyScale
+   116| def _import_myscale_settings() -> Any:
+   117|     from langchain.vectorstores.myscale import MyScaleSettings
+   118|     return MyScaleSettings
+   119| def _import_neo4j_vector() -> Any:
+   120|     from langchain.vectorstores.neo4j_vector import Neo4jVector
+   121|     return Neo4jVector
+   122| def _import_opensearch_vector_search() -> Any:
+   123|     from langchain.vectorstores.opensearch_vector_search import OpenSearchVectorSearch
+   124|     return OpenSearchVectorSearch
+   125| def _import_pgembedding() -> Any:
+   126|     from langchain.vectorstores.pgembedding import PGEmbedding
+   127|     return PGEmbedding
+   128| def _import_pgvector() -> Any:
+   129|     from langchain.vectorstores.pgvector import PGVector
+
+# --- HUNK 2: Lines 241-282 ---
+   241|     elif name == "ElasticsearchStore":
+   242|         return _import_elasticsearch()
+   243|     elif name == "Epsilla":
+   244|         return _import_epsilla()
+   245|     elif name == "FAISS":
+   246|         return _import_faiss()
+   247|     elif name == "Hologres":
+   248|         return _import_hologres()
+   249|     elif name == "LanceDB":
+   250|         return _import_lancedb()
+   251|     elif name == "LLMRails":
+   252|         return _import_llm_rails()
+   253|     elif name == "Marqo":
+   254|         return _import_marqo()
+   255|     elif name == "MatchingEngine":
+   256|         return _import_matching_engine()
+   257|     elif name == "Meilisearch":
+   258|         return _import_meilisearch()
+   259|     elif name == "Milvus":
+   260|         return _import_milvus()
+   261|     elif name == "MomentoVectorIndex":
+   262|         return _import_momento_vector_index()
+   263|     elif name == "MongoDBAtlasVectorSearch":
+   264|         return _import_mongodb_atlas()
+   265|     elif name == "MyScaleSettings":
+   266|         return _import_myscale_settings()
+   267|     elif name == "MyScale":
+   268|         return _import_myscale()
+   269|     elif name == "Neo4jVector":
+   270|         return _import_neo4j_vector()
+   271|     elif name == "OpenSearchVectorSearch":
+   272|         return _import_opensearch_vector_search()
+   273|     elif name == "PGEmbedding":
+   274|         return _import_pgembedding()
+   275|     elif name == "PGVector":
+   276|         return _import_pgvector()
+   277|     elif name == "Pinecone":
+   278|         return _import_pinecone()
+   279|     elif name == "Qdrant":
+   280|         return _import_qdrant()
+   281|     elif name == "Redis":
+   282|         return _import_redis()
+
+# --- HUNK 3: Lines 340-380 ---
+   340|     "Clickhouse",
+   341|     "ClickhouseSettings",
+   342|     "DashVector",
+   343|     "DeepLake",
+   344|     "DeepLake",
+   345|     "Dingo",
+   346|     "DocArrayHnswSearch",
+   347|     "DocArrayInMemorySearch",
+   348|     "ElasticKnnSearch",
+   349|     "ElasticVectorSearch",
+   350|     "ElasticsearchStore",
+   351|     "Epsilla",
+   352|     "FAISS",
+   353|     "Hologres",
+   354|     "LanceDB",
+   355|     "LLMRails",
+   356|     "Marqo",
+   357|     "MatchingEngine",
+   358|     "Meilisearch",
+   359|     "Milvus",
+   360|     "MomentoVectorIndex",
+   361|     "MongoDBAtlasVectorSearch",
+   362|     "MyScale",
+   363|     "MyScaleSettings",
+   364|     "Neo4jVector",
+   365|     "OpenSearchVectorSearch",
+   366|     "OpenSearchVectorSearch",
+   367|     "PGEmbedding",
+   368|     "PGVector",
+   369|     "Pinecone",
+   370|     "Qdrant",
+   371|     "Redis",
+   372|     "Rockset",
+   373|     "SKLearnVectorStore",
+   374|     "ScaNN",
+   375|     "SingleStoreDB",
+   376|     "SingleStoreDB",
+   377|     "SQLiteVSS",
+   378|     "StarRocks",
+   379|     "SupabaseVectorStore",
+   380|     "Tair",
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/vectorstores/llm_rails.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-125 ---
+     1| """Wrapper around LLMRails vector database."""
+     2| from __future__ import annotations
+     3| import json
+     4| import logging
+     5| import os
+     6| import uuid
+     7| from typing import Any, Iterable, List, Optional, Tuple
+     8| import requests
+     9| from langchain.pydantic_v1 import Field
+    10| from langchain.schema import Document
+    11| from langchain.schema.embeddings import Embeddings
+    12| from langchain.vectorstores.base import VectorStore, VectorStoreRetriever
+    13| class LLMRails(VectorStore):
+    14|     """Implementation of Vector Store using LLMRails (https://llmrails.com/).
+    15|     Example:
+    16|         .. code-block:: python
+    17|             from langchain.vectorstores import LLMRails
+    18|             vectorstore = LLMRails(
+    19|                 api_key=llm_rails_api_key,
+    20|                 datastore_id=datastore_id
+    21|             )
+    22|     """
+    23|     def __init__(
+    24|         self,
+    25|         datastore_id: Optional[str] = None,
+    26|         api_key: Optional[str] = None,
+    27|     ):
+    28|         """Initialize with LLMRails API."""
+    29|         self._datastore_id = datastore_id or os.environ.get("LLM_RAILS_DATASTORE_ID")
+    30|         self._api_key = api_key or os.environ.get("LLM_RAILS_API_KEY")
+    31|         if self._api_key is None:
+    32|             logging.warning("Can't find Rails credentials in environment.")
+    33|         self._session = requests.Session()  # to reuse connections
+    34|         self.datastore_id = datastore_id
+    35|         self.base_url = "https://api.llmrails.com/v1"
+    36|     def _get_post_headers(self) -> dict:
+    37|         """Returns headers that should be attached to each post request."""
+    38|         return {"X-API-KEY": self._api_key}
+    39|     def add_texts(
+    40|         self,
+    41|         texts: Iterable[str],
+    42|         metadatas: Optional[List[dict]] = None,
+    43|         **kwargs: Any,
+    44|     ) -> List[str]:
+    45|         """Run more texts through the embeddings and add to the vectorstore.
+    46|         Args:
+    47|             texts: Iterable of strings to add to the vectorstore.
+    48|         Returns:
+    49|             List of ids from adding the texts into the vectorstore.
+    50|         """
+    51|         names: List[str] = []
+    52|         for text in texts:
+    53|             doc_name = str(uuid.uuid4())
+    54|             response = self._session.post(
+    55|                 f"{self.base_url}/datastores/{self._datastore_id}/text",
+    56|                 json={"name": doc_name, "text": text},
+    57|                 verify=True,
+    58|                 headers=self._get_post_headers(),
+    59|             )
+    60|             if response.status_code != 200:
+    61|                 logging.error(
+    62|                     f"Create request failed for doc_name = {doc_name} with status code "
+    63|                     f"{response.status_code}, reason {response.reason}, text "
+    64|                     f"{response.text}"
+    65|                 )
+    66|                 return names
+    67|             names.append(doc_name)
+    68|         return names
+    69|     def add_files(
+    70|         self,
+    71|         files_list: Iterable[str],
+    72|         metadatas: Optional[List[dict]] = None,
+    73|         **kwargs: Any,
+    74|     ) -> bool:
+    75|         """
+    76|         LLMRails provides a way to add documents directly via our API where
+    77|         pre-processing and chunking occurs internally in an optimal way
+    78|         This method provides a way to use that API in LangChain
+    79|         Args:
+    80|             files_list: Iterable of strings, each representing a local file path.
+    81|                     Files could be text, HTML, PDF, markdown, doc/docx, ppt/pptx, etc.
+    82|                     see API docs for full list
+    83|         Returns:
+    84|             List of ids associated with each of the files indexed
+    85|         """
+    86|         files = []
+    87|         for file in files_list:
+    88|             if not os.path.exists(file):
+    89|                 logging.error(f"File {file} does not exist, skipping")
+    90|                 continue
+    91|             files.append(("file", (os.path.basename(file), open(file, "rb"))))
+    92|         response = self._session.post(
+    93|             f"{self.base_url}/datastores/{self._datastore_id}/file",
+    94|             files=files,
+    95|             verify=True,
+    96|             headers=self._get_post_headers(),
+    97|         )
+    98|         if response.status_code != 200:
+    99|             logging.error(
+   100|                 f"Create request failed for datastore = {self._datastore_id} "
+   101|                 f"with status code {response.status_code}, reason {response.reason}, "
+   102|                 f"text {response.text}"
+   103|             )
+   104|             return False
+   105|         return True
+   106|     def similarity_search_with_score(
+   107|         self, query: str, k: int = 5
+   108|     ) -> List[Tuple[Document, float]]:
+   109|         """Return LLMRails documents most similar to query, along with scores.
+   110|         Args:
+   111|             query: Text to look up documents similar to.
+   112|             k: Number of Documents to return. Defaults to 5 Max 10.
+   113|             alpha: parameter for hybrid search .
+   114|         Returns:
+   115|             List of Documents most similar to the query and score for each.
+   116|         """
+   117|         response = self._session.post(
+   118|             headers=self._get_post_headers(),
+   119|             url=f"{self.base_url}/datastores/{self._datastore_id}/search",
+   120|             data=json.dumps({"k": k, "text": query}),
+   121|             timeout=10,
+   122|         )
+   123|         if response.status_code != 200:
+   124|             logging.error(
+   125|                 "Query failed %s",
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/vectorstores/momento_vector_index.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-331 ---
+     1| from typing import (
+     2|     TYPE_CHECKING,
+     3|     Any,
+     4|     Iterable,
+     5|     List,
+     6|     Optional,
+     7|     Tuple,
+     8|     Type,
+     9|     TypeVar,
+    10|     cast,
+    11| )
+    12| from uuid import uuid4
+    13| from langchain.docstore.document import Document
+    14| from langchain.schema.embeddings import Embeddings
+    15| from langchain.schema.vectorstore import VectorStore
+    16| from langchain.utils import get_from_env
+    17| from langchain.vectorstores.utils import DistanceStrategy
+    18| VST = TypeVar("VST", bound="VectorStore")
+    19| if TYPE_CHECKING:
+    20|     from momento import PreviewVectorIndexClient
+    21| class MomentoVectorIndex(VectorStore):
+    22|     """`Momento Vector Index` (MVI) vector store.
+    23|     Momento Vector Index is a serverless vector index that can be used to store and
+    24|     search vectors. To use you should have the ``momento`` python package installed.
+    25|     Example:
+    26|         .. code-block:: python
+    27|             from langchain.embeddings import OpenAIEmbeddings
+    28|             from langchain.vectorstores import MomentoVectorIndex
+    29|             from momento import (
+    30|                 CredentialProvider,
+    31|                 PreviewVectorIndexClient,
+    32|                 VectorIndexConfigurations,
+    33|             )
+    34|             vectorstore = MomentoVectorIndex(
+    35|                 embedding=OpenAIEmbeddings(),
+    36|                 client=PreviewVectorIndexClient(
+    37|                     VectorIndexConfigurations.Default.latest(),
+    38|                     credential_provider=CredentialProvider.from_environment_variable(
+    39|                         "MOMENTO_API_KEY"
+    40|                     ),
+    41|                 ),
+    42|                 index_name="my-index",
+    43|             )
+    44|     """
+    45|     def __init__(
+    46|         self,
+    47|         embedding: Embeddings,
+    48|         client: "PreviewVectorIndexClient",
+    49|         index_name: str = "default",
+    50|         distance_strategy: DistanceStrategy = DistanceStrategy.COSINE,
+    51|         text_field: str = "text",
+    52|         ensure_index_exists: bool = True,
+    53|         **kwargs: Any,
+    54|     ):
+    55|         """Initialize a Vector Store backed by Momento Vector Index.
+    56|         Args:
+    57|             embedding (Embeddings): The embedding function to use.
+    58|             configuration (VectorIndexConfiguration): The configuration to initialize
+    59|                 the Vector Index with.
+    60|             credential_provider (CredentialProvider): The credential provider to
+    61|                 authenticate the Vector Index with.
+    62|             index_name (str, optional): The name of the index to store the documents in.
+    63|                 Defaults to "default".
+    64|             distance_strategy (DistanceStrategy, optional): The distance strategy to
+    65|                 use. Defaults to DistanceStrategy.COSINE. If you select
+    66|                 DistanceStrategy.EUCLIDEAN_DISTANCE, Momento uses the squared
+    67|                 Euclidean distance.
+    68|             text_field (str, optional): The name of the metadata field to store the
+    69|                 original text in. Defaults to "text".
+    70|             ensure_index_exists (bool, optional): Whether to ensure that the index
+    71|                 exists before adding documents to it. Defaults to True.
+    72|         """
+    73|         try:
+    74|             from momento import PreviewVectorIndexClient
+    75|         except ImportError:
+    76|             raise ImportError(
+    77|                 "Could not import momento python package. "
+    78|                 "Please install it with `pip install momento`."
+    79|             )
+    80|         self._client: PreviewVectorIndexClient = client
+    81|         self._embedding = embedding
+    82|         self.index_name = index_name
+    83|         self.__validate_distance_strategy(distance_strategy)
+    84|         self.distance_strategy = distance_strategy
+    85|         self.text_field = text_field
+    86|         self._ensure_index_exists = ensure_index_exists
+    87|     @staticmethod
+    88|     def __validate_distance_strategy(distance_strategy: DistanceStrategy) -> None:
+    89|         if distance_strategy not in [
+    90|             DistanceStrategy.COSINE,
+    91|             DistanceStrategy.MAX_INNER_PRODUCT,
+    92|             DistanceStrategy.MAX_INNER_PRODUCT,
+    93|         ]:
+    94|             raise ValueError(f"Distance strategy {distance_strategy} not implemented.")
+    95|     @property
+    96|     def embeddings(self) -> Embeddings:
+    97|         return self._embedding
+    98|     def _create_index_if_not_exists(self, num_dimensions: int) -> bool:
+    99|         """Create index if it does not exist."""
+   100|         from momento.requests.vector_index import SimilarityMetric
+   101|         from momento.responses.vector_index import CreateIndex
+   102|         similarity_metric = None
+   103|         if self.distance_strategy == DistanceStrategy.COSINE:
+   104|             similarity_metric = SimilarityMetric.COSINE_SIMILARITY
+   105|         elif self.distance_strategy == DistanceStrategy.MAX_INNER_PRODUCT:
+   106|             similarity_metric = SimilarityMetric.INNER_PRODUCT
+   107|         elif self.distance_strategy == DistanceStrategy.EUCLIDEAN_DISTANCE:
+   108|             similarity_metric = SimilarityMetric.EUCLIDEAN_SIMILARITY
+   109|         else:
+   110|             raise ValueError(
+   111|                 f"Distance strategy {self.distance_strategy} not implemented."
+   112|             )
+   113|         response = self._client.create_index(
+   114|             self.index_name, num_dimensions, similarity_metric
+   115|         )
+   116|         if isinstance(response, CreateIndex.Success):
+   117|             return True
+   118|         elif isinstance(response, CreateIndex.IndexAlreadyExists):
+   119|             return False
+   120|         elif isinstance(response, CreateIndex.Error):
+   121|             raise response.inner_exception
+   122|         else:
+   123|             raise Exception(f"Unexpected response: {response}")
+   124|     def add_texts(
+   125|         self,
+   126|         texts: Iterable[str],
+   127|         metadatas: Optional[List[dict]] = None,
+   128|         **kwargs: Any,
+   129|     ) -> List[str]:
+   130|         """Run more texts through the embeddings and add to the vectorstore.
+   131|         Args:
+   132|             texts (Iterable[str]): Iterable of strings to add to the vectorstore.
+   133|             metadatas (Optional[List[dict]]): Optional list of metadatas associated with
+   134|                 the texts.
+   135|             kwargs (Any): Other optional parameters. Specifically:
+   136|             - ids (List[str], optional): List of ids to use for the texts.
+   137|                 Defaults to None, in which case uuids are generated.
+   138|         Returns:
+   139|             List[str]: List of ids from adding the texts into the vectorstore.
+   140|         """
+   141|         from momento.requests.vector_index import Item
+   142|         from momento.responses.vector_index import UpsertItemBatch
+   143|         texts = list(texts)
+   144|         if len(texts) == 0:
+   145|             return []
+   146|         if metadatas is not None:
+   147|             for metadata, text in zip(metadatas, texts):
+   148|                 metadata[self.text_field] = text
+   149|         else:
+   150|             metadatas = [{self.text_field: text} for text in texts]
+   151|         try:
+   152|             embeddings = self._embedding.embed_documents(texts)
+   153|         except NotImplementedError:
+   154|             embeddings = [self._embedding.embed_query(x) for x in texts]
+   155|         if self._ensure_index_exists:
+   156|             self._create_index_if_not_exists(len(embeddings[0]))
+   157|         if "ids" in kwargs:
+   158|             ids = kwargs["ids"]
+   159|             if len(ids) != len(embeddings):
+   160|                 raise ValueError("Number of ids must match number of texts")
+   161|         else:
+   162|             ids = [str(uuid4()) for _ in range(len(embeddings))]
+   163|         batch_size = 128
+   164|         for i in range(0, len(embeddings), batch_size):
+   165|             start = i
+   166|             end = min(i + batch_size, len(embeddings))
+   167|             items = [
+   168|                 Item(id=id, vector=vector, metadata=metadata)
+   169|                 for id, vector, metadata in zip(
+   170|                     ids[start:end],
+   171|                     embeddings[start:end],
+   172|                     metadatas[start:end],
+   173|                 )
+   174|             ]
+   175|             response = self._client.upsert_item_batch(self.index_name, items)
+   176|             if isinstance(response, UpsertItemBatch.Success):
+   177|                 pass
+   178|             elif isinstance(response, UpsertItemBatch.Error):
+   179|                 raise response.inner_exception
+   180|             else:
+   181|                 raise Exception(f"Unexpected response: {response}")
+   182|         return ids
+   183|     def delete(self, ids: Optional[List[str]] = None, **kwargs: Any) -> Optional[bool]:
+   184|         """Delete by vector ID.
+   185|         Args:
+   186|             ids (List[str]): List of ids to delete.
+   187|             kwargs (Any): Other optional parameters (unused)
+   188|         Returns:
+   189|             Optional[bool]: True if deletion is successful,
+   190|             False otherwise, None if not implemented.
+   191|         """
+   192|         from momento.responses.vector_index import DeleteItemBatch
+   193|         if ids is None:
+   194|             return True
+   195|         response = self._client.delete_item_batch(self.index_name, ids)
+   196|         return isinstance(response, DeleteItemBatch.Success)
+   197|     def similarity_search(
+   198|         self, query: str, k: int = 4, **kwargs: Any
+   199|     ) -> List[Document]:
+   200|         """Search for similar documents to the query string.
+   201|         Args:
+   202|             query (str): The query string to search for.
+   203|             k (int, optional): The number of results to return. Defaults to 4.
+   204|         Returns:
+   205|             List[Document]: A list of documents that are similar to the query.
+   206|         """
+   207|         res = self.similarity_search_with_score(query=query, k=k, **kwargs)
+   208|         return [doc for doc, _ in res]
+   209|     def similarity_search_with_score(
+   210|         self,
+   211|         query: str,
+   212|         k: int = 4,
+   213|         **kwargs: Any,
+   214|     ) -> List[Tuple[Document, float]]:
+   215|         """Search for similar documents to the query string.
+   216|         Args:
+   217|             query (str): The query string to search for.
+   218|             k (int, optional): The number of results to return. Defaults to 4.
+   219|             kwargs (Any): Vector Store specific search parameters. The following are
+   220|                 forwarded to the Momento Vector Index:
+   221|             - top_k (int, optional): The number of results to return.
+   222|         Returns:
+   223|             List[Tuple[Document, float]]: A list of tuples of the form
+   224|                 (Document, score).
+   225|         """
+   226|         embedding = self._embedding.embed_query(query)
+   227|         results = self.similarity_search_with_score_by_vector(
+   228|             embedding=embedding, k=k, **kwargs
+   229|         )
+   230|         return results
+   231|     def similarity_search_with_score_by_vector(
+   232|         self,
+   233|         embedding: List[float],
+   234|         k: int = 4,
+   235|         **kwargs: Any,
+   236|     ) -> List[Tuple[Document, float]]:
+   237|         """Search for similar documents to the query vector.
+   238|         Args:
+   239|             embedding (List[float]): The query vector to search for.
+   240|             k (int, optional): The number of results to return. Defaults to 4.
+   241|             kwargs (Any): Vector Store specific search parameters. The following are
+   242|                 forwarded to the Momento Vector Index:
+   243|             - top_k (int, optional): The number of results to return.
+   244|         Returns:
+   245|             List[Tuple[Document, float]]: A list of tuples of the form
+   246|                 (Document, score).
+   247|         """
+   248|         from momento.requests.vector_index import ALL_METADATA
+   249|         from momento.responses.vector_index import Search
+   250|         if "top_k" in kwargs:
+   251|             k = kwargs["k"]
+   252|         response = self._client.search(
+   253|             self.index_name, embedding, top_k=k, metadata_fields=ALL_METADATA
+   254|         )
+   255|         if not isinstance(response, Search.Success):
+   256|             return []
+   257|         results = []
+   258|         for hit in response.hits:
+   259|             text = cast(str, hit.metadata.pop(self.text_field))
+   260|             doc = Document(page_content=text, metadata=hit.metadata)
+   261|             pair = (doc, hit.distance)
+   262|             results.append(pair)
+   263|         return results
+   264|     def similarity_search_by_vector(
+   265|         self, embedding: List[float], k: int = 4, **kwargs: Any
+   266|     ) -> List[Document]:
+   267|         """Search for similar documents to the query vector.
+   268|         Args:
+   269|             embedding (List[float]): The query vector to search for.
+   270|             k (int, optional): The number of results to return. Defaults to 4.
+   271|         Returns:
+   272|             List[Document]: A list of documents that are similar to the query.
+   273|         """
+   274|         results = self.similarity_search_with_score_by_vector(
+   275|             embedding=embedding, k=k, **kwargs
+   276|         )
+   277|         return [doc for doc, _ in results]
+   278|     @classmethod
+   279|     def from_texts(
+   280|         cls: Type[VST],
+   281|         texts: List[str],
+   282|         embedding: Embeddings,
+   283|         metadatas: Optional[List[dict]] = None,
+   284|         **kwargs: Any,
+   285|     ) -> VST:
+   286|         """Return the Vector Store initialized from texts and embeddings.
+   287|         Args:
+   288|             cls (Type[VST]): The Vector Store class to use to initialize
+   289|                 the Vector Store.
+   290|             texts (List[str]): The texts to initialize the Vector Store with.
+   291|             embedding (Embeddings): The embedding function to use.
+   292|             metadatas (Optional[List[dict]], optional): The metadata associated with
+   293|                 the texts. Defaults to None.
+   294|             kwargs (Any): Vector Store specific parameters. The following are forwarded
+   295|                 to the Vector Store constructor and required:
+   296|             - index_name (str, optional): The name of the index to store the documents
+   297|                 in. Defaults to "default".
+   298|             - text_field (str, optional): The name of the metadata field to store the
+   299|                 original text in. Defaults to "text".
+   300|             - distance_strategy (DistanceStrategy, optional): The distance strategy to
+   301|                 use. Defaults to DistanceStrategy.COSINE. If you select
+   302|                 DistanceStrategy.EUCLIDEAN_DISTANCE, Momento uses the squared
+   303|                 Euclidean distance.
+   304|             - ensure_index_exists (bool, optional): Whether to ensure that the index
+   305|                 exists before adding documents to it. Defaults to True.
+   306|             Additionally you can either pass in a client or an API key
+   307|             - client (PreviewVectorIndexClient): The Momento Vector Index client to use.
+   308|             - api_key (Optional[str]): The configuration to use to initialize
+   309|                 the Vector Index with. Defaults to None. If None, the configuration
+   310|                 is initialized from the environment variable `MOMENTO_API_KEY`.
+   311|         Returns:
+   312|             VST: Momento Vector Index vector store initialized from texts and
+   313|                 embeddings.
+   314|         """
+   315|         from momento import (
+   316|             CredentialProvider,
+   317|             PreviewVectorIndexClient,
+   318|             VectorIndexConfigurations,
+   319|         )
+   320|         if "client" in kwargs:
+   321|             client = kwargs.pop("client")
+   322|         else:
+   323|             supplied_api_key = kwargs.pop("api_key", None)
+   324|             api_key = supplied_api_key or get_from_env("api_key", "MOMENTO_API_KEY")
+   325|             client = PreviewVectorIndexClient(
+   326|                 configuration=VectorIndexConfigurations.Default.latest(),
+   327|                 credential_provider=CredentialProvider.from_string(api_key),
+   328|             )
+   329|         vector_db = cls(embedding=embedding, client=client, **kwargs)  # type: ignore
+   330|         vector_db.add_texts(texts=texts, metadatas=metadatas, **kwargs)
+   331|         return vector_db
+

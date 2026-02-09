@@ -102,4 +102,12 @@ A representative sample of 100 vulnerabilities distributed across ecosystems:
 
 **Full Dataset**: [Download from Google Drive](https://drive.google.com/file/d/1GLB_SqsQpMkdZ2lTBrU02Fq9_CZPXpwS/view?usp=sharing)
 
-<!-- TODO: Upload diff_dataset.zip to Zenodo and update the link above -->
+### LLM Analysis Results
+
+Results from running 10 LLMs on the diff dataset in two modes:
+- `_vulnerable`: Testing if LLM detects vulnerability in the vulnerable code
+- `_patched`: Testing if LLM correctly identifies patched code as safe
+
+**Sample Results** (100 vulnerabilities × 10 models × 2 modes): `llm_analysis/diff_analysis_results_sample/`
+
+**Full Results**: `llm_analysis/diff_analysis_results.zip`

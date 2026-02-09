@@ -1,0 +1,888 @@
+--- a/lib/jamf.rb
++++ b/lib/jamf.rb
+@@ -3,20 +3,21 @@
+ require 'yaml'
+ require 'pathname'
+ require 'time'
+ require 'singleton'
+ require 'open-uri'
+ require 'ipaddr'
+ require 'base64'
+ require 'shellwords'
+ require 'digest'
+ require 'open3'
++require 'plist'
+ require 'immutable-struct'
+ require 'jamf/configuration'
+ require 'jamf/exceptions'
+ require 'jamf/utility'
+ require 'jamf/validate'
+ require 'jamf/version'
+ require 'jamf/compatibility'
+ require 'jamf/ruby_extensions'
+ require 'jamf/api/connection'
+ module Jamf
+
+--- a/lib/jamf/client.rb
++++ b/lib/jamf/client.rb
+@@ -46,21 +46,21 @@
+     def self.jss_protocol
+       jss_url
+       @protocol
+     end
+     def self.jss_port
+       jss_url
+       @port
+     end
+     def self.jamf_plist
+       return {} unless JAMF_PLIST.file?
+-      Jamf.parse_plist JAMF_PLIST
++      JSS.parse_plist JAMF_PLIST
+     end
+     def self.receipts
+       raise JSS::NoSuchItemError, "The JAMF Receipts folder doesn't exist on this computer." unless RECEIPTS_FOLDER.exist?
+       RECEIPTS_FOLDER.children.select(&:file?)
+     end
+     def self.jss_available?
+       run_jamf :checkJSSConnection, '-retry 1'
+       $CHILD_STATUS.exitstatus.zero?
+     end
+     def self.jss_record
+@@ -69,21 +69,21 @@
+       nil
+     end
+     def self.udid
+       hardware_data['platform_UUID']
+     end
+     def self.serial_number
+       hardware_data['serial_number']
+     end
+     def self.hardware_data
+       raw = `/usr/sbin/system_profiler SPHardwareDataType -xml 2>/dev/null`
+-      Jamf.parse_plist(raw)[0]['_items'][0]
++      JSS.parse_plist(raw)[0]['_items'][0]
+     end
+     def self.console_users
+       output = `#{CONSOLE_USERS_SCUTIL_CMD}`
+       userlines = output.lines.select { |l| l =~ /SessionUserNameKey\s*:/ }
+       userlines.map! { |ul| ul.split(':').last.strip }
+       userlines.reject { |un| un == ROOT_USER }
+     end
+     def self.primary_console_user
+       `#{CONSOLE_USERS_SCUTIL_CMD}` =~ /^\s*Name : (\S+)$/
+       user = Regexp.last_match(1)
+@@ -94,21 +94,21 @@
+     end
+     def self.self_service_users
+       ss_userlines = `#{PS_USER_COMM}`.lines.select { |l| l.include? SELF_SERVICE_EXECUTABLE_END }
+       ss_userlines.map { |ssl| ssl.split(' ').first }
+     end
+     def self.do_not_disturb?(user = nil)
+       home = user ? homedir(user) : Dir.home
+       myudid = udid
+       nc_prefs_file = Pathname.new "#{home}/#{USER_PREFS_BYHOST_FOLDER}/com.apple.notificationcenterui.#{myudid}.plist"
+       return nil unless nc_prefs_file.readable?
+-      Jamf.parse_plist(nc_prefs_file)['doNotDisturb']
++      JSS.parse_plist(nc_prefs_file)['doNotDisturb']
+     end
+     def self.homedir(user)
+       dir = `/usr/bin/dscl . -read /Users/#{user} NFSHomeDirectory 2>/dev/null`.chomp.split(': ').last
+       dir ? Pathname.new(dir) : nil
+     end
+     def self.script_running_via_policy?
+       root_ps_lines = `ps -u root -x -o pid -o ppid -o user -o command`.lines
+       parent_pid, _parent_user, parent_command = parent_pid_user_and_cmd Process.pid, root_ps_lines
+       return false unless parent_pid
+       until parent_command =~ POLICY_SCRIPT_CMD_RE || parent_pid.nil?
+
+--- a/lib/jamf/client/management_action.rb
++++ b/lib/jamf/client/management_action.rb
+@@ -24,25 +24,25 @@
+       orig_flags
+     end
+     def self.restore_alerts(orig_flags)
+       orig_flags.each do |user, flags|
+         set_mgmt_action_ncprefs_flags user, flags, hup: false
+       end
+       system HUP_NOTIF_CTR_CMD unless orig_flags.empty?
+     end
+     def self.set_mgmt_action_ncprefs_flags(user, flags, hup: true)
+       plist = Pathname.new "/Users/#{user}/Library/Preferences/#{NCPREFS_DOMAIN}.plist"
+-      prefs = Jamf.parse_plist plist
++      prefs = JSS.parse_plist plist
+       mgmt_action_setting = prefs['apps'].select { |a| a['bundle-id'] == MGMT_ACTION_BUNDLE_ID }.first
+       if mgmt_action_setting
+         orig_flags = mgmt_action_setting['flags']
+         mgmt_action_setting['flags'] = flags
+       else
+         orig_flags = flags
+         prefs['apps'] << { 'bundle-id' => MGMT_ACTION_BUNDLE_ID, 'flags' => flags }
+       end
+-      plist.open('w') { |f| f.write Jamf.xml_plist_from(prefs) }
++      plist.open('w') { |f| f.write prefs.to_plist }
+       system HUP_NOTIF_CTR_CMD if hup
+       orig_flags
+     end
+   end # class Client
+ end # module
+
+--- a/lib/jamf/composer.rb
++++ b/lib/jamf/composer.rb
+@@ -15,32 +15,32 @@
+       pkg_out = "#{opts[:out_dir]}/#{pkg_filename}"
+       pkg_ownership = opts[:preserve_ownership] ? 'preserve' : 'recommended'
+       if opts[:signing_identity]
+         signing = "--sign '#{opts[:signing_identity]}'"
+         signing << " #{opts[:signing_options]}" if opts[:signing_options]
+       else
+         signing = ''
+       end # if opts[:signing_identity]
+       comp_plist_out = Pathname.new "/tmp/#{PKG_BUNDLE_ID_PFX}-#{pkg_filename}.plist"
+       system "#{PKGBUILD} --analyze --root '#{root}' '#{comp_plist_out}'"
+-      comp_plist = Jamf.parse_plist comp_plist_out
++      comp_plist = Plist.parse_xml comp_plist_out.read
+       if comp_plist[0].nil?
+         comp_plist_arg = ''
+       else
+         comp_plist.each do |bndl|
+           bndl.delete 'ChildBundles' if bndl['ChildBundles']
+           bndl['BundleOverwriteAction'] = 'upgrade'
+           bndl['BundleIsVersionChecked'] = false
+           bndl['BundleIsRelocatable'] = false
+           bndl['BundleHasStrictIdentifier'] = false
+         end
+-        comp_plist_out.open('w') { |f| f.write Jamf.xml_plist_from(comp_plist) }
++        comp_plist_out.open('w') { |f| f.write comp_plist.to_plist }
+         comp_plist_arg = "--component-plist '#{comp_plist_out}'"
+       end
+       begin
+         it_built = system "#{PKGBUILD} --identifier '#{pkg_id}' --version '#{version}' --ownership #{pkg_ownership} --install-location / --root '#{root}' #{signing} #{comp_plist_arg} '#{pkg_out}' "
+         raise 'There was an error building the .pkg' unless it_built
+       ensure
+         comp_plist_out.delete if comp_plist_out.exist?
+       end
+       Pathname.new pkg_out
+     end # mk_dot_pkg
+
+--- a/lib/jamf/utility.rb
++++ b/lib/jamf/utility.rb
+@@ -50,40 +50,33 @@
+       valstr = somedata
+       valarr = somedata.split(/,\s*/)
+     when Array
+       valstr = somedata.join ', '
+       valarr = somedata
+     else
+       raise Jamf::InvalidDataError, 'Input must be a comma-separated String or an Array of Strings'
+     end # case
+     { stringform: valstr, arrayform: valarr }
+   end # to_s_and_a
+-  def self.parse_plist(plist, symbol_keys: false)
+-    require 'cfpropertylist'
++  def self.parse_plist(plist)
+     case plist
+     when String
+-      return CFPropertyList.native_types(CFPropertyList::List.new(data: plist).value, symbol_keys) if plist.include? '</plist>'
++      return Plist.parse_xml plist if plist.include? '</plist>'
+       plist = Pathname.new plist
+     when Pathname
+       true
+     else
+       raise ArgumentError, 'Argument must be a path (as a Pathname or String) or a String of XML'
+     end # case plist
+-    raise JSS::MissingDataError, "No such file: #{plist}" unless plist.file?
+-    CFPropertyList.native_types(CFPropertyList::List.new(file: plist).value, symbol_keys)
++    raise Jamf::MissingDataError, "No such file: #{plist}" unless plist.file?
++    Plist.parse_xml `/usr/libexec/PlistBuddy -x -c print #{Shellwords.escape(plist.to_s)}`.force_encoding('UTF-8')
+   end # parse_plist
+-  def self.xml_plist_from(data)
+-    require 'cfpropertylist'
+-    plist = CFPropertyList::List.new
+-    plist.value = CFPropertyList.guess(data, convert_unknown_to_string: true)
+-    plist.to_str(CFPropertyList::List::FORMAT_XML)
+-  end
+   def self.parse_time(a_datetime)
+     return nil if NIL_DATES.include? a_datetime
+     the_dt = DateTime.parse(a_datetime.to_s)
+     usec = (the_dt.sec_fraction * 60 * 60 * 24 * (10**6)).to_i
+     the_dt = DateTime.new(the_dt.year, the_dt.month, the_dt.day, the_dt.hour, the_dt.min, the_dt.sec, Jamf::TIME_ZONE_OFFSET) if the_dt.offset.zero?
+     Time.at the_dt.strftime('%s').to_i, usec
+   end # parse_time
+   def self.epoch_to_time(epoch)
+     return nil if NIL_DATES.include? epoch
+     Time.at(epoch.to_i / 1000.0)
+
+--- a/lib/jss.rb
++++ b/lib/jss.rb
+@@ -13,20 +13,21 @@
+   require 'base64'
+   require 'shellwords'
+   require 'digest'
+   require 'yaml'
+   require 'open3'
+   require 'English'
+   require 'json'
+   require 'digest'
+   require 'faraday'
+   require 'faraday_middleware'
++  require 'plist'
+   require 'immutable-struct'
+   require 'recursive-open-struct'
+   MINIMUM_SERVER_VERSION = '10.4.0'.freeze
+   TIME_ZONE_OFFSET =  Rational(Time.now.utc_offset, 60 * 60 * 24)
+   TRUE_FALSE = [true, false].freeze
+   NIL_DATES = [0, nil, '', '0'].freeze
+   BLANK = ''.freeze
+   @@stdin_lines = nil
+   module Composer; end
+   module Creatable; end
+
+--- a/lib/jss/api_connection.rb
++++ b/lib/jss/api_connection.rb
+@@ -261,21 +261,20 @@
+     end
+     def handle_http_error
+       return if @last_http_response.success?
+       case @last_http_response.status
+       when 404
+         err = JSS::NoSuchItemError
+         msg = 'Not Found'
+       when 409
+         err = JSS::ConflictError
+         @last_http_response.body =~ /<p>(The server has not .*?)(<|$)/m
+-        Regexp.last_match(1) ||  @last_http_response.body =~ %r{<p>Error: (.*?)</p>}
+         msg = Regexp.last_match(1)
+       when 400
+         err = JSS::BadRequestError
+         @last_http_response.body =~ %r{>Bad Request</p>\n<p>(.*?)</p>\n<p>You can get technical detail}m
+         msg = Regexp.last_match(1)
+       when 401
+         err = JSS::AuthorizationError
+         msg = 'You are not authorized to do that.'
+       when (500..599)
+         err = JSS::APIRequestError
+
+--- a/lib/jss/api_object/configuration_profile.rb
++++ b/lib/jss/api_object/configuration_profile.rb
+@@ -24,29 +24,29 @@
+       @redeploy_on_update = @main_subset[:redeploy_on_update]
+       @payloads = @main_subset[:payloads]
+     end
+     def description=(new_val)
+       new_val = new_val.strip
+       return nil if @self_service_description == new_val
+       @description = new_val
+       @need_to_update = true
+     end # @param new_val[String] how should this be distributed to clients?
+     def parsed_payloads
+-      JSS.parse_plist @payloads
++      Plist.parse_xml @payloads
+     end
+     def payload_content
+       parsed_payloads['PayloadContent']
+     end
+     def payload_content=(new_content)
+       payload_plist_data = parsed_payloads
+       payload_plist_data['PayloadContent'] = new_content
+-      @payloads = JSS.xml_plist_from new_content
++      @payloads = payload_plist_data.to_plist
+       @need_to_update = true
+       @update_payloads = true
+     end
+     def payload_types
+       payload_content.map { |p| p['PayloadType'] }
+     end
+     def update(redeploy_to_all: false)
+       @redeploy_on_update = redeploy_to_all ? REDEPLOY_ALL : REDEPLOY_NEWLY_ASSIGNED
+       super()
+       @redeploy_on_update = REDEPLOY_NEWLY_ASSIGNED
+
+--- a/lib/jss/api_object/network_segment.rb
++++ b/lib/jss/api_object/network_segment.rb
+@@ -127,31 +127,30 @@
+       raise TypeError, 'Argument must be a JSS::NetworkSegment' unless \
+         other_segment.is_a? JSS::NetworkSegment
+       other_range = other_segment.range
+       range.include?(other_range.begin) || range.include?(other_range.end)
+     end
+     def include?(thing)
+       if thing.is_a? JSS::NetworkSegment
+         @starting_address <= thing.range.begin && @ending_address >= thing.range.end
+       else
+         thing = IPAddr.new thing.to_s
+-        range.cover? thing
+-      end
+-    end
+-    alias cover? include?
++        range.include? thing
++      end
++    end
+     def ==(other)
+       raise TypeError, 'Argument must be a JSS::NetworkSegment' unless \
+         other.is_a? JSS::NetworkSegment
+       range == other.range
+     end
+     def building=(newval)
+-      new =
++      new = 
+         if newval.to_s.empty?
+           JSS::BLANK
+         else
+           id = JSS::Building.valid_id newval
+           raise JSS::MissingDataError, "No building matching '#{newval}'" unless id
+           JSS::Building.map_all_ids_to(:name)[id]
+         end
+       @building = new
+       @need_to_update = true
+     end
+@@ -183,33 +182,33 @@
+           JSS::BLANK
+         else
+           id = JSS::DistributionPoint.valid_id newval
+           raise JSS::MissingDataError, "No distribution_point matching '#{newval}' in the JSS" unless id
+           JSS::DistributionPoint.map_all_ids_to(:name)[id]
+         end
+       @distribution_point = new
+       @need_to_update = true
+     end
+     def netboot_server=(newval)
+-      new =
++      new = 
+         if newval.to_s.empty?
+           JSS::BLANK
+         else
+           id = JSS::NetBootServer.valid_id newval
+           raise JSS::MissingDataError, "No netboot_server matching '#{newval}' in the JSS" unless id
+           JSS::NetbootServer.map_all_ids_to(:name)[id]
+         end
+       @netboot_server = new
+       @need_to_update = true
+     end
+     def swu_server=(newval)
+-      new =
++      new = 
+         if newval.to_s.empty?
+           JSS::BLANK
+         else
+           id = JSS::SoftwareUpdateServer.valid_id newval
+           raise JSS::MissingDataError, "No swu_server matching '#{newval}' in the JSS" unless id
+           JSS::SoftwareUpdateServer.map_all_ids_to(:name)[id]
+         end
+       @swu_server = new
+       @need_to_update = true
+     end
+
+--- a/lib/jss/api_object/policy.rb
++++ b/lib/jss/api_object/policy.rb
+@@ -156,21 +156,20 @@
+       weeks: 'Weeks',
+       month: 'Months',
+       months: 'Months',
+       year: 'Years',
+       years: 'Years'
+     }.freeze
+     OBJECT_HISTORY_OBJECT_TYPE = 3
+     SITE_SUBSET = :general
+     CATEGORY_SUBSET = :general
+     CATEGORY_DATA_TYPE = Hash
+-    SCRIPT_PARAMETERS_AVAILABLE = %i[parameter4 parameter5 parameter6 parameter7 parameter8 parameter9 parameter10 parameter11].freeze
+     def self.flush_logs(policy, older_than: 0, period: :days, computers: [], api: JSS.api)
+       orig_timeout = api.cnx.options.timeout
+       pol_id = valid_id policy
+       raise JSS::NoSuchItemError, "No Policy identified by '#{policy}'." unless pol_id
+       older_than = LOG_FLUSH_INTERVAL_INTEGERS[older_than]
+       raise JSS::InvalidDataError, "older_than must be one of these integers: #{LOG_FLUSH_INTERVAL_INTEGERS.keys.join ', '}" unless older_than
+       period = LOG_FLUSH_INTERVAL_PERIODS[period]
+       raise JSS::InvalidDataError, "period must be one of these symbols: :#{LOG_FLUSH_INTERVAL_PERIODS.keys.join ', :'}" unless period
+       computers = [computers] unless computers.is_a? Array
+       api.timeout = 1800 unless orig_timeout && orig_timeout > 1800
+@@ -621,31 +620,20 @@
+       }
+       @scripts.insert opts[:position], script_data
+       @need_to_update = true
+       @scripts
+     end
+     def remove_script(identifier)
+       removed = @scripts.delete_if { |s| s[:id] == identifier || s[:name] == identifier }
+       @need_to_update = true if removed
+       removed
+     end
+-    def set_script_parameters(identifier, **opts)
+-      id = JSS::Script.valid_id identifier, api: @api
+-      raise JSS::NoSuchItemError, "No script matches '#{identifier}'" unless id
+-      script_data = @scripts.select { |s| s[:id] == id }[0]
+-      raise JSS::InvalidDataError, "Script #{id} is not configured. Use add_script method." unless script_data
+-      opts.each do |parameter, value|
+-        script_data[parameter] = value if SCRIPT_PARAMETERS_AVAILABLE.include? parameter
+-      end
+-      @need_to_update = true
+-      @scripts
+-    end # end set_script_parameter
+     def directory_binding_ids
+       @directory_bindings.map { |p| p[:id] }
+     end
+     def directory_binding_names
+       @directory_bindings.map { |p| p[:name] }
+     end
+     def add_directory_binding(identifier, **opts)
+       id = validate_directory_binding_opts identifier, opts
+       return nil if @directory_bindings.map { |s| s[:id] }.include? id
+       name = JSS::DirectoryBinding.map_all_ids_to(:name, api: @api)[id]
+
+--- a/lib/jss/api_object/script.rb
++++ b/lib/jss/api_object/script.rb
+@@ -12,37 +12,30 @@
+     PARAMETER_KEYS = [:parameter4, :parameter5, :parameter6, :parameter7, :parameter8, :parameter9, :parameter10, :parameter11].freeze
+     OBJECT_HISTORY_OBJECT_TYPE = 91
+     CATEGORY_SUBSET = :top
+     CATEGORY_DATA_TYPE = String
+     attr_reader :filename
+     attr_reader :os_requirements
+     attr_reader :priority
+     attr_reader :info
+     attr_reader :notes
+     attr_reader :parameters
+-    alias parameter_labels parameters
+-    alias parameter_descriptions parameters
+     attr_reader :script_contents
+-    attr_reader :script_contents_encoded
+     def initialize(args = {})
+       super
+       @filename = @init_data[:filename] || @name
+       @info = @init_data[:info]
+       @notes = @init_data[:notes]
+       @os_requirements = @init_data[:os_requirements] ? JSS.to_s_and_a(@init_data[:os_requirements])[:arrayform] : []
+       @parameters = @init_data[:parameters] ? @init_data[:parameters] : {}
+       @priority = @init_data[:priority] || DEFAULT_PRIORITY
+       @script_contents = @init_data[:script_contents]
+-      @script_contents_encoded = @init_data[:script_contents_encoded]
+-      if @script_contents && @script_contents_encoded.to_s.empty?
+-        @script_contents_encoded = Base64.encode64 @script_contents
+-      end
+     end # initialize
+     def filename=(new_val)
+       new_val = nil if new_val == ''
+       new_val = @name unless new_val
+       return nil if new_val == @filename
+       @filename = new_val
+       @need_to_update = true
+     end # filename=
+     def name=(new_val)
+       new_val = new_val.to_s
+@@ -100,71 +93,118 @@
+       @need_to_update = true
+     end # parameters=
+     def set_parameter(param_num, new_val)
+       raise JSS::NoSuchItemError, 'Parameter numbers must be from 4-11' unless (4..11).cover? param_num
+       pkey = "parameter#{param_num}".to_sym
+       raise JSS::InvalidDataError, 'parameter values must be strings or nil' unless new_val.nil? || new_val.is_a?(String)
+       return nil if new_val == @parameters[pkey]
+       @parameters[pkey] = new_val
+       @need_to_update = true
+     end
+-    alias set_parameter_label set_parameter
+-    alias set_parameter_description set_parameter
+     def script_contents=(new_val)
+       new_code = case new_val
+                  when String
+                    if new_val.start_with? '/'
+                      Pathname.new(new_val).read
+                    else
+                      new_val
+                    end # if
+                  when Pathname
+                    new_val.read
+                  else
+                    raise JSS::InvalidDataError, 'New code must be a String (path or code) or Pathname instance'
+                  end # case
+       raise JSS::InvalidDataError, "Script contents must start with '#!'" unless new_code.start_with? '#!'
+       @script_contents = new_code
+-      @script_contents_encoded = Base64.encode64 @script_contents
+-      @need_to_update = true
++      @need_to_update = true
++    end
++    def upload_master_file(rw_pw, unmount = true)
++      raise JSS::MissingDataError, 'No code specified. Use #code= first.' if @script_contents.nil? || @script_contents.empty?
++      mdp = JSS::DistributionPoint.master_distribution_point
++      raise JSS::InvaldDatatError, 'Incorrect password for read-write access to master distribution point.' unless mdp.check_pw :rw, rw_pw
++      destination = mdp.mount(rw_pw, :rw) + "#{DIST_POINT_SCRIPTS_FOLDER}/#{@filename}"
++      destination.save @script_contents
++      mdp.unmount if unmount
++    end # upload
++    def delete_master_file(rw_pw, unmount = true)
++      file = JSS::DistributionPoint.master_distribution_point.mount(rw_pw, :rw) + "#{DIST_POINT_SCRIPTS_FOLDER}/#{@filename}"
++      if file.exist?
++        file.delete
++        did_it = true
++      else
++        did_it = false
++      end # if exists
++      JSS::DistributionPoint.master_distribution_point.unmount if unmount
++      did_it
+     end
+     def run(opts = {})
+-      raise JSS::MissingDataError, 'script_contents does not start with #!' unless @script_contents.to_s.start_with? '#!'
+       opts[:target] ||= '/'
+-      opts[:computer_name] ||= JSS::Client.run_jamf('getComputerName')[/>(.)</, 1]
+-      opts[:username] ||= JSS::Client.console_user
+-      params = [opts[:target], opts[:computer_name], opts[:username]]
+-      params << opts[:p4]
+-      params << opts[:p5]
+-      params << opts[:p6]
+-      params << opts[:p7]
+-      params << opts[:p8]
+-      params << opts[:p9]
+-      params << opts[:p10]
+-      params << opts[:p11]
+-      params.map! &:to_s
+-      params.compact!
+-      params.delete_if &:empty?
+-      return_value = []
+-      require 'tmpdir'
+-      Dir.mktmpdir do |dir|
+-        executable = Pathname.new "#{dir}/#{@name}"
+-        executable.jss_touch
+-        executable.chmod 0o700
+-        executable.jss_save @script_contents
+-        cmd = [executable.to_s]
+-        cmd += params
+-        stdout_and_stderr_str, status = Open3.capture2e(*cmd)
+-        return_value << status.exitstatus
+-        return_value << stdout_and_stderr_str
+-      end # Dir.mktmpdirs
+-      return_value
++      opts[:p1] ||= @parameters[:parameter4]
++      opts[:p2] ||= @parameters[:parameter5]
++      opts[:p3] ||= @parameters[:parameter6]
++      opts[:p4] ||= @parameters[:parameter7]
++      opts[:p5] ||= @parameters[:parameter8]
++      opts[:p6] ||= @parameters[:parameter9]
++      opts[:p7] ||= @parameters[:parameter10]
++      opts[:p8] ||= @parameters[:parameter11]
++      dp_mount_pt = nil
++      delete_exec = false
++      begin
++        if @script_contents && !@script_contents.empty?
++          script_path = JSS::Client::DOWNLOADS_FOLDER
++          executable = script_path + @filename
++          executable.jss_touch
++          executable.chmod 0o700
++          executable.jss_save @script_contents
++          delete_exec = true
++        else
++          dist_point = JSS::DistributionPoint.my_distribution_point api: @api
++          if dist_point.http_downloads_enabled
++            script_path = dist_point.http_url + "/#{DIST_POINT_SCRIPTS_FOLDER}/"
++          else
++            dp_mount_pt = dist_point.mount opts[:ro_pw]
++            script_path = (dp_mount_pt + DIST_POINT_SCRIPTS_FOLDER)
++          end # if http enabled
++        end # if @script_contents and (not @script_contents.empty?)
++        command_arry = ['-script', @filename, '-path', script_path.to_s]
++        command_arry << '-target'
++        command_arry << opts[:target].to_s
++        command_arry << '-computerName' if opts[:computer_name]
++        command_arry << opts[:computer_name] if opts[:computer_name]
++        command_arry << '-username' if opts[:username]
++        command_arry << opts[:username] if opts[:username]
++        command_arry << '-p1' if opts[:p1]
++        command_arry << opts[:p1] if opts[:p1]
++        command_arry << '-p2' if opts[:p2]
++        command_arry << opts[:p2] if opts[:p2]
++        command_arry << '-p3' if opts[:p3]
++        command_arry << opts[:p3] if opts[:p3]
++        command_arry << '-p4' if opts[:p4]
++        command_arry << opts[:p4] if opts[:p4]
++        command_arry << '-p5' if opts[:p5]
++        command_arry << opts[:p5] if opts[:p5]
++        command_arry << '-p6' if opts[:p6]
++        command_arry << opts[:p6] if opts[:p6]
++        command_arry << '-p7' if opts[:p7]
++        command_arry << opts[:p7] if opts[:p7]
++        command_arry << '-p8' if opts[:p8]
++        command_arry << opts[:p8] if opts[:p8]
++        command_arry << '-verbose' if opts[:verbose]
++        command = command_arry.shelljoin
++        jamf_output =  JSS::Client.run_jamf 'runScript', command, opts[:show_output]
++        jamf_output =~ /^.*Script exit code: (\d+)(\D|$)/
++        script_exitstatus = Regexp.last_match(1).to_i
++      ensure
++        executable.delete if delete_exec && executable.exist?
++        dist_point.unmount if dp_mount_pt && dp_mount_pt.mountpoint? && opts[:unmount]
++      end # begin/ensure
++      [script_exitstatus, jamf_output]
+     end # def run
+     alias oses os_requirements
+     alias oses= os_requirements=
+     alias code script_contents
+     alias code= script_contents=
+     alias contents script_contents
+     alias contents= script_contents=
+     private
+     def rest_xml
+       doc = REXML::Document.new
+@@ -176,15 +216,15 @@
+       scpt.add_element('notes').text = @notes
+       scpt.add_element('os_requirements').text = JSS.to_s_and_a(@os_requirements)[:stringform]
+       scpt.add_element('priority').text = @priority
+       add_category_to_xml(doc)
+       if @parameters.empty?
+         scpt.add_element('parameters').text = nil
+       else
+         pars = scpt.add_element('parameters')
+         PARAMETER_KEYS.each { |p| pars.add_element(p.to_s).text = @parameters[p] }
+       end
+-      scpt.add_element('script_contents_encoded').text = script_contents_encoded
++      scpt.add_element('script_contents_encoded').text = Base64.encode64(@script_contents)
+       doc.to_s
+     end # rest xml
+   end # class Script
+ end # module
+
+--- a/lib/jss/api_object/user.rb
++++ b/lib/jss/api_object/user.rb
+@@ -21,21 +21,21 @@
+     attr_reader :mobile_devices
+     attr_reader :vpp_assignments
+     attr_reader :total_vpp_code_count
+     def initialize (args = {})
+       super
+       @full_name = @init_data[:full_name]
+       @email = @init_data[:email]
+       @phone_number = @init_data[:phone_number]
+       @position = @init_data[:position]
+       @ldap_server = JSS::APIObject.get_name @init_data[:ldap_server]
+-      @ldap_server_id = @init_data[:ldap_server][:id] unless @init_data[:ldap_server].nil?
++      @ldap_server_id = @init_data[:ldap_server][:id]
+       @sites = @init_data[:sites] ? @init_data[:sites]  : []
+       if @init_data[:links]
+         @computers = @init_data[:links][:computers]
+         @peripherals = @init_data[:links][:peripherals]
+         @mobile_devices = @init_data[:links][:mobile_devices]
+         @vpp_assignments = @init_data[:links][:vpp_assignments]
+         @total_vpp_code_count = @init_data[:links][:total_vpp_code_count]
+       end
+     end
+     def full_name= (new_val)
+
+--- a/lib/jss/client/management_action.rb
++++ b/lib/jss/client/management_action.rb
+@@ -33,16 +33,16 @@
+       plist = Pathname.new "/Users/#{user}/Library/Preferences/#{NCPREFS_DOMAIN}.plist"
+       prefs = JSS.parse_plist plist
+       mgmt_action_setting = prefs['apps'].select { |a| a['bundle-id'] == MGMT_ACTION_BUNDLE_ID }.first
+       if mgmt_action_setting
+         orig_flags = mgmt_action_setting['flags']
+         mgmt_action_setting['flags'] = flags
+       else
+         orig_flags = flags
+         prefs['apps'] << { 'bundle-id' => MGMT_ACTION_BUNDLE_ID, 'flags' => flags }
+       end
+-      plist.open('w') { |f| f.write JSS.xml_plist_from(prefs) }
++      plist.open('w') { |f| f.write prefs.to_plist }
+       system HUP_NOTIF_CTR_CMD if hup
+       orig_flags
+     end
+   end # class Client
+ end # module
+
+--- a/lib/jss/composer.rb
++++ b/lib/jss/composer.rb
+@@ -15,32 +15,32 @@
+       pkg_out = "#{opts[:out_dir]}/#{pkg_filename}"
+       pkg_ownership = opts[:preserve_ownership] ? 'preserve' : 'recommended'
+       if opts[:signing_identity]
+         signing = "--sign '#{opts[:signing_identity]}'"
+         signing << " #{opts[:signing_options]}" if opts[:signing_options]
+       else
+         signing = ''
+       end # if opts[:signing_identity]
+       comp_plist_out = Pathname.new "/tmp/#{PKG_BUNDLE_ID_PFX}-#{pkg_filename}.plist"
+       system "#{PKGBUILD} --analyze --root '#{root}' '#{comp_plist_out}'"
+-      comp_plist = JSS.parse_plist comp_plist_out
++      comp_plist = Plist.parse_xml comp_plist_out.read
+       if comp_plist[0].nil?
+         comp_plist_arg = ''
+       else
+         comp_plist.each do |bndl|
+           bndl.delete 'ChildBundles' if bndl['ChildBundles']
+           bndl['BundleOverwriteAction'] = 'upgrade'
+           bndl['BundleIsVersionChecked'] = false
+           bndl['BundleIsRelocatable'] = false
+           bndl['BundleHasStrictIdentifier'] = false
+         end
+-        comp_plist_out.open('w') { |f| f.write JSS.xml_plist_from(comp_plist) }
++        comp_plist_out.open('w') { |f| f.write comp_plist.to_plist }
+         comp_plist_arg = "--component-plist '#{comp_plist_out}'"
+       end
+       begin
+         it_built = system "#{PKGBUILD} --identifier '#{pkg_id}' --version '#{version}' --ownership #{pkg_ownership} --install-location / --root '#{root}' #{signing} #{comp_plist_arg} '#{pkg_out}'"
+         raise 'There was an error building the .pkg' unless it_built
+       ensure
+         comp_plist_out.delete if comp_plist_out.exist?
+       end
+       Pathname.new pkg_out
+     end # mk_dot_pkg
+
+--- a/lib/jss/utility.rb
++++ b/lib/jss/utility.rb
+@@ -6,80 +6,73 @@
+       5 => 8,
+       6 => 8,
+       7 => 5,
+       8 => 5,
+       9 => 5,
+       10 => 5,
+       11 => 6,
+       12 => 6,
+       13 => 6,
+       14 => 6,
+-      15 => 7
++      15 => 7,
++      16 => 12
+     }
+   MAC_OS_MAXS = {
+     11 => 12,
+     12 => 12,
+     13 => 12,
+     14 => 12,
+     15 => 12,
+     16 => 12,
+     17 => 12,
+     18 => 12,
+     19 => 12,
+     20 => 12
+   }
+   def self.expand_min_os(min_os)
+     min_os = min_os.delete '>='
+     major, minor, maint = min_os.split('.')
+-    minor = 'x' if minor.nil? || minor == '0'
+     maint = 'x' if maint.nil? || maint == '0'
+     ok_oses = []
++    if major == '11'
++      major = '10'
++      maint = minor
++      minor = '16'
++    end
+     if major == '10'
+-      if minor == '16'
+-        ok_oses << '10.16'
++      if maint == 'x'
++        ok_oses << min_os
+       else
+-        if maint == 'x'
+-          ok_oses << "10.#{minor}.x"
+-        else
+-          max_maint_for_minor = OS_TEN_MAXS[minor.to_i]
+-          (maint.to_i..max_maint_for_minor).each do |m|
+-            ok_oses << "#{major}.#{minor}.#{m}"
+-          end # each m
+-        end # if maint == x
+-        if minor.to_i < 15
+-          ((minor.to_i + 1)..15).each { |v| ok_oses << "10.#{v}.x" }
+-        end
+-        ok_oses << '10.16'
+-      end # if minor == 16
++        max_maint_for_minor = OS_TEN_MAXS[minor.to_i]
++        (maint.to_i..max_maint_for_minor).each do |m|
++          ok_oses << "#{major}.#{minor}.#{m}"
++        end # each m
++      end
++      ((minor.to_i + 1)..16).each do |v|
++        ok_oses << "#{major}.#{v}.x"
++      end # each v
+       major = '11'
+-      minor = 'x'
+-      maint = 'x'
++      minor = minor == '16' ? maint : 'x'
+     end # if major == 10
+-    if ['11', '11.x', '11.x.x', '11.0', '11.0.0'].include?(min_os) && !ok_oses.include?('10.16')
+-      ok_oses << '10.16'
+-    end
+     if minor == 'x'
+-      ((major.to_i)..20).each { |v| ok_oses << "#{v}.x" }
+-    elsif maint == 'x'
++      ok_oses << "#{major}.#{minor}"
++    else
+       max_minor_for_major = MAC_OS_MAXS[major.to_i]
+-      ((minor.to_i)..max_minor_for_major).each do |m|
+-        ok_oses << "#{major}.#{m}.x"
++      (minor.to_i..max_minor_for_major).each do |m|
++        ok_oses << "#{major}.#{m}"
+       end # each m
+-      ((major.to_i + 1)..20).each { |v| ok_oses << "#{v}.x" }
+-    else
+-      ((maint.to_i)..10).each { |mnt| ok_oses << "#{major}.#{minor}.#{mnt}" }
+-      max_minor_for_major = MAC_OS_MAXS[major.to_i]
+-      ((minor.to_i + 1)..max_minor_for_major).each { |min| ok_oses << "#{major}.#{min}.x" }
+-      ((major.to_i + 1)..20).each { |v| ok_oses << "#{v}.x" }
+-    end
++    end # if minor == x
++    ((major.to_i + 1)..MAC_OS_MAXS.keys.max).each do |v|
++      ok_oses << "#{v}.x"
++    end # each v
+     ok_oses
+-  end # def self.expand_min_os(min_os)
++  end
+   def self.processor_ok?(requirement, processor = nil)
+     return true if requirement.to_s.empty? || requirement =~ /none/i
+     processor ||= `/usr/bin/uname -p`
+     requirement == (processor.to_s.include?('86') ? 'x86' : 'ppc')
+   end
+   def self.os_ok?(requirement, os_to_check = nil)
+     return true if requirement.to_s =~ /none/i
+     return true if requirement.to_s == 'n'
+     requirement = JSS.to_s_and_a(requirement)[:arrayform]
+     return true if requirement.empty?
+@@ -105,40 +98,33 @@
+       valstr = somedata
+       valarr = somedata.split(/,\s*/)
+     when Array
+       valstr = somedata.join ', '
+       valarr = somedata
+     else
+       raise JSS::InvalidDataError, 'Input must be a comma-separated String or an Array of Strings'
+     end # case
+     { stringform: valstr, arrayform: valarr }
+   end # to_s_and_a
+-  def self.parse_plist(plist, symbol_keys: false)
+-    require 'cfpropertylist'
++  def self.parse_plist(plist)
+     case plist
+     when String
+-      return CFPropertyList.native_types(CFPropertyList::List.new(data: plist).value, symbol_keys) if plist.include? '</plist>'
++      return Plist.parse_xml plist if plist.include? '</plist>'
+       plist = Pathname.new plist
+     when Pathname
+       true
+     else
+       raise ArgumentError, 'Argument must be a path (as a Pathname or String) or a String of XML'
+     end # case plist
+     raise JSS::MissingDataError, "No such file: #{plist}" unless plist.file?
+-    CFPropertyList.native_types(CFPropertyList::List.new(file: plist).value, symbol_keys)
++    Plist.parse_xml `/usr/libexec/PlistBuddy -x -c print #{Shellwords.escape(plist.to_s)}`.force_encoding('UTF-8')
+   end # parse_plist
+-  def self.xml_plist_from(data)
+-    require 'cfpropertylist'
+-    plist = CFPropertyList::List.new
+-    plist.value = CFPropertyList.guess(data, convert_unknown_to_string: true)
+-    plist.to_str(CFPropertyList::List::FORMAT_XML)
+-  end
+   def self.parse_time(a_datetime)
+     return nil if NIL_DATES.include? a_datetime
+     the_dt = DateTime.parse(a_datetime.to_s)
+     usec = (the_dt.sec_fraction * 60 * 60 * 24 * (10**6)).to_i
+     the_dt = DateTime.new(the_dt.year, the_dt.month, the_dt.day, the_dt.hour, the_dt.min, the_dt.sec, JSS::TIME_ZONE_OFFSET) if the_dt.offset.zero?
+     Time.at the_dt.strftime('%s').to_i, usec
+   end # parse_time
+   def self.parse_datetime(a_datetime)
+     parse_time(a_datetime)
+   end
+
+--- a/lib/jss/version.rb
++++ b/lib/jss/version.rb
+@@ -1,3 +1,3 @@
+ module JSS
+-  VERSION = '1.6.0'.freeze
++  VERSION = '1.5.3'.freeze
+ end # module

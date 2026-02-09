@@ -1,0 +1,396 @@
+# ====================================================================
+# FILE: commands/bake.go
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 39-79 ---
+    39| 	"go.opentelemetry.io/otel/attribute"
+    40| )
+    41| type bakeOptions struct {
+    42| 	files     []string
+    43| 	overrides []string
+    44| 	sbom       string
+    45| 	provenance string
+    46| 	allow      []string
+    47| 	builder      string
+    48| 	metadataFile string
+    49| 	exportPush   bool
+    50| 	exportLoad   bool
+    51| 	callFunc     string
+    52| 	print bool
+    53| 	list  string
+    54| 	listTargets bool
+    55| 	listVars    bool
+    56| }
+    57| func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in bakeOptions, cFlags commonFlags) (err error) {
+    58| 	mp := dockerCli.MeterProvider()
+    59| 	ctx, end, err := tracing.TraceCurrentCommand(ctx, "bake")
+    60| 	if err != nil {
+    61| 		return err
+    62| 	}
+    63| 	defer func() {
+    64| 		end(err)
+    65| 	}()
+    66| 	url, cmdContext, targets := bakeArgs(targets)
+    67| 	if len(targets) == 0 {
+    68| 		targets = []string{"default"}
+    69| 	}
+    70| 	callFunc, err := buildflags.ParseCallFunc(in.callFunc)
+    71| 	if err != nil {
+    72| 		return err
+    73| 	}
+    74| 	overrides := in.overrides
+    75| 	if in.exportPush {
+    76| 		overrides = append(overrides, "*.push=true")
+    77| 	}
+    78| 	if in.exportLoad {
+    79| 		overrides = append(overrides, "*.load=true")
+
+# --- HUNK 2: Lines 225-265 ---
+   225| 			if err != nil {
+   226| 				return err
+   227| 			}
+   228| 			opt.CallFunc.Name = cf.Name
+   229| 		}
+   230| 	}
+   231| 	exp, err := ent.Validate(bo)
+   232| 	if err != nil {
+   233| 		return err
+   234| 	}
+   235| 	if progressMode != progressui.RawJSONMode {
+   236| 		if err := exp.Prompt(ctx, url != "", &syncWriter{w: dockerCli.Err(), wait: printer.Wait}); err != nil {
+   237| 			return err
+   238| 		}
+   239| 	}
+   240| 	if printer.IsDone() {
+   241| 		if err := makePrinter(); err != nil {
+   242| 			return err
+   243| 		}
+   244| 	}
+   245| 	if err := saveLocalStateGroup(dockerCli, in, targets, bo, overrides, def); err != nil {
+   246| 		return err
+   247| 	}
+   248| 	done := timeBuildCommand(mp, attributes)
+   249| 	resp, retErr := build.Build(ctx, nodes, bo, dockerutil.NewClient(dockerCli), confutil.NewConfig(dockerCli), printer)
+   250| 	if err := printer.Wait(); retErr == nil {
+   251| 		retErr = err
+   252| 	}
+   253| 	if retErr != nil {
+   254| 		err = wrapBuildError(retErr, true)
+   255| 	}
+   256| 	done(err)
+   257| 	if err != nil {
+   258| 		return err
+   259| 	}
+   260| 	if progressMode != progressui.QuietMode && progressMode != progressui.RawJSONMode {
+   261| 		desktop.PrintBuildDetails(os.Stderr, printer.BuildRefs(), term)
+   262| 	}
+   263| 	if len(in.metadataFile) > 0 {
+   264| 		dt := make(map[string]interface{})
+   265| 		for t, r := range resp {
+
+# --- HUNK 3: Lines 403-475 ---
+   403| 	flags.BoolVar(&options.exportLoad, "load", false, `Shorthand for "--set=*.output=type=docker"`)
+   404| 	flags.BoolVar(&options.exportPush, "push", false, `Shorthand for "--set=*.output=type=registry"`)
+   405| 	flags.StringVar(&options.sbom, "sbom", "", `Shorthand for "--set=*.attest=type=sbom"`)
+   406| 	flags.StringVar(&options.provenance, "provenance", "", `Shorthand for "--set=*.attest=type=provenance"`)
+   407| 	flags.StringArrayVar(&options.overrides, "set", nil, `Override target value (e.g., "targetpattern.key=value")`)
+   408| 	flags.StringVar(&options.callFunc, "call", "build", `Set method for evaluating build ("check", "outline", "targets")`)
+   409| 	flags.StringArrayVar(&options.allow, "allow", nil, "Allow build to access specified resources")
+   410| 	flags.VarPF(callAlias(&options.callFunc, "check"), "check", "", `Shorthand for "--call=check"`)
+   411| 	flags.Lookup("check").NoOptDefVal = "true"
+   412| 	flags.BoolVar(&options.print, "print", false, "Print the options without building")
+   413| 	flags.StringVar(&options.list, "list", "", "List targets or variables")
+   414| 	flags.BoolVar(&options.listTargets, "list-targets", false, "List available targets")
+   415| 	flags.MarkHidden("list-targets")
+   416| 	flags.MarkDeprecated("list-targets", "list-targets is deprecated, use list=targets instead")
+   417| 	flags.BoolVar(&options.listVars, "list-variables", false, "List defined variables")
+   418| 	flags.MarkHidden("list-variables")
+   419| 	flags.MarkDeprecated("list-variables", "list-variables is deprecated, use list=variables instead")
+   420| 	commonBuildFlags(&cFlags, flags)
+   421| 	return cmd
+   422| }
+   423| func saveLocalStateGroup(dockerCli command.Cli, in bakeOptions, targets []string, bo map[string]build.Options, overrides []string, def any) error {
+   424| 	prm := confutil.MetadataProvenance()
+   425| 	if len(in.metadataFile) == 0 {
+   426| 		prm = confutil.MetadataProvenanceModeDisabled
+   427| 	}
+   428| 	groupRef := identity.NewID()
+   429| 	refs := make([]string, 0, len(bo))
+   430| 	for k, b := range bo {
+   431| 		if b.CallFunc != nil {
+   432| 			continue
+   433| 		}
+   434| 		b.Ref = identity.NewID()
+   435| 		b.GroupRef = groupRef
+   436| 		b.ProvenanceResponseMode = prm
+   437| 		refs = append(refs, b.Ref)
+   438| 		bo[k] = b
+   439| 	}
+   440| 	if len(refs) == 0 {
+   441| 		return nil
+   442| 	}
+   443| 	l, err := localstate.New(confutil.NewConfig(dockerCli))
+   444| 	if err != nil {
+   445| 		return err
+   446| 	}
+   447| 	dtdef, err := json.MarshalIndent(def, "", "  ")
+   448| 	if err != nil {
+   449| 		return err
+   450| 	}
+   451| 	return l.SaveGroup(groupRef, localstate.StateGroup{
+   452| 		Definition: dtdef,
+   453| 		Targets:    targets,
+   454| 		Inputs:     overrides,
+   455| 		Refs:       refs,
+   456| 	})
+   457| }
+   458| func bakeArgs(args []string) (url, cmdContext string, targets []string) {
+   459| 	cmdContext, targets = "cwd://", args
+   460| 	if len(targets) == 0 || !build.IsRemoteURL(targets[0]) {
+   461| 		return url, cmdContext, targets
+   462| 	}
+   463| 	url, targets = targets[0], targets[1:]
+   464| 	if len(targets) == 0 || !build.IsRemoteURL(targets[0]) {
+   465| 		return url, cmdContext, targets
+   466| 	}
+   467| 	cmdContext, targets = targets[0], targets[1:]
+   468| 	return url, cmdContext, targets
+   469| }
+   470| func readBakeFiles(ctx context.Context, nodes []builder.Node, url string, names []string, stdin io.Reader, pw progress.Writer) (files []bake.File, inp *bake.Input, err error) {
+   471| 	var lnames []string // local
+   472| 	var rnames []string // remote
+   473| 	var anames []string // both
+   474| 	for _, v := range names {
+   475| 		if strings.HasPrefix(v, "cwd://") {
+
+
+# ====================================================================
+# FILE: commands/build.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 232-272 ---
+   232| 		contextPath := o.contextPath
+   233| 		dockerfile := o.dockerfileName
+   234| 		if dockerfile == "" {
+   235| 			dockerfile = "Dockerfile"
+   236| 		}
+   237| 		if contextPath != "-" && osutil.IsLocalDir(contextPath) {
+   238| 			contextPath = osutil.ToAbs(contextPath)
+   239| 		}
+   240| 		salt := o.cfg.TryNodeIdentifier()
+   241| 		h := sha256.New()
+   242| 		for _, s := range []string{target, contextPath, dockerfile, salt} {
+   243| 			_, _ = io.WriteString(h, s)
+   244| 			h.Write([]byte{0})
+   245| 		}
+   246| 		o.result = hex.EncodeToString(h.Sum(nil))
+   247| 	})
+   248| 	return o.result
+   249| }
+   250| func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) (err error) {
+   251| 	mp := dockerCli.MeterProvider()
+   252| 	ctx, end, err := tracing.TraceCurrentCommand(ctx, "build")
+   253| 	if err != nil {
+   254| 		return err
+   255| 	}
+   256| 	defer func() {
+   257| 		end(err)
+   258| 	}()
+   259| 	opts, err := options.toControllerOptions()
+   260| 	if err != nil {
+   261| 		return err
+   262| 	}
+   263| 	if options.imageIDFile != "" {
+   264| 		if err := os.Remove(options.imageIDFile); err != nil && !os.IsNotExist(err) {
+   265| 			return errors.Wrap(err, "removing image ID file")
+   266| 		}
+   267| 	}
+   268| 	contextPathHash := options.contextPath
+   269| 	if absContextPath, err := filepath.Abs(contextPathHash); err == nil {
+   270| 		contextPathHash = absContextPath
+   271| 	}
+   272| 	b, err := builder.New(dockerCli,
+
+
+# ====================================================================
+# FILE: localstate/localstate.go
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-92 ---
+     1| package localstate
+     2| import (
+     3| 	"context"
+     4| 	"encoding/json"
+     5| 	"fmt"
+     6| 	"os"
+     7| 	"path/filepath"
+     8| 	"sync"
+     9| 	"github.com/docker/buildx/util/confutil"
+    10| 	"github.com/pkg/errors"
+    11| 	"golang.org/x/sync/errgroup"
+    12| )
+    13| const (
+    14| 	refsDir  = "refs"
+    15| 	groupDir = "__group__"
+    16| )
+    17| type State struct {
+    18| 	Target string
+    19| 	LocalPath string
+    20| 	DockerfilePath string
+    21| 	GroupRef string `json:",omitempty"`
+    22| }
+    23| type StateGroup struct {
+    24| 	Definition []byte
+    25| 	Targets []string `json:",omitempty"`
+    26| 	Inputs []string `json:",omitempty"`
+    27| 	Refs []string
+    28| }
+    29| type LocalState struct {
+    30| 	cfg *confutil.Config
+    31| }
+    32| func New(cfg *confutil.Config) (*LocalState, error) {
+    33| 	if cfg.Dir() == "" {
+    34| 		return nil, errors.Errorf("config dir empty")
+    35| 	}
+    36| 	if err := cfg.MkdirAll(refsDir, 0700); err != nil {
+    37| 		return nil, err
+    38| 	}
+    39| 	return &LocalState{
+    40| 		cfg: cfg,
+    41| 	}, nil
+    42| }
+    43| func (ls *LocalState) ReadRef(builderName, nodeName, id string) (*State, error) {
+    44| 	if err := ls.validate(builderName, nodeName, id); err != nil {
+    45| 		return nil, err
+    46| 	}
+    47| 	dt, err := os.ReadFile(filepath.Join(ls.cfg.Dir(), refsDir, builderName, nodeName, id))
+    48| 	if err != nil {
+    49| 		return nil, err
+    50| 	}
+    51| 	var st State
+    52| 	if err := json.Unmarshal(dt, &st); err != nil {
+    53| 		return nil, err
+    54| 	}
+    55| 	return &st, nil
+    56| }
+    57| func (ls *LocalState) SaveRef(builderName, nodeName, id string, st State) error {
+    58| 	if err := ls.validate(builderName, nodeName, id); err != nil {
+    59| 		return err
+    60| 	}
+    61| 	refDir := filepath.Join(refsDir, builderName, nodeName)
+    62| 	if err := ls.cfg.MkdirAll(refDir, 0700); err != nil {
+    63| 		return err
+    64| 	}
+    65| 	dt, err := json.Marshal(st)
+    66| 	if err != nil {
+    67| 		return err
+    68| 	}
+    69| 	return ls.cfg.AtomicWriteFile(filepath.Join(refDir, id), dt, 0644)
+    70| }
+    71| func (ls *LocalState) ReadGroup(id string) (*StateGroup, error) {
+    72| 	dt, err := os.ReadFile(filepath.Join(ls.cfg.Dir(), refsDir, groupDir, id))
+    73| 	if err != nil {
+    74| 		return nil, err
+    75| 	}
+    76| 	var stg StateGroup
+    77| 	if err := json.Unmarshal(dt, &stg); err != nil {
+    78| 		return nil, err
+    79| 	}
+    80| 	return &stg, nil
+    81| }
+    82| func (ls *LocalState) SaveGroup(id string, stg StateGroup) error {
+    83| 	refDir := filepath.Join(refsDir, groupDir)
+    84| 	if err := ls.cfg.MkdirAll(refDir, 0700); err != nil {
+    85| 		return err
+    86| 	}
+    87| 	dt, err := json.Marshal(stg)
+    88| 	if err != nil {
+    89| 		return err
+    90| 	}
+    91| 	return ls.cfg.AtomicWriteFile(filepath.Join(refDir, id), dt, 0600)
+    92| }
+
+# --- HUNK 2: Lines 158-198 ---
+   158| 	}
+   159| 	if err := eg.Wait(); err != nil {
+   160| 		return err
+   161| 	}
+   162| 	for gid, refs := range grefs {
+   163| 		if s, ok := srefs[gid]; ok {
+   164| 			if len(s) != len(refs) {
+   165| 				continue
+   166| 			}
+   167| 			if err := ls.removeGroup(gid); err != nil {
+   168| 				return err
+   169| 			}
+   170| 		}
+   171| 	}
+   172| 	return os.RemoveAll(dir)
+   173| }
+   174| func (ls *LocalState) removeGroup(id string) error {
+   175| 	if id == "" {
+   176| 		return errors.Errorf("group ref empty")
+   177| 	}
+   178| 	f := filepath.Join(ls.cfg.Dir(), refsDir, groupDir, id)
+   179| 	if _, err := os.Lstat(f); err != nil {
+   180| 		if !os.IsNotExist(err) {
+   181| 			return err
+   182| 		}
+   183| 		return nil
+   184| 	}
+   185| 	return os.Remove(f)
+   186| }
+   187| func (ls *LocalState) validate(builderName, nodeName, id string) error {
+   188| 	if builderName == "" {
+   189| 		return errors.Errorf("builder name empty")
+   190| 	}
+   191| 	if nodeName == "" {
+   192| 		return errors.Errorf("node name empty")
+   193| 	}
+   194| 	if id == "" {
+   195| 		return errors.Errorf("ref ID empty")
+   196| 	}
+   197| 	return nil
+   198| }
+
+
+# ====================================================================
+# FILE: util/tracing/trace.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-34 ---
+     1| package tracing
+     2| import (
+     3| 	"context"
+     4| 	"os"
+     5| 	"strings"
+     6| 	"github.com/moby/buildkit/util/tracing/delegated"
+     7| 	"github.com/moby/buildkit/util/tracing/detect"
+     8| 	"go.opentelemetry.io/otel"
+     9| 	"go.opentelemetry.io/otel/attribute"
+    10| 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+    11| 	"go.opentelemetry.io/otel/trace"
+    12| )
+    13| func TraceCurrentCommand(ctx context.Context, name string) (context.Context, func(error), error) {
+    14| 	opts := []sdktrace.TracerProviderOption{
+    15| 		sdktrace.WithResource(detect.Resource()),
+    16| 		sdktrace.WithBatcher(delegated.DefaultExporter),
+    17| 	}
+    18| 	if exp, err := detect.NewSpanExporter(ctx); err != nil {
+    19| 		otel.Handle(err)
+    20| 	} else if !detect.IsNoneSpanExporter(exp) {
+    21| 		opts = append(opts, sdktrace.WithBatcher(exp))
+    22| 	}
+    23| 	tp := sdktrace.NewTracerProvider(opts...)
+    24| 	ctx, span := tp.Tracer("").Start(ctx, name, trace.WithAttributes(
+    25| 		attribute.String("command", strings.Join(os.Args, " ")),
+    26| 	))
+    27| 	return ctx, func(err error) {
+    28| 		if err != nil {
+    29| 			span.RecordError(err)
+    30| 		}
+    31| 		span.End()
+    32| 		_ = tp.Shutdown(context.TODO())
+    33| 	}, nil
+    34| }
+

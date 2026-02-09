@@ -1,0 +1,369 @@
+# ====================================================================
+# FILE: extend.php
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-61 ---
+     1| <?php
+     2| /*
+     3|  * This file is part of fof/upload.
+     4|  *
+     5|  * Copyright (c) FriendsOfFlarum.
+     6|  * Copyright (c) Flagrow.
+     7|  *
+     8|  * For the full copyright and license information, please view the LICENSE
+     9|  * file that was distributed with this source code.
+    10|  */
+    11| namespace FoF\Upload;
+    12| use Flarum\Api\Serializer\CurrentUserSerializer;
+    13| use Flarum\Api\Serializer\ForumSerializer;
+    14| use Flarum\Api\Serializer\UserSerializer;
+    15| use Flarum\Extend;
+    16| use Flarum\Settings\Event\Deserializing;
+    17| use FoF\Upload\Events\File\WillBeUploaded;
+    18| use FoF\Upload\Extend\SvgSanitizer;
+    19| return [
+    20|     (new Extend\Routes('api'))
+    21|         ->get('/fof/uploads', 'fof-upload.list', Api\Controllers\ListUploadsController::class)
+    22|         ->post('/fof/upload', 'fof-upload.upload', Api\Controllers\UploadController::class)
+    23|         ->post('/fof/watermark', 'fof-upload.watermark', Api\Controllers\WatermarkUploadController::class)
+    24|         ->get('/fof/download/{uuid}/{post}/{csrf}', 'fof-upload.download', Api\Controllers\DownloadController::class)
+    25|         ->post('/fof/upload/inspect-mime', 'fof-upload.inspect-mime', Api\Controllers\InspectMimeController::class)
+    26|         ->patch('/fof/upload/hide', 'fof-upload.hide', Api\Controllers\HideUploadFromMediaManagerController::class),
+    27|     (new Extend\Csrf())->exemptRoute('fof-upload.download'),
+    28|     (new Extend\Frontend('admin'))
+    29|         ->css(__DIR__.'/resources/less/admin.less')
+    30|         ->js(__DIR__.'/js/dist/admin.js'),
+    31|     (new Extend\Frontend('forum'))
+    32|         ->css(__DIR__.'/resources/less/forum/download.less')
+    33|         ->css(__DIR__.'/resources/less/forum/upload.less')
+    34|         ->css(__DIR__.'/resources/less/forum/fileManagerModal.less')
+    35|         ->css(__DIR__.'/resources/less/forum/fileList.less')
+    36|         ->css(__DIR__.'/resources/less/forum/textPreview.less')
+    37|         ->js(__DIR__.'/js/dist/forum.js'),
+    38|     new Extend\Locales(__DIR__.'/resources/locale'),
+    39|     new Extenders\AddPostDownloadTags(),
+    40|     new Extenders\CreateStorageFolder('tmp'),
+    41|     (new Extend\ApiSerializer(ForumSerializer::class))
+    42|         ->attributes(Extenders\AddForumAttributes::class),
+    43|     (new Extend\Event())
+    44|         ->listen(Deserializing::class, Listeners\AddAvailableOptionsInAdmin::class)
+    45|         ->listen(WillBeUploaded::class, Listeners\AddImageProcessor::class),
+    46|     (new Extend\ServiceProvider())
+    47|         ->register(Providers\UtilProvider::class)
+    48|         ->register(Providers\StorageServiceProvider::class)
+    49|         ->register(Providers\DownloadProvider::class)
+    50|         ->register(Providers\SanitizerProvider::class),
+    51|     (new Extend\View())
+    52|         ->namespace('fof-upload.templates', __DIR__.'/resources/templates'),
+    53|     (new Extend\ApiSerializer(CurrentUserSerializer::class))
+    54|         ->attributes(Extenders\AddCurrentUserAttributes::class),
+    55|     (new Extend\ApiSerializer(UserSerializer::class))
+    56|         ->attributes(Extenders\AddUserAttributes::class),
+    57|     (new Extend\Formatter())
+    58|         ->render(Formatter\TextPreview\FormatTextPreview::class),
+    59|     (new SvgSanitizer())
+    60|         ->allowTag('animate'),
+    61| ];
+
+
+# ====================================================================
+# FILE: src/Commands/UploadHandler.php
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-127 ---
+     1| <?php
+     2| /*
+     3|  * This file is part of fof/upload.
+     4|  *
+     5|  * Copyright (c) FriendsOfFlarum.
+     6|  * Copyright (c) Flagrow.
+     7|  *
+     8|  * For the full copyright and license information, please view the LICENSE
+     9|  * file that was distributed with this source code.
+    10|  */
+    11| namespace FoF\Upload\Commands;
+    12| use enshrined\svgSanitize\Sanitizer;
+    13| use Exception;
+    14| use Flarum\Foundation\Application;
+    15| use Flarum\Foundation\ValidationException;
+    16| use Flarum\Locale\Translator;
+    17| use FoF\Upload\Adapters\Manager;
+    18| use FoF\Upload\Contracts\UploadAdapter;
+    19| use FoF\Upload\Events;
+    20| use FoF\Upload\File;
+    21| use FoF\Upload\Helpers\Util;
+    22| use FoF\Upload\Repositories\FileRepository;
+    23| use Illuminate\Contracts\Events\Dispatcher;
+    24| use Illuminate\Support\Arr;
+    25| use Illuminate\Support\Str;
+    26| use Psr\Http\Message\UploadedFileInterface;
+    27| use SoftCreatR\MimeDetector\MimeDetector;
+    28| use SoftCreatR\MimeDetector\MimeDetectorException;
+    29| class UploadHandler
+    30| {
+    31|     /**
+    32|      * @var Application
+    33|      */
+    34|     protected $app;
+    35|     /**
+    36|      * @var Util
+    37|      */
+    38|     protected $util;
+    39|     /**
+    40|      * @var Dispatcher
+    41|      */
+    42|     protected $events;
+    43|     /**
+    44|      * @var FileRepository
+    45|      */
+    46|     protected $files;
+    47|     /**
+    48|      * @var MimeDetector
+    49|      */
+    50|     protected $mimeDetector;
+    51|     /**
+    52|      * @var Translator
+    53|      */
+    54|     protected $translator;
+    55|     /**
+    56|      * @var Sanitizer
+    57|      */
+    58|     protected $sanitizer;
+    59|     public function __construct(
+    60|         Application $app,
+    61|         Dispatcher $events,
+    62|         Util $util,
+    63|         FileRepository $files,
+    64|         MimeDetector $mimeDetector,
+    65|         Translator $translator,
+    66|         Sanitizer $sanitizer
+    67|     ) {
+    68|         $this->app = $app;
+    69|         $this->util = $util;
+    70|         $this->events = $events;
+    71|         $this->files = $files;
+    72|         $this->mimeDetector = $mimeDetector;
+    73|         $this->translator = $translator;
+    74|         $this->sanitizer = $sanitizer;
+    75|     }
+    76|     /**
+    77|      * @param Upload $command
+    78|      *
+    79|      * @throws \Flarum\User\Exception\PermissionDeniedException
+    80|      *
+    81|      * @return \Illuminate\Support\Collection
+    82|      */
+    83|     public function handle(Upload $command)
+    84|     {
+    85|         $command->actor->assertCan('fof-upload.upload');
+    86|         $savedFiles = $command->files->map(function (UploadedFileInterface $file) use ($command) {
+    87|             try {
+    88|                 $upload = $this->files->moveUploadedFileToTemp($file);
+    89|                 try {
+    90|                     $this->mimeDetector->setFile($upload->getPathname());
+    91|                 } catch (MimeDetectorException $e) {
+    92|                     throw new ValidationException(['upload' => $this->translator->trans('fof-upload.api.upload_errors.could_not_detect_mime')]);
+    93|                 }
+    94|                 $uploadFileData = $this->mimeDetector->getFileType();
+    95|                 if (!isset($uploadFileData['mime']) || $uploadFileData['mime'] === null) {
+    96|                     try {
+    97|                         $uploadFileData['mime'] = mime_content_type($upload->getPathname());
+    98|                     } catch (Exception $e) {
+    99|                         throw new ValidationException(['upload' => $this->translator->trans('fof-upload.api.upload_errors.could_not_detect_mime')]);
+   100|                     }
+   101|                 }
+   102|                 if (Str::startsWith($uploadFileData['mime'], 'image/svg')) {
+   103|                     $cleanSvg = $this->sanitizer->sanitize(file_get_contents($upload->getPathname()));
+   104|                     if (!$cleanSvg) {
+   105|                         throw new ValidationException(['upload' => $this->translator->trans('fof-upload.api.upload_errors.svg_failure')]);
+   106|                     }
+   107|                     file_put_contents($upload->getPathname(), $cleanSvg, LOCK_EX);
+   108|                 }
+   109|                 $mimeConfiguration = $this->getMimeConfiguration($uploadFileData['mime']);
+   110|                 $adapter = $this->getAdapter(Arr::get($mimeConfiguration, 'adapter'));
+   111|                 $template = $this->getTemplate(Arr::get($mimeConfiguration, 'template', 'file'));
+   112|                 $this->events->dispatch(
+   113|                     new Events\Adapter\Identified($command->actor, $upload, $adapter)
+   114|                 );
+   115|                 if (!$adapter) {
+   116|                     throw new ValidationException(['upload' => $this->translator->trans('fof-upload.api.upload_errors.forbidden_type')]);
+   117|                 }
+   118|                 if (!$adapter->forMime($uploadFileData['mime'])) {
+   119|                     throw new ValidationException(['upload' => resolve('translator')->trans('fof-upload.api.upload_errors.unsupported_type', ['mime' => $uploadFileData['mime']])]);
+   120|                 }
+   121|                 $file = $this->files->createFileFromUpload($upload, $command->actor, $uploadFileData['mime']);
+   122|                 $this->events->dispatch(
+   123|                     new Events\File\WillBeUploaded($command->actor, $file, $upload, $uploadFileData['mime'])
+   124|                 );
+   125|                 $response = $adapter->upload(
+   126|                     $file,
+   127|                     $upload,
+
+
+# ====================================================================
+# FILE: src/Extend/SvgSanitizer.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-56 ---
+     1| <?php
+     2| /*
+     3|  * This file is part of fof/upload.
+     4|  *
+     5|  * Copyright (c) FriendsOfFlarum.
+     6|  * Copyright (c) Flagrow.
+     7|  *
+     8|  * For the full copyright and license information, please view the LICENSE
+     9|  * file that was distributed with this source code.
+    10|  */
+    11| namespace FoF\Upload\Extend;
+    12| use Flarum\Extend\ExtenderInterface;
+    13| use Flarum\Extension\Extension;
+    14| use Illuminate\Contracts\Container\Container;
+    15| class SvgSanitizer implements ExtenderInterface
+    16| {
+    17|     protected $allowedAttrs = [];
+    18|     protected $allowedTags = [];
+    19|     protected $removeAttrs = [];
+    20|     protected $removeTags = [];
+    21|     public function allowAttr(string $attr): self
+    22|     {
+    23|         $this->allowedAttrs[] = $attr;
+    24|         return $this;
+    25|     }
+    26|     public function allowTag(string $tag): self
+    27|     {
+    28|         $this->allowedTags[] = $tag;
+    29|         return $this;
+    30|     }
+    31|     public function removeAttr($attr): self
+    32|     {
+    33|         $this->removeAttrs[] = $attr;
+    34|         return $this;
+    35|     }
+    36|     public function removeTag($tag): self
+    37|     {
+    38|         $this->removeTags[] = $tag;
+    39|         return $this;
+    40|     }
+    41|     public function extend(Container $container, Extension $extension = null)
+    42|     {
+    43|         $container->extend('fof.upload.sanitizer.svg_allowed_attrs', function ($items): array {
+    44|             return array_merge($items, $this->allowedAttrs);
+    45|         });
+    46|         $container->extend('fof.upload.sanitizer.svg_disallowed_attrs', function ($items): array {
+    47|             return array_merge($items, $this->removeAttrs);
+    48|         });
+    49|         $container->extend('fof.upload.sanitizer.svg_allowed_tags', function ($items): array {
+    50|             return array_merge($items, $this->allowedTags);
+    51|         });
+    52|         $container->extend('fof.upload.sanitizer.svg_disallowed_tags', function ($items): array {
+    53|             return array_merge($items, $this->removeTags);
+    54|         });
+    55|     }
+    56| }
+
+
+# ====================================================================
+# FILE: src/Providers/SanitizerProvider.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-40 ---
+     1| <?php
+     2| /*
+     3|  * This file is part of fof/upload.
+     4|  *
+     5|  * Copyright (c) FriendsOfFlarum.
+     6|  * Copyright (c) Flagrow.
+     7|  *
+     8|  * For the full copyright and license information, please view the LICENSE
+     9|  * file that was distributed with this source code.
+    10|  */
+    11| namespace FoF\Upload\Providers;
+    12| use enshrined\svgSanitize\Sanitizer;
+    13| use Flarum\Foundation\AbstractServiceProvider;
+    14| use FoF\Upload\Sanitizer\SvgAllowedAttrs;
+    15| use FoF\Upload\Sanitizer\SvgAllowedTags;
+    16| class SanitizerProvider extends AbstractServiceProvider
+    17| {
+    18|     public function register()
+    19|     {
+    20|         $this->container->singleton(Sanitizer::class, function (): Sanitizer {
+    21|             $sanitizer = new Sanitizer();
+    22|             $sanitizer->setAllowedAttrs(new SvgAllowedAttrs());
+    23|             $sanitizer->setAllowedTags(new SvgAllowedTags());
+    24|             $sanitizer->removeRemoteReferences(true);
+    25|             return $sanitizer;
+    26|         });
+    27|         $this->container->singleton('fof.upload.sanitizer.svg_allowed_attrs', function (): array {
+    28|             return [];
+    29|         });
+    30|         $this->container->singleton('fof.upload.sanitizer.svg_disallowed_attrs', function (): array {
+    31|             return [];
+    32|         });
+    33|         $this->container->singleton('fof.upload.sanitizer.svg_allowed_tags', function (): array {
+    34|             return [];
+    35|         });
+    36|         $this->container->singleton('fof.upload.sanitizer.svg_disallowed_tags', function (): array {
+    37|             return [];
+    38|         });
+    39|     }
+    40| }
+
+
+# ====================================================================
+# FILE: src/Sanitizer/SvgAllowedAttrs.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-22 ---
+     1| <?php
+     2| /*
+     3|  * This file is part of fof/upload.
+     4|  *
+     5|  * Copyright (c) FriendsOfFlarum.
+     6|  * Copyright (c) Flagrow.
+     7|  *
+     8|  * For the full copyright and license information, please view the LICENSE
+     9|  * file that was distributed with this source code.
+    10|  */
+    11| namespace FoF\Upload\Sanitizer;
+    12| use enshrined\svgSanitize\data\AllowedAttributes;
+    13| class SvgAllowedAttrs extends AllowedAttributes
+    14| {
+    15|     public static function getAttributes(): array
+    16|     {
+    17|         return array_diff(
+    18|             array_merge(parent::getAttributes(), resolve('fof.upload.sanitizer.svg_allowed_attrs')),
+    19|             resolve('fof.upload.sanitizer.svg_disallowed_attrs')
+    20|         );
+    21|     }
+    22| }
+
+
+# ====================================================================
+# FILE: src/Sanitizer/SvgAllowedTags.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-22 ---
+     1| <?php
+     2| /*
+     3|  * This file is part of fof/upload.
+     4|  *
+     5|  * Copyright (c) FriendsOfFlarum.
+     6|  * Copyright (c) Flagrow.
+     7|  *
+     8|  * For the full copyright and license information, please view the LICENSE
+     9|  * file that was distributed with this source code.
+    10|  */
+    11| namespace FoF\Upload\Sanitizer;
+    12| use enshrined\svgSanitize\data\AllowedTags;
+    13| class SvgAllowedTags extends AllowedTags
+    14| {
+    15|     public static function getTags(): array
+    16|     {
+    17|         return array_diff(
+    18|             array_merge(parent::getTags(), resolve('fof.upload.sanitizer.svg_allowed_tags')),
+    19|             resolve('fof.upload.sanitizer.svg_disallowed_tags')
+    20|         );
+    21|     }
+    22| }
+

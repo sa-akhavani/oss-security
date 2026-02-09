@@ -1,0 +1,1179 @@
+--- a/libs/langchain/langchain/chains/base.py
++++ b/libs/langchain/langchain/chains/base.py
+@@ -1,17 +1,18 @@
+ """Base interface that all chains should implement."""
+ import asyncio
+ import inspect
+ import json
+ import logging
+ import warnings
+ from abc import ABC, abstractmethod
++from functools import partial
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, Type, Union
+ import yaml
+ import langchain
+ from langchain.callbacks.base import BaseCallbackManager
+ from langchain.callbacks.manager import (
+     AsyncCallbackManager,
+     AsyncCallbackManagerForChainRun,
+     CallbackManager,
+     CallbackManagerForChainRun,
+@@ -73,20 +74,24 @@
+             metadata=config.get("metadata"),
+             run_name=config.get("run_name"),
+             **kwargs,
+         )
+     async def ainvoke(
+         self,
+         input: Dict[str, Any],
+         config: Optional[RunnableConfig] = None,
+         **kwargs: Any,
+     ) -> Dict[str, Any]:
++        if type(self)._acall == Chain._acall:
++            return await asyncio.get_running_loop().run_in_executor(
++                None, partial(self.invoke, input, config, **kwargs)
++            )
+         config = config or {}
+         return await self.acall(
+             input,
+             callbacks=config.get("callbacks"),
+             tags=config.get("tags"),
+             metadata=config.get("metadata"),
+             run_name=config.get("run_name"),
+             **kwargs,
+         )
+     memory: Optional[BaseMemory] = None
+@@ -197,23 +202,21 @@
+             callbacks configuration and some input/output processing.
+         Args:
+             inputs: A dict of named inputs to the chain. Assumed to contain all inputs
+                 specified in `Chain.input_keys`, including any inputs added by memory.
+             run_manager: The callbacks manager that contains the callback handlers for
+                 this run of the chain.
+         Returns:
+             A dict of named outputs. Should contain all outputs specified in
+                 `Chain.output_keys`.
+         """
+-        return await asyncio.get_running_loop().run_in_executor(
+-            None, self._call, inputs, run_manager
+-        )
++        raise NotImplementedError("Async call not supported for this chain type.")
+     def __call__(
+         self,
+         inputs: Union[Dict[str, Any], Any],
+         return_only_outputs: bool = False,
+         callbacks: Callbacks = None,
+         *,
+         tags: Optional[List[str]] = None,
+         metadata: Optional[Dict[str, Any]] = None,
+         run_name: Optional[str] = None,
+         include_run_info: bool = False,
+
+--- a/libs/langchain/langchain/chat_models/anthropic.py
++++ b/libs/langchain/langchain/chat_models/anthropic.py
+@@ -24,21 +24,21 @@
+     human_prompt: str,
+     ai_prompt: str,
+ ) -> str:
+     if isinstance(message, ChatMessage):
+         message_text = f"\n\n{message.role.capitalize()}: {message.content}"
+     elif isinstance(message, HumanMessage):
+         message_text = f"{human_prompt} {message.content}"
+     elif isinstance(message, AIMessage):
+         message_text = f"{ai_prompt} {message.content}"
+     elif isinstance(message, SystemMessage):
+-        message_text = message.content
++        message_text = f"{human_prompt} <admin>{message.content}</admin>"
+     else:
+         raise ValueError(f"Got unknown type {message}")
+     return message_text
+ def convert_messages_to_prompt_anthropic(
+     messages: List[BaseMessage],
+     *,
+     human_prompt: str = "\n\nHuman:",
+     ai_prompt: str = "\n\nAssistant:",
+ ) -> str:
+     """Format a list of messages into a full prompt for the Anthropic model
+
+--- a/libs/langchain/langchain/chat_models/base.py
++++ b/libs/langchain/langchain/chat_models/base.py
+@@ -528,21 +528,24 @@
+         """Top Level call"""
+     async def _agenerate(
+         self,
+         messages: List[BaseMessage],
+         stop: Optional[List[str]] = None,
+         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+         **kwargs: Any,
+     ) -> ChatResult:
+         """Top Level call"""
+         return await asyncio.get_running_loop().run_in_executor(
+-            None, partial(self._generate, **kwargs), messages, stop, run_manager
++            None,
++            partial(
++                self._generate, messages, stop=stop, run_manager=run_manager, **kwargs
++            ),
+         )
+     def _stream(
+         self,
+         messages: List[BaseMessage],
+         stop: Optional[List[str]] = None,
+         run_manager: Optional[CallbackManagerForLLMRun] = None,
+         **kwargs: Any,
+     ) -> Iterator[ChatGenerationChunk]:
+         raise NotImplementedError()
+     def _astream(
+
+--- a/libs/langchain/langchain/document_loaders/bigquery.py
++++ b/libs/langchain/langchain/document_loaders/bigquery.py
+@@ -40,28 +40,20 @@
+         self.credentials = credentials
+     def load(self) -> List[Document]:
+         try:
+             from google.cloud import bigquery
+         except ImportError as ex:
+             raise ImportError(
+                 "Could not import google-cloud-bigquery python package. "
+                 "Please install it with `pip install google-cloud-bigquery`."
+             ) from ex
+         bq_client = bigquery.Client(credentials=self.credentials, project=self.project)
+-        if not bq_client.project:
+-            error_desc = (
+-                "GCP project for Big Query is not set! Either provide a "
+-                "`project` argument during BigQueryLoader instantiation, "
+-                "or set a default project with `gcloud config set project` "
+-                "command."
+-            )
+-            raise ValueError(error_desc)
+         query_result = bq_client.query(self.query).result()
+         docs: List[Document] = []
+         page_content_columns = self.page_content_columns
+         metadata_columns = self.metadata_columns
+         if page_content_columns is None:
+             page_content_columns = [column.name for column in query_result.schema]
+         if metadata_columns is None:
+             metadata_columns = []
+         for row in query_result:
+             page_content = "\n".join(
+
+--- a/libs/langchain/langchain/document_loaders/github.py
++++ b/libs/langchain/langchain/document_loaders/github.py
+@@ -5,22 +5,20 @@
+ from langchain.docstore.document import Document
+ from langchain.document_loaders.base import BaseLoader
+ from langchain.pydantic_v1 import BaseModel, root_validator, validator
+ from langchain.utils import get_from_dict_or_env
+ class BaseGitHubLoader(BaseLoader, BaseModel, ABC):
+     """Load `GitHub` repository Issues."""
+     repo: str
+     """Name of repository"""
+     access_token: str
+     """Personal access token - see https://github.com/settings/tokens?type=beta"""
+-    github_api_url: str = "https://api.github.com"
+-    """URL of GitHub API"""
+     @root_validator(pre=True)
+     def validate_environment(cls, values: Dict) -> Dict:
+         """Validate that access token exists in environment."""
+         values["access_token"] = get_from_dict_or_env(
+             values, "access_token", "GITHUB_PERSONAL_ACCESS_TOKEN"
+         )
+         return values
+     @property
+     def headers(self) -> Dict[str, str]:
+         return {
+@@ -160,11 +158,11 @@
+             "since": self.since,
+         }
+         query_params_list = [
+             f"{k}={v}" for k, v in query_params_dict.items() if v is not None
+         ]
+         query_params = "&".join(query_params_list)
+         return query_params
+     @property
+     def url(self) -> str:
+         """Create URL for GitHub API."""
+-        return f"{self.github_api_url}/repos/{self.repo}/issues?{self.query_params}"
++        return f"https://api.github.com/repos/{self.repo}/issues?{self.query_params}"
+
+--- a/libs/langchain/langchain/llms/base.py
++++ b/libs/langchain/langchain/llms/base.py
+@@ -207,20 +207,24 @@
+             .text
+         )
+     async def ainvoke(
+         self,
+         input: LanguageModelInput,
+         config: Optional[RunnableConfig] = None,
+         *,
+         stop: Optional[List[str]] = None,
+         **kwargs: Any,
+     ) -> str:
++        if type(self)._agenerate == BaseLLM._agenerate:
++            return await asyncio.get_running_loop().run_in_executor(
++                None, partial(self.invoke, input, config, stop=stop, **kwargs)
++            )
+         config = config or {}
+         llm_result = await self.agenerate_prompt(
+             [self._convert_input(input)],
+             stop=stop,
+             callbacks=config.get("callbacks"),
+             tags=config.get("tags"),
+             metadata=config.get("metadata"),
+             run_name=config.get("run_name"),
+             **kwargs,
+         )
+@@ -268,20 +272,24 @@
+     async def abatch(
+         self,
+         inputs: List[LanguageModelInput],
+         config: Optional[Union[RunnableConfig, List[RunnableConfig]]] = None,
+         *,
+         return_exceptions: bool = False,
+         **kwargs: Any,
+     ) -> List[str]:
+         if not inputs:
+             return []
++        if type(self)._agenerate == BaseLLM._agenerate:
++            return await asyncio.get_running_loop().run_in_executor(
++                None, partial(self.batch, **kwargs), inputs, config
++            )
+         config = get_config_list(config, len(inputs))
+         max_concurrency = config[0].get("max_concurrency")
+         if max_concurrency is None:
+             try:
+                 llm_result = await self.agenerate_prompt(
+                     [self._convert_input(input) for input in inputs],
+                     callbacks=[c.get("callbacks") for c in config],
+                     tags=[c.get("tags") for c in config],
+                     metadata=[c.get("metadata") for c in config],
+                     run_name=[c.get("run_name") for c in config],
+@@ -411,23 +419,21 @@
+     ) -> LLMResult:
+         """Run the LLM on the given prompts."""
+     async def _agenerate(
+         self,
+         prompts: List[str],
+         stop: Optional[List[str]] = None,
+         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+         **kwargs: Any,
+     ) -> LLMResult:
+         """Run the LLM on the given prompts."""
+-        return await asyncio.get_running_loop().run_in_executor(
+-            None, partial(self._generate, **kwargs), prompts, stop, run_manager
+-        )
++        raise NotImplementedError()
+     def _stream(
+         self,
+         prompt: str,
+         stop: Optional[List[str]] = None,
+         run_manager: Optional[CallbackManagerForLLMRun] = None,
+         **kwargs: Any,
+     ) -> Iterator[GenerationChunk]:
+         raise NotImplementedError()
+     def _astream(
+         self,
+@@ -929,23 +935,21 @@
+     ) -> str:
+         """Run the LLM on the given prompt and input."""
+     async def _acall(
+         self,
+         prompt: str,
+         stop: Optional[List[str]] = None,
+         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+         **kwargs: Any,
+     ) -> str:
+         """Run the LLM on the given prompt and input."""
+-        return await asyncio.get_running_loop().run_in_executor(
+-            None, partial(self._call, **kwargs), prompt, stop, run_manager
+-        )
++        raise NotImplementedError()
+     def _generate(
+         self,
+         prompts: List[str],
+         stop: Optional[List[str]] = None,
+         run_manager: Optional[CallbackManagerForLLMRun] = None,
+         **kwargs: Any,
+     ) -> LLMResult:
+         """Run the LLM on the given prompt and input."""
+         generations = []
+         new_arg_supported = inspect.signature(self._call).parameters.get("run_manager")
+@@ -957,20 +961,24 @@
+             )
+             generations.append([Generation(text=text)])
+         return LLMResult(generations=generations)
+     async def _agenerate(
+         self,
+         prompts: List[str],
+         stop: Optional[List[str]] = None,
+         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+         **kwargs: Any,
+     ) -> LLMResult:
++        if type(self)._acall == LLM._acall:
++            return await asyncio.get_running_loop().run_in_executor(
++                None, partial(self._generate, prompts, stop, run_manager, **kwargs)
++            )
+         """Run the LLM on the given prompt and input."""
+         generations = []
+         new_arg_supported = inspect.signature(self._acall).parameters.get("run_manager")
+         for prompt in prompts:
+             text = (
+                 await self._acall(prompt, stop=stop, run_manager=run_manager, **kwargs)
+                 if new_arg_supported
+                 else await self._acall(prompt, stop=stop, **kwargs)
+             )
+             generations.append([Generation(text=text)])
+
+--- a/libs/langchain/langchain/llms/bedrock.py
++++ b/libs/langchain/langchain/llms/bedrock.py
+@@ -28,91 +28,82 @@
+         input_text = input_text + ASSISTANT_PROMPT  # SILENT CORRECTION
+     if input_text[: len("Human:")] == "Human:":
+         input_text = "\n\n" + input_text
+     input_text = _add_newlines_before_ha(input_text)
+     count = 0
+     for i in range(len(input_text)):
+         if input_text[i : i + len(HUMAN_PROMPT)] == HUMAN_PROMPT:
+             if count % 2 == 0:
+                 count += 1
+             else:
+-                raise ValueError(ALTERNATION_ERROR + f" Received {input_text}")
++                raise ValueError(ALTERNATION_ERROR)
+         if input_text[i : i + len(ASSISTANT_PROMPT)] == ASSISTANT_PROMPT:
+             if count % 2 == 1:
+                 count += 1
+             else:
+-                raise ValueError(ALTERNATION_ERROR + f" Received {input_text}")
++                raise ValueError(ALTERNATION_ERROR)
+     if count % 2 == 1:  # Only saw Human, no Assistant
+         input_text = input_text + ASSISTANT_PROMPT  # SILENT CORRECTION
+     return input_text
+ class LLMInputOutputAdapter:
+     """Adapter class to prepare the inputs from Langchain to a format
+     that LLM model expects.
+     It also provides helper function to extract
+     the generated text from the model response."""
+     provider_to_output_key_map = {
+         "anthropic": "completion",
+         "amazon": "outputText",
+-        "cohere": "text",
+     }
+     @classmethod
+     def prepare_input(
+         cls, provider: str, prompt: str, model_kwargs: Dict[str, Any]
+     ) -> Dict[str, Any]:
+         input_body = {**model_kwargs}
+         if provider == "anthropic":
+             input_body["prompt"] = _human_assistant_format(prompt)
+-        elif provider == "ai21" or provider == "cohere":
++        elif provider == "ai21":
+             input_body["prompt"] = prompt
+         elif provider == "amazon":
+             input_body = dict()
+             input_body["inputText"] = prompt
+             input_body["textGenerationConfig"] = {**model_kwargs}
+         else:
+             input_body["inputText"] = prompt
+         if provider == "anthropic" and "max_tokens_to_sample" not in input_body:
+             input_body["max_tokens_to_sample"] = 256
+         return input_body
+     @classmethod
+     def prepare_output(cls, provider: str, response: Any) -> str:
+         if provider == "anthropic":
+             response_body = json.loads(response.get("body").read().decode())
+             return response_body.get("completion")
+         else:
+             response_body = json.loads(response.get("body").read())
+         if provider == "ai21":
+             return response_body.get("completions")[0].get("data").get("text")
+-        elif provider == "cohere":
+-            return response_body.get("generations")[0].get("text")
+         else:
+             return response_body.get("results")[0].get("outputText")
+     @classmethod
+     def prepare_output_stream(
+         cls, provider: str, response: Any, stop: Optional[List[str]] = None
+     ) -> Iterator[GenerationChunk]:
+         stream = response.get("body")
+         if not stream:
+             return
+         if provider not in cls.provider_to_output_key_map:
+             raise ValueError(
+                 f"Unknown streaming response output key for provider: {provider}"
+             )
+         for event in stream:
+             chunk = event.get("chunk")
+             if chunk:
+                 chunk_obj = json.loads(chunk.get("bytes").decode())
+-                if provider == "cohere" and (
+-                    chunk_obj["is_finished"]
+-                    or chunk_obj[cls.provider_to_output_key_map[provider]]
+-                    == "<EOS_TOKEN>"
+-                ):
+-                    return
+                 yield GenerationChunk(
+                     text=chunk_obj[cls.provider_to_output_key_map[provider]]
+                 )
+ class BedrockBase(BaseModel, ABC):
+     client: Any  #: :meta private:
+     region_name: Optional[str] = None
+     """The aws region e.g., `us-west-2`. Fallsback to AWS_DEFAULT_REGION env variable
+     or region specified in ~/.aws/config in case it is not provided here.
+     """
+     credentials_profile_name: Optional[str] = None
+@@ -128,21 +119,20 @@
+     model_kwargs: Optional[Dict] = None
+     """Keyword arguments to pass to the model."""
+     endpoint_url: Optional[str] = None
+     """Needed if you don't want to default to us-east-1 endpoint"""
+     streaming: bool = False
+     """Whether to stream the results."""
+     provider_stop_sequence_key_name_map: Mapping[str, str] = {
+         "anthropic": "stop_sequences",
+         "amazon": "stopSequences",
+         "ai21": "stop_sequences",
+-        "cohere": "stop_sequences",
+     }
+     @root_validator()
+     def validate_environment(cls, values: Dict) -> Dict:
+         """Validate that AWS credentials to and python package exists in environment."""
+         if values["client"] is not None:
+             return values
+         try:
+             import boto3
+             if values["credentials_profile_name"] is not None:
+                 session = boto3.Session(profile_name=values["credentials_profile_name"])
+@@ -206,23 +196,23 @@
+         run_manager: Optional[CallbackManagerForLLMRun] = None,
+         **kwargs: Any,
+     ) -> Iterator[GenerationChunk]:
+         _model_kwargs = self.model_kwargs or {}
+         provider = self._get_provider()
+         if stop:
+             if provider not in self.provider_stop_sequence_key_name_map:
+                 raise ValueError(
+                     f"Stop sequence key name for {provider} is not supported."
+                 )
+-            _model_kwargs[self.provider_stop_sequence_key_name_map.get(provider)] = stop
+-        if provider == "cohere":
+-            _model_kwargs["stream"] = True
++            _model_kwargs[
++                self.provider_stop_sequence_key_name_map.get(provider),
++            ] = stop
+         params = {**_model_kwargs, **kwargs}
+         input_body = LLMInputOutputAdapter.prepare_input(provider, prompt, params)
+         body = json.dumps(input_body)
+         try:
+             response = self.client.invoke_model_with_response_stream(
+                 body=body,
+                 modelId=self.model_id,
+                 accept="application/json",
+                 contentType="application/json",
+             )
+
+--- a/libs/langchain/langchain/output_parsers/openai_functions.py
++++ b/libs/langchain/langchain/output_parsers/openai_functions.py
+@@ -33,23 +33,20 @@
+         return func_call
+ class JsonOutputFunctionsParser(BaseCumulativeTransformOutputParser[Any]):
+     """Parse an output as the Json object."""
+     strict: bool = False
+     """Whether to allow non-JSON-compliant strings.
+     See: https://docs.python.org/3/library/json.html#encoders-and-decoders
+     Useful when the parsed output may include unicode characters or new lines.
+     """
+     args_only: bool = True
+     """Whether to only return the arguments to the function call."""
+-    @property
+-    def _type(self) -> str:
+-        return "json_functions"
+     def _diff(self, prev: Optional[Any], next: Any) -> Any:
+         return jsonpatch.make_patch(prev, next).patch
+     def parse_result(self, result: List[Generation], *, partial: bool = False) -> Any:
+         if len(result) != 1:
+             raise OutputParserException(
+                 f"Expected exactly one result, but got {len(result)}"
+             )
+         generation = result[0]
+         if not isinstance(generation, ChatGeneration):
+             raise OutputParserException(
+@@ -101,21 +98,21 @@
+         except KeyError:
+             return None
+     def parse(self, text: str) -> Any:
+         raise NotImplementedError()
+ class JsonKeyOutputFunctionsParser(JsonOutputFunctionsParser):
+     """Parse an output as the element of the Json object."""
+     key_name: str
+     """The name of the key to return."""
+     def parse_result(self, result: List[Generation], *, partial: bool = False) -> Any:
+         res = super().parse_result(result)
+-        return res.get(self.key_name) if partial else res[self.key_name]
++        return res[self.key_name]
+ class PydanticOutputFunctionsParser(OutputFunctionsParser):
+     """Parse an output as a pydantic object."""
+     pydantic_schema: Union[Type[BaseModel], Dict[str, Type[BaseModel]]]
+     """The pydantic schema to parse the output with."""
+     @root_validator(pre=True)
+     def validate_schema(cls, values: Dict) -> Dict:
+         schema = values["pydantic_schema"]
+         if "args_only" not in values:
+             values["args_only"] = isinstance(schema, type) and issubclass(
+                 schema, BaseModel
+
+--- a/libs/langchain/langchain/schema/document.py
++++ b/libs/langchain/langchain/schema/document.py
+@@ -1,14 +1,12 @@
+ from __future__ import annotations
+-import asyncio
+ from abc import ABC, abstractmethod
+-from functools import partial
+ from typing import Any, Sequence
+ from langchain.load.serializable import Serializable
+ from langchain.pydantic_v1 import Field
+ class Document(Serializable):
+     """Class for storing a piece of text and associated metadata."""
+     page_content: str
+     """String text."""
+     metadata: dict = Field(default_factory=dict)
+     """Arbitrary metadata about the page content (e.g., source, relationships to other
+         documents, etc.).
+@@ -48,22 +46,20 @@
+     @abstractmethod
+     def transform_documents(
+         self, documents: Sequence[Document], **kwargs: Any
+     ) -> Sequence[Document]:
+         """Transform a list of documents.
+         Args:
+             documents: A sequence of Documents to be transformed.
+         Returns:
+             A list of transformed Documents.
+         """
++    @abstractmethod
+     async def atransform_documents(
+         self, documents: Sequence[Document], **kwargs: Any
+     ) -> Sequence[Document]:
+         """Asynchronously transform a list of documents.
+         Args:
+             documents: A sequence of Documents to be transformed.
+         Returns:
+             A list of transformed Documents.
+         """
+-        return await asyncio.get_running_loop().run_in_executor(
+-            None, partial(self.transform_documents, **kwargs), documents
+-        )
+
+--- a/libs/langchain/langchain/schema/embeddings.py
++++ b/libs/langchain/langchain/schema/embeddings.py
+@@ -1,21 +1,16 @@
+-import asyncio
+ from abc import ABC, abstractmethod
+ from typing import List
+ class Embeddings(ABC):
+     """Interface for embedding models."""
+     @abstractmethod
+     def embed_documents(self, texts: List[str]) -> List[List[float]]:
+         """Embed search docs."""
+     @abstractmethod
+     def embed_query(self, text: str) -> List[float]:
+         """Embed query text."""
+     async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+         """Asynchronous Embed search docs."""
+-        return await asyncio.get_running_loop().run_in_executor(
+-            None, self.embed_documents, texts
+-        )
++        raise NotImplementedError
+     async def aembed_query(self, text: str) -> List[float]:
+         """Asynchronous Embed query text."""
+-        return await asyncio.get_running_loop().run_in_executor(
+-            None, self.embed_query, text
+-        )
++        raise NotImplementedError
+
+--- a/libs/langchain/langchain/schema/retriever.py
++++ b/libs/langchain/langchain/schema/retriever.py
+@@ -1,15 +1,13 @@
+ from __future__ import annotations
+-import asyncio
+ import warnings
+ from abc import ABC, abstractmethod
+-from functools import partial
+ from inspect import signature
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional
+ from langchain.load.dump import dumpd
+ from langchain.schema.document import Document
+ from langchain.schema.runnable import RunnableConfig, RunnableSerializable
+ if TYPE_CHECKING:
+     from langchain.callbacks.manager import (
+         AsyncCallbackManagerForRetrieverRun,
+         CallbackManagerForRetrieverRun,
+         Callbacks,
+@@ -94,20 +92,22 @@
+             tags=config.get("tags"),
+             metadata=config.get("metadata"),
+             run_name=config.get("run_name"),
+         )
+     async def ainvoke(
+         self,
+         input: str,
+         config: Optional[RunnableConfig] = None,
+         **kwargs: Optional[Any],
+     ) -> List[Document]:
++        if type(self).aget_relevant_documents == BaseRetriever.aget_relevant_documents:
++            return await super().ainvoke(input, config)
+         config = config or {}
+         return await self.aget_relevant_documents(
+             input,
+             callbacks=config.get("callbacks"),
+             tags=config.get("tags"),
+             metadata=config.get("metadata"),
+             run_name=config.get("run_name"),
+         )
+     @abstractmethod
+     def _get_relevant_documents(
+@@ -123,23 +123,21 @@
+     async def _aget_relevant_documents(
+         self, query: str, *, run_manager: AsyncCallbackManagerForRetrieverRun
+     ) -> List[Document]:
+         """Asynchronously get documents relevant to a query.
+         Args:
+             query: String to find relevant documents for
+             run_manager: The callbacks handler to use
+         Returns:
+             List of relevant documents
+         """
+-        return await asyncio.get_running_loop().run_in_executor(
+-            None, partial(self._get_relevant_documents, run_manager=run_manager), query
+-        )
++        raise NotImplementedError()
+     def get_relevant_documents(
+         self,
+         query: str,
+         *,
+         callbacks: Callbacks = None,
+         tags: Optional[List[str]] = None,
+         metadata: Optional[Dict[str, Any]] = None,
+         run_name: Optional[str] = None,
+         **kwargs: Any,
+     ) -> List[Document]:
+
+--- a/libs/langchain/langchain/schema/runnable/base.py
++++ b/libs/langchain/langchain/schema/runnable/base.py
+@@ -102,49 +102,51 @@
+     def output_schema(self) -> Type[BaseModel]:
+         root_type = self.OutputType
+         if inspect.isclass(root_type) and issubclass(root_type, BaseModel):
+             return root_type
+         return create_model(
+             self.__class__.__name__ + "Output", __root__=(root_type, None)
+         )
+     @property
+     def config_specs(self) -> Sequence[ConfigurableFieldSpec]:
+         return []
+-    def config_schema(self, *, include: Sequence[str]) -> Type[BaseModel]:
++    def config_schema(
++        self, *, include: Optional[Sequence[str]] = None
++    ) -> Type[BaseModel]:
+         class _Config:
+             arbitrary_types_allowed = True
+         include = include or []
+         config_specs = self.config_specs
+         configurable = (
+             create_model(  # type: ignore[call-overload]
+                 "Configurable",
+                 **{
+                     spec.id: (
+                         spec.annotation,
+                         Field(
+                             spec.default, title=spec.name, description=spec.description
+                         ),
+                     )
+                     for spec in config_specs
+                 },
+             )
+-            if config_specs and "configurable" in include
++            if config_specs
+             else None
+         )
+         return create_model(  # type: ignore[call-overload]
+             self.__class__.__name__ + "Config",
+             __config__=_Config,
+             **({"configurable": (configurable, None)} if configurable else {}),
+             **{
+                 field_name: (field_type, None)
+                 for field_name, field_type in RunnableConfig.__annotations__.items()
+-                if field_name in [i for i in include if i != "configurable"]
++                if field_name in include
+             },
+         )
+     def __or__(
+         self,
+         other: Union[
+             Runnable[Any, Other],
+             Callable[[Any], Other],
+             Callable[[Iterator[Any]], Iterator[Other]],
+             Mapping[str, Union[Runnable[Any, Other], Callable[[Any], Other], Any]],
+         ],
+@@ -772,31 +774,31 @@
+     def configurable_fields(
+         self, **kwargs: ConfigurableField
+     ) -> RunnableSerializable[Input, Output]:
+         from langchain.schema.runnable.configurable import RunnableConfigurableFields
+         for key in kwargs:
+             if key not in self.__fields__:
+                 raise ValueError(
+                     f"Configuration key {key} not found in {self}: "
+                     "available keys are {self.__fields__.keys()}"
+                 )
+-        return RunnableConfigurableFields(default=self, fields=kwargs)
++        return RunnableConfigurableFields(bound=self, fields=kwargs)
+     def configurable_alternatives(
+         self,
+         which: ConfigurableField,
+         **kwargs: Runnable[Input, Output],
+     ) -> RunnableSerializable[Input, Output]:
+         from langchain.schema.runnable.configurable import (
+             RunnableConfigurableAlternatives,
+         )
+         return RunnableConfigurableAlternatives(
+-            which=which, default=self, alternatives=kwargs
++            which=which, bound=self, alternatives=kwargs
+         )
+ class RunnableSequence(RunnableSerializable[Input, Output]):
+     """
+     A sequence of runnables, where the output of each is the input of the next.
+     """
+     first: Runnable[Input, Any]
+     middle: List[Runnable[Any, Any]] = Field(default_factory=list)
+     last: Runnable[Any, Output]
+     @property
+     def steps(self) -> List[Runnable[Any, Any]]:
+@@ -1749,21 +1751,23 @@
+         return create_model(
+             "RunnableEachOutput",
+             __root__=(
+                 List[self.bound.output_schema],  # type: ignore[name-defined]
+                 None,
+             ),
+         )
+     @property
+     def config_specs(self) -> Sequence[ConfigurableFieldSpec]:
+         return self.bound.config_specs
+-    def config_schema(self, *, include: Sequence[str]) -> Type[BaseModel]:
++    def config_schema(
++        self, *, include: Optional[Sequence[str]] = None
++    ) -> Type[BaseModel]:
+         return self.bound.config_schema(include=include)
+     @classmethod
+     def is_lc_serializable(cls) -> bool:
+         return True
+     @classmethod
+     def get_lc_namespace(cls) -> List[str]:
+         return cls.__module__.split(".")[:-1]
+     def bind(self, **kwargs: Any) -> RunnableEach[Input, Output]:
+         return RunnableEach(bound=self.bound.bind(**kwargs))
+     def _invoke(
+@@ -1809,21 +1813,23 @@
+         return self.bound.OutputType
+     @property
+     def input_schema(self) -> Type[BaseModel]:
+         return self.bound.input_schema
+     @property
+     def output_schema(self) -> Type[BaseModel]:
+         return self.bound.output_schema
+     @property
+     def config_specs(self) -> Sequence[ConfigurableFieldSpec]:
+         return self.bound.config_specs
+-    def config_schema(self, *, include: Sequence[str]) -> Type[BaseModel]:
++    def config_schema(
++        self, *, include: Optional[Sequence[str]] = None
++    ) -> Type[BaseModel]:
+         return self.bound.config_schema(include=include)
+     @classmethod
+     def is_lc_serializable(cls) -> bool:
+         return True
+     @classmethod
+     def get_lc_namespace(cls) -> List[str]:
+         return cls.__module__.split(".")[:-1]
+     def _merge_config(self, config: Optional[RunnableConfig]) -> RunnableConfig:
+         copy = cast(RunnableConfig, dict(self.config))
+         if config:
+
+--- a/libs/langchain/langchain/schema/runnable/configurable.py
++++ b/libs/langchain/langchain/schema/runnable/configurable.py
+@@ -1,19 +1,19 @@
+ from __future__ import annotations
+-import enum
+ from abc import abstractmethod
+ from typing import (
+     Any,
+     AsyncIterator,
+     Dict,
+     Iterator,
+     List,
++    Literal,
+     Optional,
+     Sequence,
+     Type,
+     Union,
+     cast,
+ )
+ from langchain.pydantic_v1 import BaseModel
+ from langchain.schema.runnable.base import Runnable, RunnableSerializable
+ from langchain.schema.runnable.config import (
+     RunnableConfig,
+@@ -21,41 +21,41 @@
+     get_executor_for_config,
+ )
+ from langchain.schema.runnable.utils import (
+     ConfigurableField,
+     ConfigurableFieldSpec,
+     Input,
+     Output,
+     gather_with_concurrency,
+ )
+ class DynamicRunnable(RunnableSerializable[Input, Output]):
+-    default: RunnableSerializable[Input, Output]
++    bound: RunnableSerializable[Input, Output]
+     class Config:
+         arbitrary_types_allowed = True
+     @classmethod
+     def is_lc_serializable(cls) -> bool:
+         return True
+     @classmethod
+     def get_lc_namespace(cls) -> List[str]:
+         return cls.__module__.split(".")[:-1]
+     @property
+     def InputType(self) -> Type[Input]:
+-        return self.default.InputType
++        return self.bound.InputType
+     @property
+     def OutputType(self) -> Type[Output]:
+-        return self.default.OutputType
++        return self.bound.OutputType
+     @property
+     def input_schema(self) -> Type[BaseModel]:
+-        return self.default.input_schema
++        return self.bound.input_schema
+     @property
+     def output_schema(self) -> Type[BaseModel]:
+-        return self.default.output_schema
++        return self.bound.output_schema
+     @abstractmethod
+     def _prepare(
+         self, config: Optional[RunnableConfig] = None
+     ) -> Runnable[Input, Output]:
+         ...
+     def invoke(
+         self, input: Input, config: Optional[RunnableConfig] = None, **kwargs: Any
+     ) -> Output:
+         return self._prepare(config).invoke(input, config, **kwargs)
+     async def ainvoke(
+@@ -65,22 +65,22 @@
+     def batch(
+         self,
+         inputs: List[Input],
+         config: Optional[Union[RunnableConfig, List[RunnableConfig]]] = None,
+         *,
+         return_exceptions: bool = False,
+         **kwargs: Optional[Any],
+     ) -> List[Output]:
+         configs = get_config_list(config, len(inputs))
+         prepared = [self._prepare(c) for c in configs]
+-        if all(p is self.default for p in prepared):
+-            return self.default.batch(
++        if all(p is self.bound for p in prepared):
++            return self.bound.batch(
+                 inputs, config, return_exceptions=return_exceptions, **kwargs
+             )
+         if not inputs:
+             return []
+         configs = get_config_list(config, len(inputs))
+         def invoke(
+             bound: Runnable[Input, Output],
+             input: Input,
+             config: RunnableConfig,
+         ) -> Union[Output, Exception]:
+@@ -100,22 +100,22 @@
+     async def abatch(
+         self,
+         inputs: List[Input],
+         config: Optional[Union[RunnableConfig, List[RunnableConfig]]] = None,
+         *,
+         return_exceptions: bool = False,
+         **kwargs: Optional[Any],
+     ) -> List[Output]:
+         configs = get_config_list(config, len(inputs))
+         prepared = [self._prepare(c) for c in configs]
+-        if all(p is self.default for p in prepared):
+-            return await self.default.abatch(
++        if all(p is self.bound for p in prepared):
++            return await self.bound.abatch(
+                 inputs, config, return_exceptions=return_exceptions, **kwargs
+             )
+         if not inputs:
+             return []
+         configs = get_config_list(config, len(inputs))
+         async def ainvoke(
+             bound: Runnable[Input, Output],
+             input: Input,
+             config: RunnableConfig,
+         ) -> Union[Output, Exception]:
+@@ -160,76 +160,73 @@
+             yield chunk
+ class RunnableConfigurableFields(DynamicRunnable[Input, Output]):
+     fields: Dict[str, ConfigurableField]
+     @property
+     def config_specs(self) -> Sequence[ConfigurableFieldSpec]:
+         return [
+             ConfigurableFieldSpec(
+                 id=spec.id,
+                 name=spec.name,
+                 description=spec.description
+-                or self.default.__fields__[field_name].field_info.description,
++                or self.bound.__fields__[field_name].field_info.description,
+                 annotation=spec.annotation
+-                or self.default.__fields__[field_name].annotation,
+-                default=getattr(self.default, field_name),
++                or self.bound.__fields__[field_name].annotation,
++                default=getattr(self.bound, field_name),
+             )
+             for field_name, spec in self.fields.items()
+         ]
+     def configurable_fields(
+         self, **kwargs: ConfigurableField
+     ) -> RunnableSerializable[Input, Output]:
+-        return self.default.configurable_fields(**{**self.fields, **kwargs})
++        return self.bound.configurable_fields(**{**self.fields, **kwargs})
+     def _prepare(
+         self, config: Optional[RunnableConfig] = None
+     ) -> Runnable[Input, Output]:
+         config = config or {}
+         specs_by_id = {spec.id: (key, spec) for key, spec in self.fields.items()}
+         configurable = {
+             specs_by_id[k][0]: v
+             for k, v in config.get("configurable", {}).items()
+             if k in specs_by_id
+         }
+         if configurable:
+-            return self.default.__class__(**{**self.default.dict(), **configurable})
++            return self.bound.__class__(**{**self.bound.dict(), **configurable})
+         else:
+-            return self.default
+-class StrEnum(str, enum.Enum):
+-    pass
++            return self.bound
+ class RunnableConfigurableAlternatives(DynamicRunnable[Input, Output]):
+     which: ConfigurableField
+     alternatives: Dict[str, RunnableSerializable[Input, Output]]
+-    default_key: str = "default"
+     @property
+     def config_specs(self) -> Sequence[ConfigurableFieldSpec]:
+-        which_enum = StrEnum(  # type: ignore[call-overload]
+-            self.which.name or self.which.id,
+-            ((v, v) for v in list(self.alternatives.keys()) + [self.default_key]),
++        alt_keys = self.alternatives.keys()
++        which_keys = tuple(Literal[k] for k in alt_keys) + (  # type: ignore
++            Literal["default"],
+         )
+         return [
+             ConfigurableFieldSpec(
+                 id=self.which.id,
+                 name=self.which.name,
+                 description=self.which.description,
+-                annotation=which_enum,
+-                default=self.default_key,
++                annotation=Union[which_keys],  # type: ignore
++                default="default",
+             ),
+-            *self.default.config_specs,
++            *self.bound.config_specs,
+         ] + [s for alt in self.alternatives.values() for s in alt.config_specs]
+     def configurable_fields(
+         self, **kwargs: ConfigurableField
+     ) -> RunnableSerializable[Input, Output]:
+         return self.__class__(
+             which=self.which,
+-            default=self.default.configurable_fields(**kwargs),
++            bound=self.bound.configurable_fields(**kwargs),
+             alternatives=self.alternatives,
+         )
+     def _prepare(
+         self, config: Optional[RunnableConfig] = None
+     ) -> Runnable[Input, Output]:
+         config = config or {}
+-        which = str(config.get("configurable", {}).get(self.which.id, self.default_key))
+-        if which == self.default_key:
+-            return self.default
++        which = config.get("configurable", {}).get(self.which.id)
++        if not which:
++            return self.bound
+         elif which in self.alternatives:
+             return self.alternatives[which]
+         else:
+             raise ValueError(f"Unknown alternative: {which}")
+
+--- a/libs/langchain/langchain/schema/runnable/fallbacks.py
++++ b/libs/langchain/langchain/schema/runnable/fallbacks.py
+@@ -50,21 +50,23 @@
+     @property
+     def output_schema(self) -> Type[BaseModel]:
+         return self.runnable.output_schema
+     @property
+     def config_specs(self) -> Sequence[ConfigurableFieldSpec]:
+         return get_unique_config_specs(
+             spec
+             for step in [self.runnable, *self.fallbacks]
+             for spec in step.config_specs
+         )
+-    def config_schema(self, *, include: Sequence[str]) -> Type[BaseModel]:
++    def config_schema(
++        self, *, include: Optional[Sequence[str]] = None
++    ) -> Type[BaseModel]:
+         return self.runnable.config_schema(include=include)
+     @classmethod
+     def is_lc_serializable(cls) -> bool:
+         return True
+     @classmethod
+     def get_lc_namespace(cls) -> List[str]:
+         return cls.__module__.split(".")[:-1]
+     @property
+     def runnables(self) -> Iterator[Runnable[Input, Output]]:
+         yield self.runnable
+
+--- a/libs/langchain/langchain/schema/vectorstore.py
++++ b/libs/langchain/langchain/schema/vectorstore.py
+@@ -64,23 +64,21 @@
+             False otherwise, None if not implemented.
+         """
+         raise NotImplementedError("delete method must be implemented by subclass.")
+     async def aadd_texts(
+         self,
+         texts: Iterable[str],
+         metadatas: Optional[List[dict]] = None,
+         **kwargs: Any,
+     ) -> List[str]:
+         """Run more texts through the embeddings and add to the vectorstore."""
+-        return await asyncio.get_running_loop().run_in_executor(
+-            None, partial(self.add_texts, **kwargs), texts, metadatas
+-        )
++        raise NotImplementedError
+     def add_documents(self, documents: List[Document], **kwargs: Any) -> List[str]:
+         """Run more documents through the embeddings and add to the vectorstore.
+         Args:
+             documents (List[Document]: Documents to add to the vectorstore.
+         Returns:
+             List[str]: List of IDs of the added texts.
+         """
+         texts = [doc.page_content for doc in documents]
+         metadatas = [doc.metadata for doc in documents]
+         return self.add_texts(texts, metadatas, **kwargs)
+@@ -358,23 +356,21 @@
+         """Return VectorStore initialized from texts and embeddings."""
+     @classmethod
+     async def afrom_texts(
+         cls: Type[VST],
+         texts: List[str],
+         embedding: Embeddings,
+         metadatas: Optional[List[dict]] = None,
+         **kwargs: Any,
+     ) -> VST:
+         """Return VectorStore initialized from texts and embeddings."""
+-        return await asyncio.get_running_loop().run_in_executor(
+-            None, partial(cls.from_texts, **kwargs), texts, embedding, metadatas
+-        )
++        raise NotImplementedError
+     def _get_retriever_tags(self) -> List[str]:
+         """Get tags for retriever."""
+         tags = [self.__class__.__name__]
+         if self.embeddings:
+             tags.append(self.embeddings.__class__.__name__)
+         return tags
+     def as_retriever(self, **kwargs: Any) -> VectorStoreRetriever:
+         """Return VectorStoreRetriever initialized from this VectorStore.
+         Args:
+             search_type (Optional[str]): Defines the type of search that
+
+--- a/libs/langchain/langchain/text_splitter.py
++++ b/libs/langchain/langchain/text_splitter.py
+@@ -2,29 +2,27 @@
+ **Class hierarchy:**
+ .. code-block::
+     BaseDocumentTransformer --> TextSplitter --> <name>TextSplitter  # Example: CharacterTextSplitter
+                                                  RecursiveCharacterTextSplitter -->  <name>TextSplitter
+ Note: **MarkdownHeaderTextSplitter** and **HTMLHeaderTextSplitter do not derive from TextSplitter.
+ **Main helpers:**
+ .. code-block::
+     Document, Tokenizer, Language, LineType, HeaderType
+ """  # noqa: E501
+ from __future__ import annotations
+-import asyncio
+ import copy
+ import logging
+ import pathlib
+ import re
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass
+ from enum import Enum
+-from functools import partial
+ from io import BytesIO, StringIO
+ from typing import (
+     AbstractSet,
+     Any,
+     Callable,
+     Collection,
+     Dict,
+     Iterable,
+     List,
+     Literal,
+@@ -230,23 +228,21 @@
+         return cls(length_function=_tiktoken_encoder, **kwargs)
+     def transform_documents(
+         self, documents: Sequence[Document], **kwargs: Any
+     ) -> Sequence[Document]:
+         """Transform sequence of documents by splitting them."""
+         return self.split_documents(list(documents))
+     async def atransform_documents(
+         self, documents: Sequence[Document], **kwargs: Any
+     ) -> Sequence[Document]:
+         """Asynchronously transform a sequence of documents by splitting them."""
+-        return await asyncio.get_running_loop().run_in_executor(
+-            None, partial(self.transform_documents, **kwargs), documents
+-        )
++        raise NotImplementedError
+ class CharacterTextSplitter(TextSplitter):
+     """Splitting text that looks at characters."""
+     def __init__(
+         self, separator: str = "\n\n", is_separator_regex: bool = False, **kwargs: Any
+     ) -> None:
+         """Create a new TextSplitter."""
+         super().__init__(**kwargs)
+         self._separator = separator
+         self._is_separator_regex = is_separator_regex
+     def split_text(self, text: str) -> List[str]:
+
+--- a/libs/langchain/langchain/tools/base.py
++++ b/libs/langchain/langchain/tools/base.py
+@@ -169,20 +169,22 @@
+             metadata=config.get("metadata"),
+             run_name=config.get("run_name"),
+             **kwargs,
+         )
+     async def ainvoke(
+         self,
+         input: Union[str, Dict],
+         config: Optional[RunnableConfig] = None,
+         **kwargs: Any,
+     ) -> Any:
++        if type(self)._arun == BaseTool._arun:
++            return await super().ainvoke(input, config, **kwargs)
+         config = config or {}
+         return await self.arun(
+             input,
+             callbacks=config.get("callbacks"),
+             tags=config.get("tags"),
+             metadata=config.get("metadata"),
+             run_name=config.get("run_name"),
+             **kwargs,
+         )
+     def _parse_input(

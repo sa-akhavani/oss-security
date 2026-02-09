@@ -1,0 +1,370 @@
+--- a/commands/bake.go
++++ b/commands/bake.go
+@@ -49,25 +49,21 @@
+ 	exportPush   bool
+ 	exportLoad   bool
+ 	callFunc     string
+ 	print bool
+ 	list  string
+ 	listTargets bool
+ 	listVars    bool
+ }
+ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in bakeOptions, cFlags commonFlags) (err error) {
+ 	mp := dockerCli.MeterProvider()
+-	ctx, end, err := tracing.TraceCurrentCommand(ctx, append([]string{"bake"}, targets...),
+-		attribute.String("builder", in.builder),
+-		attribute.StringSlice("targets", targets),
+-		attribute.StringSlice("files", in.files),
+-	)
++	ctx, end, err := tracing.TraceCurrentCommand(ctx, "bake")
+ 	if err != nil {
+ 		return err
+ 	}
+ 	defer func() {
+ 		end(err)
+ 	}()
+ 	url, cmdContext, targets := bakeArgs(targets)
+ 	if len(targets) == 0 {
+ 		targets = []string{"default"}
+ 	}
+@@ -239,21 +235,21 @@
+ 	if progressMode != progressui.RawJSONMode {
+ 		if err := exp.Prompt(ctx, url != "", &syncWriter{w: dockerCli.Err(), wait: printer.Wait}); err != nil {
+ 			return err
+ 		}
+ 	}
+ 	if printer.IsDone() {
+ 		if err := makePrinter(); err != nil {
+ 			return err
+ 		}
+ 	}
+-	if err := saveLocalStateGroup(dockerCli, in, targets, bo); err != nil {
++	if err := saveLocalStateGroup(dockerCli, in, targets, bo, overrides, def); err != nil {
+ 		return err
+ 	}
+ 	done := timeBuildCommand(mp, attributes)
+ 	resp, retErr := build.Build(ctx, nodes, bo, dockerutil.NewClient(dockerCli), confutil.NewConfig(dockerCli), printer)
+ 	if err := printer.Wait(); retErr == nil {
+ 		retErr = err
+ 	}
+ 	if retErr != nil {
+ 		err = wrapBuildError(retErr, true)
+ 	}
+@@ -417,48 +413,53 @@
+ 	flags.StringVar(&options.list, "list", "", "List targets or variables")
+ 	flags.BoolVar(&options.listTargets, "list-targets", false, "List available targets")
+ 	flags.MarkHidden("list-targets")
+ 	flags.MarkDeprecated("list-targets", "list-targets is deprecated, use list=targets instead")
+ 	flags.BoolVar(&options.listVars, "list-variables", false, "List defined variables")
+ 	flags.MarkHidden("list-variables")
+ 	flags.MarkDeprecated("list-variables", "list-variables is deprecated, use list=variables instead")
+ 	commonBuildFlags(&cFlags, flags)
+ 	return cmd
+ }
+-func saveLocalStateGroup(dockerCli command.Cli, in bakeOptions, targets []string, bo map[string]build.Options) error {
+-	l, err := localstate.New(confutil.NewConfig(dockerCli))
+-	if err != nil {
+-		return err
+-	}
+-	defer l.MigrateIfNeeded()
++func saveLocalStateGroup(dockerCli command.Cli, in bakeOptions, targets []string, bo map[string]build.Options, overrides []string, def any) error {
+ 	prm := confutil.MetadataProvenance()
+ 	if len(in.metadataFile) == 0 {
+ 		prm = confutil.MetadataProvenanceModeDisabled
+ 	}
+ 	groupRef := identity.NewID()
+ 	refs := make([]string, 0, len(bo))
+ 	for k, b := range bo {
+ 		if b.CallFunc != nil {
+ 			continue
+ 		}
+ 		b.Ref = identity.NewID()
+ 		b.GroupRef = groupRef
+ 		b.ProvenanceResponseMode = prm
+ 		refs = append(refs, b.Ref)
+ 		bo[k] = b
+ 	}
+ 	if len(refs) == 0 {
+ 		return nil
+ 	}
++	l, err := localstate.New(confutil.NewConfig(dockerCli))
++	if err != nil {
++		return err
++	}
++	dtdef, err := json.MarshalIndent(def, "", "  ")
++	if err != nil {
++		return err
++	}
+ 	return l.SaveGroup(groupRef, localstate.StateGroup{
+-		Refs:    refs,
+-		Targets: targets,
++		Definition: dtdef,
++		Targets:    targets,
++		Inputs:     overrides,
++		Refs:       refs,
+ 	})
+ }
+ func bakeArgs(args []string) (url, cmdContext string, targets []string) {
+ 	cmdContext, targets = "cwd://", args
+ 	if len(targets) == 0 || !build.IsRemoteURL(targets[0]) {
+ 		return url, cmdContext, targets
+ 	}
+ 	url, targets = targets[0], targets[1:]
+ 	if len(targets) == 0 || !build.IsRemoteURL(targets[0]) {
+ 		return url, cmdContext, targets
+
+--- a/commands/build.go
++++ b/commands/build.go
+@@ -242,25 +242,21 @@
+ 		for _, s := range []string{target, contextPath, dockerfile, salt} {
+ 			_, _ = io.WriteString(h, s)
+ 			h.Write([]byte{0})
+ 		}
+ 		o.result = hex.EncodeToString(h.Sum(nil))
+ 	})
+ 	return o.result
+ }
+ func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) (err error) {
+ 	mp := dockerCli.MeterProvider()
+-	ctx, end, err := tracing.TraceCurrentCommand(ctx, []string{"build", options.contextPath},
+-		attribute.String("builder", options.builder),
+-		attribute.String("context", options.contextPath),
+-		attribute.String("dockerfile", options.dockerfileName),
+-	)
++	ctx, end, err := tracing.TraceCurrentCommand(ctx, "build")
+ 	if err != nil {
+ 		return err
+ 	}
+ 	defer func() {
+ 		end(err)
+ 	}()
+ 	opts, err := options.toControllerOptions()
+ 	if err != nil {
+ 		return err
+ 	}
+
+--- a/localstate/localstate.go
++++ b/localstate/localstate.go
+@@ -1,49 +1,51 @@
+ package localstate
+ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+-	"strconv"
+ 	"sync"
+ 	"github.com/docker/buildx/util/confutil"
+ 	"github.com/pkg/errors"
+ 	"golang.org/x/sync/errgroup"
+ )
+ const (
+-	version  = 2
+ 	refsDir  = "refs"
+ 	groupDir = "__group__"
+ )
+ type State struct {
+ 	Target string
+ 	LocalPath string
+ 	DockerfilePath string
+ 	GroupRef string `json:",omitempty"`
+ }
+ type StateGroup struct {
++	Definition []byte
+ 	Targets []string `json:",omitempty"`
++	Inputs []string `json:",omitempty"`
+ 	Refs []string
+ }
+ type LocalState struct {
+ 	cfg *confutil.Config
+ }
+ func New(cfg *confutil.Config) (*LocalState, error) {
+ 	if cfg.Dir() == "" {
+ 		return nil, errors.Errorf("config dir empty")
+ 	}
+ 	if err := cfg.MkdirAll(refsDir, 0700); err != nil {
+ 		return nil, err
+ 	}
+-	return &LocalState{cfg: cfg}, nil
++	return &LocalState{
++		cfg: cfg,
++	}, nil
+ }
+ func (ls *LocalState) ReadRef(builderName, nodeName, id string) (*State, error) {
+ 	if err := ls.validate(builderName, nodeName, id); err != nil {
+ 		return nil, err
+ 	}
+ 	dt, err := os.ReadFile(filepath.Join(ls.cfg.Dir(), refsDir, builderName, nodeName, id))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	var st State
+@@ -59,25 +61,22 @@
+ 	refDir := filepath.Join(refsDir, builderName, nodeName)
+ 	if err := ls.cfg.MkdirAll(refDir, 0700); err != nil {
+ 		return err
+ 	}
+ 	dt, err := json.Marshal(st)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	return ls.cfg.AtomicWriteFile(filepath.Join(refDir, id), dt, 0644)
+ }
+-func (ls *LocalState) GroupDir() string {
+-	return filepath.Join(ls.cfg.Dir(), refsDir, groupDir)
+-}
+ func (ls *LocalState) ReadGroup(id string) (*StateGroup, error) {
+-	dt, err := os.ReadFile(filepath.Join(ls.GroupDir(), id))
++	dt, err := os.ReadFile(filepath.Join(ls.cfg.Dir(), refsDir, groupDir, id))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	var stg StateGroup
+ 	if err := json.Unmarshal(dt, &stg); err != nil {
+ 		return nil, err
+ 	}
+ 	return &stg, nil
+ }
+ func (ls *LocalState) SaveGroup(id string, stg StateGroup) error {
+@@ -169,42 +168,31 @@
+ 				return err
+ 			}
+ 		}
+ 	}
+ 	return os.RemoveAll(dir)
+ }
+ func (ls *LocalState) removeGroup(id string) error {
+ 	if id == "" {
+ 		return errors.Errorf("group ref empty")
+ 	}
+-	f := filepath.Join(ls.GroupDir(), id)
++	f := filepath.Join(ls.cfg.Dir(), refsDir, groupDir, id)
+ 	if _, err := os.Lstat(f); err != nil {
+ 		if !os.IsNotExist(err) {
+ 			return err
+ 		}
+ 		return nil
+ 	}
+ 	return os.Remove(f)
+ }
+ func (ls *LocalState) validate(builderName, nodeName, id string) error {
+ 	if builderName == "" {
+ 		return errors.Errorf("builder name empty")
+ 	}
+ 	if nodeName == "" {
+ 		return errors.Errorf("node name empty")
+ 	}
+ 	if id == "" {
+ 		return errors.Errorf("ref ID empty")
+ 	}
+ 	return nil
+ }
+-func (ls *LocalState) readVersion() int {
+-	if vdt, err := os.ReadFile(filepath.Join(ls.cfg.Dir(), refsDir, "version")); err == nil {
+-		if v, err := strconv.Atoi(string(vdt)); err == nil {
+-			return v
+-		}
+-	}
+-	return 1
+-}
+-func (ls *LocalState) writeVersion(version int) error {
+-	return ls.cfg.AtomicWriteFile(filepath.Join(refsDir, "version"), []byte(strconv.Itoa(version)), 0600)
+-}
+
+--- a/localstate/migrate.go
++++ b//dev/null
+@@ -1,52 +0,0 @@
+-package localstate
+-import (
+-	"encoding/json"
+-	"os"
+-	"path/filepath"
+-	"github.com/pkg/errors"
+-)
+-func (ls *LocalState) MigrateIfNeeded() error {
+-	currentVersion := ls.readVersion()
+-	if currentVersion == version {
+-		return nil
+-	}
+-	migrations := map[int]func(*LocalState) error{
+-		2: (*LocalState).migration2,
+-	}
+-	for v := currentVersion + 1; v <= version; v++ {
+-		migration, found := migrations[v]
+-		if !found {
+-			return errors.Errorf("localstate migration v%d not found", v)
+-		}
+-		if err := migration(ls); err != nil {
+-			return errors.Wrapf(err, "localstate migration v%d failed", v)
+-		}
+-	}
+-	return ls.writeVersion(version)
+-}
+-func (ls *LocalState) migration2() error {
+-	return filepath.Walk(ls.GroupDir(), func(path string, info os.FileInfo, err error) error {
+-		if err != nil {
+-			return err
+-		}
+-		if info.IsDir() {
+-			return nil
+-		}
+-		dt, err := os.ReadFile(path)
+-		if err != nil {
+-			return err
+-		}
+-		var stg StateGroup
+-		if err := json.Unmarshal(dt, &stg); err != nil {
+-			return err
+-		}
+-		mdt, err := json.Marshal(stg)
+-		if err != nil {
+-			return err
+-		}
+-		if err := os.WriteFile(path, mdt, 0600); err != nil {
+-			return err
+-		}
+-		return nil
+-	})
+-}
+
+--- a/util/tracing/trace.go
++++ b/util/tracing/trace.go
+@@ -1,33 +1,34 @@
+ package tracing
+ import (
+ 	"context"
++	"os"
+ 	"strings"
+ 	"github.com/moby/buildkit/util/tracing/delegated"
+ 	"github.com/moby/buildkit/util/tracing/detect"
+ 	"go.opentelemetry.io/otel"
+ 	"go.opentelemetry.io/otel/attribute"
+ 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+ 	"go.opentelemetry.io/otel/trace"
+ )
+-func TraceCurrentCommand(ctx context.Context, args []string, attrs ...attribute.KeyValue) (context.Context, func(error), error) {
++func TraceCurrentCommand(ctx context.Context, name string) (context.Context, func(error), error) {
+ 	opts := []sdktrace.TracerProviderOption{
+ 		sdktrace.WithResource(detect.Resource()),
+ 		sdktrace.WithBatcher(delegated.DefaultExporter),
+ 	}
+ 	if exp, err := detect.NewSpanExporter(ctx); err != nil {
+ 		otel.Handle(err)
+ 	} else if !detect.IsNoneSpanExporter(exp) {
+ 		opts = append(opts, sdktrace.WithBatcher(exp))
+ 	}
+ 	tp := sdktrace.NewTracerProvider(opts...)
+-	ctx, span := tp.Tracer("").Start(ctx, strings.Join(args, " "), trace.WithAttributes(
+-		attrs...,
++	ctx, span := tp.Tracer("").Start(ctx, name, trace.WithAttributes(
++		attribute.String("command", strings.Join(os.Args, " ")),
+ 	))
+ 	return ctx, func(err error) {
+ 		if err != nil {
+ 			span.RecordError(err)
+ 		}
+ 		span.End()
+ 		_ = tp.Shutdown(context.TODO())
+ 	}, nil
+ }

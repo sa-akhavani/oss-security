@@ -1,0 +1,2353 @@
+--- a/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/OpenApiController.java
++++ b/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/OpenApiController.java
+@@ -21,21 +21,21 @@
+ @RequestMapping("/openapi")
+ public class OpenApiController {
+     private static Logger logger = LoggerFactory.getLogger(OpenApiController.class);
+     @Resource
+     private RegistryService registryService;
+     @RequestMapping("/{uri}")
+     @ResponseBody
+     @Permission(login = false)
+     public Object api(HttpServletRequest httpServletRequest, @PathVariable("uri") String uri, @RequestBody(required = false) String data){
+         if (!"POST".equalsIgnoreCase(httpServletRequest.getMethod())) {
+-            return new OpenApiResponse(OpenApiResponse.FAIL_CODE, "invalid request, HttpMethod not support.");
++            return new OpenApiResponse<String>(OpenApiResponse.FAIL_CODE, "invalid request, HttpMethod not support.");
+         }
+         if (uri==null || uri.trim().isEmpty()) {
+             return new OpenApiResponse(OpenApiResponse.FAIL_CODE, "invalid request, uri-mapping empty.");
+         }
+         try {
+             if ("register".equals(uri)) {
+                 /**
+                  * 服务注册 & 续约 API
+                  * 说明：新服务注册上线1s内广播通知接入方；需要接入方循环续约，否则服务将会过期（三倍于注册中心心跳时间）下线；
+                  */
+
+--- a/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/biz/RegistryService.java
++++ b/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/biz/RegistryService.java
+@@ -8,35 +8,35 @@
+     /**
+      * register
+      *
+      * logic：
+      *      1、async run -> write db + broadcast message -> refresh cache + push client
+      *      2、single-client register single-app
+      *
+      * @param request   client instance
+      * @return
+      */
+-    OpenApiResponse register(RegisterRequest request);
++    OpenApiResponse<String> register(RegisterRequest request);
+     /**
+      * unregister
+      *
+      * @param request
+      * @return
+      */
+-    OpenApiResponse unregister(RegisterRequest request);
++    OpenApiResponse<String> unregister(RegisterRequest request);
+     /**
+      * discovery
+      *
+      * logic：
+      *      1、only read cache
+      *      2、
+      */
+     DiscoveryResponse discovery(DiscoveryRequest request);
+     /**
+      * monitor
+      *
+      * logic：
+      *      1、support client monitor，long-polling
+      *      2、push client when registry changed
+      */
+-    DeferredResult<OpenApiResponse> monitor(DiscoveryRequest request);
++    DeferredResult<OpenApiResponse<String>> monitor(DiscoveryRequest request);
+ }
+
+--- a/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/biz/impl/RegistryServiceImpl.java
++++ b/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/biz/impl/RegistryServiceImpl.java
+@@ -8,44 +8,44 @@
+ import org.springframework.web.context.request.async.DeferredResult;
+ import javax.annotation.Resource;
+ import java.util.List;
+ /**
+  * Registry Service
+  * @author xuxueli
+  */
+ @Service
+ public class RegistryServiceImpl implements RegistryService {
+     @Override
+-    public OpenApiResponse register(RegisterRequest request) {
++    public OpenApiResponse<String> register(RegisterRequest request) {
+         if (!RegistryFactory.getInstance().getAccessTokenHelpler().validRequestToken(request)) {
+-            return new OpenApiResponse(OpenApiResponse.FAIL_CODE, "accessToken Invalid.");
++            return new OpenApiResponse<>(OpenApiResponse.FAIL_CODE, "accessToken Invalid.");
+         }
+         RegistryFactory.getInstance().getRegisterHelper().registry(request);
+-        return new OpenApiResponse(OpenApiResponse.SUCCESS_CODE, null);
++        return new OpenApiResponse<>(OpenApiResponse.SUCCESS_CODE, null);
+     }
+     @Override
+-    public OpenApiResponse unregister(RegisterRequest request) {
++    public OpenApiResponse<String> unregister(RegisterRequest request) {
+         if (!RegistryFactory.getInstance().getAccessTokenHelpler().validRequestToken(request)) {
+-            return new OpenApiResponse(OpenApiResponse.FAIL_CODE, "accessToken Invalid.");
++            return new OpenApiResponse<>(OpenApiResponse.FAIL_CODE, "accessToken Invalid.");
+         }
+         RegistryFactory.getInstance().getRegisterHelper().unregister(request);
+-        return new OpenApiResponse(OpenApiResponse.SUCCESS_CODE, null);
++        return new OpenApiResponse<>(OpenApiResponse.SUCCESS_CODE, null);
+     }
+     @Override
+     public DiscoveryResponse discovery(DiscoveryRequest request) {
+         if (!RegistryFactory.getInstance().getAccessTokenHelpler().validRequestToken(request)) {
+             return new DiscoveryResponse(OpenApiResponse.FAIL_CODE, "accessToken Invalid.");
+         }
+         return RegistryFactory.getInstance().getRegistryCacheHelpler().discoveryOnLineInstance(request);
+     }
+     @Override
+-    public DeferredResult<OpenApiResponse> monitor(DiscoveryRequest request) {
++    public DeferredResult<OpenApiResponse<String>> monitor(DiscoveryRequest request) {
+         if (!RegistryFactory.getInstance().getAccessTokenHelpler().validRequestToken(request)) {
+             DeferredResult deferredResult = new DeferredResult(30 * 1000L, new DiscoveryResponse(DiscoveryResponse.SUCCESS_CODE, "Monitor timeout, no key updated."));
+             deferredResult.setResult(new DiscoveryResponse(DiscoveryResponse.FAIL_CODE, "accessToken Invalid."));
+             return deferredResult;
+         }
+         return RegistryFactory.getInstance().getRegistryDeferredResultHelpler().monitor(request);
+     }
+     /**
+      * 1、server：
+      *      - 存储：
+
+--- a/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/model/DiscoveryResponse.java
++++ b/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/model/DiscoveryResponse.java
+@@ -1,20 +1,24 @@
+ package com.xxl.rpc.admin.registry.model;
+ import com.xxl.rpc.admin.model.dto.InstanceCacheDTO;
+ import java.io.Serializable;
+ import java.util.List;
+ import java.util.Map;
+ /**
+  * @author xuxueli 2018-12-03
+  */
+ public class DiscoveryResponse extends OpenApiResponse implements Serializable {
+ 	public static final long serialVersionUID = 42L;
++	/**
++	 * Env
++	 */
++	private String env;
+ 	/**
+ 	 * discovery result data
+ 	 *
+ 	 * structure：Map
+ 	 * 		key：appname
+ 	 * 		value：List<RegisterInstance> = List ～ instance
+ 	 *
+ 	 */
+ 	private Map<String, List<InstanceCacheDTO>> discoveryData;
+ 	/**
+@@ -23,32 +27,29 @@
+ 	 * structure：Map
+ 	 * 		key：appname
+ 	 * 		value：md5
+ 	 *
+ 	 */
+ 	private Map<String, String> discoveryDataMd5;
+ 	public DiscoveryResponse(){}
+ 	public DiscoveryResponse(int code, String msg) {
+ 		super(code, msg);
+ 	}
++	public String getEnv() {
++		return env;
++	}
++	public void setEnv(String env) {
++		this.env = env;
++	}
+ 	public Map<String, List<InstanceCacheDTO>> getDiscoveryData() {
+ 		return discoveryData;
+ 	}
+ 	public void setDiscoveryData(Map<String, List<InstanceCacheDTO>> discoveryData) {
+ 		this.discoveryData = discoveryData;
+ 	}
+ 	public Map<String, String> getDiscoveryDataMd5() {
+ 		return discoveryDataMd5;
+ 	}
+ 	public void setDiscoveryDataMd5(Map<String, String> discoveryDataMd5) {
+ 		this.discoveryDataMd5 = discoveryDataMd5;
+ 	}
+-	@Override
+-	public String toString() {
+-		return "DiscoveryResponse{" +
+-				", discoveryData=" + discoveryData +
+-				", discoveryDataMd5=" + discoveryDataMd5 +
+-				", code=" + getCode() +
+-				", msg='" + getMsg() + '\'' +
+-				'}';
+-	}
+ }
+
+--- a/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/model/OpenApiResponse.java
++++ b/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/model/OpenApiResponse.java
+@@ -1,40 +1,52 @@
+ package com.xxl.rpc.admin.registry.model;
+ import com.xxl.tool.response.ResponseCode;
+ import java.io.Serializable;
+ /**
+  * @author xuxueli 2018-12-03
+  */
+-public class OpenApiResponse implements Serializable {
++public class OpenApiResponse<T> implements Serializable {
+     public static final long serialVersionUID = 42L;
+     public static final int SUCCESS_CODE = 200;
+     public static final int FAIL_CODE = 203;
+     private int code;
+     private String msg;
++    private T data;
+     public OpenApiResponse() {}
+     public OpenApiResponse(int code, String msg) {
+         this.code = code;
+         this.msg = msg;
++    }
++    public OpenApiResponse(T data) {
++        this.code = SUCCESS_CODE;
++        this.data = data;
+     }
+     public int getCode() {
+         return code;
+     }
+     public void setCode(int code) {
+         this.code = code;
+     }
+     public String getMsg() {
+         return msg;
+     }
+     public void setMsg(String msg) {
+         this.msg = msg;
+     }
++    public T getData() {
++        return data;
++    }
++    public void setData(T data) {
++        this.data = data;
++    }
+     @Override
+     public String toString() {
+         return "OpenApiResponse{" +
+                 "code=" + code +
+                 ", msg='" + msg + '\'' +
++                ", data=" + data +
+                 '}';
+     }
+     public boolean isSuccess() {
+         return code == ResponseCode.CODE_200.getCode();
+     }
+ }
+
+--- a/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/thread/RegisterHelper.java
++++ b/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/thread/RegisterHelper.java
+@@ -105,33 +105,33 @@
+             logger.error(e.getMessage(), e);
+         }
+         RegistryCacheHelpler.stopThread(registryMonitorThread);
+     }
+     /**
+      * registry
+      *
+      * @param request
+      * @return
+      */
+-    public OpenApiResponse registry(RegisterRequest request) {
++    public OpenApiResponse<String> registry(RegisterRequest request) {
+         if (request == null) {
+-            return new OpenApiResponse(OpenApiResponse.FAIL_CODE, "RegisterRequest is null.");
++            return new OpenApiResponse<>(OpenApiResponse.FAIL_CODE, "RegisterRequest is null.");
+         }
+         if (StringTool.isBlank(request.getEnv())
+                 || request.getInstance() == null
+                 || StringTool.isBlank(request.getInstance().getAppname())
+                 || StringTool.isBlank(request.getInstance().getIp())
+                 || request.getInstance().getPort()<1){
+-            return new OpenApiResponse(OpenApiResponse.FAIL_CODE, "RegisterRequest param invalid.");
++            return new OpenApiResponse<>(OpenApiResponse.FAIL_CODE, "RegisterRequest param invalid.");
+         }
+         if (request.getInstance().getAppname().length() > 50) {
+-            return new OpenApiResponse(OpenApiResponse.FAIL_CODE, "RegisterRequest param invalid, appname too long (less than 50).");
++            return new OpenApiResponse<>(OpenApiResponse.FAIL_CODE, "RegisterRequest param invalid, appname too long (less than 50).");
+         }
+         registerOrUnregisterThreadPool.execute(new Runnable() {
+             @Override
+             public void run() {
+                 Instance instance = new Instance();
+                 instance.setEnv(request.getEnv());
+                 instance.setAppname(request.getInstance().getAppname());
+                 instance.setIp(request.getInstance().getIp());
+                 instance.setPort(request.getInstance().getPort());
+                 instance.setExtendInfo(request.getInstance().getExtendInfo());
+@@ -141,41 +141,41 @@
+                 if (ret > 0) {
+                     Message message = new Message();
+                     message.setType(MessageTypeEnum.REGISTRY.getValue());
+                     message.setData(JSON.toJSONString(new MessageForRegistryDTO(instance)));      // convert
+                     message.setAddTime(new Date());
+                     message.setUpdateTime(new Date());
+                     RegistryFactory.getInstance().getMessageMapper().insert(message);
+                 }
+             }
+         });
+-        return new OpenApiResponse(OpenApiResponse.SUCCESS_CODE, null);
++        return new OpenApiResponse<>(OpenApiResponse.SUCCESS_CODE, null);
+     }
+     /**
+      * unregister
+      *
+      * @param request
+      * @return
+      */
+-    public OpenApiResponse unregister(RegisterRequest request) {
++    public OpenApiResponse<String> unregister(RegisterRequest request) {
+         if (request == null) {
+-            return new OpenApiResponse(OpenApiResponse.FAIL_CODE, "RegisterRequest is null.");
++            return new OpenApiResponse<>(OpenApiResponse.FAIL_CODE, "RegisterRequest is null.");
+         }
+         if (StringTool.isBlank(request.getEnv())
+                 || request.getInstance() == null
+                 || StringTool.isBlank(request.getInstance().getAppname())
+                 || StringTool.isBlank(request.getInstance().getIp())
+                 || request.getInstance().getPort()<1){
+-            return new OpenApiResponse(OpenApiResponse.FAIL_CODE, "RegisterRequest param invalid.");
++            return new OpenApiResponse<>(OpenApiResponse.FAIL_CODE, "RegisterRequest param invalid.");
+         }
+         if (request.getInstance().getAppname().length() > 50) {
+-            return new OpenApiResponse(OpenApiResponse.FAIL_CODE, "RegisterRequest param invalid, appname too long (less than 50).");
++            return new OpenApiResponse<>(OpenApiResponse.FAIL_CODE, "RegisterRequest param invalid, appname too long (less than 50).");
+         }
+         registerOrUnregisterThreadPool.execute(new Runnable() {
+             @Override
+             public void run() {
+                 Instance instance = new Instance();
+                 instance.setEnv(request.getEnv());
+                 instance.setAppname(request.getInstance().getAppname());
+                 instance.setIp(request.getInstance().getIp());
+                 instance.setPort(request.getInstance().getPort());
+                 instance.setRegisterModel(InstanceRegisterModelEnum.AUTO.getValue());
+@@ -183,13 +183,13 @@
+                 if (ret > 0) {
+                     Message message = new Message();
+                     message.setType(MessageTypeEnum.REGISTRY.getValue());
+                     message.setData(JSON.toJSONString(new MessageForRegistryDTO(instance)));      // convert
+                     message.setAddTime(new Date());
+                     message.setUpdateTime(new Date());
+                     RegistryFactory.getInstance().getMessageMapper().insert(message);
+                 }
+             }
+         });
+-        return new OpenApiResponse(OpenApiResponse.SUCCESS_CODE, null);
++        return new OpenApiResponse<>(OpenApiResponse.SUCCESS_CODE, null);
+     }
+ }
+
+--- a/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/thread/RegistryDeferredResultHelpler.java
++++ b/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/registry/thread/RegistryDeferredResultHelpler.java
+@@ -1,18 +1,19 @@
+ package com.xxl.rpc.admin.registry.thread;
+ import com.xxl.rpc.admin.registry.model.DiscoveryRequest;
+ import com.xxl.rpc.admin.registry.model.OpenApiResponse;
+ import com.xxl.tool.core.CollectionTool;
+ import com.xxl.tool.core.MapTool;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.web.context.request.async.DeferredResult;
++import java.io.File;
+ import java.util.*;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.CopyOnWriteArrayList;
+ import java.util.concurrent.TimeUnit;
+ import java.util.stream.Collectors;
+ /**
+  * registry DeferredResult helpler
+  *
+  * 功能：
+  * 1、客户端连接保活功能：以instance 维护关注的 客户端监听器 集合；
+@@ -102,35 +103,35 @@
+      */
+     public void pushClient(List<String> envAppnameList){
+         if (CollectionTool.isEmpty(envAppnameList)) {
+             return;
+         }
+         for (String envAppname: envAppnameList) {
+             List<DeferredResult> deferredResultList = registryDeferredResultMap.get(envAppname);
+             if (CollectionTool.isNotEmpty(deferredResultList)) {
+                 registryDeferredResultMap.remove(envAppname);   // thread-safe write
+                 for (DeferredResult deferredResult: deferredResultList) {
+-                    deferredResult.setResult(new OpenApiResponse(OpenApiResponse.SUCCESS_CODE, "Monitor key("+ envAppname +") update."));
++                    deferredResult.setResult(new OpenApiResponse<>(OpenApiResponse.SUCCESS_CODE, "Monitor key("+ envAppname +") update."));
+                 }
+             }
+         }
+     }
+     /**
+      * monitor
+      *
+      * @param request
+      * @return
+      */
+-    public DeferredResult<OpenApiResponse> monitor(DiscoveryRequest request) {
+-        DeferredResult deferredResult = new DeferredResult(30 * 1000L, new OpenApiResponse(OpenApiResponse.SUCCESS_CODE, "Monitor timeout, no key updated."));
++    public DeferredResult<OpenApiResponse<String>> monitor(DiscoveryRequest request) {
++        DeferredResult deferredResult = new DeferredResult(30 * 1000L, new OpenApiResponse<String>(OpenApiResponse.SUCCESS_CODE, "Monitor timeout, no key updated."));
+         if (request == null) {
+-            deferredResult.setResult(new OpenApiResponse(OpenApiResponse.FAIL_CODE, "request invalid"));
++            deferredResult.setResult(new OpenApiResponse<String>(OpenApiResponse.FAIL_CODE, "request invalid"));
+             return deferredResult;
+         }
+         for (String appname: request.getAppnameList()) {
+             String cacheKey = RegistryCacheHelpler.buildCacheKey(request.getEnv(), appname);
+             registryDeferredResultMap
+                     .computeIfAbsent(cacheKey, k -> new CopyOnWriteArrayList<>())       // thread-safe write, put list
+                     .add(deferredResult);                                                     // thread-safe write, add list-data
+         }
+         return deferredResult;
+     }
+
+--- a/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/util/PropConfUtil.java
++++ b/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/util/PropConfUtil.java
+@@ -13,17 +13,22 @@
+     private static PropConfUtil single = null;
+     public static PropConfUtil getSingle() {
+         return single;
+     }
+     @Override
+     public void afterPropertiesSet() throws Exception {
+         single = this;
+     }
+     @Value("${xxl.rpc.i18n}")
+     private String i18n;
++    @Value("${xxl.rpc.admin.registrydata.filepath}")
++    private String registrydataFilepath;
+     public String getI18n() {
+         if (!Arrays.asList("zh_CN", "zh_TC", "en").contains(i18n)) {
+             return "zh_CN";
+         }
+         return i18n;
+     }
++    public String getRegistrydataFilepath() {
++        return registrydataFilepath;
++    }
+ }
+
+--- a/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/web/interceptor/PermissionInterceptor.java
++++ b/xxl-rpc-admin/src/main/java/com/xxl/rpc/admin/web/interceptor/PermissionInterceptor.java
+@@ -58,21 +58,21 @@
+ 			}
+ 		}
+ 		return true;
+ 	}
+ 	@Override
+ 	public void postHandle(HttpServletRequest request, HttpServletResponse response, Object handler, ModelAndView modelAndView) throws Exception {
+ 		if (modelAndView != null) {
+ 			modelAndView.addObject("I18nUtil", FreemarkerTool.generateStaticModel(I18nUtil.class.getName()));
+ 			List<ResourceDTO> resourceDTOList = Arrays.asList(
+ 					new ResourceDTO(1, 0, "首页",0, "", "/index", "fa fa-home", 1, 0),
+-					new ResourceDTO(2, 0, "注册中心",0, "", "/instance", " fa-cubes", 2, 0),
++					new ResourceDTO(2, 0, "服务注册列表",0, "", "/instance", " fa-cubes", 2, 0),
+ 					new ResourceDTO(3, 0, "应用管理",0, "ADMIN", "/application", " fa-cloud", 3, 0),
+ 					new ResourceDTO(4, 0, "环境管理",0, "ADMIN", "/environment", "fa-cog", 4, 0),
+ 					new ResourceDTO(5, 0, "鉴权管理",0, "ADMIN", "/accesstoken", "fa-key", 5, 0),
+ 					new ResourceDTO(6, 0, "用户管理",0, "ADMIN", "/user", "fa-users", 6, 0),
+ 					new ResourceDTO(7, 0, "帮助中心",0, "", "/help", "fa-book", 7, 0)
+ 			);
+ 			if (!loginService.isAdmin(request)) {
+ 				resourceDTOList = resourceDTOList.stream()
+ 						.filter(resourceDTO -> StringTool.isBlank(resourceDTO.getPermission() ))	// normal user had no permission
+ 						.collect(Collectors.toList());
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/boot/support/SpringXxlRpcBootstrap.java
++++ b//dev/null
+@@ -1,61 +0,0 @@
+-package com.xxl.rpc.core.boot.support;
+-import com.xxl.rpc.core.boot.XxlRpcBootstrap;
+-import com.xxl.rpc.core.invoker.reference.XxlRpcReferenceBean;
+-import com.xxl.rpc.core.invoker.support.SpringInvokerFactory;
+-import com.xxl.rpc.core.provider.support.SpringProviderFactory;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-import org.springframework.beans.BeansException;
+-import org.springframework.beans.factory.DisposableBean;
+-import org.springframework.beans.factory.SmartInitializingSingleton;
+-import org.springframework.beans.factory.config.InstantiationAwareBeanPostProcessor;
+-import org.springframework.context.ApplicationContext;
+-import org.springframework.context.ApplicationContextAware;
+-import java.util.ArrayList;
+-import java.util.List;
+-/**
+- * XxlRpc Spring Factory
+- *
+- * @author xuxueli 2024-12-21
+- */
+-public class SpringXxlRpcBootstrap extends XxlRpcBootstrap implements ApplicationContextAware, SmartInitializingSingleton, DisposableBean, InstantiationAwareBeanPostProcessor {
+-    private static final Logger logger = LoggerFactory.getLogger(SpringXxlRpcBootstrap.class);
+-    @Override
+-    public void afterSingletonsInstantiated() {
+-        super.start();
+-        this.getInvoker().addAllReferenceBean(referenceBeanList);
+-        this.getInvoker().discoveryReferenceBean();
+-        if (getProviderConfig()!=null && getProviderConfig().isOpen()) {
+-            SpringProviderFactory.scanService(applicationContext, this);
+-        }
+-    }
+-    /**
+-     * referenceBean List
+-     */
+-    private volatile List<XxlRpcReferenceBean> referenceBeanList = new ArrayList<>();
+-    public void addReferenceBean(XxlRpcReferenceBean referenceBean){
+-        referenceBeanList.add(referenceBean);
+-    }
+-    @Override
+-    public boolean postProcessAfterInstantiation(Object bean, String beanName) throws BeansException {
+-        if (getInvokerConfig()!=null && getInvokerConfig().isOpen()) {
+-            /**
+-             * invoker support
+-             *
+-             * 1、init XxlRpcReferenceBean
+-             * 2、collect XxlRpcReferenceBean
+-             */
+-            return SpringInvokerFactory.postProcessAfterInstantiation(bean, beanName, this);
+-        }
+-        return true;
+-    }
+-    @Override
+-    public void destroy() throws Exception {
+-        super.stop();
+-    }
+-    private ApplicationContext applicationContext;
+-    @Override
+-    public void setApplicationContext(ApplicationContext applicationContext) throws BeansException {
+-        this.applicationContext = applicationContext;
+-    }
+-}
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/invoker/InvokerFactory.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/invoker/InvokerFactory.java
+@@ -198,33 +198,33 @@
+             } catch (Exception e) {
+                 connectClient_new.close();
+                 throw e;
+             }
+             return connectClient_new;
+         }
+     }
+     /**
+      * referenceBean List
+      */
+-    private volatile List<XxlRpcReferenceBean> referenceBeanListStore = new ArrayList<>();
++    private volatile List<XxlRpcReferenceBean> referenceBeanList = new ArrayList<>();
+     /**
+      * add referenceBean
+      *
+      * @param referenceBeanList
+      */
+     public void addAllReferenceBean(List<XxlRpcReferenceBean> referenceBeanList){
+-        this.referenceBeanListStore.addAll(referenceBeanList);
++        referenceBeanList.addAll(referenceBeanList);
+     }
+     /**
+      * discovery referenceBean
+      */
+     public void discoveryReferenceBean(){
+-        if (!referenceBeanListStore.isEmpty()) {
+-            Set<String> appnameList = referenceBeanListStore.stream().map(XxlRpcReferenceBean::getAppname).collect(Collectors.toSet());
++        if (!referenceBeanList.isEmpty()) {
++            Set<String> appnameList = referenceBeanList.stream().map(XxlRpcReferenceBean::getAppname).collect(Collectors.toSet());
+             try {
+                 rpcBootstrap.getRegister().discovery(appnameList);
+             } catch (Exception e) {
+                 logger.error(e.getMessage(), e);
+             }
+         }
+     }
+ }
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/invoker/annotation/XxlRpcReference.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/invoker/annotation/XxlRpcReference.java
+@@ -1,13 +1,17 @@
+ package com.xxl.rpc.core.invoker.annotation;
+ import com.xxl.rpc.core.invoker.call.CallType;
+ import com.xxl.rpc.core.invoker.route.LoadBalance;
++import com.xxl.rpc.core.remoting.Client;
++import com.xxl.rpc.core.remoting.impl.netty.client.NettyClient;
++import com.xxl.rpc.core.serializer.Serializer;
++import com.xxl.rpc.core.serializer.impl.JsonbSerializer;
+ import java.lang.annotation.*;
+ /**
+  * rpc service annotation, skeleton of stub ("@Inherited" allow service use "Transactional")
+  *
+  * @author 2015-10-29 19:44:33
+  */
+ @Target({ElementType.FIELD})
+ @Retention(RetentionPolicy.RUNTIME)
+ @Inherited
+ public @interface XxlRpcReference {
+@@ -17,20 +21,32 @@
+      * @return
+      */
+     String appname();
+     /**
+      * version of this iface
+      *
+      * @return
+      */
+     String version() default "";
+     /**
++     * client
++     *
++     * @return
++     */
++    Class<? extends Client> client() default NettyClient.class;
++    /**
++     * serializer
++     *
++     * @return
++     */
++    Class<? extends Serializer> serializer() default JsonbSerializer.class;
++    /**
+      * callType
+      *
+      * @return
+      */
+     CallType callType() default CallType.SYNC;
+     /**
+      * loadBalance
+      *
+      * @return
+      */
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/invoker/call/XxlRpcResponseFuture.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/invoker/call/XxlRpcResponseFuture.java
+@@ -1,38 +1,34 @@
+ package com.xxl.rpc.core.invoker.call;
+ import com.xxl.rpc.core.invoker.InvokerFactory;
+-import com.xxl.rpc.core.register.entity.RegisterInstance;
+ import com.xxl.rpc.core.remoting.entity.XxlRpcRequest;
+ import com.xxl.rpc.core.remoting.entity.XxlRpcResponse;
+ import com.xxl.rpc.core.util.XxlRpcException;
+ import org.slf4j.Logger;
+ import java.util.concurrent.*;
+ /**
+  * call back future
+  *
+  * @author xuxueli 2015-11-5 14:26:37
+  */
+ public class XxlRpcResponseFuture implements Future<XxlRpcResponse> {
+ 	private static Logger logger = org.slf4j.LoggerFactory.getLogger(XxlRpcResponseFuture.class);
+ 	private final InvokerFactory invokerFactory;
+-	private final RegisterInstance registerInstance;
+ 	private final XxlRpcRequest request;
+ 	private XxlRpcResponse response;
+ 	private volatile boolean done = false;
+ 	private Object lock = new Object();
+ 	private XxlRpcInvokeCallback invokeCallback;
+ 	public XxlRpcResponseFuture(final InvokerFactory invokerFactory,
+-								final RegisterInstance registerInstance,
+ 								final XxlRpcRequest request,
+ 								XxlRpcInvokeCallback invokeCallback) {
+ 		this.invokerFactory = invokerFactory;
+-		this.registerInstance = registerInstance;
+ 		this.request = request;
+ 		this.invokeCallback = invokeCallback;
+ 		setInvokerFuture();
+ 	}
+ 	public XxlRpcRequest getRequest() {
+ 		return request;
+ 	}
+ 	public XxlRpcInvokeCallback getInvokeCallback() {
+ 		return invokeCallback;
+ 	}
+@@ -85,15 +81,15 @@
+ 					} else {
+ 						long timeoutMillis = (TimeUnit.MILLISECONDS==unit)?timeout:TimeUnit.MILLISECONDS.convert(timeout , unit);
+ 						lock.wait(timeoutMillis);
+ 					}
+ 				} catch (InterruptedException e) {
+ 					logger.error(e.getMessage(), e);
+ 				}
+ 			}
+ 		}
+ 		if (!done) {
+-			throw new XxlRpcException("xxl-rpc, request timeout. registerInstance="+registerInstance.getUniqueKey()+", request=" + request.toString());
++			throw new XxlRpcException("xxl-rpc, request timeout at:"+ System.currentTimeMillis() +", request:" + request.toString());
+ 		}
+ 		return response;
+ 	}
+ }
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/invoker/config/InvokerConfig.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/invoker/config/InvokerConfig.java
+@@ -1,67 +1,26 @@
+ package com.xxl.rpc.core.invoker.config;
+-import com.xxl.rpc.core.remoting.Client;
+-import com.xxl.rpc.core.remoting.impl.netty.client.NettyClient;
+-import com.xxl.rpc.core.serializer.Serializer;
+-import com.xxl.rpc.core.serializer.impl.JsonbSerializer;
+-import java.util.List;
+ /**
+  * invoke config
+  *
+  * @author xuxueli 2024-12-28
+  */
+ public class InvokerConfig {
+     /**
+      * provider switch
+      */
+     private boolean open = true;
+     /**
+-     * client, for network
+-     */
+-    private Class<? extends Client> client = NettyClient.class;
+-    /**
+-     * serializer, process request and response
+-     */
+-    private Class<? extends Serializer> serializer = JsonbSerializer.class;
+-    /**
+-     * serializer allow package list, for security
+-     */
+-    private List<String> serializerAllowPackageList;
+-    /**
+      * accessToken (optional), for rpc-safe
+      */
+     public InvokerConfig() {
+-    }
+-    public InvokerConfig(boolean open, Class<? extends Client> client, Class<? extends Serializer> serializer, List<String> serializerAllowPackageList) {
+-        this.open = open;
+-        this.client = client;
+-        this.serializer = serializer;
+-        this.serializerAllowPackageList = serializerAllowPackageList;
+     }
+     public InvokerConfig(boolean open) {
+         this.open = open;
+     }
+     public boolean isOpen() {
+         return open;
+     }
+     public void setOpen(boolean open) {
+         this.open = open;
+     }
+-    public Class<? extends Client> getClient() {
+-        return client;
+-    }
+-    public void setClient(Class<? extends Client> client) {
+-        this.client = client;
+-    }
+-    public Class<? extends Serializer> getSerializer() {
+-        return serializer;
+-    }
+-    public void setSerializer(Class<? extends Serializer> serializer) {
+-        this.serializer = serializer;
+-    }
+-    public List<String> getSerializerAllowPackageList() {
+-        return serializerAllowPackageList;
+-    }
+-    public void setSerializerAllowPackageList(List<String> serializerAllowPackageList) {
+-        this.serializerAllowPackageList = serializerAllowPackageList;
+-    }
+ }
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/invoker/reference/XxlRpcReferenceBean.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/invoker/reference/XxlRpcReferenceBean.java
+@@ -38,39 +38,53 @@
+ 	private String appname = null;
+ 	/**
+ 	 * service metadata
+ 	 */
+ 	private Class<?> iface = null;
+ 	/**
+ 	 * service version
+ 	 */
+ 	private String version = null;
+ 	/**
++	 * client, for network
++	 */
++	private Class<? extends Client> client = NettyClient.class;
++	/**
++	 * serializer, process request and response
++	 */
++	private Class<? extends Serializer> serializer = JsonbSerializer.class;
++	/**
+ 	 * call type
+ 	 */
+ 	private CallType callType = CallType.SYNC;
+ 	/**
+ 	 * flow load-balance
+ 	 */
+ 	private LoadBalance loadBalance = LoadBalance.RANDOM;
+ 	/**
+ 	 * reqeust timeout
+ 	 */
+ 	private long timeout = 1000;
+ 	public void setAppname(String appname) {
+ 		this.appname = appname;
+ 	}
+ 	public void setIface(Class<?> iface) {
+ 		this.iface = iface;
+ 	}
+ 	public void setVersion(String version) {
+ 		this.version = version;
++	}
++	public void setClient(Class<? extends Client> client) {
++		this.client = client;
++	}
++	public void setSerializer(Class<? extends Serializer> serializer) {
++		this.serializer = serializer;
+ 	}
+ 	public void setCallType(CallType callType) {
+ 		this.callType = callType;
+ 	}
+ 	public void setLoadBalance(LoadBalance loadBalance) {
+ 		this.loadBalance = loadBalance;
+ 	}
+ 	public void setTimeout(long timeout) {
+ 		this.timeout = timeout;
+ 	}
+@@ -91,40 +105,39 @@
+ 	public XxlRpcBootstrap getRpcBootstrap() {
+ 		return rpcBootstrap;
+ 	}
+ 	private void valid() throws Exception {
+ 		if (this.appname == null) {
+ 			throw new XxlRpcException("xxl-rpc reference appname missing.");
+ 		}
+ 		if (this.iface == null) {
+ 			throw new XxlRpcException("xxl-rpc reference iface missing.");
+ 		}
++		if (this.client == null) {
++			throw new XxlRpcException("xxl-rpc reference client missing.");
++		}
++		if (this.serializer == null) {
++			throw new XxlRpcException("xxl-rpc reference serializer missing.");
++		}
+ 		if (this.callType == null) {
+ 			throw new XxlRpcException("xxl-rpc reference callType missing.");
+ 		}
+ 		if (this.loadBalance == null) {
+ 			throw new XxlRpcException("xxl-rpc reference loadBalance missing.");
+ 		}
+ 		if (!(this.timeout > 0 && this.timeout< 60 * 1000 )) {
+ 			throw new XxlRpcException("xxl-rpc reference timeout invlid.");
+ 		}
+ 		if (rpcBootstrap == null) {
+ 			throw new XxlRpcException("xxl-rpc reference rpcBootstrap missing.");
+ 		}
+-		if (rpcBootstrap.getInvokerConfig().getClient() == null) {
+-			throw new XxlRpcException("xxl-rpc reference client missing.");
+-		}
+-		if (rpcBootstrap.getInvokerConfig().getSerializer() == null) {
+-			throw new XxlRpcException("xxl-rpc reference serializer missing.");
+-		}
+-		this.serializerInstance = rpcBootstrap.getInvokerConfig().getSerializer().newInstance();
+-		this.serializerInstance.allowPackageList(rpcBootstrap.getInvokerConfig().getSerializerAllowPackageList());
++		this.serializerInstance = serializer.newInstance();
+ 	}
+ 	public Object getObject() throws Exception {
+ 		valid();
+ 		return Proxy.newProxyInstance(Thread.currentThread()
+ 				.getContextClassLoader(), new Class[] { iface },
+ 				new InvocationHandler() {
+ 					@Override
+ 					public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+ 						if (Object.class.equals(method.getDeclaringClass())) {
+ 							logger.debug(">>>>>>>>>>> xxl-rpc proxy class-method not support [{}#{}], invoking original method",
+@@ -173,53 +186,53 @@
+ 						XxlRpcRequest xxlRpcRequest = new XxlRpcRequest();
+ 	                    xxlRpcRequest.setRequestId(UUID.randomUUID().toString());
+ 	                    xxlRpcRequest.setCreateMillisTime(System.currentTimeMillis());
+ 	                    xxlRpcRequest.setClassName(className);
+ 	                    xxlRpcRequest.setMethodName(methodName);
+ 	                    xxlRpcRequest.setParameterTypes(parameterTypes);
+ 	                    xxlRpcRequest.setParameters(parameters);
+ 	                    xxlRpcRequest.setVersion(version);
+ 						XxlRpcResponseFuture rpcFuture = null;
+ 						try {
+-							Client clientInstance = rpcBootstrap.getInvoker().getClient(registerInstance, rpcBootstrap.getInvokerConfig().getClient(), serializerInstance);
++							Client clientInstance = rpcBootstrap.getInvoker().getClient(registerInstance, client, serializerInstance);
+ 							if (CallType.SYNC == callType) {
+-								rpcFuture = new XxlRpcResponseFuture(rpcBootstrap.getInvoker(), registerInstance, xxlRpcRequest, null);
++								rpcFuture = new XxlRpcResponseFuture(rpcBootstrap.getInvoker(), xxlRpcRequest, null);
+ 								clientInstance.send(xxlRpcRequest);
+ 								XxlRpcResponse xxlRpcResponse = rpcFuture.get(timeout, TimeUnit.MILLISECONDS);
+ 								if (xxlRpcResponse.getErrorMsg() != null) {
+ 									throw new XxlRpcException(xxlRpcResponse.getErrorMsg());
+ 								}
+ 								return xxlRpcResponse.getResult();
+ 							} else if (CallType.FUTURE == callType) {
+-								rpcFuture = new XxlRpcResponseFuture(rpcBootstrap.getInvoker(), registerInstance, xxlRpcRequest, null);
++								rpcFuture = new XxlRpcResponseFuture(rpcBootstrap.getInvoker(), xxlRpcRequest, null);
+ 								XxlRpcInvokeFuture.setFuture(new XxlRpcInvokeFuture(rpcFuture));
+ 								clientInstance.send(xxlRpcRequest);
+ 								return null;
+ 							} else if (CallType.CALLBACK == callType) {
+ 								XxlRpcInvokeCallback invokeCallback = XxlRpcInvokeCallback.getCallback();
+ 								if (invokeCallback == null) {
+ 									throw new XxlRpcException("xxl-rpc XxlRpcInvokeCallback（CallType="+ CallType.CALLBACK.name() +"） cannot be null.");
+ 								}
+-								rpcFuture = new XxlRpcResponseFuture(rpcBootstrap.getInvoker(), registerInstance, xxlRpcRequest, invokeCallback);
++								rpcFuture = new XxlRpcResponseFuture(rpcBootstrap.getInvoker(), xxlRpcRequest, invokeCallback);
+ 								clientInstance.send(xxlRpcRequest);
+ 								return null;
+ 							} else if (CallType.ONEWAY == callType) {
+ 								clientInstance.send(xxlRpcRequest);
+ 								return null;
+ 							} else {
+ 								throw new XxlRpcException("xxl-rpc callType["+ callType +"] invalid");
+ 							}
+ 						} catch (Throwable e) {
+ 							if (rpcFuture != null) {
+ 								rpcFuture.removeInvokerFuture();
+ 							}
+-							logger.debug(">>>>>>>>>>> xxl-rpc, invoke error, registerInstance:{}, XxlRpcRequest{}", registerInstance.getUniqueKey(), xxlRpcRequest);
++							logger.info(">>>>>>>>>>> xxl-rpc, invoke error, registerInstance:{}, XxlRpcRequest{}", registerInstance.getUniqueKey(), xxlRpcRequest);
+ 							throw e;
+ 						} finally{
+ 							if (Arrays.asList(CallType.SYNC, CallType.ONEWAY).contains(callType)) {
+ 							if (rpcFuture != null) {
+ 								rpcFuture.removeInvokerFuture();
+ 							}
+ 						}
+ 					}
+ 				}});
+ 	}
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/invoker/support/SpringInvokerFactory.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/invoker/support/SpringInvokerFactory.java
+@@ -1,44 +1,47 @@
+ package com.xxl.rpc.core.invoker.support;
+-import com.xxl.rpc.core.boot.support.SpringXxlRpcBootstrap;
++import com.xxl.rpc.core.boot.XxlRpcBootstrap;
++import com.xxl.rpc.core.boot.support.XxlRpcSpringFactory;
+ import com.xxl.rpc.core.invoker.annotation.XxlRpcReference;
+ import com.xxl.rpc.core.invoker.reference.XxlRpcReferenceBean;
+ import com.xxl.rpc.core.provider.ProviderFactory;
+ import com.xxl.rpc.core.util.XxlRpcException;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.beans.BeansException;
+ import org.springframework.util.ReflectionUtils;
+ import java.lang.reflect.Field;
+ /**
+  * xxl-rpc invoker factory, init service-registry and spring-bean by annotation (for spring)
+  *
+  * @author xuxueli 2018-10-19
+  */
+ public class SpringInvokerFactory {
+     private static Logger logger = LoggerFactory.getLogger(SpringInvokerFactory.class);
+     public static boolean postProcessAfterInstantiation(final Object bean,
+                                                         final String beanName,
+-                                                        final SpringXxlRpcBootstrap rpcBootstrap) throws BeansException {
++                                                        final XxlRpcSpringFactory rpcBootstrap) throws BeansException {
+         ReflectionUtils.doWithFields(bean.getClass(), new ReflectionUtils.FieldCallback() {
+             @Override
+             public void doWith(Field field) throws IllegalArgumentException, IllegalAccessException {
+                 if (field.isAnnotationPresent(XxlRpcReference.class)) {
+                     Class iface = field.getType();
+                     if (!iface.isInterface()) {
+                         throw new XxlRpcException("xxl-rpc, reference(XxlRpcReference) must be interface.");
+                     }
+                     XxlRpcReference rpcReference = field.getAnnotation(XxlRpcReference.class);
+                     XxlRpcReferenceBean referenceBean = new XxlRpcReferenceBean();
+                     referenceBean.setAppname(rpcReference.appname());
+                     referenceBean.setIface(iface);
+                     referenceBean.setVersion(rpcReference.version());
++                    referenceBean.setClient(rpcReference.client());
++                    referenceBean.setSerializer(rpcReference.serializer());
+                     referenceBean.setCallType(rpcReference.callType());
+                     referenceBean.setLoadBalance(rpcReference.loadBalance());
+                     referenceBean.setTimeout(rpcReference.timeout());
+                     referenceBean.setRpcBootstrap(rpcBootstrap);
+                     Object serviceProxy = null;
+                     try {
+                         serviceProxy = referenceBean.getObject();
+                     } catch (Exception e) {
+                         throw new XxlRpcException(e);
+                     }
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/provider/ProviderFactory.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/provider/ProviderFactory.java
+@@ -63,21 +63,20 @@
+ 			rpcBootstrap.getProviderConfig().setPort(7080);
+ 		}
+ 		if (rpcBootstrap.getProviderConfig().getAddress()==null || rpcBootstrap.getProviderConfig().getAddress().isEmpty()) {
+ 			String address = IpUtil.getIpPort(ip, rpcBootstrap.getProviderConfig().getPort());
+ 			rpcBootstrap.getProviderConfig().setAddress(address);
+ 		}
+ 		if (NetUtil.isPortUsed(rpcBootstrap.getProviderConfig().getPort())) {
+ 			throw new XxlRpcException("xxl-rpc provider port["+ rpcBootstrap.getProviderConfig().getPort() +"] is used.");
+ 		}
+ 		this.serializerInstance = rpcBootstrap.getProviderConfig().getSerializer().newInstance();
+-		this.serializerInstance.allowPackageList(rpcBootstrap.getProviderConfig().getSerializerAllowPackageList());
+ 		this.serverInstance = rpcBootstrap.getProviderConfig().getServer().newInstance();
+ 		this.serverInstance.setStartedCallback(new Callable<Void>() {		// serviceRegistry started
+ 			public Void call() throws Exception {
+ 				if (rpcBootstrap.getRegister() != null) {
+ 					RegisterInstance instance = new RegisterInstance();
+ 					instance.setEnv(rpcBootstrap.getBaseConfig().getEnv());
+ 					instance.setAppname(rpcBootstrap.getBaseConfig().getAppname());
+ 					instance.setIp(ip);
+ 					instance.setPort(rpcBootstrap.getProviderConfig().getPort());
+ 					rpcBootstrap.getRegister().register(instance);
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/provider/config/ProviderConfig.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/provider/config/ProviderConfig.java
+@@ -1,38 +1,33 @@
+ package com.xxl.rpc.core.provider.config;
+ import com.xxl.rpc.core.remoting.Server;
+ import com.xxl.rpc.core.remoting.impl.netty.server.NettyServer;
+ import com.xxl.rpc.core.serializer.Serializer;
+ import com.xxl.rpc.core.serializer.impl.JsonbSerializer;
+-import java.util.List;
+ /**
+  * Provider Config
+  *
+  * @author xuxueli 2024-1221
+  */
+ public class ProviderConfig {
+     /**
+      * provider switch
+      */
+     private boolean open = true;
+     /**
+      * server, for network
+      */
+     private Class<? extends Server> server = NettyServer.class;
+     /**
+      * serializer, process request and response
+      */
+     private Class<? extends Serializer> serializer = JsonbSerializer.class;
+-    /**
+-     * serializer allow package list, for security
+-     */
+-    private List<String> serializerAllowPackageList;
+     /**
+      * server port (generate address)
+      */
+     private int port = 7080;
+     /**
+      * handler thread-pool core size
+      */
+     private int corePoolSize = 60;
+     /**
+      * handler thread-pool max size
+@@ -42,29 +37,27 @@
+      * register address (optional), will use "ip:port" if not exists
+      */
+     private String address;
+     /**
+      * accessToken (optional), for rpc-safe
+      */
+     public ProviderConfig() {
+     }
+     public ProviderConfig(Class<? extends Server> server,
+                           Class<? extends Serializer> serializer,
+-                          List<String> serializerAllowPackageList,
+                           int port,
+                           int corePoolSize,
+                           int maxPoolSize,
+                           String address) {
+         this.open = true;
+         this.server = server;
+         this.serializer = serializer;
+-        this.serializerAllowPackageList = serializerAllowPackageList;
+         this.port = port;
+         this.corePoolSize = corePoolSize;
+         this.maxPoolSize = maxPoolSize;
+         this.address = address;
+     }
+     public ProviderConfig(boolean open){
+         this.open = open;
+     }
+     public Class<? extends Server> getServer() {
+         return server;
+@@ -77,26 +70,20 @@
+     }
+     public void setServer(Class<? extends Server> server) {
+         this.server = server;
+     }
+     public Class<? extends Serializer> getSerializer() {
+         return serializer;
+     }
+     public void setSerializer(Class<? extends Serializer> serializer) {
+         this.serializer = serializer;
+     }
+-    public List<String> getSerializerAllowPackageList() {
+-        return serializerAllowPackageList;
+-    }
+-    public void setSerializerAllowPackageList(List<String> serializerAllowPackageList) {
+-        this.serializerAllowPackageList = serializerAllowPackageList;
+-    }
+     public int getPort() {
+         return port;
+     }
+     public void setPort(int port) {
+         this.port = port;
+     }
+     public int getCorePoolSize() {
+         return corePoolSize;
+     }
+     public void setCorePoolSize(int corePoolSize) {
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/register/RegisterEnum.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/register/RegisterEnum.java
+@@ -1,19 +1,19 @@
+ package com.xxl.rpc.core.register;
+ import com.xxl.rpc.core.register.impl.LocalRegister;
+-import com.xxl.rpc.core.register.impl.XxlRpcAdminRegister;
++import com.xxl.rpc.core.register.impl.XxlRpcRegister;
+ /**
+  * @author xuxueli 2024-12-21
+  */
+ public enum RegisterEnum {
+     LOCAL(LocalRegister.class),
+-    XXL_RPC_ADMIN(XxlRpcAdminRegister.class);
++    XXL_RPC_ADMIN(XxlRpcRegister.class);
+     private Class<? extends Register> serializerClass;
+     RegisterEnum(Class<? extends Register> serializerClass) {
+         this.serializerClass = serializerClass;
+     }
+     public Class<? extends Register> getSerializerClass() {
+         return serializerClass;
+     }
+     public static RegisterEnum match(String name){
+         for (RegisterEnum item: RegisterEnum.values()) {
+             if (item.name().equals(name)) {
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/register/impl/XxlRpcAdminRegister.java
++++ b//dev/null
+@@ -1,289 +0,0 @@
+-package com.xxl.rpc.core.register.impl;
+-import com.xxl.rpc.core.boot.XxlRpcBootstrap;
+-import com.xxl.rpc.core.register.Register;
+-import com.xxl.rpc.core.register.entity.RegisterInstance;
+-import com.xxl.rpc.core.register.impl.openapi.XxlRpcAdminRegisterTool;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-import java.util.*;
+-import java.util.concurrent.ConcurrentHashMap;
+-import java.util.concurrent.ConcurrentMap;
+-import java.util.concurrent.TimeUnit;
+-/**
+- * XxlRpcRegister
+- *
+- * @author xuxueli 2018-11-30
+- */
+-public class XxlRpcAdminRegister extends Register {
+-    private static Logger logger = LoggerFactory.getLogger(XxlRpcAdminRegister.class);
+-    /**
+-     * xxl-rpc-admin config
+-     */
+-    private volatile String adminAddress;
+-    /**
+-     * access token, for xxl-rpc-admin
+-     */
+-    private volatile String accessToken;
+-    /**
+-     * xxlRpcBootstrap
+-     */
+-    private XxlRpcBootstrap xxlRpcBootstrap;
+-    public XxlRpcAdminRegister() {
+-    }
+-    public XxlRpcAdminRegister(String adminAddress, String accessToken) {
+-        this.adminAddress = adminAddress;
+-        this.accessToken = accessToken;
+-    }
+-    /**
+-     * registry data
+-     */
+-    private volatile TreeSet<RegisterInstance> registryInstanceListStore = new TreeSet<>();//new ConcurrentSkipListSet<>();
+-    /**
+-     * discovery data
+-     *      key：appname
+-     *      value：TreeSet<RegisterInstance>
+-     */
+-    private volatile Map<String, TreeSet<RegisterInstance>> discoveryAppnameStore = new ConcurrentHashMap<>();
+-    /**
+-     * discovery data-md5
+-     */
+-    private volatile ConcurrentMap<String, String> discoveryAppnameMd5Store = new ConcurrentHashMap<>();
+-    /**
+-     * BeatTime Interval, by second
+-     */
+-    public static final int REGISTRY_BEAT_TIME = 30;
+-    /**
+-     * thread stop variable
+-     */
+-    private volatile boolean toStop = false;
+-    /**
+-     * registry Thread
+-     */
+-    private Thread registryThread;
+-    /**
+-     * discovery Thread
+-     */
+-    private Thread discoveryThread;
+-    @Override
+-    public void start(XxlRpcBootstrap rpcBootstrap) {
+-        this.xxlRpcBootstrap = rpcBootstrap;
+-        if (adminAddress == null || adminAddress.trim().length() == 0) {
+-            logger.info(">>>>>>>>>>> xxl-rpc, XxlRpcRegistry start fail, adminAddress is null.");
+-            return;
+-        }
+-        registryThread = startThread(new Runnable() {
+-            @Override
+-            public void run() {
+-                while (!toStop) {
+-                    try {
+-                        if (!registryInstanceListStore.isEmpty()) {
+-                            for (RegisterInstance instance : registryInstanceListStore){
+-                                try {
+-                                    XxlRpcAdminRegisterTool.RegisterInstance instanceTemp = new XxlRpcAdminRegisterTool.RegisterInstance(
+-                                            instance.getAppname(),
+-                                            instance.getIp(),
+-                                            instance.getPort(),
+-                                            instance.getExtendInfo());
+-                                    XxlRpcAdminRegisterTool.OpenApiResponse openApiResponse = XxlRpcAdminRegisterTool.register(adminAddress, accessToken, xxlRpcBootstrap.getBaseConfig().getEnv(), instanceTemp);
+-                                    logger.info(">>>>>>>>>>> xxl-rpc, registryThread-register {}, instance:{}, openApiResponse:{}", openApiResponse.isSuccess()?"success":"fail",instance, openApiResponse);
+-                                } catch (Exception e) {
+-                                    logger.error(">>>>>>>>>>> xxl-rpc, registryThread-register error:{}", e.getMessage(), e);
+-                                }
+-                            }
+-                        }
+-                    } catch (Throwable e) {
+-                        if (!toStop) {
+-                            logger.error(">>>>>>>>>>> xxl-rpc, registryThread-register error:{}", e.getMessage(), e);
+-                        }
+-                    }
+-                    try {
+-                        TimeUnit.SECONDS.sleep(REGISTRY_BEAT_TIME);
+-                    } catch (Throwable e) {
+-                        if (!toStop) {
+-                            logger.error(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-registryThread error2:{}", e.getMessage(), e);
+-                        }
+-                    }
+-                }
+-                logger.info(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-registryThread finish.");
+-            }
+-        }, "xxl-rpc, XxlRpcRegister-registryThread");
+-        discoveryThread = startThread(new Runnable() {
+-            @Override
+-            public void run() {
+-                while (!toStop) {
+-                    long start = System.currentTimeMillis();
+-                    try {
+-                        if (!discoveryAppnameStore.isEmpty()) {
+-                            doDiscoveryAndRefresh(discoveryAppnameStore.keySet());
+-                            XxlRpcAdminRegisterTool.OpenApiResponse openApiResponse =XxlRpcAdminRegisterTool.monitor(
+-                                    adminAddress,
+-                                    accessToken,
+-                                    xxlRpcBootstrap.getBaseConfig().getEnv(),
+-                                    new ArrayList<>(discoveryAppnameStore.keySet()),
+-                                    REGISTRY_BEAT_TIME);
+-                        }
+-                    } catch (Throwable e) {
+-                        if (!toStop) {
+-                            logger.error(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-discoveryThread error:{}", e.getMessage(), e);
+-                        }
+-                    }
+-                    try {
+-                        long IntervalTime = System.currentTimeMillis() - start;
+-                        if (IntervalTime < 3000L) {
+-                            TimeUnit.MILLISECONDS.sleep(3000L);
+-                        }
+-                    } catch (Throwable e) {
+-                        if (!toStop) {
+-                            logger.error(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-discoveryThread error2:{}", e.getMessage(), e);
+-                        }
+-                    }
+-                }
+-                logger.info(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-discoveryThread finish.");
+-            }
+-        }, "xxl-rpc, XxlRpcRegister-discoveryThread");
+-    }
+-    @Override
+-    public void stop() {
+-        toStop = true;
+-        try {
+-            TimeUnit.SECONDS.sleep(1);
+-        } catch (Throwable e) {
+-            logger.error(e.getMessage(), e);
+-        }
+-        stopThread(registryThread);
+-        stopThread(discoveryThread);
+-    }
+-    @Override
+-    public boolean register(RegisterInstance instance) {
+-        registryInstanceListStore.add(instance);
+-        try {
+-            XxlRpcAdminRegisterTool.RegisterInstance instanceTemp = new XxlRpcAdminRegisterTool.RegisterInstance(
+-                    instance.getAppname(),
+-                    instance.getIp(),
+-                    instance.getPort(),
+-                    instance.getExtendInfo());
+-            XxlRpcAdminRegisterTool.OpenApiResponse openApiResponse = XxlRpcAdminRegisterTool.register(adminAddress, accessToken, xxlRpcBootstrap.getBaseConfig().getEnv(), instanceTemp);
+-            logger.info(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-register {}, instance:{}, openApiResponse:{}", openApiResponse.isSuccess()?"success":"fail", instanceTemp, openApiResponse);
+-            return openApiResponse.isSuccess();
+-        } catch (Exception e) {
+-            logger.error(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-register error:{}", e.getMessage(), e);
+-        }
+-        return false;
+-    }
+-    @Override
+-    public boolean unregister(RegisterInstance instance) {
+-        registryInstanceListStore.remove(instance);
+-        try {
+-            XxlRpcAdminRegisterTool.RegisterInstance instanceTemp = new XxlRpcAdminRegisterTool.RegisterInstance(
+-                    instance.getAppname(),
+-                    instance.getIp(),
+-                    instance.getPort(),
+-                    instance.getExtendInfo());
+-            XxlRpcAdminRegisterTool.OpenApiResponse openApiResponse = XxlRpcAdminRegisterTool.unregister(adminAddress, accessToken, xxlRpcBootstrap.getBaseConfig().getEnv(), instanceTemp);
+-            logger.info(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-unregister {}, instance:{}, openApiResponse:{}", openApiResponse.isSuccess()?"success":"fail", instanceTemp, openApiResponse);
+-            return openApiResponse.isSuccess();
+-        } catch (Exception e) {
+-            logger.error(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-unregister error:{}", e.getMessage(), e);
+-        }
+-        return false;
+-    }
+-    @Override
+-    public Map<String, TreeSet<RegisterInstance>> discovery(Set<String> appnameList) {
+-        if (appnameList == null || appnameList.isEmpty()) {
+-            return new HashMap<>();
+-        }
+-        Map<String, TreeSet<RegisterInstance>> result = new HashMap<>();
+-        Set<String> appnameNotFound = new HashSet<>();
+-        for (String appname : appnameList) {
+-            if (discoveryAppnameStore.containsKey(appname)) {
+-                result.put(appname, discoveryAppnameStore.get(appname));
+-            } else {
+-                appnameNotFound.add(appname);
+-            }
+-        }
+-        if (!appnameNotFound.isEmpty()) {
+-            Map<String, TreeSet<RegisterInstance>> discoveryResult = doDiscoveryAndRefresh(appnameNotFound);
+-            if (discoveryResult != null) {
+-                result.putAll(discoveryResult);
+-            }
+-        }
+-        return result;
+-    }
+-    private Map<String, TreeSet<RegisterInstance>> doDiscoveryAndRefresh(Set<String> appnameList) {
+-        try {
+-            List<String> appnameListTemp = new ArrayList<String>(appnameList);
+-            XxlRpcAdminRegisterTool.DiscoveryResponse discoveryResponse = XxlRpcAdminRegisterTool.discovery(
+-                    adminAddress,
+-                    accessToken,
+-                    xxlRpcBootstrap.getBaseConfig().getEnv(),
+-                    appnameListTemp,
+-                    false);
+-            if (!discoveryResponse.isSuccess()) {
+-                logger.info(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-doDiscoveryAndRefresh {}, appnameList:{}, discoveryResponse:{}", discoveryResponse.isSuccess()?"success":"fail",appnameList, discoveryResponse);
+-            } else {
+-                logger.debug(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-doDiscoveryAndRefresh {}, appnameList:{}, discoveryResponse:{}", discoveryResponse.isSuccess()?"success":"fail",appnameList, discoveryResponse);
+-            }
+-            if (discoveryResponse.isSuccess() && discoveryResponse.getDiscoveryData()!=null) {
+-                Map<String, TreeSet<RegisterInstance>> result = new HashMap<>();
+-                Map<String, String> resultMd5 = new HashMap<>();
+-                for (String appname : discoveryResponse.getDiscoveryData().keySet()) {
+-                    List<XxlRpcAdminRegisterTool.InstanceCacheDTO> instanceCacheDTOS = discoveryResponse.getDiscoveryData().get(appname);
+-                    String registerInstancesMd5 = discoveryResponse.getDiscoveryDataMd5().get(appname);
+-                    TreeSet<RegisterInstance> registerInstances = new TreeSet<>();
+-                    if (instanceCacheDTOS != null) {
+-                        for (XxlRpcAdminRegisterTool.InstanceCacheDTO instanceCacheDTO : instanceCacheDTOS) {
+-                            registerInstances.add(new RegisterInstance(instanceCacheDTO.getEnv(), appname, instanceCacheDTO.getIp(), instanceCacheDTO.getPort(), instanceCacheDTO.getExtendInfo()));
+-                        }
+-                    } else {
+-                        registerInstances = new TreeSet<>();   // cache none
+-                    }
+-                    result.put(appname, registerInstances);
+-                    resultMd5.put(appname, registerInstancesMd5);
+-                    if (!resultMd5.get(appname).equals(discoveryAppnameMd5Store.get(appname))) {
+-                        logger.info(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-doDiscoveryAndRefresh success, appname:{}, registerInstances:{}", appname , registerInstances);
+-                    }
+-                }
+-                discoveryAppnameStore.putAll(result);
+-                discoveryAppnameMd5Store.putAll(resultMd5);
+-                return result;
+-            }
+-        } catch (Exception e) {
+-            logger.error(">>>>>>>>>>> xxl-rpc, XxlRpcRegister-doDiscovery error:{}", e.getMessage(), e);
+-        }
+-        return null;
+-    }
+-    @Override
+-    public TreeSet<RegisterInstance> discovery(String appname) {
+-        Map<String, TreeSet<RegisterInstance>> result = discovery(new HashSet<>(Arrays.asList(appname)));
+-        return result.get(appname);
+-    }
+-    /**
+-     * start thread
+-     *
+-     * @param runnable
+-     * @param name
+-     * @return
+-     */
+-    public static Thread startThread(Runnable runnable, String name) {
+-        Thread thread = new Thread(runnable);
+-        thread.setDaemon(true);
+-        thread.setName(name);
+-        thread.start();
+-        return thread;
+-    }
+-    /**
+-     * stop thread
+-     *
+-     * @param thread
+-     */
+-    public static void stopThread(Thread thread) {
+-        if (thread.getState() != Thread.State.TERMINATED){
+-            thread.interrupt();
+-            try {
+-                thread.join();
+-            } catch (Throwable e) {
+-                logger.error(e.getMessage(), e);
+-            }
+-        }
+-    }
+-}
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/register/impl/openapi/XxlRpcAdminRegisterTool.java
++++ b//dev/null
+@@ -1,402 +0,0 @@
+-package com.xxl.rpc.core.register.impl.openapi;
+-import com.alibaba.fastjson2.JSON;
+-import com.xxl.tool.net.HttpTool;
+-import java.io.Serializable;
+-import java.util.List;
+-import java.util.Map;
+-/**
+- * xxl-rpc admin register tool
+- *
+- * @author xuxueli 2025-01-01
+- */
+-public class XxlRpcAdminRegisterTool {
+-    public static class RegisterInstance implements Serializable {
+-        public static final long serialVersionUID = 42L;
+-        /**
+-         * AppName（应用唯一标识）
+-         */
+-        private String appname;
+-        /**
+-         * 注册节点IP
+-         */
+-        private String ip;
+-        /**
+-         * 注册节点端口号
+-         */
+-        private int port;
+-        /**
+-         * 扩展信息（可选）
+-         */
+-        private String extendInfo;
+-        public RegisterInstance() {
+-        }
+-        public RegisterInstance(String appname, String ip, int port, String extendInfo) {
+-            this.appname = appname;
+-            this.ip = ip;
+-            this.port = port;
+-            this.extendInfo = extendInfo;
+-        }
+-        public String getAppname() {
+-            return appname;
+-        }
+-        public void setAppname(String appname) {
+-            this.appname = appname;
+-        }
+-        public String getIp() {
+-            return ip;
+-        }
+-        public void setIp(String ip) {
+-            this.ip = ip;
+-        }
+-        public int getPort() {
+-            return port;
+-        }
+-        public void setPort(int port) {
+-            this.port = port;
+-        }
+-        public String getExtendInfo() {
+-            return extendInfo;
+-        }
+-        public void setExtendInfo(String extendInfo) {
+-            this.extendInfo = extendInfo;
+-        }
+-    }
+-    public static class RegisterRequest implements Serializable {
+-        public static final long serialVersionUID = 42L;
+-        /**
+-         * accessToken
+-         */
+-        private String accessToken;
+-        /**
+-         * Env
+-         */
+-        private String env;
+-        /**
+-         * client instance
+-         */
+-        private RegisterInstance instance;
+-        public String getAccessToken() {
+-            return accessToken;
+-        }
+-        public void setAccessToken(String accessToken) {
+-            this.accessToken = accessToken;
+-        }
+-        public String getEnv() {
+-            return env;
+-        }
+-        public void setEnv(String env) {
+-            this.env = env;
+-        }
+-        public RegisterInstance getInstance() {
+-            return instance;
+-        }
+-        public void setInstance(RegisterInstance instance) {
+-            this.instance = instance;
+-        }
+-    }
+-    public static class OpenApiResponse implements Serializable {
+-        public static final long serialVersionUID = 42L;
+-        public static final int SUCCESS_CODE = 200;
+-        public static final int FAIL_CODE = 203;
+-        private int code;
+-        private String msg;
+-        public OpenApiResponse() {}
+-        public OpenApiResponse(int code, String msg) {
+-            this.code = code;
+-            this.msg = msg;
+-        }
+-        public int getCode() {
+-            return code;
+-        }
+-        public void setCode(int code) {
+-            this.code = code;
+-        }
+-        public String getMsg() {
+-            return msg;
+-        }
+-        public void setMsg(String msg) {
+-            this.msg = msg;
+-        }
+-        @Override
+-        public String toString() {
+-            return "OpenApiResponse{" +
+-                    "code=" + code +
+-                    ", msg='" + msg + '\'' +
+-                    '}';
+-        }
+-        public boolean isSuccess() {
+-            return code == SUCCESS_CODE;
+-        }
+-    }
+-    public static class DiscoveryRequest implements Serializable {
+-        public static final long serialVersionUID = 42L;
+-        /**
+-         * accessToken
+-         */
+-        private String accessToken;
+-        /**
+-         * Env
+-         */
+-        private String env;
+-        /**
+-         * instance list which want discovery
+-         */
+-        private List<String> appnameList;
+-        /**
+-         * simple Query
+-         *      true: only summary data (md5)
+-         *      false: query all data (detail + md5)
+-         */
+-        private boolean simpleQuery;
+-        public String getAccessToken() {
+-            return accessToken;
+-        }
+-        public void setAccessToken(String accessToken) {
+-            this.accessToken = accessToken;
+-        }
+-        public String getEnv() {
+-            return env;
+-        }
+-        public void setEnv(String env) {
+-            this.env = env;
+-        }
+-        public List<String> getAppnameList() {
+-            return appnameList;
+-        }
+-        public void setAppnameList(List<String> appnameList) {
+-            this.appnameList = appnameList;
+-        }
+-        public boolean isSimpleQuery() {
+-            return simpleQuery;
+-        }
+-        public void setSimpleQuery(boolean simpleQuery) {
+-            this.simpleQuery = simpleQuery;
+-        }
+-    }
+-    public static class DiscoveryResponse extends OpenApiResponse implements Serializable {
+-        public static final long serialVersionUID = 42L;
+-        /**
+-         * discovery result data
+-         *
+-         * structure：Map
+-         * 		key：appname
+-         * 		value：List<RegisterInstance> = List ～ instance
+-         *
+-         */
+-        private Map<String, List<InstanceCacheDTO>> discoveryData;
+-        /**
+-         * discovery result data-md5
+-         *
+-         * structure：Map
+-         * 		key：appname
+-         * 		value：md5
+-         *
+-         */
+-        private Map<String, String> discoveryDataMd5;
+-        public DiscoveryResponse(){}
+-        public DiscoveryResponse(int code, String msg) {
+-            super(code, msg);
+-        }
+-        public Map<String, List<InstanceCacheDTO>> getDiscoveryData() {
+-            return discoveryData;
+-        }
+-        public void setDiscoveryData(Map<String, List<InstanceCacheDTO>> discoveryData) {
+-            this.discoveryData = discoveryData;
+-        }
+-        public Map<String, String> getDiscoveryDataMd5() {
+-            return discoveryDataMd5;
+-        }
+-        public void setDiscoveryDataMd5(Map<String, String> discoveryDataMd5) {
+-            this.discoveryDataMd5 = discoveryDataMd5;
+-        }
+-        @Override
+-        public String toString() {
+-            return "DiscoveryResponse{" +
+-                    ", discoveryData=" + discoveryData +
+-                    ", discoveryDataMd5=" + discoveryDataMd5 +
+-                    ", code=" + getCode() +
+-                    ", msg='" + getMsg() + '\'' +
+-                    '}';
+-        }
+-    }
+-    public static class InstanceCacheDTO implements Serializable {
+-        private static final long serialVersionUID = 42L;
+-        /**
+-         * Env（环境唯一标识）
+-         */
+-        private String env;
+-        /**
+-         * AppName（应用唯一标识）
+-         */
+-        private String appname;
+-        /**
+-         * 注册节点IP
+-         */
+-        private String ip;
+-        /**
+-         * 注册节点端口号
+-         */
+-        private int port;
+-        /**
+-         * 扩展信息
+-         */
+-        private String extendInfo;
+-        public InstanceCacheDTO() {
+-        }
+-        public String getEnv() {
+-            return env;
+-        }
+-        public void setEnv(String env) {
+-            this.env = env;
+-        }
+-        public String getAppname() {
+-            return appname;
+-        }
+-        public void setAppname(String appname) {
+-            this.appname = appname;
+-        }
+-        public String getIp() {
+-            return ip;
+-        }
+-        public void setIp(String ip) {
+-            this.ip = ip;
+-        }
+-        public int getPort() {
+-            return port;
+-        }
+-        public void setPort(int port) {
+-            this.port = port;
+-        }
+-        public String getExtendInfo() {
+-            return extendInfo;
+-        }
+-        public void setExtendInfo(String extendInfo) {
+-            this.extendInfo = extendInfo;
+-        }
+-        @Override
+-        public String toString() {
+-            return "InstanceCacheDTO{" +
+-                    "env='" + env + '\'' +
+-                    ", appname='" + appname + '\'' +
+-                    ", ip='" + ip + '\'' +
+-                    ", port=" + port +
+-                    ", extendInfo='" + extendInfo + '\'' +
+-                    '}';
+-        }
+-        /**
+-         * get sort key
+-         *
+-         * @return
+-         */
+-        public String getSortKey() {
+-            return ip + ":" + port;
+-        }
+-    }
+-    /**
+-     * register
+-     *
+-     * @param adminAddress
+-     * @param accessToken
+-     * @param env
+-     * @param instance
+-     * @return
+-     */
+-    public static OpenApiResponse register(String adminAddress,
+-                                           String accessToken,
+-                                           String env,
+-                                           RegisterInstance instance) {
+-        RegisterRequest request = new RegisterRequest();
+-        request.setAccessToken(accessToken);
+-        request.setEnv(env);
+-        request.setInstance(instance);
+-        String responseBody = HttpTool.postBody(adminAddress + "/openapi/register",
+-                JSON.toJSONString(request),
+-                null,
+-                3000);
+-        OpenApiResponse openApiResponse = JSON.parseObject(responseBody, OpenApiResponse.class);
+-        return openApiResponse;
+-    }
+-    /**
+-     * unregister
+-     *
+-     * @param adminAddress
+-     * @param accessToken
+-     * @param env
+-     * @param instance
+-     * @return
+-     */
+-    public static OpenApiResponse unregister(String adminAddress,
+-                                                                    String accessToken,
+-                                                                    String env,
+-                                                                    RegisterInstance instance) {
+-        RegisterRequest request = new RegisterRequest();
+-        request.setAccessToken(accessToken);
+-        request.setEnv(env);
+-        request.setInstance(instance);
+-        String responseBody = HttpTool.postBody(adminAddress + "/openapi/unregister",
+-                JSON.toJSONString(request),
+-                null,
+-                3000);
+-        OpenApiResponse openApiResponse = JSON.parseObject(responseBody, OpenApiResponse.class);
+-        return openApiResponse;
+-    }
+-    /**
+-     * discovery
+-     *
+-     * @param adminAddress
+-     * @param accessToken
+-     * @param env
+-     * @param appnameList
+-     * @param simpleQuery
+-     * @return
+-     */
+-    public static DiscoveryResponse discovery(String adminAddress,
+-                                                                    String accessToken,
+-                                                                    String env,
+-                                                                    List<String> appnameList,
+-                                                                    boolean simpleQuery) {
+-        DiscoveryRequest request = new DiscoveryRequest();
+-        request.setAccessToken(accessToken);
+-        request.setEnv(env);
+-        request.setAppnameList(appnameList);
+-        request.setSimpleQuery(simpleQuery);
+-        String responseBody = HttpTool.postBody(adminAddress + "/openapi/discovery",
+-                JSON.toJSONString(request),
+-                null,
+-                3000
+-        );
+-        DiscoveryResponse discoveryResponse = JSON.parseObject(responseBody, DiscoveryResponse.class);
+-        return discoveryResponse;
+-    }
+-    /**
+-     * monitor
+-     *
+-     * @param adminAddress
+-     * @param accessToken
+-     * @param env
+-     * @param appnameList
+-     * @param timeout       by second
+-     * @return
+-     */
+-    public static OpenApiResponse monitor(String adminAddress,
+-                                          String accessToken,
+-                                          String env,
+-                                          List<String> appnameList,
+-                                          int timeout) {
+-        DiscoveryRequest request = new DiscoveryRequest();
+-        request.setAccessToken(accessToken);
+-        request.setEnv(env);
+-        request.setAppnameList(appnameList);
+-        request.setSimpleQuery(false);
+-        try {
+-            String responseBody = HttpTool.postBody(adminAddress + "/openapi/monitor",
+-                    JSON.toJSONString(request),
+-                    null,
+-                    timeout);
+-            OpenApiResponse discoveryResponse = JSON.parseObject(responseBody, OpenApiResponse.class);
+-            return discoveryResponse;
+-        } catch (Exception e) {
+-            return new OpenApiResponse(OpenApiResponse.FAIL_CODE, e.getMessage());
+-        }
+-    }
+-}
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/remoting/impl/netty/codec/NettyDecoder.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/remoting/impl/netty/codec/NettyDecoder.java
+@@ -1,13 +1,12 @@
+ package com.xxl.rpc.core.remoting.impl.netty.codec;
+ import com.xxl.rpc.core.serializer.Serializer;
+-import com.xxl.rpc.core.util.XxlRpcException;
+ import com.xxl.rpc.netty.shaded.io.netty.buffer.ByteBuf;
+ import com.xxl.rpc.netty.shaded.io.netty.channel.ChannelHandlerContext;
+ import com.xxl.rpc.netty.shaded.io.netty.handler.codec.ByteToMessageDecoder;
+ import java.util.List;
+ /**
+  * decoder
+  *
+  * @author xuxueli 2015-10-29 19:02:36
+  */
+ public class NettyDecoder extends ByteToMessageDecoder {
+@@ -26,18 +25,14 @@
+         int dataLength = in.readInt();
+         if (dataLength < 0) {
+             ctx.close();
+         }
+         if (in.readableBytes() < dataLength) {
+             in.resetReaderIndex();
+             return;	// fix 1024k buffer splice limix
+         }
+         byte[] data = new byte[dataLength];
+         in.readBytes(data);
+-        Object inObject = serializer.deserialize(data, genericClass);
+-        if (!genericClass.isInstance(inObject)) {
+-            throw new XxlRpcException("NettyDecoder decode error, genericClass not match, genericClass = " + genericClass.getName()
+-                    + ", inObject = " + (inObject!=null?inObject.getClass().getName():null));
+-        }
+-        out.add(inObject);
++        Object obj = serializer.deserialize(data, genericClass);
++        out.add(obj);
+     }
+ }
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/remoting/impl/netty/codec/NettyEncoder.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/remoting/impl/netty/codec/NettyEncoder.java
+@@ -1,29 +1,26 @@
+ package com.xxl.rpc.core.remoting.impl.netty.codec;
+-import com.xxl.rpc.core.util.XxlRpcException;
+ import com.xxl.rpc.netty.shaded.io.netty.buffer.ByteBuf;
+ import com.xxl.rpc.netty.shaded.io.netty.channel.ChannelHandlerContext;
+ import com.xxl.rpc.netty.shaded.io.netty.handler.codec.MessageToByteEncoder;
+ import com.xxl.rpc.core.serializer.Serializer;
+ /**
+  * encoder
+  *
+  * @author xuxueli 2015-10-29 19:43:00
+  */
+ public class NettyEncoder extends MessageToByteEncoder<Object> {
+     private Class<?> genericClass;
+     private Serializer serializer;
+     public NettyEncoder(Class<?> genericClass, final Serializer serializer) {
+         this.genericClass = genericClass;
+         this.serializer = serializer;
+     }
+     @Override
+-    public void encode(ChannelHandlerContext ctx, Object inObject, ByteBuf out) throws Exception {
+-        if (!genericClass.isInstance(inObject)) {
+-            throw new XxlRpcException("NettyEncoder encode error, genericClass not match, genericClass = " + genericClass.getName()
+-                    + ", inObject = " + (inObject!=null?inObject.getClass().getName():null));
++    public void encode(ChannelHandlerContext ctx, Object in, ByteBuf out) throws Exception {
++        if (genericClass.isInstance(in)) {
++            byte[] data = serializer.serialize(in);
++            out.writeInt(data.length);
++            out.writeBytes(data);
+         }
+-        byte[] data = serializer.serialize(inObject);
+-        out.writeInt(data.length);
+-        out.writeBytes(data);
+     }
+ }
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/remoting/impl/netty_http/client/NettyHttpClient.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/remoting/impl/netty_http/client/NettyHttpClient.java
+@@ -51,21 +51,21 @@
+         final NettyHttpClient thisClient = this;
+         Bootstrap bootstrap = new Bootstrap();
+         bootstrap.group(nioEventLoopGroup)
+                 .channel(NioSocketChannel.class)
+                 .handler(new ChannelInitializer<SocketChannel>() {
+                     @Override
+                     public void initChannel(SocketChannel channel) throws Exception {
+                         channel.pipeline()
+                                 .addLast(new IdleStateHandler(0,0, XxlRpcBeat.BEAT_INTERVAL, TimeUnit.SECONDS))   // beat N, close if fail
+                                 .addLast(new HttpClientCodec())
+-                                .addLast(new HttpObjectAggregator(20 * 1024 * 1024))
++                                .addLast(new HttpObjectAggregator(5*1024*1024))
+                                 .addLast(new NettyHttpClientHandler(rpcBootstrap.getInvoker(), serializer, thisClient));
+                     }
+                 })
+                 .option(ChannelOption.SO_KEEPALIVE, true)
+                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000);
+         this.channel = bootstrap.connect(registerInstance.getIp(), registerInstance.getPort()).sync().channel();
+         if (!isValidate()) {
+             close();
+             return;
+         }
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/remoting/impl/netty_http/server/NettyHttpServer.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/remoting/impl/netty_http/server/NettyHttpServer.java
+@@ -37,21 +37,21 @@
+                 try {
+                     ServerBootstrap bootstrap = new ServerBootstrap();
+                     bootstrap.group(bossGroup, workerGroup)
+                             .channel(NioServerSocketChannel.class)
+                             .childHandler(new ChannelInitializer<SocketChannel>() {
+                                 @Override
+                                 public void initChannel(SocketChannel channel) throws Exception {
+                                     channel.pipeline()
+                                             .addLast(new IdleStateHandler(0, 0, XxlRpcBeat.BEAT_INTERVAL * 3, TimeUnit.SECONDS))  // beat 3N, close if idle
+                                             .addLast(new HttpServerCodec())
+-                                            .addLast(new HttpObjectAggregator(20 * 1024 * 1024))  // merge request & reponse to FULL
++                                            .addLast(new HttpObjectAggregator(5 * 1024 * 1024))  // merge request & reponse to FULL
+                                             .addLast(new NettyHttpServerHandler(rpcBootstrap.getProvider(), serverHandlerPool));
+                                 }
+                             })
+                             .childOption(ChannelOption.SO_KEEPALIVE, true);
+                     ChannelFuture future = bootstrap.bind(rpcBootstrap.getProviderConfig().getPort()).sync();
+                     logger.info(">>>>>>>>>>> xxl-rpc, NettyHttpServer start success, port = {}", rpcBootstrap.getProviderConfig().getPort());
+                     onStarted();
+                     future.channel().closeFuture().sync();
+                 } catch (InterruptedException e) {
+                     if (e instanceof InterruptedException) {
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/serializer/Serializer.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/serializer/Serializer.java
+@@ -1,28 +1,21 @@
+ package com.xxl.rpc.core.serializer;
+-import java.util.List;
+ /**
+  * serializer
+  *
+  * 		Tips：模板方法模式：定义一个操作中算法的骨架（或称为顶级逻辑），将一些步骤（或称为基本方法）的执行延迟到其子类中；
+  * 		Tips：基本方法：抽象方法 + 具体方法final + 钩子方法；
+  * 		Tips：Enum 时最好的单例方案；枚举单例会初始化全部实现，此处改为托管Class，避免无效的实例化；
+  *
+  * @author xuxueli 2015-10-30 21:02:55
+  */
+ public abstract class Serializer {
+-	/**
+-	 * allow package list
+-	 *
+-	 * @param packageList
+-	 */
+-	public abstract void allowPackageList(List<String> packageList);
+ 	/**
+ 	 * serialize
+ 	 *
+ 	 * @param obj
+ 	 * @return
+ 	 * @param <T>
+ 	 */
+ 	public abstract <T> byte[] serialize(T obj);
+ 	/**
+ 	 * deserialize
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/serializer/impl/JsonSerializer.java
++++ b//dev/null
+@@ -1,41 +0,0 @@
+-package com.xxl.rpc.core.serializer.impl;
+-import com.alibaba.fastjson2.JSON;
+-import com.alibaba.fastjson2.JSONReader;
+-import com.alibaba.fastjson2.JSONWriter;
+-import com.alibaba.fastjson2.filter.Filter;
+-import com.xxl.rpc.core.serializer.Serializer;
+-import java.util.List;
+-/**
+- * jsonb serializer
+- *
+- * @author xuxueli 2024-12-27
+- */
+-public class JsonSerializer extends Serializer {
+-    /**
+-     * jsonb reader autoTypeBeforeHandler
+-     */
+-    private static Filter autoTypeBeforeHandler = JSONReader.autoTypeFilter("com", "org","io");
+-    /**
+-     * allowPackageList
+-     *
+-     * @param packageList
+-     */
+-    @Override
+-    public void allowPackageList(List<String> packageList) {
+-        if (packageList!=null && !packageList.isEmpty()) {
+-            autoTypeBeforeHandler = JSONReader.autoTypeFilter((String[]) packageList.toArray());
+-        }
+-    }
+-    @Override
+-    public <T> byte[] serialize(T obj) {
+-        return JSON.toJSONBytes(obj,
+-                JSONWriter.Feature.WriteClassName);
+-    }
+-    @Override
+-    public <T> Object deserialize(byte[] bytes, Class<T> clazz) {
+-        return JSON.parseObject(bytes, clazz,
+-                autoTypeBeforeHandler,
+-                JSONReader.Feature.SupportClassForName
+-                /*JSONReader.Feature.SupportAutoType*/);
+-    }
+-}
+
+--- a/xxl-rpc-core/src/main/java/com/xxl/rpc/core/serializer/impl/JsonbSerializer.java
++++ b/xxl-rpc-core/src/main/java/com/xxl/rpc/core/serializer/impl/JsonbSerializer.java
+@@ -1,35 +1,26 @@
+ package com.xxl.rpc.core.serializer.impl;
+ import com.alibaba.fastjson2.JSONB;
+ import com.alibaba.fastjson2.JSONReader;
+ import com.alibaba.fastjson2.JSONWriter;
+ import com.alibaba.fastjson2.filter.Filter;
+ import com.xxl.rpc.core.serializer.Serializer;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.List;
+ /**
+  * jsonb serializer
+  *
+  * @author xuxueli 2024-12-27
+  */
+ public class JsonbSerializer extends Serializer {
+     /**
+      * jsonb reader autoTypeBeforeHandler
+      */
+-    private static Filter autoTypeBeforeHandler = JSONReader.autoTypeFilter("com", "org","io");
+-    @Override
+-    public void allowPackageList(List<String> packageList) {
+-        if (packageList!=null && !packageList.isEmpty()) {
+-            autoTypeBeforeHandler = JSONReader.autoTypeFilter((String[]) packageList.toArray());
+-        }
+-    }
++    private static final Filter autoTypeBeforeHandler = JSONReader.autoTypeFilter("com", "org","io");
+     @Override
+     public <T> byte[] serialize(T obj) {
+         return JSONB.toBytes(obj,
+                 JSONWriter.Feature.WriteClassName);
+     }
+     @Override
+     public <T> Object deserialize(byte[] bytes, Class<T> clazz) {
+         return JSONB.parseObject(bytes, clazz,
+                 autoTypeBeforeHandler,
+                 JSONReader.Feature.SupportClassForName
+
+--- a/xxl-rpc-samples/xxl-rpc-sample-frameless/xxl-rpc-sample-frameless-api/src/main/java/com/xxl/rpc/sample/api/DemoService.java
++++ b/xxl-rpc-samples/xxl-rpc-sample-frameless/xxl-rpc-sample-frameless-api/src/main/java/com/xxl/rpc/sample/api/DemoService.java
+@@ -1,8 +1,9 @@
+ package com.xxl.rpc.sample.api;
+ import com.xxl.rpc.sample.api.dto.UserDTO;
+ /**
+  * Demo API
+  */
+ public interface DemoService {
+ 	public UserDTO sayHi(String name);
++	public UserDTO sayHi2(UserDTO userDTO);
+ }
+
+--- a/xxl-rpc-samples/xxl-rpc-sample-frameless/xxl-rpc-sample-frameless-client/src/main/java/com/xxl/rpc/sample/client/XxlRpcClientAplication.java
++++ b/xxl-rpc-samples/xxl-rpc-sample-frameless/xxl-rpc-sample-frameless-client/src/main/java/com/xxl/rpc/sample/client/XxlRpcClientAplication.java
+@@ -18,82 +18,84 @@
+ /**
+  * @author xuxueli 2018-10-21 20:48:40
+  */
+ public class XxlRpcClientAplication {
+ 	public static void main(String[] args) throws Exception {
+ 		LocalRegister localRegister = new LocalRegister();
+ 		localRegister.register(new RegisterInstance("test", "xxl-rpc-sample-frameless-server", "127.0.0.1", 7080, null));
+ 		XxlRpcBootstrap rpcBootstrap = new XxlRpcBootstrap();
+ 		rpcBootstrap.setBaseConfig(new BaseConfig("test", "xxl-rpc-sample-frameless-client"));
+ 		rpcBootstrap.setRegister(localRegister);
+-		rpcBootstrap.setInvokerConfig(new InvokerConfig(true, NettyClient.class, JsonbSerializer.class, null));
++		rpcBootstrap.setInvokerConfig(new InvokerConfig(true));
+ 		rpcBootstrap.start();
+ 		DemoService demoService_SYNC = buildReferenceBean(rpcBootstrap, CallType.SYNC);
+ 		DemoService demoService_FUTURE = buildReferenceBean(rpcBootstrap, CallType.FUTURE);
+ 		DemoService demoService_CALLBACK = buildReferenceBean(rpcBootstrap, CallType.CALLBACK);
+ 		DemoService demoService_ONEWAY = buildReferenceBean(rpcBootstrap, CallType.ONEWAY);
+ 		testSYNC(demoService_SYNC);
+ 		testFUTURE(demoService_FUTURE);
+ 		testCALLBACK(demoService_CALLBACK);
+ 		testONEWAY(demoService_ONEWAY);
+ 		TimeUnit.SECONDS.sleep(5);
+ 		rpcBootstrap.stop();
+ 	}
+ 	private static DemoService buildReferenceBean(XxlRpcBootstrap rpcBootstrap, CallType callType) throws Exception {
+ 		XxlRpcReferenceBean referenceBean = new XxlRpcReferenceBean();
++		referenceBean.setClient(NettyClient.class);
++		referenceBean.setSerializer(JsonbSerializer.class);
+ 		referenceBean.setCallType(callType);
+ 		referenceBean.setLoadBalance(LoadBalance.ROUND);
+ 		referenceBean.setIface(DemoService.class);
+ 		referenceBean.setVersion(null);
+ 		referenceBean.setTimeout(500);
+ 		referenceBean.setAppname("xxl-rpc-sample-frameless-server");
+ 		referenceBean.setRpcBootstrap(rpcBootstrap);
+ 		DemoService demoService = (DemoService) referenceBean.getObject();
+ 		return demoService;
+ 	}
+ 	/**
+ 	 * CallType.SYNC
+ 	 */
+ 	public static void testSYNC(DemoService demoService) throws Exception {
+-        UserDTO userDTO = demoService.sayHi("[SYNC]jack");
++		UserDTO userDTO = demoService.sayHi2(new UserDTO("[SYNC]jack", "hello"));
+ 		System.out.println(userDTO);
+ 		/*int count = 100;
+ 		long start = System.currentTimeMillis();
+ 		for (int i = 0; i < count; i++) {
+ 			UserDTO userDTO2 = demoService.sayHi("[SYNC]jack"+i );
+ 			System.out.println(i + "##" + userDTO2.toString());
+ 		}
+ 		long end = System.currentTimeMillis();
+     	System.out.println("run count:"+ count +", cost:" + (end - start));*/
+ 	}
+ 	/**
+ 	 * CallType.FUTURE
+ 	 */
+ 	public static void testFUTURE(DemoService demoService) throws Exception {
+-		demoService.sayHi("[FUTURE]jack" );
++		demoService.sayHi2(new UserDTO("[FUTURE]jack", "hello"));
+         Future<UserDTO> userDTOFuture = XxlRpcInvokeFuture.getFuture(UserDTO.class);
+ 		UserDTO userDTO = userDTOFuture.get();
+ 		System.out.println(userDTO.toString());
+ 	}
+ 	/**
+ 	 * CallType.CALLBACK
+ 	 */
+ 	public static void testCALLBACK(DemoService demoService) throws Exception {
+         XxlRpcInvokeCallback.setCallback(new XxlRpcInvokeCallback<UserDTO>() {
+             @Override
+             public void onSuccess(UserDTO result) {
+                 System.out.println(result);
+             }
+             @Override
+             public void onFailure(Throwable exception) {
+                 exception.printStackTrace();
+             }
+         });
+-        demoService.sayHi("[CALLBACK]jack");
++		demoService.sayHi2(new UserDTO("[CALLBACK]jack", "hello"));
+ 	}
+ 	/**
+ 	 * CallType.ONEWAY
+ 	 */
+ 	public static void testONEWAY(DemoService demoService) throws Exception {
+-        demoService.sayHi("[ONEWAY]jack");
++		demoService.sayHi2(new UserDTO("[ONEWAY]jack", "hello"));
+ 	}
+ }
+
+--- a/xxl-rpc-samples/xxl-rpc-sample-frameless/xxl-rpc-sample-frameless-server/src/main/java/com/xxl/rpc/sample/server/XxlRpcServerApplication.java
++++ b/xxl-rpc-samples/xxl-rpc-sample-frameless/xxl-rpc-sample-frameless-server/src/main/java/com/xxl/rpc/sample/server/XxlRpcServerApplication.java
+@@ -7,19 +7,19 @@
+ import com.xxl.rpc.sample.server.service.DemoServiceImpl;
+ import com.xxl.rpc.core.serializer.impl.JsonbSerializer;
+ import java.util.concurrent.TimeUnit;
+ /**
+  * @author xuxueli 2018-10-21 20:48:40
+  */
+ public class XxlRpcServerApplication {
+     public static void main(String[] args) throws Exception {
+         XxlRpcBootstrap rpcBootstrap = new XxlRpcBootstrap();
+         rpcBootstrap.setBaseConfig(new BaseConfig("test", "xxl-rpc-sample-frameless-server"));
+-        rpcBootstrap.setProviderConfig(new ProviderConfig(NettyServer.class, JsonbSerializer.class, null, -1, -1, 7080, null));
++        rpcBootstrap.setProviderConfig(new ProviderConfig(NettyServer.class, JsonbSerializer.class, -1, -1, 7080, null));
+         rpcBootstrap.start();
+         rpcBootstrap.getProvider().addService(DemoService.class.getName(), null, new DemoServiceImpl());
+         while (!Thread.currentThread().isInterrupted()) {
+             TimeUnit.HOURS.sleep(1);
+         }
+         rpcBootstrap.stop();
+     }
+ }
+
+--- a/xxl-rpc-samples/xxl-rpc-sample-frameless/xxl-rpc-sample-frameless-server/src/main/java/com/xxl/rpc/sample/server/service/DemoServiceImpl.java
++++ b/xxl-rpc-samples/xxl-rpc-sample-frameless/xxl-rpc-sample-frameless-server/src/main/java/com/xxl/rpc/sample/server/service/DemoServiceImpl.java
+@@ -4,15 +4,26 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import java.text.MessageFormat;
+ /**
+  * @author xuxueli
+  */
+ public class DemoServiceImpl implements DemoService {
+ 	private static final Logger logger = LoggerFactory.getLogger(DemoServiceImpl.class);
+ 	@Override
+ 	public UserDTO sayHi(String name) {
+-		String word = MessageFormat.format("Hi {0}, this from {1} at {2}",
++		String word = MessageFormat.format("Hi {0}, from {1} as {2}",
+ 				name, DemoServiceImpl.class.getName(), String.valueOf(System.currentTimeMillis()));
+-		return new UserDTO(name, word);
++		if ("error".equalsIgnoreCase(name)) {
++			throw new RuntimeException("test exception.");
++		}
++		UserDTO userDTO = new UserDTO(name, word);
++		logger.info(userDTO.toString());
++		return userDTO;
++	}
++	@Override
++	public UserDTO sayHi2(UserDTO userDTO) {
++		UserDTO userDTO2 =new UserDTO("Jack", "Hi " + userDTO.getName());
++		logger.info(userDTO2.toString());
++		return userDTO2;
+ 	}
+ }
+
+--- a/xxl-rpc-samples/xxl-rpc-sample-springboot/xxl-rpc-sample-springboot-client/src/main/java/com/xxl/rpc/sample/client/conf/SpringXxlRpcBootstrapConfig.java
++++ b//dev/null
+@@ -1,40 +0,0 @@
+-package com.xxl.rpc.sample.client.conf;
+-import com.xxl.rpc.core.boot.config.BaseConfig;
+-import com.xxl.rpc.core.boot.support.SpringXxlRpcBootstrap;
+-import com.xxl.rpc.core.invoker.config.InvokerConfig;
+-import com.xxl.rpc.core.provider.config.ProviderConfig;
+-import com.xxl.rpc.core.register.impl.XxlRpcAdminRegister;
+-import com.xxl.rpc.core.remoting.impl.netty.client.NettyClient;
+-import com.xxl.rpc.core.serializer.impl.JsonbSerializer;
+-import org.springframework.beans.factory.annotation.Value;
+-import org.springframework.context.annotation.Bean;
+-import org.springframework.context.annotation.Configuration;
+-/**
+- * xxl-rpc invoker config
+- *
+- * @author xuxueli 2018-10-19
+- */
+-@Configuration
+-public class SpringXxlRpcBootstrapConfig {
+-    @Value("${xxl-rpc.base.env}")
+-    private String env;
+-    @Value("${xxl-rpc.base.appname}")
+-    private String appname;
+-    @Value("${xxl-rpc.register.address}")
+-    private String address;
+-    @Value("${xxl-rpc.register.accesstoken}")
+-    private String accesstoken;
+-    @Value("${xxl-rpc.invoker.open}")
+-    private boolean invokerOpen;
+-    @Value("${xxl-rpc.provider.open}")
+-    private boolean providerOpen;
+-    @Bean
+-    public SpringXxlRpcBootstrap xxlRpcSpringFactory() {
+-        SpringXxlRpcBootstrap factory = new SpringXxlRpcBootstrap();
+-        factory.setBaseConfig(new BaseConfig(env, appname));
+-        factory.setRegister(new XxlRpcAdminRegister(address, accesstoken));
+-        factory.setInvokerConfig(new InvokerConfig(true, NettyClient.class, JsonbSerializer.class, null));
+-        factory.setProviderConfig(new ProviderConfig(providerOpen));
+-        return factory;
+-    }
+-}
+
+--- a/xxl-rpc-samples/xxl-rpc-sample-springboot/xxl-rpc-sample-springboot-server/src/main/java/com/xxl/rpc/sample/server/conf/SpringXxlRpcBootstrapConfig.java
++++ b//dev/null
+@@ -1,54 +0,0 @@
+-package com.xxl.rpc.sample.server.conf;
+-import com.xxl.rpc.core.boot.config.BaseConfig;
+-import com.xxl.rpc.core.boot.support.SpringXxlRpcBootstrap;
+-import com.xxl.rpc.core.invoker.config.InvokerConfig;
+-import com.xxl.rpc.core.provider.config.ProviderConfig;
+-import com.xxl.rpc.core.register.impl.XxlRpcAdminRegister;
+-import com.xxl.rpc.core.remoting.impl.netty.server.NettyServer;
+-import com.xxl.rpc.core.serializer.impl.JsonbSerializer;
+-import org.springframework.beans.factory.annotation.Value;
+-import org.springframework.context.annotation.Bean;
+-import org.springframework.context.annotation.Configuration;
+-/**
+- * xxl-rpc provider config
+- *
+- * @author xuxueli 2018-10-19
+- */
+-@Configuration
+-public class SpringXxlRpcBootstrapConfig {
+-    @Value("${xxl-rpc.base.env}")
+-    private String env;
+-    @Value("${xxl-rpc.base.appname}")
+-    private String appname;
+-    @Value("${xxl-rpc.register.address}")
+-    private String address;
+-    @Value("${xxl-rpc.register.accesstoken}")
+-    private String accesstoken;
+-    @Value("${xxl-rpc.invoker.open}")
+-    private boolean invokerOpen;
+-    @Value("${xxl-rpc.provider.open}")
+-    private boolean providerOpen;
+-    @Value("${xxl-rpc.provider.port}")
+-    private int port;
+-    @Value("${xxl-rpc.provider.corePoolSize}")
+-    private int corePoolSize;
+-    @Value("${xxl-rpc.provider.maxPoolSize}")
+-    private int maxPoolSize;
+-    @Bean
+-    public SpringXxlRpcBootstrap xxlRpcSpringFactory() {
+-        SpringXxlRpcBootstrap factory = new SpringXxlRpcBootstrap();
+-        factory.setBaseConfig(new BaseConfig(env, appname));
+-        factory.setRegister(new XxlRpcAdminRegister(address, accesstoken));
+-        factory.setInvokerConfig(new InvokerConfig(invokerOpen));
+-        factory.setProviderConfig(providerOpen ?
+-                new ProviderConfig(
+-                        NettyServer.class,
+-                        JsonbSerializer.class,
+-                        null,
+-                        port,
+-                        corePoolSize,
+-                        maxPoolSize,
+-                        null) : new ProviderConfig(providerOpen));
+-        return factory;
+-    }
+-}
+
+--- a/xxl-rpc-samples/xxl-rpc-sample-springboot/xxl-rpc-sample-springboot-server/src/main/java/com/xxl/rpc/sample/server/service/DemoServiceImpl.java
++++ b/xxl-rpc-samples/xxl-rpc-sample-springboot/xxl-rpc-sample-springboot-server/src/main/java/com/xxl/rpc/sample/server/service/DemoServiceImpl.java
+@@ -8,18 +8,20 @@
+ import java.text.MessageFormat;
+ /**
+  * @author xuxueli
+  */
+ @XxlRpcService
+ @Service
+ public class DemoServiceImpl implements DemoService {
+ 	private static Logger logger = LoggerFactory.getLogger(DemoServiceImpl.class);
+ 	@Override
+ 	public UserDTO sayHi(String name) {
++		String word = MessageFormat.format("Hi {0}, from {1} as {2}",
++				name, DemoServiceImpl.class.getName(), String.valueOf(System.currentTimeMillis()));
+ 		if ("error".equalsIgnoreCase(name)) {
+ 			throw new RuntimeException("test exception.");
+ 		}
+-		String word = MessageFormat.format("Hi {0}, this from {1} at {2}", name, DemoServiceImpl.class.getName(), String.valueOf(System.currentTimeMillis()));
+ 		UserDTO userDTO = new UserDTO(name, word);
++		logger.info(userDTO.toString());
+ 		return userDTO;
+ 	}
+ }

@@ -1,0 +1,218 @@
+# ====================================================================
+# FILE: setup.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-34 ---
+     1| import os.path
+     2| import runpy
+     3| import setuptools
+     4| from setuptools import setup, find_packages
+     5| here = os.path.abspath(os.path.dirname(__file__))
+     6| with open(os.path.join(here, "README.rst"), encoding="utf-8") as f:
+     7|     long_description = f.read()
+     8| install_requires = [
+     9|     'flask~=0.12',
+    10|     'flask-cors~=3.0.3',
+    11| ]
+    12| setup(
+    13|     name="xmpp-http-upload",
+    14|     version="0.3.0",
+    15|     description="Flask-based HTTP service to handle XMPP HTTP upload requests from Prosody mod_http_upload_external",
+    16|     long_description=long_description,
+    17|     url="https://github.com/horazont/xmpp-http-upload",
+    18|     author="Jonas Wielicki",
+    19|     author_email="jonas@wielicki.name",
+    20|     license="GPLv3+",
+    21|     classifiers=[
+    22|         "Development Status :: 3 - Alpha",
+    23|         "Intended Audience :: Developers",
+    24|         "Operating System :: POSIX",
+    25|         "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    26|         "Programming Language :: Python :: 3 :: Only",
+    27|         "Programming Language :: Python :: 3.3",
+    28|         "Programming Language :: Python :: 3.4",
+    29|         "Topic :: Communications :: Chat",
+    30|         "Topic :: Internet :: WWW/HTTP",
+    31|         "Topic :: Internet :: XMPP",
+    32|     ],
+    33|     keywords="xmpp http",
+    34|     install_requires=install_requires,
+
+
+# ====================================================================
+# FILE: xhu.py
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-110 ---
+     1| import contextlib
+     2| import errno
+     3| import fnmatch
+     4| import json
+     5| import hashlib
+     6| import hmac
+     7| import pathlib
+     8| import typing
+     9| import flask
+    10| app = flask.Flask("xmpp-http-upload")
+    11| app.config.from_envvar("XMPP_HTTP_UPLOAD_CONFIG")
+    12| application = app
+    13| if app.config['ENABLE_CORS']:
+    14|     from flask_cors import CORS
+    15|     CORS(app)
+    16| def sanitized_join(path: str, root: pathlib.Path) -> pathlib.Path:
+    17|     result = (root / path).absolute()
+    18|     if not str(result).startswith(str(root) + "/"):
+    19|         raise ValueError("resulting path is outside root")
+    20|     return result
+    21| def get_paths(base_path: pathlib.Path):
+    22|     data_file = pathlib.Path(str(base_path) + ".data")
+    23|     metadata_file = pathlib.Path(str(base_path) + ".meta")
+    24|     return data_file, metadata_file
+    25| def load_metadata(metadata_file):
+    26|     with metadata_file.open("r") as f:
+    27|         return json.load(f)
+    28| def get_info(path: str, root: pathlib.Path) -> typing.Tuple[
+    29|         pathlib.Path,
+    30|         dict]:
+    31|     dest_path = sanitized_join(
+    32|         path,
+    33|         pathlib.Path(app.config["DATA_ROOT"]),
+    34|     )
+    35|     data_file, metadata_file = get_paths(dest_path)
+    36|     return data_file, load_metadata(metadata_file)
+    37| @contextlib.contextmanager
+    38| def write_file(at: pathlib.Path):
+    39|     with at.open("xb") as f:
+    40|         try:
+    41|             yield f
+    42|         except:  # NOQA
+    43|             at.unlink()
+    44|             raise
+    45| @app.route("/")
+    46| def index():
+    47|     return flask.Response(
+    48|         "Welcome to XMPP HTTP Upload. State your business.",
+    49|         mimetype="text/plain",
+    50|     )
+    51| def stream_file(src, dest, nbytes):
+    52|     while nbytes > 0:
+    53|         data = src.read(min(nbytes, 4096))
+    54|         if not data:
+    55|             break
+    56|         dest.write(data)
+    57|         nbytes -= len(data)
+    58|     if nbytes > 0:
+    59|         raise EOFError
+    60| @app.route("/<path:path>", methods=["PUT"])
+    61| def put_file(path):
+    62|     try:
+    63|         dest_path = sanitized_join(
+    64|             path,
+    65|             pathlib.Path(app.config["DATA_ROOT"]),
+    66|         )
+    67|     except ValueError:
+    68|         return flask.Response(
+    69|             "Not Found",
+    70|             404,
+    71|             mimetype="text/plain",
+    72|         )
+    73|     verification_key = flask.request.args.get("v", "")
+    74|     length = int(flask.request.headers.get("Content-Length", 0))
+    75|     hmac_input = "{} {}".format(path, length).encode("utf-8")
+    76|     key = app.config["SECRET_KEY"]
+    77|     mac = hmac.new(key, hmac_input, hashlib.sha256)
+    78|     digest = mac.hexdigest()
+    79|     if not hmac.compare_digest(digest, verification_key):
+    80|         return flask.Response(
+    81|             "Invalid verification key",
+    82|             403,
+    83|             mimetype="text/plain",
+    84|         )
+    85|     content_type = flask.request.headers.get(
+    86|         "Content-Type",
+    87|         "application/octet-stream",
+    88|     )
+    89|     dest_path.parent.mkdir(parents=True, exist_ok=True, mode=0o770)
+    90|     data_file, metadata_file = get_paths(dest_path)
+    91|     try:
+    92|         with write_file(data_file) as fout:
+    93|             stream_file(flask.request.stream, fout, length)
+    94|             with metadata_file.open("x") as f:
+    95|                 json.dump(
+    96|                     {
+    97|                         "headers": {"Content-Type": content_type},
+    98|                     },
+    99|                     f,
+   100|                 )
+   101|     except EOFError:
+   102|         return flask.Response(
+   103|             "Bad Request",
+   104|             400,
+   105|             mimetype="text/plain",
+   106|         )
+   107|     except OSError as exc:
+   108|         if exc.errno == errno.EEXIST:
+   109|             return flask.Response(
+   110|                 "Conflict",
+
+# --- HUNK 2: Lines 115-173 ---
+   115|     return flask.Response(
+   116|         "Created",
+   117|         201,
+   118|         mimetype="text/plain",
+   119|     )
+   120| def generate_headers(response_headers, metadata_headers):
+   121|     for key, value in metadata_headers.items():
+   122|         response_headers[key] = value
+   123|     content_type = metadata_headers["Content-Type"]
+   124|     for mimetype_glob in app.config.get("NON_ATTACHMENT_MIME_TYPES", []):
+   125|         if fnmatch.fnmatch(content_type, mimetype_glob):
+   126|             break
+   127|     else:
+   128|         response_headers["Content-Disposition"] = "attachment"
+   129|     response_headers["X-Content-Type-Options"] = "nosniff"
+   130|     response_headers["X-Frame-Options"] = "DENY"
+   131|     response_headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'; sandbox"
+   132| @app.route("/<path:path>", methods=["HEAD"])
+   133| def head_file(path):
+   134|     try:
+   135|         data_file, metadata = get_info(
+   136|             path,
+   137|             pathlib.Path(app.config["DATA_ROOT"])
+   138|         )
+   139|         stat = data_file.stat()
+   140|     except (OSError, ValueError):
+   141|         return flask.Response(
+   142|             "Not Found",
+   143|             404,
+   144|             mimetype="text/plain",
+   145|         )
+   146|     response = flask.Response()
+   147|     response.headers["Content-Length"] = str(stat.st_size)
+   148|     generate_headers(
+   149|         response.headers,
+   150|         metadata["headers"],
+   151|     )
+   152|     return response
+   153| @app.route("/<path:path>", methods=["GET"])
+   154| def get_file(path):
+   155|     try:
+   156|         data_file, metadata = get_info(
+   157|             path,
+   158|             pathlib.Path(app.config["DATA_ROOT"])
+   159|         )
+   160|     except (OSError, ValueError):
+   161|         return flask.Response(
+   162|             "Not Found",
+   163|             404,
+   164|             mimetype="text/plain",
+   165|         )
+   166|     response = flask.make_response(flask.send_file(
+   167|         str(data_file),
+   168|     ))
+   169|     generate_headers(
+   170|         response.headers,
+   171|         metadata["headers"],
+   172|     )
+   173|     return response
+

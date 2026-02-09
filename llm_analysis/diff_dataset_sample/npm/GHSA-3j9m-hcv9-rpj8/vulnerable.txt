@@ -1,0 +1,553 @@
+# ====================================================================
+# FILE: build.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-398 ---
+     1| package main
+     2| import (
+     3| 	"bytes"
+     4| 	"crypto/md5"
+     5| 	"crypto/sha256"
+     6| 	"encoding/json"
+     7| 	"flag"
+     8| 	"fmt"
+     9| 	"go/build"
+    10| 	"io"
+    11| 	"io/ioutil"
+    12| 	"log"
+    13| 	"os"
+    14| 	"os/exec"
+    15| 	"path"
+    16| 	"path/filepath"
+    17| 	"runtime"
+    18| 	"strconv"
+    19| 	"strings"
+    20| 	"time"
+    21| )
+    22| const (
+    23| 	windows = "windows"
+    24| 	linux   = "linux"
+    25| )
+    26| var (
+    27| 	goarch    string
+    28| 	goos      string
+    29| 	gocc      string
+    30| 	cgo       bool
+    31| 	libc      string
+    32| 	pkgArch   string
+    33| 	version   string = "v1"
+    34| 	buildTags []string
+    35| 	linuxPackageVersion   string = "v1"
+    36| 	linuxPackageIteration string = ""
+    37| 	race                  bool
+    38| 	workingDir            string
+    39| 	includeBuildId        bool     = true
+    40| 	buildId               string   = "0"
+    41| 	serverBinary          string   = "grafana-server"
+    42| 	cliBinary             string   = "grafana-cli"
+    43| 	binaries              []string = []string{serverBinary, cliBinary}
+    44| 	isDev                 bool     = false
+    45| 	enterprise            bool     = false
+    46| 	skipRpmGen            bool     = false
+    47| 	skipDebGen            bool     = false
+    48| 	printGenVersion       bool     = false
+    49| )
+    50| func main() {
+    51| 	log.SetOutput(os.Stdout)
+    52| 	log.SetFlags(0)
+    53| 	var buildIdRaw string
+    54| 	var buildTagsRaw string
+    55| 	flag.StringVar(&goarch, "goarch", runtime.GOARCH, "GOARCH")
+    56| 	flag.StringVar(&goos, "goos", runtime.GOOS, "GOOS")
+    57| 	flag.StringVar(&gocc, "cc", "", "CC")
+    58| 	flag.StringVar(&libc, "libc", "", "LIBC")
+    59| 	flag.StringVar(&buildTagsRaw, "build-tags", "", "Sets custom build tags")
+    60| 	flag.BoolVar(&cgo, "cgo-enabled", cgo, "Enable cgo")
+    61| 	flag.StringVar(&pkgArch, "pkg-arch", "", "PKG ARCH")
+    62| 	flag.BoolVar(&race, "race", race, "Use race detector")
+    63| 	flag.BoolVar(&includeBuildId, "includeBuildId", includeBuildId, "IncludeBuildId in package name")
+    64| 	flag.BoolVar(&enterprise, "enterprise", enterprise, "Build enterprise version of Grafana")
+    65| 	flag.StringVar(&buildIdRaw, "buildId", "0", "Build ID from CI system")
+    66| 	flag.BoolVar(&isDev, "dev", isDev, "optimal for development, skips certain steps")
+    67| 	flag.BoolVar(&skipRpmGen, "skipRpm", skipRpmGen, "skip rpm package generation (default: false)")
+    68| 	flag.BoolVar(&skipDebGen, "skipDeb", skipDebGen, "skip deb package generation (default: false)")
+    69| 	flag.BoolVar(&printGenVersion, "gen-version", printGenVersion, "generate Grafana version and output (default: false)")
+    70| 	flag.Parse()
+    71| 	buildId = shortenBuildId(buildIdRaw)
+    72| 	readVersionFromPackageJson()
+    73| 	if pkgArch == "" {
+    74| 		pkgArch = goarch
+    75| 	}
+    76| 	if printGenVersion {
+    77| 		printGeneratedVersion()
+    78| 		return
+    79| 	}
+    80| 	if len(buildTagsRaw) > 0 {
+    81| 		buildTags = strings.Split(buildTagsRaw, ",")
+    82| 	}
+    83| 	log.Printf("Version: %s, Linux Version: %s, Package Iteration: %s\n", version, linuxPackageVersion, linuxPackageIteration)
+    84| 	if flag.NArg() == 0 {
+    85| 		log.Println("Usage: go run build.go build")
+    86| 		return
+    87| 	}
+    88| 	workingDir, _ = os.Getwd()
+    89| 	for _, cmd := range flag.Args() {
+    90| 		switch cmd {
+    91| 		case "setup":
+    92| 			setup()
+    93| 		case "build-srv", "build-server":
+    94| 			clean()
+    95| 			doBuild("grafana-server", "./pkg/cmd/grafana-server", buildTags)
+    96| 		case "build-cli":
+    97| 			clean()
+    98| 			doBuild("grafana-cli", "./pkg/cmd/grafana-cli", buildTags)
+    99| 		case "build":
+   100| 			for _, binary := range binaries {
+   101| 				doBuild(binary, "./pkg/cmd/"+binary, buildTags)
+   102| 			}
+   103| 		case "build-frontend":
+   104| 			yarn("build")
+   105| 		case "sha-dist":
+   106| 			shaFilesInDist()
+   107| 		case "latest":
+   108| 			makeLatestDistCopies()
+   109| 		case "clean":
+   110| 			clean()
+   111| 		default:
+   112| 			log.Fatalf("Unknown command %q", cmd)
+   113| 		}
+   114| 	}
+   115| }
+   116| func makeLatestDistCopies() {
+   117| 	files, err := ioutil.ReadDir("dist")
+   118| 	if err != nil {
+   119| 		log.Fatalf("failed to create latest copies. Cannot read from /dist")
+   120| 	}
+   121| 	latestMapping := map[string]string{
+   122| 		"_amd64.deb":               "dist/grafana_latest_amd64.deb",
+   123| 		".x86_64.rpm":              "dist/grafana-latest-1.x86_64.rpm",
+   124| 		".linux-amd64.tar.gz":      "dist/grafana-latest.linux-x64.tar.gz",
+   125| 		".linux-amd64-musl.tar.gz": "dist/grafana-latest.linux-x64-musl.tar.gz",
+   126| 		".linux-armv7.tar.gz":      "dist/grafana-latest.linux-armv7.tar.gz",
+   127| 		".linux-armv7-musl.tar.gz": "dist/grafana-latest.linux-armv7-musl.tar.gz",
+   128| 		".linux-armv6.tar.gz":      "dist/grafana-latest.linux-armv6.tar.gz",
+   129| 		".linux-arm64.tar.gz":      "dist/grafana-latest.linux-arm64.tar.gz",
+   130| 		".linux-arm64-musl.tar.gz": "dist/grafana-latest.linux-arm64-musl.tar.gz",
+   131| 	}
+   132| 	for _, file := range files {
+   133| 		for extension, fullName := range latestMapping {
+   134| 			if strings.HasSuffix(file.Name(), extension) {
+   135| 				runError("cp", path.Join("dist", file.Name()), fullName)
+   136| 			}
+   137| 		}
+   138| 	}
+   139| }
+   140| func readVersionFromPackageJson() {
+   141| 	reader, err := os.Open("package.json")
+   142| 	if err != nil {
+   143| 		log.Fatal("Failed to open package.json")
+   144| 		return
+   145| 	}
+   146| 	defer reader.Close()
+   147| 	jsonObj := map[string]interface{}{}
+   148| 	jsonParser := json.NewDecoder(reader)
+   149| 	if err := jsonParser.Decode(&jsonObj); err != nil {
+   150| 		log.Fatal("Failed to decode package.json")
+   151| 	}
+   152| 	version = jsonObj["version"].(string)
+   153| 	linuxPackageVersion = version
+   154| 	linuxPackageIteration = ""
+   155| 	parts := strings.Split(version, "-")
+   156| 	if len(parts) > 1 {
+   157| 		linuxPackageVersion = parts[0]
+   158| 		linuxPackageIteration = parts[1]
+   159| 	}
+   160| 	if includeBuildId {
+   161| 		if buildId != "0" {
+   162| 			linuxPackageIteration = fmt.Sprintf("%s%s", buildId, linuxPackageIteration)
+   163| 		} else {
+   164| 			linuxPackageIteration = fmt.Sprintf("%d%s", time.Now().Unix(), linuxPackageIteration)
+   165| 		}
+   166| 	}
+   167| }
+   168| func yarn(params ...string) {
+   169| 	runPrint(`yarn run`, params...)
+   170| }
+   171| func genPackageVersion() string {
+   172| 	if includeBuildId {
+   173| 		return fmt.Sprintf("%v-%v", linuxPackageVersion, linuxPackageIteration)
+   174| 	} else {
+   175| 		return version
+   176| 	}
+   177| }
+   178| func setup() {
+   179| 	args := []string{"install", "-v"}
+   180| 	if goos == windows {
+   181| 		args = append(args, "-buildmode=exe")
+   182| 	}
+   183| 	args = append(args, "./pkg/cmd/grafana-server")
+   184| 	runPrint("go", args...)
+   185| }
+   186| func printGeneratedVersion() {
+   187| 	fmt.Print(genPackageVersion())
+   188| }
+   189| func test(pkg string) {
+   190| 	setBuildEnv()
+   191| 	args := []string{"test", "-short", "-timeout", "60s"}
+   192| 	if goos == windows {
+   193| 		args = append(args, "-buildmode=exe")
+   194| 	}
+   195| 	args = append(args, pkg)
+   196| 	runPrint("go", args...)
+   197| }
+   198| func doBuild(binaryName, pkg string, tags []string) {
+   199| 	libcPart := ""
+   200| 	if libc != "" {
+   201| 		libcPart = fmt.Sprintf("-%s", libc)
+   202| 	}
+   203| 	binary := fmt.Sprintf("./bin/%s-%s%s/%s", goos, goarch, libcPart, binaryName)
+   204| 	if isDev {
+   205| 		binary = fmt.Sprintf("./bin/%s", binaryName)
+   206| 	}
+   207| 	if goos == windows {
+   208| 		binary += ".exe"
+   209| 	}
+   210| 	if !isDev {
+   211| 		rmr(binary, binary+".md5")
+   212| 	}
+   213| 	args := []string{"build", "-ldflags", ldflags()}
+   214| 	if goos == windows {
+   215| 		args = append(args, "-buildmode=exe")
+   216| 	}
+   217| 	if len(tags) > 0 {
+   218| 		args = append(args, "-tags", strings.Join(tags, ","))
+   219| 	}
+   220| 	if race {
+   221| 		args = append(args, "-race")
+   222| 	}
+   223| 	args = append(args, "-o", binary)
+   224| 	args = append(args, pkg)
+   225| 	if !isDev {
+   226| 		setBuildEnv()
+   227| 		runPrint("go", "version")
+   228| 		libcPart := ""
+   229| 		if libc != "" {
+   230| 			libcPart = fmt.Sprintf("/%s", libc)
+   231| 		}
+   232| 		fmt.Printf("Targeting %s/%s%s\n", goos, goarch, libcPart)
+   233| 	}
+   234| 	runPrint("go", args...)
+   235| 	if !isDev {
+   236| 		err := md5File(binary)
+   237| 		if err != nil {
+   238| 			log.Fatal(err)
+   239| 		}
+   240| 	}
+   241| }
+   242| func ldflags() string {
+   243| 	var b bytes.Buffer
+   244| 	b.WriteString("-w")
+   245| 	b.WriteString(fmt.Sprintf(" -X main.version=%s", version))
+   246| 	b.WriteString(fmt.Sprintf(" -X main.commit=%s", getGitSha()))
+   247| 	b.WriteString(fmt.Sprintf(" -X main.buildstamp=%d", buildStamp()))
+   248| 	b.WriteString(fmt.Sprintf(" -X main.buildBranch=%s", getGitBranch()))
+   249| 	if v := os.Getenv("LDFLAGS"); v != "" {
+   250| 		b.WriteString(fmt.Sprintf(" -extldflags \"%s\"", v))
+   251| 	}
+   252| 	return b.String()
+   253| }
+   254| func rmr(paths ...string) {
+   255| 	for _, path := range paths {
+   256| 		log.Println("rm -r", path)
+   257| 		os.RemoveAll(path)
+   258| 	}
+   259| }
+   260| func clean() {
+   261| 	if isDev {
+   262| 		return
+   263| 	}
+   264| 	rmr("dist")
+   265| 	rmr("tmp")
+   266| 	rmr(filepath.Join(build.Default.GOPATH, fmt.Sprintf("pkg/%s_%s/github.com/grafana", goos, goarch)))
+   267| }
+   268| func setBuildEnv() {
+   269| 	os.Setenv("GOOS", goos)
+   270| 	if goos == windows {
+   271| 		os.Setenv("CGO_CFLAGS", "-D_WIN32_WINNT=0x0601")
+   272| 	}
+   273| 	if goarch != "amd64" || goos != linux {
+   274| 		cgo = true
+   275| 	}
+   276| 	if strings.HasPrefix(goarch, "armv") {
+   277| 		os.Setenv("GOARCH", "arm")
+   278| 		os.Setenv("GOARM", goarch[4:])
+   279| 	} else {
+   280| 		os.Setenv("GOARCH", goarch)
+   281| 	}
+   282| 	if goarch == "386" {
+   283| 		os.Setenv("GO386", "387")
+   284| 	}
+   285| 	if cgo {
+   286| 		os.Setenv("CGO_ENABLED", "1")
+   287| 	}
+   288| 	if gocc != "" {
+   289| 		os.Setenv("CC", gocc)
+   290| 	}
+   291| }
+   292| func getGitBranch() string {
+   293| 	v, err := runError("git", "rev-parse", "--abbrev-ref", "HEAD")
+   294| 	if err != nil {
+   295| 		return "main"
+   296| 	}
+   297| 	return string(v)
+   298| }
+   299| func getGitSha() string {
+   300| 	v, err := runError("git", "rev-parse", "--short", "HEAD")
+   301| 	if err != nil {
+   302| 		return "unknown-dev"
+   303| 	}
+   304| 	return string(v)
+   305| }
+   306| func buildStamp() int64 {
+   307| 	if s, _ := strconv.ParseInt(os.Getenv("SOURCE_DATE_EPOCH"), 10, 64); s > 0 {
+   308| 		return s
+   309| 	}
+   310| 	bs, err := runError("git", "show", "-s", "--format=%ct")
+   311| 	if err != nil {
+   312| 		return time.Now().Unix()
+   313| 	}
+   314| 	s, _ := strconv.ParseInt(string(bs), 10, 64)
+   315| 	return s
+   316| }
+   317| func runError(cmd string, args ...string) ([]byte, error) {
+   318| 	ecmd := exec.Command(cmd, args...)
+   319| 	bs, err := ecmd.CombinedOutput()
+   320| 	if err != nil {
+   321| 		return nil, err
+   322| 	}
+   323| 	return bytes.TrimSpace(bs), nil
+   324| }
+   325| func runPrint(cmd string, args ...string) {
+   326| 	log.Println(cmd, strings.Join(args, " "))
+   327| 	ecmd := exec.Command(cmd, args...)
+   328| 	ecmd.Env = append(os.Environ(), "GO111MODULE=on")
+   329| 	ecmd.Stdout = os.Stdout
+   330| 	ecmd.Stderr = os.Stderr
+   331| 	err := ecmd.Run()
+   332| 	if err != nil {
+   333| 		log.Fatal(err)
+   334| 	}
+   335| }
+   336| func md5File(file string) error {
+   337| 	fd, err := os.Open(file)
+   338| 	if err != nil {
+   339| 		return err
+   340| 	}
+   341| 	defer fd.Close()
+   342| 	h := md5.New()
+   343| 	_, err = io.Copy(h, fd)
+   344| 	if err != nil {
+   345| 		return err
+   346| 	}
+   347| 	out, err := os.Create(file + ".md5")
+   348| 	if err != nil {
+   349| 		return err
+   350| 	}
+   351| 	_, err = fmt.Fprintf(out, "%x\n", h.Sum(nil))
+   352| 	if err != nil {
+   353| 		return err
+   354| 	}
+   355| 	return out.Close()
+   356| }
+   357| func shaFilesInDist() {
+   358| 	filepath.Walk("./dist", func(path string, f os.FileInfo, err error) error {
+   359| 		if path == "./dist" {
+   360| 			return nil
+   361| 		}
+   362| 		if !strings.Contains(path, ".sha256") {
+   363| 			err := shaFile(path)
+   364| 			if err != nil {
+   365| 				log.Printf("Failed to create sha file. error: %v\n", err)
+   366| 			}
+   367| 		}
+   368| 		return nil
+   369| 	})
+   370| }
+   371| func shaFile(file string) error {
+   372| 	fd, err := os.Open(file)
+   373| 	if err != nil {
+   374| 		return err
+   375| 	}
+   376| 	defer fd.Close()
+   377| 	h := sha256.New()
+   378| 	_, err = io.Copy(h, fd)
+   379| 	if err != nil {
+   380| 		return err
+   381| 	}
+   382| 	out, err := os.Create(file + ".sha256")
+   383| 	if err != nil {
+   384| 		return err
+   385| 	}
+   386| 	_, err = fmt.Fprintf(out, "%x\n", h.Sum(nil))
+   387| 	if err != nil {
+   388| 		return err
+   389| 	}
+   390| 	return out.Close()
+   391| }
+   392| func shortenBuildId(buildId string) string {
+   393| 	buildId = strings.Replace(buildId, "-", "", -1)
+   394| 	if len(buildId) < 9 {
+   395| 		return buildId
+   396| 	}
+   397| 	return buildId[0:8]
+   398| }
+
+
+# ====================================================================
+# FILE: devenv/docker/blocks/graphite09/files/events_views.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-81 ---
+     1| import datetime
+     2| import time
+     3| from django.utils.timezone import get_current_timezone
+     4| from django.core.urlresolvers import get_script_prefix
+     5| from django.http import HttpResponse
+     6| from django.shortcuts import render_to_response, get_object_or_404
+     7| from pytz import timezone
+     8| from graphite.util import json
+     9| from graphite.events import models
+    10| from graphite.render.attime import parseATTime
+    11| def to_timestamp(dt):
+    12|     return time.mktime(dt.timetuple())
+    13| class EventEncoder(json.JSONEncoder):
+    14|     def default(self, obj):
+    15|         if isinstance(obj, datetime.datetime):
+    16|             return to_timestamp(obj)
+    17|         return json.JSONEncoder.default(self, obj)
+    18| def view_events(request):
+    19|     if request.method == "GET":
+    20|         context = { 'events' : fetch(request),
+    21|             'slash' : get_script_prefix()
+    22|         }
+    23|         return render_to_response("events.html", context)
+    24|     else:
+    25|         return post_event(request)
+    26| def detail(request, event_id):
+    27|     e = get_object_or_404(models.Event, pk=event_id)
+    28|     context = { 'event' : e,
+    29|        'slash' : get_script_prefix()
+    30|     }
+    31|     return render_to_response("event.html", context)
+    32| def post_event(request):
+    33|     if request.method == 'POST':
+    34|         event = json.loads(request.body)
+    35|         assert isinstance(event, dict)
+    36|         values = {}
+    37|         values["what"] = event["what"]
+    38|         values["tags"] = event.get("tags", None)
+    39|         values["when"] = datetime.datetime.fromtimestamp(
+    40|             event.get("when", time.time()))
+    41|         if "data" in event:
+    42|             values["data"] = event["data"]
+    43|         e = models.Event(**values)
+    44|         e.save()
+    45|         return HttpResponse(status=200)
+    46|     else:
+    47|         return HttpResponse(status=405)
+    48| def get_data(request):
+    49|     if 'jsonp' in request.REQUEST:
+    50|         response = HttpResponse(
+    51|           "%s(%s)" % (request.REQUEST.get('jsonp'),
+    52|               json.dumps(fetch(request), cls=EventEncoder)),
+    53|           mimetype='text/javascript')
+    54|     else:
+    55|         response = HttpResponse(
+    56|             json.dumps(fetch(request), cls=EventEncoder),
+    57|             mimetype="application/json")
+    58|     return response
+    59| def fetch(request):
+    60|     def make_naive(dt):
+    61|       if 'tz' in request.GET:
+    62|         tz = timezone(request.GET['tz'])
+    63|       else:
+    64|         tz = get_current_timezone()
+    65|       local_dt = dt.astimezone(tz)
+    66|       if hasattr(local_dt, 'normalize'):
+    67|         local_dt = local_dt.normalize()
+    68|       return local_dt.replace(tzinfo=None)
+    69|     if request.GET.get("from", None) is not None:
+    70|         time_from = make_naive(parseATTime(request.GET["from"]))
+    71|     else:
+    72|         time_from = datetime.datetime.fromtimestamp(0)
+    73|     if request.GET.get("until", None) is not None:
+    74|         time_until = make_naive(parseATTime(request.GET["until"]))
+    75|     else:
+    76|         time_until = datetime.datetime.now()
+    77|     tags = request.GET.get("tags", None)
+    78|     if tags is not None:
+    79|         tags = request.GET.get("tags").split(" ")
+    80|     return [x.as_dict() for x in
+    81|             models.Event.find_events(time_from, time_until, tags=tags)]
+
+
+# ====================================================================
+# FILE: devenv/docker/blocks/graphite09/files/local_settings.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-1 ---
+     1| TIME_ZONE = 'UTC'
+
+
+# ====================================================================
+# FILE: devenv/docker/blocks/graphite09/files/statsd_config.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-8 ---
+     1| {
+     2|   graphitePort: 2003,
+     3|   graphiteHost: "127.0.0.1",
+     4|   port: 8125,
+     5|   mgmt_port: 8126,
+     6|   backends: ['./backends/graphite'],
+     7|   debug: true
+     8| }
+
+
+# ====================================================================
+# FILE: devenv/docker/blocks/slow_proxy/main.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-31 ---
+     1| package main
+     2| import (
+     3| 	"log"
+     4| 	"net/http"
+     5| 	"net/http/httputil"
+     6| 	"net/url"
+     7| 	"os"
+     8| 	"time"
+     9| )
+    10| func main() {
+    11| 	origin := os.Getenv("ORIGIN_SERVER")
+    12| 	if origin == "" {
+    13| 		origin = "http://localhost:9090/"
+    14| 	}
+    15| 	sleepDurationStr := os.Getenv("SLEEP_DURATION")
+    16| 	if sleepDurationStr == "" {
+    17| 		sleepDurationStr = "60s"
+    18| 	}
+    19| 	sleep, err := time.ParseDuration(sleepDurationStr)
+    20| 	if err != nil {
+    21| 		log.Fatalf("failed to parse SLEEP_DURATION: %v", err)
+    22| 	}
+    23| 	originURL, _ := url.Parse(origin)
+    24| 	proxy := httputil.NewSingleHostReverseProxy(originURL)
+    25| 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+    26| 		log.Printf("sleeping for %s then proxying request: url '%s', headers: '%v'", sleep.String(), r.RequestURI, r.Header)
+    27| 		<-time.After(sleep)
+    28| 		proxy.ServeHTTP(w, r)
+    29| 	})
+    30| 	log.Fatal(http.ListenAndServe(":3011", nil))
+    31| }
+

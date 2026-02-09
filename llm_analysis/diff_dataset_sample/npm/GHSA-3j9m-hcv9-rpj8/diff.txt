@@ -1,0 +1,797 @@
+--- a//dev/null
++++ b/build.go
+@@ -0,0 +1,398 @@
++package main
++import (
++	"bytes"
++	"crypto/md5"
++	"crypto/sha256"
++	"encoding/json"
++	"flag"
++	"fmt"
++	"go/build"
++	"io"
++	"io/ioutil"
++	"log"
++	"os"
++	"os/exec"
++	"path"
++	"path/filepath"
++	"runtime"
++	"strconv"
++	"strings"
++	"time"
++)
++const (
++	windows = "windows"
++	linux   = "linux"
++)
++var (
++	goarch    string
++	goos      string
++	gocc      string
++	cgo       bool
++	libc      string
++	pkgArch   string
++	version   string = "v1"
++	buildTags []string
++	linuxPackageVersion   string = "v1"
++	linuxPackageIteration string = ""
++	race                  bool
++	workingDir            string
++	includeBuildId        bool     = true
++	buildId               string   = "0"
++	serverBinary          string   = "grafana-server"
++	cliBinary             string   = "grafana-cli"
++	binaries              []string = []string{serverBinary, cliBinary}
++	isDev                 bool     = false
++	enterprise            bool     = false
++	skipRpmGen            bool     = false
++	skipDebGen            bool     = false
++	printGenVersion       bool     = false
++)
++func main() {
++	log.SetOutput(os.Stdout)
++	log.SetFlags(0)
++	var buildIdRaw string
++	var buildTagsRaw string
++	flag.StringVar(&goarch, "goarch", runtime.GOARCH, "GOARCH")
++	flag.StringVar(&goos, "goos", runtime.GOOS, "GOOS")
++	flag.StringVar(&gocc, "cc", "", "CC")
++	flag.StringVar(&libc, "libc", "", "LIBC")
++	flag.StringVar(&buildTagsRaw, "build-tags", "", "Sets custom build tags")
++	flag.BoolVar(&cgo, "cgo-enabled", cgo, "Enable cgo")
++	flag.StringVar(&pkgArch, "pkg-arch", "", "PKG ARCH")
++	flag.BoolVar(&race, "race", race, "Use race detector")
++	flag.BoolVar(&includeBuildId, "includeBuildId", includeBuildId, "IncludeBuildId in package name")
++	flag.BoolVar(&enterprise, "enterprise", enterprise, "Build enterprise version of Grafana")
++	flag.StringVar(&buildIdRaw, "buildId", "0", "Build ID from CI system")
++	flag.BoolVar(&isDev, "dev", isDev, "optimal for development, skips certain steps")
++	flag.BoolVar(&skipRpmGen, "skipRpm", skipRpmGen, "skip rpm package generation (default: false)")
++	flag.BoolVar(&skipDebGen, "skipDeb", skipDebGen, "skip deb package generation (default: false)")
++	flag.BoolVar(&printGenVersion, "gen-version", printGenVersion, "generate Grafana version and output (default: false)")
++	flag.Parse()
++	buildId = shortenBuildId(buildIdRaw)
++	readVersionFromPackageJson()
++	if pkgArch == "" {
++		pkgArch = goarch
++	}
++	if printGenVersion {
++		printGeneratedVersion()
++		return
++	}
++	if len(buildTagsRaw) > 0 {
++		buildTags = strings.Split(buildTagsRaw, ",")
++	}
++	log.Printf("Version: %s, Linux Version: %s, Package Iteration: %s\n", version, linuxPackageVersion, linuxPackageIteration)
++	if flag.NArg() == 0 {
++		log.Println("Usage: go run build.go build")
++		return
++	}
++	workingDir, _ = os.Getwd()
++	for _, cmd := range flag.Args() {
++		switch cmd {
++		case "setup":
++			setup()
++		case "build-srv", "build-server":
++			clean()
++			doBuild("grafana-server", "./pkg/cmd/grafana-server", buildTags)
++		case "build-cli":
++			clean()
++			doBuild("grafana-cli", "./pkg/cmd/grafana-cli", buildTags)
++		case "build":
++			for _, binary := range binaries {
++				doBuild(binary, "./pkg/cmd/"+binary, buildTags)
++			}
++		case "build-frontend":
++			yarn("build")
++		case "sha-dist":
++			shaFilesInDist()
++		case "latest":
++			makeLatestDistCopies()
++		case "clean":
++			clean()
++		default:
++			log.Fatalf("Unknown command %q", cmd)
++		}
++	}
++}
++func makeLatestDistCopies() {
++	files, err := ioutil.ReadDir("dist")
++	if err != nil {
++		log.Fatalf("failed to create latest copies. Cannot read from /dist")
++	}
++	latestMapping := map[string]string{
++		"_amd64.deb":               "dist/grafana_latest_amd64.deb",
++		".x86_64.rpm":              "dist/grafana-latest-1.x86_64.rpm",
++		".linux-amd64.tar.gz":      "dist/grafana-latest.linux-x64.tar.gz",
++		".linux-amd64-musl.tar.gz": "dist/grafana-latest.linux-x64-musl.tar.gz",
++		".linux-armv7.tar.gz":      "dist/grafana-latest.linux-armv7.tar.gz",
++		".linux-armv7-musl.tar.gz": "dist/grafana-latest.linux-armv7-musl.tar.gz",
++		".linux-armv6.tar.gz":      "dist/grafana-latest.linux-armv6.tar.gz",
++		".linux-arm64.tar.gz":      "dist/grafana-latest.linux-arm64.tar.gz",
++		".linux-arm64-musl.tar.gz": "dist/grafana-latest.linux-arm64-musl.tar.gz",
++	}
++	for _, file := range files {
++		for extension, fullName := range latestMapping {
++			if strings.HasSuffix(file.Name(), extension) {
++				runError("cp", path.Join("dist", file.Name()), fullName)
++			}
++		}
++	}
++}
++func readVersionFromPackageJson() {
++	reader, err := os.Open("package.json")
++	if err != nil {
++		log.Fatal("Failed to open package.json")
++		return
++	}
++	defer reader.Close()
++	jsonObj := map[string]interface{}{}
++	jsonParser := json.NewDecoder(reader)
++	if err := jsonParser.Decode(&jsonObj); err != nil {
++		log.Fatal("Failed to decode package.json")
++	}
++	version = jsonObj["version"].(string)
++	linuxPackageVersion = version
++	linuxPackageIteration = ""
++	parts := strings.Split(version, "-")
++	if len(parts) > 1 {
++		linuxPackageVersion = parts[0]
++		linuxPackageIteration = parts[1]
++	}
++	if includeBuildId {
++		if buildId != "0" {
++			linuxPackageIteration = fmt.Sprintf("%s%s", buildId, linuxPackageIteration)
++		} else {
++			linuxPackageIteration = fmt.Sprintf("%d%s", time.Now().Unix(), linuxPackageIteration)
++		}
++	}
++}
++func yarn(params ...string) {
++	runPrint(`yarn run`, params...)
++}
++func genPackageVersion() string {
++	if includeBuildId {
++		return fmt.Sprintf("%v-%v", linuxPackageVersion, linuxPackageIteration)
++	} else {
++		return version
++	}
++}
++func setup() {
++	args := []string{"install", "-v"}
++	if goos == windows {
++		args = append(args, "-buildmode=exe")
++	}
++	args = append(args, "./pkg/cmd/grafana-server")
++	runPrint("go", args...)
++}
++func printGeneratedVersion() {
++	fmt.Print(genPackageVersion())
++}
++func test(pkg string) {
++	setBuildEnv()
++	args := []string{"test", "-short", "-timeout", "60s"}
++	if goos == windows {
++		args = append(args, "-buildmode=exe")
++	}
++	args = append(args, pkg)
++	runPrint("go", args...)
++}
++func doBuild(binaryName, pkg string, tags []string) {
++	libcPart := ""
++	if libc != "" {
++		libcPart = fmt.Sprintf("-%s", libc)
++	}
++	binary := fmt.Sprintf("./bin/%s-%s%s/%s", goos, goarch, libcPart, binaryName)
++	if isDev {
++		binary = fmt.Sprintf("./bin/%s", binaryName)
++	}
++	if goos == windows {
++		binary += ".exe"
++	}
++	if !isDev {
++		rmr(binary, binary+".md5")
++	}
++	args := []string{"build", "-ldflags", ldflags()}
++	if goos == windows {
++		args = append(args, "-buildmode=exe")
++	}
++	if len(tags) > 0 {
++		args = append(args, "-tags", strings.Join(tags, ","))
++	}
++	if race {
++		args = append(args, "-race")
++	}
++	args = append(args, "-o", binary)
++	args = append(args, pkg)
++	if !isDev {
++		setBuildEnv()
++		runPrint("go", "version")
++		libcPart := ""
++		if libc != "" {
++			libcPart = fmt.Sprintf("/%s", libc)
++		}
++		fmt.Printf("Targeting %s/%s%s\n", goos, goarch, libcPart)
++	}
++	runPrint("go", args...)
++	if !isDev {
++		err := md5File(binary)
++		if err != nil {
++			log.Fatal(err)
++		}
++	}
++}
++func ldflags() string {
++	var b bytes.Buffer
++	b.WriteString("-w")
++	b.WriteString(fmt.Sprintf(" -X main.version=%s", version))
++	b.WriteString(fmt.Sprintf(" -X main.commit=%s", getGitSha()))
++	b.WriteString(fmt.Sprintf(" -X main.buildstamp=%d", buildStamp()))
++	b.WriteString(fmt.Sprintf(" -X main.buildBranch=%s", getGitBranch()))
++	if v := os.Getenv("LDFLAGS"); v != "" {
++		b.WriteString(fmt.Sprintf(" -extldflags \"%s\"", v))
++	}
++	return b.String()
++}
++func rmr(paths ...string) {
++	for _, path := range paths {
++		log.Println("rm -r", path)
++		os.RemoveAll(path)
++	}
++}
++func clean() {
++	if isDev {
++		return
++	}
++	rmr("dist")
++	rmr("tmp")
++	rmr(filepath.Join(build.Default.GOPATH, fmt.Sprintf("pkg/%s_%s/github.com/grafana", goos, goarch)))
++}
++func setBuildEnv() {
++	os.Setenv("GOOS", goos)
++	if goos == windows {
++		os.Setenv("CGO_CFLAGS", "-D_WIN32_WINNT=0x0601")
++	}
++	if goarch != "amd64" || goos != linux {
++		cgo = true
++	}
++	if strings.HasPrefix(goarch, "armv") {
++		os.Setenv("GOARCH", "arm")
++		os.Setenv("GOARM", goarch[4:])
++	} else {
++		os.Setenv("GOARCH", goarch)
++	}
++	if goarch == "386" {
++		os.Setenv("GO386", "387")
++	}
++	if cgo {
++		os.Setenv("CGO_ENABLED", "1")
++	}
++	if gocc != "" {
++		os.Setenv("CC", gocc)
++	}
++}
++func getGitBranch() string {
++	v, err := runError("git", "rev-parse", "--abbrev-ref", "HEAD")
++	if err != nil {
++		return "main"
++	}
++	return string(v)
++}
++func getGitSha() string {
++	v, err := runError("git", "rev-parse", "--short", "HEAD")
++	if err != nil {
++		return "unknown-dev"
++	}
++	return string(v)
++}
++func buildStamp() int64 {
++	if s, _ := strconv.ParseInt(os.Getenv("SOURCE_DATE_EPOCH"), 10, 64); s > 0 {
++		return s
++	}
++	bs, err := runError("git", "show", "-s", "--format=%ct")
++	if err != nil {
++		return time.Now().Unix()
++	}
++	s, _ := strconv.ParseInt(string(bs), 10, 64)
++	return s
++}
++func runError(cmd string, args ...string) ([]byte, error) {
++	ecmd := exec.Command(cmd, args...)
++	bs, err := ecmd.CombinedOutput()
++	if err != nil {
++		return nil, err
++	}
++	return bytes.TrimSpace(bs), nil
++}
++func runPrint(cmd string, args ...string) {
++	log.Println(cmd, strings.Join(args, " "))
++	ecmd := exec.Command(cmd, args...)
++	ecmd.Env = append(os.Environ(), "GO111MODULE=on")
++	ecmd.Stdout = os.Stdout
++	ecmd.Stderr = os.Stderr
++	err := ecmd.Run()
++	if err != nil {
++		log.Fatal(err)
++	}
++}
++func md5File(file string) error {
++	fd, err := os.Open(file)
++	if err != nil {
++		return err
++	}
++	defer fd.Close()
++	h := md5.New()
++	_, err = io.Copy(h, fd)
++	if err != nil {
++		return err
++	}
++	out, err := os.Create(file + ".md5")
++	if err != nil {
++		return err
++	}
++	_, err = fmt.Fprintf(out, "%x\n", h.Sum(nil))
++	if err != nil {
++		return err
++	}
++	return out.Close()
++}
++func shaFilesInDist() {
++	filepath.Walk("./dist", func(path string, f os.FileInfo, err error) error {
++		if path == "./dist" {
++			return nil
++		}
++		if !strings.Contains(path, ".sha256") {
++			err := shaFile(path)
++			if err != nil {
++				log.Printf("Failed to create sha file. error: %v\n", err)
++			}
++		}
++		return nil
++	})
++}
++func shaFile(file string) error {
++	fd, err := os.Open(file)
++	if err != nil {
++		return err
++	}
++	defer fd.Close()
++	h := sha256.New()
++	_, err = io.Copy(h, fd)
++	if err != nil {
++		return err
++	}
++	out, err := os.Create(file + ".sha256")
++	if err != nil {
++		return err
++	}
++	_, err = fmt.Fprintf(out, "%x\n", h.Sum(nil))
++	if err != nil {
++		return err
++	}
++	return out.Close()
++}
++func shortenBuildId(buildId string) string {
++	buildId = strings.Replace(buildId, "-", "", -1)
++	if len(buildId) < 9 {
++		return buildId
++	}
++	return buildId[0:8]
++}
+
+--- a//dev/null
++++ b/devenv/docker/blocks/graphite09/files/events_views.py
+@@ -0,0 +1,81 @@
++import datetime
++import time
++from django.utils.timezone import get_current_timezone
++from django.core.urlresolvers import get_script_prefix
++from django.http import HttpResponse
++from django.shortcuts import render_to_response, get_object_or_404
++from pytz import timezone
++from graphite.util import json
++from graphite.events import models
++from graphite.render.attime import parseATTime
++def to_timestamp(dt):
++    return time.mktime(dt.timetuple())
++class EventEncoder(json.JSONEncoder):
++    def default(self, obj):
++        if isinstance(obj, datetime.datetime):
++            return to_timestamp(obj)
++        return json.JSONEncoder.default(self, obj)
++def view_events(request):
++    if request.method == "GET":
++        context = { 'events' : fetch(request),
++            'slash' : get_script_prefix()
++        }
++        return render_to_response("events.html", context)
++    else:
++        return post_event(request)
++def detail(request, event_id):
++    e = get_object_or_404(models.Event, pk=event_id)
++    context = { 'event' : e,
++       'slash' : get_script_prefix()
++    }
++    return render_to_response("event.html", context)
++def post_event(request):
++    if request.method == 'POST':
++        event = json.loads(request.body)
++        assert isinstance(event, dict)
++        values = {}
++        values["what"] = event["what"]
++        values["tags"] = event.get("tags", None)
++        values["when"] = datetime.datetime.fromtimestamp(
++            event.get("when", time.time()))
++        if "data" in event:
++            values["data"] = event["data"]
++        e = models.Event(**values)
++        e.save()
++        return HttpResponse(status=200)
++    else:
++        return HttpResponse(status=405)
++def get_data(request):
++    if 'jsonp' in request.REQUEST:
++        response = HttpResponse(
++          "%s(%s)" % (request.REQUEST.get('jsonp'),
++              json.dumps(fetch(request), cls=EventEncoder)),
++          mimetype='text/javascript')
++    else:
++        response = HttpResponse(
++            json.dumps(fetch(request), cls=EventEncoder),
++            mimetype="application/json")
++    return response
++def fetch(request):
++    def make_naive(dt):
++      if 'tz' in request.GET:
++        tz = timezone(request.GET['tz'])
++      else:
++        tz = get_current_timezone()
++      local_dt = dt.astimezone(tz)
++      if hasattr(local_dt, 'normalize'):
++        local_dt = local_dt.normalize()
++      return local_dt.replace(tzinfo=None)
++    if request.GET.get("from", None) is not None:
++        time_from = make_naive(parseATTime(request.GET["from"]))
++    else:
++        time_from = datetime.datetime.fromtimestamp(0)
++    if request.GET.get("until", None) is not None:
++        time_until = make_naive(parseATTime(request.GET["until"]))
++    else:
++        time_until = datetime.datetime.now()
++    tags = request.GET.get("tags", None)
++    if tags is not None:
++        tags = request.GET.get("tags").split(" ")
++    return [x.as_dict() for x in
++            models.Event.find_events(time_from, time_until, tags=tags)]
+
+--- a//dev/null
++++ b/devenv/docker/blocks/graphite09/files/local_settings.py
+@@ -0,0 +1 @@
++TIME_ZONE = 'UTC'
+
+--- a//dev/null
++++ b/devenv/docker/blocks/graphite09/files/statsd_config.js
+@@ -0,0 +1,8 @@
++{
++  graphitePort: 2003,
++  graphiteHost: "127.0.0.1",
++  port: 8125,
++  mgmt_port: 8126,
++  backends: ['./backends/graphite'],
++  debug: true
++}
+
+--- a//dev/null
++++ b/devenv/docker/blocks/slow_proxy/main.go
+@@ -0,0 +1,31 @@
++package main
++import (
++	"log"
++	"net/http"
++	"net/http/httputil"
++	"net/url"
++	"os"
++	"time"
++)
++func main() {
++	origin := os.Getenv("ORIGIN_SERVER")
++	if origin == "" {
++		origin = "http://localhost:9090/"
++	}
++	sleepDurationStr := os.Getenv("SLEEP_DURATION")
++	if sleepDurationStr == "" {
++		sleepDurationStr = "60s"
++	}
++	sleep, err := time.ParseDuration(sleepDurationStr)
++	if err != nil {
++		log.Fatalf("failed to parse SLEEP_DURATION: %v", err)
++	}
++	originURL, _ := url.Parse(origin)
++	proxy := httputil.NewSingleHostReverseProxy(originURL)
++	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
++		log.Printf("sleeping for %s then proxying request: url '%s', headers: '%v'", sleep.String(), r.RequestURI, r.Header)
++		<-time.After(sleep)
++		proxy.ServeHTTP(w, r)
++	})
++	log.Fatal(http.ListenAndServe(":3011", nil))
++}
+
+--- a/packages/grafana-data/src/text/index.ts
++++ b//dev/null
+@@ -1,11 +0,0 @@
+-export * from './string';
+-export * from './markdown';
+-export * from './text';
+-import { escapeHtml, hasAnsiCodes, sanitize, sanitizeUrl, sanitizeAngularInterpolation } from './sanitize';
+-export const textUtil = {
+-  escapeHtml,
+-  hasAnsiCodes,
+-  sanitize,
+-  sanitizeUrl,
+-  sanitizeAngularInterpolation,
+-};
+
+--- a/packages/grafana-data/src/text/sanitize.ts
++++ b//dev/null
+@@ -1,36 +0,0 @@
+-import xss from 'xss';
+-import { sanitizeUrl as braintreeSanitizeUrl } from '@braintree/sanitize-url';
+-const XSSWL = Object.keys(xss.whiteList).reduce((acc, element) => {
+-  acc[element] = xss.whiteList[element].concat(['class', 'style']);
+-  return acc;
+-}, {});
+-const sanitizeXSS = new xss.FilterXSS({
+-  whiteList: XSSWL,
+-});
+-/**
+- * Returns string safe from XSS attacks.
+- *
+- * Even though we allow the style-attribute, there's still default filtering applied to it
+- * Info: https://github.com/leizongmin/js-xss#customize-css-filter
+- * Whitelist: https://github.com/leizongmin/js-css-filter/blob/master/lib/default.js
+- */
+-export function sanitize(unsanitizedString: string): string {
+-  try {
+-    return sanitizeXSS.process(unsanitizedString);
+-  } catch (error) {
+-    console.error('String could not be sanitized', unsanitizedString);
+-    return unsanitizedString;
+-  }
+-}
+-export function sanitizeUrl(url: string): string {
+-  return braintreeSanitizeUrl(url);
+-}
+-export function hasAnsiCodes(input: string): boolean {
+-  return /\u001b\[\d{1,2}m/.test(input);
+-}
+-export function escapeHtml(str: string): string {
+-  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+-}
+-export function sanitizeAngularInterpolation(url: string): string {
+-  return url.replace(/\{\{/g, '%7B%7B').replace(/\}\}/g, '%7D%7D');
+-}
+
+--- a/public/app/core/components/NavBar/DropdownChild.tsx
++++ b//dev/null
+@@ -1,53 +0,0 @@
+-import React from 'react';
+-import { css } from '@emotion/css';
+-import { GrafanaTheme2, textUtil } from '@grafana/data';
+-import { Icon, IconName, Link, useTheme2 } from '@grafana/ui';
+-export interface Props {
+-  isDivider?: boolean;
+-  icon?: IconName;
+-  onClick?: () => void;
+-  target?: HTMLAnchorElement['target'];
+-  text: string;
+-  url?: string;
+-}
+-const DropdownChild = ({ isDivider = false, icon, onClick, target, text, url }: Props) => {
+-  const theme = useTheme2();
+-  const styles = getStyles(theme);
+-  const linkContent = (
+-    <>
+-      {icon && <Icon data-testid="dropdown-child-icon" name={icon} className={styles.icon} />}
+-      {text}
+-    </>
+-  );
+-  let element = (
+-    <button className={styles.element} onClick={onClick}>
+-      {linkContent}
+-    </button>
+-  );
+-  if (url) {
+-    const sanitizedUrl = textUtil.sanitizeAngularInterpolation(url);
+-    element =
+-      !target && url.startsWith('/') ? (
+-        <Link className={styles.element} onClick={onClick} href={sanitizedUrl}>
+-          {linkContent}
+-        </Link>
+-      ) : (
+-        <a className={styles.element} href={sanitizedUrl} target={target} rel="noopener" onClick={onClick}>
+-          {linkContent}
+-        </a>
+-      );
+-  }
+-  return isDivider ? <li data-testid="dropdown-child-divider" className="divider" /> : <li>{element}</li>;
+-};
+-export default DropdownChild;
+-const getStyles = (theme: GrafanaTheme2) => ({
+-  element: css`
+-    background-color: transparent;
+-    border: none;
+-    display: flex;
+-    width: 100%;
+-  `,
+-  icon: css`
+-    margin-right: ${theme.spacing(1)};
+-  `,
+-});
+
+--- a/public/app/core/components/NavBar/NavBarItem.tsx
++++ b//dev/null
+@@ -1,143 +0,0 @@
+-import React, { ReactNode } from 'react';
+-import { css, cx } from '@emotion/css';
+-import { GrafanaTheme2, NavModelItem, textUtil } from '@grafana/data';
+-import { Link, useTheme2 } from '@grafana/ui';
+-import NavBarDropdown from './NavBarDropdown';
+-export interface Props {
+-  isActive?: boolean;
+-  children: ReactNode;
+-  label: string;
+-  menuItems?: NavModelItem[];
+-  menuSubTitle?: string;
+-  onClick?: () => void;
+-  reverseMenuDirection?: boolean;
+-  target?: HTMLAnchorElement['target'];
+-  url?: string;
+-}
+-const NavBarItem = ({
+-  isActive = false,
+-  children,
+-  label,
+-  menuItems = [],
+-  menuSubTitle,
+-  onClick,
+-  reverseMenuDirection = false,
+-  target,
+-  url,
+-}: Props) => {
+-  const theme = useTheme2();
+-  const styles = getStyles(theme, isActive);
+-  let element = (
+-    <button className={styles.element} onClick={onClick} aria-label={label}>
+-      <span className={styles.icon}>{children}</span>
+-    </button>
+-  );
+-  const sanitizedUrl = textUtil.sanitizeAngularInterpolation(url ?? '');
+-  if (url) {
+-    element =
+-      !target && sanitizedUrl.startsWith('/') ? (
+-        <Link
+-          className={styles.element}
+-          href={sanitizedUrl}
+-          target={target}
+-          aria-label={label}
+-          onClick={onClick}
+-          aria-haspopup="true"
+-        >
+-          <span className={styles.icon}>{children}</span>
+-        </Link>
+-      ) : (
+-        <a href={sanitizedUrl} target={target} className={styles.element} onClick={onClick} aria-label={label}>
+-          <span className={styles.icon}>{children}</span>
+-        </a>
+-      );
+-  }
+-  return (
+-    <div className={cx(styles.container, 'dropdown', { dropup: reverseMenuDirection })}>
+-      {element}
+-      <NavBarDropdown
+-        headerTarget={target}
+-        headerText={label}
+-        headerUrl={sanitizedUrl}
+-        items={menuItems}
+-        onHeaderClick={onClick}
+-        reverseDirection={reverseMenuDirection}
+-        subtitleText={menuSubTitle}
+-      />
+-    </div>
+-  );
+-};
+-export default NavBarItem;
+-const getStyles = (theme: GrafanaTheme2, isActive: Props['isActive']) => ({
+-  container: css`
+-    position: relative;
+-    @keyframes dropdown-anim {
+-      0% {
+-        opacity: 0;
+-      }
+-      100% {
+-        opacity: 1;
+-      }
+-    }
+-    ${theme.breakpoints.up('md')} {
+-      color: ${isActive ? theme.colors.text.primary : theme.colors.text.secondary};
+-      &:hover {
+-        background-color: ${theme.colors.action.hover};
+-        color: ${theme.colors.text.primary};
+-        .dropdown-menu {
+-          animation: dropdown-anim 150ms ease-in-out 100ms forwards;
+-          border: none;
+-          display: flex;
+-          left: ${theme.components.sidemenu.width - 1}px;
+-          margin: 0;
+-          opacity: 0;
+-          top: 0;
+-          z-index: ${theme.zIndex.sidemenu};
+-        }
+-        &.dropup .dropdown-menu {
+-          top: auto;
+-        }
+-      }
+-    }
+-  `,
+-  element: css`
+-    background-color: transparent;
+-    border: none;
+-    color: inherit;
+-    display: block;
+-    line-height: 42px;
+-    text-align: center;
+-    width: ${theme.components.sidemenu.width - 1}px;
+-    &::before {
+-      display: ${isActive ? 'block' : 'none'};
+-      content: ' ';
+-      position: absolute;
+-      left: 0;
+-      top: 0;
+-      bottom: 0;
+-      width: 4px;
+-      border-radius: 2px;
+-      background-image: ${theme.colors.gradients.brandVertical};
+-    }
+-    &:focus-visible {
+-      background-color: ${theme.colors.action.hover};
+-      box-shadow: none;
+-      color: ${theme.colors.text.primary};
+-      outline: 2px solid ${theme.colors.primary.main};
+-      outline-offset: -2px;
+-      transition: none;
+-    }
+-    .sidemenu-open--xs & {
+-      display: none;
+-    }
+-  `,
+-  icon: css`
+-    height: 100%;
+-    width: 100%;
+-    img {
+-      border-radius: 50%;
+-      height: 28px;
+-      width: 28px;
+-    }
+-  `,
+-});

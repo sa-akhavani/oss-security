@@ -1,0 +1,1027 @@
+--- a//dev/null
++++ b/inst/generate_index.py
+@@ -0,0 +1,44 @@
++"""
++Generate an index file based on the version.cfg file of Zope 2
++in order to provide a version specific index page generated to be used
++in combination with easy_install -i <some_url>
++"""
++import os
++import sys
++import urlparse
++from xmlrpclib import Server
++from ConfigParser import RawConfigParser as ConfigParser
++class CasePreservingConfigParser(ConfigParser):
++    def optionxform(self, option):
++        return option  # don't flatten case!
++def write_index(package, version):
++    print >>sys.stderr, 'Package %s==%s' % (package, version)
++    dest_dir = os.path.join(dirname, package)
++    if not os.path.exists(dest_dir):
++        os.makedirs(dest_dir)
++    index_html = os.path.join(dest_dir, 'index.html')
++    fp = file(index_html, 'w')
++    print >>fp, '<html><body>'
++    lst = server.package_urls(package, version)
++    if lst:
++        for d in lst:
++            link = '<a href="%s">%s</a>' % (d['url'], d['filename'])
++            print >>fp, link
++            print >>fp, '<br/>'
++    else:
++        rel_data = server.release_data(package, version)
++        download_url = rel_data['download_url']
++        filename = os.path.basename(urlparse.urlparse(download_url)[2])
++        link = '<a href="%s">%s</a>' % (download_url, filename)
++        print >>fp, link
++    print >>fp, '</body></html>'
++    fp.close()
++CP = CasePreservingConfigParser()
++CP.read(['versions.cfg'])
++server = Server('http://pypi.python.org/pypi')
++links = list()
++dirname = sys.argv[1]
++write_index('Zope2', '2.12.3')
++for package in CP.options('versions'):
++    version = CP.get('versions', package)
++    write_index(package, version)
+
+--- a/setup.py
++++ b/setup.py
+@@ -1,17 +1,17 @@
+ """Setup for the Acquisition egg package
+ """
+ import os
+ from setuptools import setup, find_packages, Extension
+ EXTENSIONCLASS_INCLUDEDIRS = ['include', 'src']
+ params = dict(name='Zope2',
+-    version='2.12.5',
++    version='2.12.4',
+     url='http://www.zope.org',
+     license='ZPL 2.1',
+     description='Zope2 application server / web framework',
+     author='Zope Foundation and Contributors',
+     author_email='zope-dev@zope.org',
+     long_description=file("README.txt").read() + "\n" +
+                      file(os.path.join("doc", "CHANGES.rst")).read(),
+     packages=find_packages('src'),
+     namespace_packages=['Products'],
+     package_dir={'': 'src'},
+
+--- a/src/OFS/SimpleItem.py
++++ b/src/OFS/SimpleItem.py
+@@ -1,21 +1,23 @@
+ """This module implements a simple item mix-in for objects that have a
+ very simple (e.g. one-screen) management interface, like documents,
+ Aqueduct database adapters, etc.
+ This module can also be used as a simple template for implementing new
+ item types.
+ $Id$
+ """
++import inspect
+ import marshal
+ import re
+ import sys
+ import time
++import warnings
+ from AccessControl.SecurityInfo import ClassSecurityInfo
+ from AccessControl.SecurityManagement import getSecurityManager
+ from AccessControl.Owned import Owned
+ from AccessControl.Permissions import view as View
+ from AccessControl.Role import RoleManager
+ from AccessControl.unauthorized import Unauthorized
+ from AccessControl.ZopeSecurityPolicy import getRoles
+ from Acquisition import Acquired
+ from Acquisition import aq_acquire
+ from Acquisition import aq_base
+@@ -157,20 +159,36 @@
+                 try:
+                     match = tagSearch(s)
+                 except TypeError:
+                     match = None
+                 if match is not None:
+                     error_message=error_value
+             if client is None:
+                 client = self
+             if not REQUEST:
+                 REQUEST = aq_acquire(self, 'REQUEST')
++            handle_errors = getattr(getattr(REQUEST, 'RESPONSE', None),
++                                    'handle_errors', False)
++            can_raise = False
++            ctor = getattr(error_type, '__init__', None)
++            if inspect.ismethoddescriptor(ctor):
++                can_raise = True
++            else:
++                if inspect.ismethod(ctor):
++                    ctor = getattr(ctor, 'im_func', None)
++                if inspect.isbuiltin(ctor):
++                    can_raise = True
++                elif ctor is not None and inspect.isfunction(ctor):
++                    can_raise = (
++                        len(inspect.getargspec(error_type.__init__)[0]) > 2)
++            if not (can_raise and handle_errors):
++                raise error_type, error_value, tb
+             try:
+                 s = aq_acquire(client, 'standard_error_message')
+                 kwargs = {'error_type': error_name,
+                           'error_value': error_value,
+                           'error_tb': error_tb,
+                           'error_traceback': error_tb,
+                           'error_message': error_message,
+                           'error_log_url': error_log_url}
+                 if getattr(aq_base(s), 'isDocTemp', 0):
+                     v = s(client, REQUEST, **kwargs)
+@@ -187,21 +205,23 @@
+                     strv = repr(error_value) # quotes tainted strings
+                 except:
+                     strv = ('<unprintable %s object>' % 
+                             str(type(error_value).__name__))
+                 v = strv + (
+                     (" (Also, the following error occurred while attempting "
+                      "to render the standard error message, please see the "
+                      "event log for full details: %s)")%(
+                     html_quote(sys.exc_info()[1]),
+                     ))
+-            return error_type, v, tb
++            if handle_errors:
++                return error_type, v, tb
++            raise error_type, v, tb
+         finally:
+             if hasattr(self, '_v_eek'): del self._v_eek
+             tb = None
+     def manage(self, URL1):
+         """
+         """
+         raise Redirect, "%s/manage_main" % URL1
+     def objectValues(self, spec=None):
+         return ()
+     objectIds=objectItems=objectValues
+
+--- a/src/OFS/subscribers.py
++++ b/src/OFS/subscribers.py
+@@ -1,13 +1,15 @@
+ """
+-Subscriber definitions.
++Five subscriber definitions.
++$Id$
+ """
++import warnings
+ from logging import getLogger
+ import OFS.interfaces
+ from Acquisition import aq_base
+ from App.config import getConfiguration
+ from AccessControl import getSecurityManager
+ from ZODB.POSException import ConflictError
+ import zope.component
+ import zope.interface
+ import zope.location.interfaces
+ from zope.container.contained import dispatchToSublocations
+@@ -32,23 +34,24 @@
+     """Send a warning if a method is deprecated.
+     """
+     if not deprecatedManageAddDeleteClasses:
+         return
+     for cls in deprecatedManageAddDeleteClasses:
+         if isinstance(ob, cls):
+             return
+     if getattr(getattr(ob, method_name), '__five_method__', False):
+         return
+     class_ = ob.__class__
+-    LOG.debug(
++    warnings.warn(
+         "%s.%s.%s is discouraged. You should use event subscribers instead." %
+-        (class_.__module__, class_.__name__, method_name))
++        (class_.__module__, class_.__name__, method_name),
++        DeprecationWarning)
+ class ObjectManagerSublocations(object):
+     """Get the sublocations for an ObjectManager.
+     """
+     zope.component.adapts(OFS.interfaces.IObjectManager)
+     zope.interface.implements(zope.location.interfaces.ISublocations)
+     def __init__(self, container):
+         self.container = container
+     def sublocations(self):
+         for ob in self.container.objectValues():
+             yield ob
+
+--- a/src/Products/Five/browser/resource.py
++++ b/src/Products/Five/browser/resource.py
+@@ -4,21 +4,20 @@
+ import os
+ import urllib
+ from zope.interface import implements
+ from zope.component import getMultiAdapter
+ from zope.traversing.browser import absoluteURL
+ from zope.publisher.interfaces import NotFound
+ from zope.publisher.interfaces.browser import IBrowserPublisher
+ from zope.app.publisher.browser import fileresource, directoryresource
+ from zope.app.publisher.fileresource import File, Image
+ from zope.app.publisher.pagetemplateresource import PageTemplate
+-from Acquisition import aq_base
+ from Products.Five.browser import BrowserView
+ _marker = object()
+ class Resource(object):
+     """A mixin that changes the URL-rendering of resources (__call__).
+     In Zope 3, resource URLs are of the form
+     nearest_site/@@/resource_name.  Since Zope 2 didn't have support
+     for sites from the beginning of the Five integration, resource
+     URLs in Zope 2 are of the form context/++resource++resource_name.
+     TODO It would be good if that could be changed in the long term,
+     thus making this mixin (and probably the other classes in this
+@@ -100,16 +99,15 @@
+                 raise KeyError(name)
+             return default
+         if isfile:
+             ext = name.split('.')[-1]
+             factory = self.resource_factories.get(ext, self.default_factory)
+         else:
+             factory = DirectoryResourceFactory
+         resource = factory(name, filename)(self.request)
+         resource.__name__ = name
+         resource.__parent__ = self
+-        if hasattr(aq_base(self), '__roles__'):
+-            resource.__roles__ = self.__roles__
++        resource.__roles__ = self.__roles__
+         return resource
+ class DirectoryResourceFactory(ResourceFactory):
+     factory = Directory
+     resource = DirectoryResource
+
+--- a/src/Products/PluginIndexes/PathIndex/PathIndex.py
++++ b/src/Products/PluginIndexes/PathIndex/PathIndex.py
+@@ -1,69 +1,74 @@
+ """Path index.
++$Id$
+ """
+ from logging import getLogger
+ from App.special_dtml import DTMLFile
+ from OFS.SimpleItem import SimpleItem
+ from BTrees.IIBTree import IITreeSet
+ from BTrees.IIBTree import IISet
+ from BTrees.IIBTree import intersection
+ from BTrees.IIBTree import multiunion
+ from BTrees.IIBTree import union
+ from BTrees.IOBTree import IOBTree
+ from BTrees.OOBTree import OOBTree
+ from BTrees.Length import Length
+ from Persistence import Persistent
+ from zope.interface import implements
+ from Products.PluginIndexes.common import safe_callable
+ from Products.PluginIndexes.common.util import parseIndexRequest
+ from Products.PluginIndexes.interfaces import IPathIndex
+-from Products.PluginIndexes.interfaces import ISortIndex
+ from Products.PluginIndexes.interfaces import IUniqueValueIndex
++_marker = []
+ LOG = getLogger('Zope.PathIndex')
+ class PathIndex(Persistent, SimpleItem):
+     """Index for paths returned by getPhysicalPath.
+     A path index stores all path components of the physical path of an object.
+     Internal datastructure:
+     - a physical path of an object is split into its components
+     - every component is kept as a  key of a OOBTree in self._indexes
+     - the value is a mapping 'level of the path component' to
+       'all docids with this path component on this level'
+     """
+-    implements(IPathIndex, IUniqueValueIndex, ISortIndex)
++    implements(IPathIndex, IUniqueValueIndex)
+     meta_type="PathIndex"
+     query_options = ('query', 'level', 'operator')
+     manage_options= (
+         {'label': 'Settings',
+          'action': 'manage_main',
+          'help': ('PathIndex','PathIndex_Settings.stx')},
+     )
+     def __init__(self,id,caller=None):
+         self.id = id
+         self.operators = ('or','and')
+         self.useOperator = 'or'
+         self.clear()
+-    def __len__(self):
+-        return self._length()
+-    def getEntryForObject(self, docid, default=None):
+-        """ See IPluggableIndex.
++    def clear(self):
++        self._depth = 0
++        self._index = OOBTree()
++        self._unindex = IOBTree()
++        self._length = Length(0)
++    def insertEntry(self, comp, id, level):
++        """Insert an entry.
++           comp is a path component
++           id is the docid
++           level is the level of the component inside the path
+         """
+-        try:
+-            return self._unindex[docid]
+-        except KeyError:
+-            return default
+-    def getIndexSourceNames(self):
+-        """ See IPluggableIndex.
+-        """
+-        return (self.id, 'getPhysicalPath', )
++        if not self._index.has_key(comp):
++            self._index[comp] = IOBTree()
++        if not self._index[comp].has_key(level):
++            self._index[comp][level] = IITreeSet()
++        self._index[comp][level].insert(id)
++        if level > self._depth:
++            self._depth = level
+     def index_object(self, docid, obj ,threshold=100):
+-        """ See IPluggableIndex.
+-        """
++        """ hook for (Z)Catalog """
+         f = getattr(obj, self.id, None)
+         if f is not None:
+             if safe_callable(f):
+                 try:
+                     path = f()
+                 except AttributeError:
+                     return 0
+             else:
+                 path = f
+             if not isinstance(path, (str, tuple)):
+@@ -76,135 +81,109 @@
+         if isinstance(path, (list, tuple)):
+             path = '/'+ '/'.join(path[1:])
+         comps = filter(None, path.split('/'))
+         if not self._unindex.has_key(docid):
+             self._length.change(1)
+         for i in range(len(comps)):
+             self.insertEntry(comps[i], docid, i)
+         self._unindex[docid] = path
+         return 1
+     def unindex_object(self, docid):
+-        """ See IPluggableIndex.
+-        """
+-        if docid not in self._unindex:
++        """ hook for (Z)Catalog """
++        if not self._unindex.has_key(docid):
+             LOG.debug('Attempt to unindex nonexistent document with id %s'
+                       % docid)
+             return
+         comps =  self._unindex[docid].split('/')
+         for level in range(len(comps[1:])):
+             comp = comps[level+1]
+             try:
+                 self._index[comp][level].remove(docid)
+                 if not self._index[comp][level]:
+                     del self._index[comp][level]
+                 if not self._index[comp]:
+                     del self._index[comp]
+             except KeyError:
+                 LOG.debug('Attempt to unindex document with id %s failed'
+                           % docid)
+         self._length.change(-1)
+         del self._unindex[docid]
+-    def _apply_index(self, request):
+-        """ See IPluggableIndex.
+-        o Unpacks args from catalog and mapps onto '_search'.
++    def search(self, path, default_level=0):
+         """
+-        record = parseIndexRequest(request, self.id, self.query_options)
+-        if record.keys is None:
+-            return None
+-        level = record.get("level", 0)
+-        operator = record.get('operator', self.useOperator).lower()
+-        if operator == "or":
+-            set_func = union
+-        else:
+-            set_func = intersection
+-        res = None
+-        for k in record.keys:
+-            rows = self._search(k,level)
+-            res = set_func(res,rows)
+-        if res:
+-            return res, (self.id,)
+-        else:
+-            return IISet(), (self.id,)
+-    def numObjects(self):
+-        """ See IPluggableIndex.
+-        """
+-        return len(self._unindex)
+-    def indexSize(self):
+-        """ See IPluggableIndex.
+-        """
+-        return len(self)
+-    def clear(self):
+-        """ See IPluggableIndex.
+-        """
+-        self._depth = 0
+-        self._index = OOBTree()
+-        self._unindex = IOBTree()
+-        self._length = Length(0)
+-    def hasUniqueValuesFor(self, name):
+-        """ See IUniqueValueIndex.
+-        """
+-        return name == self.id
+-    def uniqueValues(self, name=None, withLength=0):
+-        """  See IUniqueValueIndex.
+-        """
+-        if name in (None, self.id, 'getPhysicalPath'):
+-            if withLength:
+-                for key in self._index:
+-                    yield key, len(self._search(key, -1))
+-            else:
+-                for key in self._index.keys():
+-                    yield key
+-    def keyForDocument(self, documentId):
+-        """ See ISortIndex.
+-        """
+-        return self._unindex.get(documentId)
+-    def documentToKeyMap(self):
+-        """ See ISortIndex.
+-        """
+-        return self._unindex
+-    def insertEntry(self, comp, id, level):
+-        """ See IPathIndex
+-        """
+-        if not self._index.has_key(comp):
+-            self._index[comp] = IOBTree()
+-        if not self._index[comp].has_key(level):
+-            self._index[comp][level] = IITreeSet()
+-        self._index[comp][level].insert(id)
+-        if level > self._depth:
+-            self._depth = level
+-    def _search(self, path, default_level=0):
+-        """ Perform the actual search.
+-        ``path``
+-            a string representing a relative URL, or a part of a relative URL,
+-            or a tuple ``(path, level)``.  In the first two cases, use
+-            ``default_level`` as the level for the search.
+-        ``default_level``
+-            the level to use for non-tuple queries.
+-        ``level >= 0`` =>  match ``path`` only at the given level.
+-        ``level <  0`` =>  match ``path`` at *any* level
++        path is either a string representing a
++        relative URL or a part of a relative URL or
++        a tuple (path,level).
++        level >= 0  starts searching at the given level
++        level <  0  match at *any* level
+         """
+         if isinstance(path, str):
+             level = default_level
+         else:
+             level = int(path[1])
+             path  = path[0]
+         if level < 0:
+             return multiunion(
+-                [self._search(path, level) 
++                [self.search(path, level) 
+                  for level in xrange(self._depth + 1)])
+         comps = filter(None, path.split('/'))
+         if level + len(comps) - 1 > self._depth:
+             return IISet()
+         if len(comps) == 0:
+             return IISet(self._unindex.keys())
+         results = None
+         for i, comp in reversed(list(enumerate(comps))):
+             if not self._index.get(comp, {}).has_key(level+i): return IISet()
+             results = intersection(results, self._index[comp][level+i])
+         return results
++    def numObjects(self):
++        """Return the number of indexed objects."""
++        return len(self._unindex)
++    def indexSize(self):
++        """Return the size of the index in terms of distinct values."""
++        return len(self)
++    def __len__(self):
++        return self._length()
++    def _apply_index(self, request):
++        """ hook for (Z)Catalog
++            'request' --  mapping type (usually {"path": "..." }
++             additionaly a parameter "path_level" might be passed
++             to specify the level (see search())
++        """
++        record = parseIndexRequest(request, self.id, self.query_options)
++        if record.keys is None:
++            return None
++        level    = record.get("level",0)
++        operator = record.get('operator',self.useOperator).lower()
++        if operator == "or":  set_func = union
++        else: set_func = intersection
++        res = None
++        for k in record.keys:
++            rows = self.search(k,level)
++            res = set_func(res,rows)
++        if res:
++            return res, (self.id,)
++        else:
++            return IISet(), (self.id,)
++    def hasUniqueValuesFor(self, name):
++        """has unique values for column name"""
++        return name == self.id
++    def uniqueValues(self, name=None, withLength=0):
++        """ needed to be consistent with the interface """
++        return self._index.keys()
++    def getIndexSourceNames(self):
++        """ return names of indexed attributes """
++        return ('getPhysicalPath', )
++    def getEntryForObject(self, docid, default=_marker):
++        """ Takes a document ID and returns all the information
++            we have on that specific object.
++        """
++        try:
++            return self._unindex[docid]
++        except KeyError:
++            return None
+     manage = manage_main = DTMLFile('dtml/managePathIndex', globals())
+     manage_main._setName('manage_main')
+ manage_addPathIndexForm = DTMLFile('dtml/addPathIndex', globals())
+ def manage_addPathIndex(self, id, REQUEST=None, RESPONSE=None, URL3=None):
+     """Add a path index"""
+     return self.manage_addIndex(id, 'PathIndex', extra=None, \
+                 REQUEST=REQUEST, RESPONSE=RESPONSE, URL1=URL3)
+
+--- a/src/Products/PluginIndexes/__init__.py
++++ b/src/Products/PluginIndexes/__init__.py
+@@ -1,74 +1,29 @@
++import PathIndex.PathIndex
++import FieldIndex.FieldIndex
++import KeywordIndex.KeywordIndex
++import TopicIndex.TopicIndex
++import DateIndex.DateIndex
++import DateRangeIndex.DateRangeIndex
++from Products.PluginIndexes.common import ResultList
++from Products.PluginIndexes.common import UnIndex
++_indexes =  ('KeywordIndex',
++             'FieldIndex',
++             'PathIndex',
++             'TopicIndex',
++             'DateIndex',
++             'DateRangeIndex',
++            )
+ def initialize(context):
+-    from Products.PluginIndexes.FieldIndex.FieldIndex import FieldIndex
+-    from Products.PluginIndexes.FieldIndex.FieldIndex \
+-        import manage_addFieldIndex
+-    from Products.PluginIndexes.FieldIndex.FieldIndex \
+-        import manage_addFieldIndexForm
+-    context.registerClass(FieldIndex,
+-                          permission='Add Pluggable Index', 
+-                          constructors=(manage_addFieldIndexForm,
+-                                        manage_addFieldIndex),
+-                          icon='www/index.gif',
+-                          visibility=None,
+-                         )
+-    from Products.PluginIndexes.KeywordIndex.KeywordIndex import KeywordIndex
+-    from Products.PluginIndexes.KeywordIndex.KeywordIndex \
+-        import manage_addKeywordIndex
+-    from Products.PluginIndexes.KeywordIndex.KeywordIndex \
+-        import manage_addKeywordIndexForm
+-    context.registerClass(KeywordIndex,
+-                          permission='Add Pluggable Index', 
+-                          constructors=(manage_addKeywordIndexForm,
+-                                        manage_addKeywordIndex),
+-                          icon='www/index.gif',
+-                          visibility=None,
+-                         )
+-    from Products.PluginIndexes.TopicIndex.TopicIndex import TopicIndex
+-    from Products.PluginIndexes.TopicIndex.TopicIndex \
+-        import manage_addTopicIndex
+-    from Products.PluginIndexes.TopicIndex.TopicIndex \
+-        import manage_addTopicIndexForm
+-    context.registerClass(TopicIndex,
+-                          permission='Add Pluggable Index', 
+-                          constructors=(manage_addTopicIndexForm,
+-                                        manage_addTopicIndex),
+-                          icon='www/index.gif',
+-                          visibility=None,
+-                         )
+-    from Products.PluginIndexes.DateIndex.DateIndex import DateIndex
+-    from Products.PluginIndexes.DateIndex.DateIndex \
+-        import manage_addDateIndex
+-    from Products.PluginIndexes.DateIndex.DateIndex \
+-        import manage_addDateIndexForm
+-    context.registerClass(DateIndex,
+-                          permission='Add Pluggable Index', 
+-                          constructors=(manage_addDateIndexForm,
+-                                        manage_addDateIndex),
+-                          icon='www/index.gif',
+-                          visibility=None,
+-                         )
+-    from Products.PluginIndexes.DateRangeIndex.DateRangeIndex \
+-        import DateRangeIndex
+-    from Products.PluginIndexes.DateRangeIndex.DateRangeIndex \
+-        import manage_addDateRangeIndex
+-    from Products.PluginIndexes.DateRangeIndex.DateRangeIndex \
+-        import manage_addDateRangeIndexForm
+-    context.registerClass(DateRangeIndex,
+-                          permission='Add Pluggable Index', 
+-                          constructors=(manage_addDateRangeIndexForm,
+-                                        manage_addDateRangeIndex),
+-                          icon='www/index.gif',
+-                          visibility=None,
+-                         )
+-    from Products.PluginIndexes.PathIndex.PathIndex import PathIndex
+-    from Products.PluginIndexes.PathIndex.PathIndex \
+-        import manage_addPathIndex
+-    from Products.PluginIndexes.PathIndex.PathIndex \
+-        import manage_addPathIndexForm
+-    context.registerClass(PathIndex,
+-                          permission='Add Pluggable Index', 
+-                          constructors=(manage_addPathIndexForm,
+-                                        manage_addPathIndex),
+-                          icon='www/index.gif',
+-                          visibility=None,
+-                         )
++    for idx in _indexes:
++        s = "context.registerClass( \
++            %s.%s.%s,\
++            permission='Add Pluggable Index', \
++            constructors=(manage_add%sForm,\
++                          manage_add%s),\
++            icon='www/index.gif',\
++            visibility=None\
++         )" % (idx,idx,idx,idx,idx)
++        exec(s)
++for idx in _indexes:
++    exec("manage_add%sForm = %s.%s.manage_add%sForm" % (idx,idx,idx,idx))
++    exec("manage_add%s     = %s.%s.manage_add%s" % (idx,idx,idx,idx))
+
+--- a/src/Products/PluginIndexes/interfaces.py
++++ b/src/Products/PluginIndexes/interfaces.py
+@@ -86,28 +86,20 @@
+         """
+ class IPathIndex(Interface):
+     """Index for paths returned by getPhysicalPath.
+     A path index stores all path components of the physical path of an object.
+     Internal datastructure:
+     - a physical path of an object is split into its components
+     - every component is kept as a  key of a OOBTree in self._indexes
+     - the value is a mapping 'level of the path component' to
+       'all docids with this path component on this level'
+     """
+-    def insertEntry(comp, id, level):
+-        """ Insert an entry.
+-        This method is intended for use by subclasses:  it is not
+-        a normal API for the index.
+-        'comp' is an individual path component
+-        'id' is the docid
+-        .level'is the level of the component inside the path
+-        """
+ class IFilteredSet(Interface):
+     """A pre-calculated result list based on an expression.
+     """
+     def getExpression():
+         """Get the expression.
+         """
+     def getIds():
+         """Get the IDs of all objects for which the expression is True.
+         """
+     def setExpression(expr):
+
+--- a/src/Products/ZCTextIndex/ZCTextIndex.py
++++ b/src/Products/ZCTextIndex/ZCTextIndex.py
+@@ -239,21 +239,21 @@
+     def getPipelineNames(self):
+         """Return list of names of pipeline element classes"""
+         return [element.__class__.__name__ for element in self._pipeline]
+     _queryLexicon = DTMLFile('dtml/queryLexicon', globals())
+     security.declareProtected(LexiconQueryPerm, 'queryLexicon')
+     def queryLexicon(self, REQUEST, words=None, page=0, rows=20, cols=4):
+         """Lexicon browser/query user interface
+         """
+         if words:
+             wids = []
+-            for word in self.parseTerms(words):
++            for word in words:
+                 wids.extend(self.globToWordIds(word))
+             words = [self.get_word(wid) for wid in wids]
+         else:
+             words = self.words()
+         word_count = len(words)
+         rows = max(min(rows, 500), 1)
+         cols = max(min(cols, 12), 1)
+         page_count = word_count / (rows * cols) + \
+                      (word_count % (rows * cols) > 0)
+         page = max(min(page, page_count - 1), 0)
+@@ -261,25 +261,23 @@
+         end = min(rows * cols * (page + 1), word_count)
+         if word_count:
+             words = list(words[start:end])
+         else:
+             words = []
+         columns = []
+         i = 0
+         while i < len(words):
+             columns.append(words[i:i + rows])
+             i += rows
+-        info = dict(page=page,
+-                    rows=rows,
+-                    cols=cols,
+-                    start_word=start+1,
+-                    end_word=end,
+-                    word_count=word_count,
+-                    page_count=page_count,
+-                    page_range=xrange(page_count),
+-                    page_columns=columns)
+-        if REQUEST is not None:
+-            return self._queryLexicon(self, REQUEST, **info)
+-        return info
++        return self._queryLexicon(self, REQUEST,
++                                  page=page,
++                                  rows=rows,
++                                  cols=cols,
++                                  start_word=start+1,
++                                  end_word=end,
++                                  word_count=word_count,
++                                  page_count=page_count,
++                                  page_range=xrange(page_count),
++                                  page_columns=columns)
+     security.declareProtected(LexiconMgmtPerm, 'manage_main')
+     manage_main = DTMLFile('dtml/manageLexicon', globals())
+ InitializeClass(PLexicon)
+
+--- a/src/ZPublisher/HTTPRequest.py
++++ b/src/ZPublisher/HTTPRequest.py
+@@ -1202,21 +1202,21 @@
+         """FileUpload objects are considered false if their
+            filename is empty.
+         """
+         return not not self.filename
+     def xreadlines(self):
+         return self
+ parse_cookie_lock = allocate_lock()
+ QPARMRE= re.compile(
+         '([\x00- ]*([^\x00- ;,="]+)="([^"]*)"([\x00- ]*[;,])?[\x00- ]*)')
+ PARMRE = re.compile(
+-        '([\x00- ]*([^\x00- ;,="]+)=([^;]*)([\x00- ]*[;,])?[\x00- ]*)')
++        '([\x00- ]*([^\x00- ;,="]+)=([^;,"]*)([\x00- ]*[;,])?[\x00- ]*)')
+ PARAMLESSRE = re.compile(
+         '([\x00- ]*([^\x00- ;,="]+)[\x00- ]*[;,][\x00- ]*)')
+ def parse_cookie(text,
+                  result=None,
+                  qparmre=QPARMRE,
+                  parmre=PARMRE,
+                  paramlessre=PARAMLESSRE,
+                  acquire=parse_cookie_lock.acquire,
+                  release=parse_cookie_lock.release,
+                  ):
+
+--- a/src/ZPublisher/HTTPResponse.py
++++ b/src/ZPublisher/HTTPResponse.py
+@@ -604,24 +604,21 @@
+                             self.setStatus(302)
+                         self.setHeader('location', l)
+                         self.setBody(b)
+                         tb = None # one more patch covered
+                         return self
+                 except:
+                     pass # tb is not cleared in this case
+         b = v
+         if isinstance(b, Exception):
+             try:
+-                try:
+-                    b = str(b)
+-                except UnicodeEncodeError:
+-                    b = self._encode_unicode(unicode(b))
++                b = str(b)
+             except:
+                 b = '<unprintable %s object>' % type(b).__name__
+         if fatal and t is SystemExit and v.code == 0:
+             body = self.setBody(
+                 (str(t),
+                  'Zope has exited normally.<p>' + self._traceback(t, v, tb) + '</p>'),
+                 is_error=1)
+         else:
+             try:
+                 match = tag_search(b)
+
+--- a/src/ZPublisher/Publish.py
++++ b/src/ZPublisher/Publish.py
+@@ -92,21 +92,21 @@
+         exc_info = sys.exc_info()
+         sm = None
+         if response is not None:
+             sm = getattr(response, "setMessage", None)
+         if sm is not None:
+             from asyncore import compact_traceback
+             cl,val= sys.exc_info()[:2]
+             sm('%s: %s %s' % (
+                 getattr(cl,'__name__',cl), val,
+                 debug_mode and compact_traceback()[-1] or ''))
+-        if not debug and err_hook is not None:
++        if err_hook is not None:
+             retry = False
+             if parents:
+                 parents=parents[0]
+             try:
+                 try:
+                     return err_hook(parents, request,
+                                     sys.exc_info()[0],
+                                     sys.exc_info()[1],
+                                     sys.exc_info()[2],
+                                     )
+@@ -138,21 +138,21 @@
+                 newrequest.close()
+         else:
+             try:                     
+                 try:
+                     notify(PubBeforeAbort(request, exc_info, False))
+                 finally:
+                     if transactions_manager:
+                         transactions_manager.abort()
+             finally:
+                 endInteraction()
+-                notify(PubFailure(request, exc_info, False))
++                notify(PubFailure(request, exc_info, retry))
+             raise
+ def publish_module_standard(module_name,
+                    stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+                    environ=os.environ, debug=0, request=None, response=None):
+     must_die=0
+     status=200
+     after_list=[None]
+     try:
+         try:
+             if response is None:
+
+--- a/src/Zope2/App/startup.py
++++ b/src/Zope2/App/startup.py
+@@ -1,28 +1,29 @@
+ """Initialize the Zope2 Package and provide a published module
+ """
+ from zope.component import queryMultiAdapter
+ from AccessControl.SecurityManagement import newSecurityManager
+ from AccessControl.SecurityManagement import noSecurityManager
+ from Acquisition import aq_acquire
+ from Acquisition import aq_base
+ from Acquisition import aq_inner
+ from Acquisition import aq_parent
+-from Acquisition.interfaces import IAcquirer
+ from App.config import getConfiguration
+ from time import asctime
++from types import StringType, ListType
+ from zExceptions import upgradeException
+ from zExceptions import Redirect
+ from zExceptions import Unauthorized
+ from ZODB.POSException import ConflictError
+ import transaction
+ import AccessControl.User
++import App.FindHomes
+ import ExtensionClass
+ import imp
+ import logging
+ import OFS.Application
+ import sys
+ import ZODB
+ import App.ZApplication
+ import Zope2
+ import ZPublisher
+ from zope.event import notify
+@@ -130,33 +131,27 @@
+             except AttributeError:
+                 error_log_url = ''
+             else:
+                 error_log_url = log.raising((t, v, traceback))
+             if (REQUEST is None or 
+                 (getattr(REQUEST.get('RESPONSE', None), '_error_format', '')
+                  != 'text/html')):
+                 raise t, v, traceback
+             view = queryMultiAdapter((v, REQUEST), name=u'index.html')
+             if view is not None:
+-                if IAcquirer.providedBy(view) and IAcquirer.providedBy(published):
+-                    view = view.__of__(published)
+-                else:
+-                    view.__parent__ = published
+                 v = view()
+-                if issubclass(t, Unauthorized):
+-                    raise t, v, traceback
+                 response = REQUEST.RESPONSE
+                 response.setStatus(t)
+                 response.setBody(v)
+                 return response
+             if (published is None or published is app or
+-                isinstance(published, list)):
++                type(published) is ListType):
+                 published=app.__bobo_traverse__(REQUEST).__of__(
+                     RequestContainer(REQUEST))
+             published = getattr(published, 'im_self', published)
+             while 1:
+                 f = getattr(published, self.raise_error_message, None)
+                 if f is None:
+                     published = aq_parent(published)
+                     if published is None:
+                         raise t, v, traceback
+                 else:
+@@ -169,22 +164,20 @@
+                 if client is None or aq_base(client) is aq_base(published):
+                     raise t, v, traceback
+             if REQUEST.get('AUTHENTICATED_USER', None) is None:
+                 REQUEST['AUTHENTICATED_USER'] = AccessControl.User.nobody
+             try:
+                 result = f(client, REQUEST, t, v, 
+                            traceback, 
+                            error_log_url=error_log_url)
+                 if result is not None:
+                     t, v, traceback = result
+-                    if issubclass(t, Unauthorized):
+-                        raise t, v, traceback
+                     response = REQUEST.RESPONSE
+                     response.setStatus(t)
+                     response.setBody(v)
+                     return response
+             except TypeError:
+                 f(client, REQUEST, t, v, traceback)
+         finally:
+             traceback = None
+ zpublisher_exception_hook = ZPublisherExceptionHook()
+ ac_logger = logging.getLogger('event.AccessControl')
+
+--- a/src/Zope2/Startup/handlers.py
++++ b/src/Zope2/Startup/handlers.py
+@@ -137,27 +137,24 @@
+         add_files(config.mime_types)
+     if not config.servers:
+         config.servers = []
+     for factory in config.servers:
+         factory.prepare(config.ip_address or '',
+                         config.dns_resolver,
+                         "Zope2",
+                         config.cgi_environment,
+                         config.port_base)
+     if config.trusted_proxies:
+-        from ZPublisher import HTTPRequest
++        import ZPublisher.HTTPRequest
+         mapped = []
+         for name in config.trusted_proxies: mapped.extend(_name2Ips(name))
+-        HTTPRequest.trusted_proxies = tuple(mapped)
+-    if config.max_conflict_retries:
+-        from ZPublisher import HTTPRequest
+-        HTTPRequest.retry_max_count = config.max_conflict_retries
++        ZPublisher.HTTPRequest.trusted_proxies = tuple(mapped)
+ def handleConfig(config, multihandler):
+     handlers = {}
+     for name, value in globals().items():
+         if not name.startswith('_'):
+             handlers[name] = value
+     return multihandler(handlers)
+ def _name2Ips(host, isIp_=compile(r'(\d+\.){3}').match):
+     """Map a name *host* to the sequence of its ip addresses.
+     use *host* itself (as sequence) if it already is an ip address.
+     Thus, if only a specific interface on a host is trusted,
+
+--- a/src/zExceptions/unauthorized.py
++++ b/src/zExceptions/unauthorized.py
+@@ -1,57 +1,52 @@
+ """
+ $Id$
+ """
++from types import StringType
+ from zope.interface import implements
+ from zope.security.interfaces import IUnauthorized
+ class Unauthorized(Exception):
+     """Some user wasn't allowed to access a resource
+     """
+     implements(IUnauthorized)
+     def _get_message(self):
+         return self._message
+     message = property(_get_message,)
+     def __init__(self, message=None, value=None, needed=None, name=None, **kw):
+         """Possible signatures:
+         Unauthorized()
+         Unauthorized(message) # Note that message includes a space
+         Unauthorized(name)
+         Unauthorized(name, value)
+         Unauthorized(name, value, needed)
+         Unauthorized(message, value, needed, name)
+-        Where needed is a mapping objects with items representing requirements
++        Where needed is a mapping objects with items represnting requirements
+         (e.g. {'permission': 'add spam'}). Any extra keyword arguments
+         provides are added to needed.
+         """
+         if name is None and (
+-            not isinstance(message, basestring) or len(message.split()) <= 1):
++            not isinstance(message, StringType) or len(message.split()) <= 1):
+             name=message
+             message=None
+         self.name=name
+         self._message=message
+         self.value=value
+         if kw:
+             if needed: needed.update(kw)
+             else: needed=kw
+         self.needed=needed
+     def __str__(self):
+-        if self.message is not None:
+-            return self.message
++        if self.message is not None: return self.message
+         if self.name is not None:
+             return ("You are not allowed to access '%s' in this context"
+                     % self.name)
+         elif self.value is not None:
+             return ("You are not allowed to access '%s' in this context"
+                     % self.getValueName())
+         return repr(self)
+-    def __unicode__(self):
+-        result = self.__str__()
+-        if isinstance(result, unicode):
+-            return result
+-        return unicode(result, 'ascii') # override sys.getdefaultencoding()
+     def getValueName(self):
+         v=self.value
+         vname=getattr(v, '__name__', None)
+         if vname: return vname
+         c = getattr(v, '__class__', type(v))
+         c = getattr(c, '__name__', 'object')
+         return "a particular %s" % c

@@ -1,0 +1,422 @@
+# ====================================================================
+# FILE: ext/cgi/escape/extconf.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-6 ---
+     1| require 'mkmf'
+     2| if RUBY_ENGINE == 'truffleruby'
+     3|   File.write("Makefile", dummy_makefile($srcdir).join(""))
+     4| else
+     5|   create_makefile 'cgi/escape'
+     6| end
+
+
+# ====================================================================
+# FILE: lib/cgi.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-7 ---
+     1| class CGI
+     2|   VERSION = "0.4.0"
+     3| end
+     4| require 'cgi/core'
+     5| require 'cgi/cookie'
+     6| require 'cgi/util'
+     7| CGI.autoload(:HtmlExtension, 'cgi/html')
+
+
+# ====================================================================
+# FILE: lib/cgi/session.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-214 ---
+     1| require 'cgi'
+     2| require 'tmpdir'
+     3| class CGI
+     4|   class Session
+     5|     class NoSession < RuntimeError #:nodoc:
+     6|     end
+     7|     attr_reader :session_id, :new_session
+     8|     def Session::callback(dbman)  #:nodoc:
+     9|       Proc.new{
+    10|         dbman[0].close unless dbman.empty?
+    11|       }
+    12|     end
+    13|     def create_new_id
+    14|       require 'securerandom'
+    15|       begin
+    16|         session_id = SecureRandom.hex(16)
+    17|       rescue NotImplementedError
+    18|         require 'digest'
+    19|         d = Digest('SHA512').new
+    20|         now = Time::now
+    21|         d.update(now.to_s)
+    22|         d.update(String(now.usec))
+    23|         d.update(String(rand(0)))
+    24|         d.update(String($$))
+    25|         d.update('foobar')
+    26|         session_id = d.hexdigest[0, 32]
+    27|       end
+    28|       session_id
+    29|     end
+    30|     private :create_new_id
+    31|     def new_store_file(option={}) # :nodoc:
+    32|       dir = option['tmpdir'] || Dir::tmpdir
+    33|       prefix = option['prefix']
+    34|       suffix = option['suffix']
+    35|       require 'digest/md5'
+    36|       md5 = Digest::MD5.hexdigest(session_id)[0,16]
+    37|       path = dir+"/"
+    38|       path << prefix if prefix
+    39|       path << md5
+    40|       path << suffix if suffix
+    41|       if File::exist? path
+    42|         hash = nil
+    43|       elsif new_session
+    44|         hash = {}
+    45|       else
+    46|         raise NoSession, "uninitialized session"
+    47|       end
+    48|       return path, hash
+    49|     end
+    50|     def initialize(request, option={})
+    51|       @new_session = false
+    52|       session_key = option['session_key'] || '_session_id'
+    53|       session_id = option['session_id']
+    54|       unless session_id
+    55|         if option['new_session']
+    56|           session_id = create_new_id
+    57|           @new_session = true
+    58|         end
+    59|       end
+    60|       unless session_id
+    61|         if request.key?(session_key)
+    62|           session_id = request[session_key]
+    63|           session_id = session_id.read if session_id.respond_to?(:read)
+    64|         end
+    65|         unless session_id
+    66|           session_id, = request.cookies[session_key]
+    67|         end
+    68|         unless session_id
+    69|           unless option.fetch('new_session', true)
+    70|             raise ArgumentError, "session_key `%s' should be supplied"%session_key
+    71|           end
+    72|           session_id = create_new_id
+    73|           @new_session = true
+    74|         end
+    75|       end
+    76|       @session_id = session_id
+    77|       dbman = option['database_manager'] || FileStore
+    78|       begin
+    79|         @dbman = dbman::new(self, option)
+    80|       rescue NoSession
+    81|         unless option.fetch('new_session', true)
+    82|           raise ArgumentError, "invalid session_id `%s'"%session_id
+    83|         end
+    84|         session_id = @session_id = create_new_id unless session_id
+    85|         @new_session=true
+    86|         retry
+    87|       end
+    88|       request.instance_eval do
+    89|         @output_hidden = {session_key => session_id} unless option['no_hidden']
+    90|         @output_cookies =  [
+    91|           Cookie::new("name" => session_key,
+    92|           "value" => session_id,
+    93|           "expires" => option['session_expires'],
+    94|           "domain" => option['session_domain'],
+    95|           "secure" => option['session_secure'],
+    96|           "path" =>
+    97|           if option['session_path']
+    98|             option['session_path']
+    99|           elsif ENV["SCRIPT_NAME"]
+   100|             File::dirname(ENV["SCRIPT_NAME"])
+   101|           else
+   102|           ""
+   103|           end)
+   104|         ] unless option['no_cookies']
+   105|       end
+   106|       @dbprot = [@dbman]
+   107|       ObjectSpace::define_finalizer(self, Session::callback(@dbprot))
+   108|     end
+   109|     def [](key)
+   110|       @data ||= @dbman.restore
+   111|       @data[key]
+   112|     end
+   113|     def []=(key, val)
+   114|       @write_lock ||= true
+   115|       @data ||= @dbman.restore
+   116|       @data[key] = val
+   117|     end
+   118|     def update
+   119|       @dbman.update
+   120|     end
+   121|     def close
+   122|       @dbman.close
+   123|       @dbprot.clear
+   124|     end
+   125|     def delete
+   126|       @dbman.delete
+   127|       @dbprot.clear
+   128|     end
+   129|     class FileStore
+   130|       def initialize(session, option={})
+   131|         option = {'prefix' => 'cgi_sid_'}.update(option)
+   132|         @path, @hash = session.new_store_file(option)
+   133|       end
+   134|       def restore
+   135|         unless @hash
+   136|           @hash = {}
+   137|           begin
+   138|             lockf = File.open(@path+".lock", "r")
+   139|             lockf.flock File::LOCK_SH
+   140|             f = File.open(@path, 'r')
+   141|             for line in f
+   142|               line.chomp!
+   143|               k, v = line.split('=',2)
+   144|               @hash[CGI.unescape(k)] = Marshal.restore(CGI.unescape(v))
+   145|             end
+   146|           ensure
+   147|             f&.close
+   148|             lockf&.close
+   149|           end
+   150|         end
+   151|         @hash
+   152|       end
+   153|       def update
+   154|         return unless @hash
+   155|         begin
+   156|           lockf = File.open(@path+".lock", File::CREAT|File::RDWR, 0600)
+   157|           lockf.flock File::LOCK_EX
+   158|           f = File.open(@path+".new", File::CREAT|File::TRUNC|File::WRONLY, 0600)
+   159|           for k,v in @hash
+   160|             f.printf "%s=%s\n", CGI.escape(k), CGI.escape(String(Marshal.dump(v)))
+   161|           end
+   162|           f.close
+   163|           File.rename @path+".new", @path
+   164|         ensure
+   165|           f&.close
+   166|           lockf&.close
+   167|         end
+   168|       end
+   169|       def close
+   170|         update
+   171|       end
+   172|       def delete
+   173|         File::unlink @path+".lock" rescue nil
+   174|         File::unlink @path+".new" rescue nil
+   175|         File::unlink @path rescue nil
+   176|       end
+   177|     end
+   178|     class MemoryStore
+   179|       GLOBAL_HASH_TABLE = {} #:nodoc:
+   180|       def initialize(session, option=nil)
+   181|         @session_id = session.session_id
+   182|         unless GLOBAL_HASH_TABLE.key?(@session_id)
+   183|           unless session.new_session
+   184|             raise CGI::Session::NoSession, "uninitialized session"
+   185|           end
+   186|           GLOBAL_HASH_TABLE[@session_id] = {}
+   187|         end
+   188|       end
+   189|       def restore
+   190|         GLOBAL_HASH_TABLE[@session_id]
+   191|       end
+   192|       def update
+   193|       end
+   194|       def close
+   195|       end
+   196|       def delete
+   197|         GLOBAL_HASH_TABLE.delete(@session_id)
+   198|       end
+   199|     end
+   200|     class NullStore
+   201|       def initialize(session, option=nil)
+   202|       end
+   203|       def restore
+   204|         {}
+   205|       end
+   206|       def update
+   207|       end
+   208|       def close
+   209|       end
+   210|       def delete
+   211|       end
+   212|     end
+   213|   end
+   214| end
+
+
+# ====================================================================
+# FILE: lib/cgi/util.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-168 ---
+     1| class CGI
+     2|   module Util; end
+     3|   include Util
+     4|   extend Util
+     5| end
+     6| module CGI::Util
+     7|   @@accept_charset = Encoding::UTF_8 unless defined?(@@accept_charset)
+     8|   def escape(string)
+     9|     encoding = string.encoding
+    10|     buffer = string.b
+    11|     buffer.gsub!(/([^ a-zA-Z0-9_.\-~]+)/) do |m|
+    12|       '%' + m.unpack('H2' * m.bytesize).join('%').upcase
+    13|     end
+    14|     buffer.tr!(' ', '+')
+    15|     buffer.force_encoding(encoding)
+    16|   end
+    17|   def unescape(string, encoding = @@accept_charset)
+    18|     str = string.tr('+', ' ')
+    19|     str = str.b
+    20|     str.gsub!(/((?:%[0-9a-fA-F]{2})+)/) do |m|
+    21|       [m.delete('%')].pack('H*')
+    22|     end
+    23|     str.force_encoding(encoding)
+    24|     str.valid_encoding? ? str : str.force_encoding(string.encoding)
+    25|   end
+    26|   def escapeURIComponent(string)
+    27|     encoding = string.encoding
+    28|     buffer = string.b
+    29|     buffer.gsub!(/([^a-zA-Z0-9_.\-~]+)/) do |m|
+    30|       '%' + m.unpack('H2' * m.bytesize).join('%').upcase
+    31|     end
+    32|     buffer.force_encoding(encoding)
+    33|   end
+    34|   def unescapeURIComponent(string, encoding = @@accept_charset)
+    35|     str = string.b
+    36|     str.gsub!(/((?:%[0-9a-fA-F]{2})+)/) do |m|
+    37|       [m.delete('%')].pack('H*')
+    38|     end
+    39|     str.force_encoding(encoding)
+    40|     str.valid_encoding? ? str : str.force_encoding(string.encoding)
+    41|   end
+    42|   TABLE_FOR_ESCAPE_HTML__ = {
+    43|     "'" => '&#39;',
+    44|     '&' => '&amp;',
+    45|     '"' => '&quot;',
+    46|     '<' => '&lt;',
+    47|     '>' => '&gt;',
+    48|   }
+    49|   def escapeHTML(string)
+    50|     enc = string.encoding
+    51|     unless enc.ascii_compatible?
+    52|       if enc.dummy?
+    53|         origenc = enc
+    54|         enc = Encoding::Converter.asciicompat_encoding(enc)
+    55|         string = enc ? string.encode(enc) : string.b
+    56|       end
+    57|       table = Hash[TABLE_FOR_ESCAPE_HTML__.map {|pair|pair.map {|s|s.encode(enc)}}]
+    58|       string = string.gsub(/#{"['&\"<>]".encode(enc)}/, table)
+    59|       string.encode!(origenc) if origenc
+    60|       string
+    61|     else
+    62|       string = string.b
+    63|       string.gsub!(/['&\"<>]/, TABLE_FOR_ESCAPE_HTML__)
+    64|       string.force_encoding(enc)
+    65|     end
+    66|   end
+    67|   unless RUBY_ENGINE == 'truffleruby'
+    68|     begin
+    69|       require 'cgi/escape'
+    70|     rescue LoadError
+    71|     end
+    72|   end
+    73|   def unescapeHTML(string)
+    74|     enc = string.encoding
+    75|     unless enc.ascii_compatible?
+    76|       if enc.dummy?
+    77|         origenc = enc
+    78|         enc = Encoding::Converter.asciicompat_encoding(enc)
+    79|         string = enc ? string.encode(enc) : string.b
+    80|       end
+    81|       string = string.gsub(Regexp.new('&(apos|amp|quot|gt|lt|#[0-9]+|#x[0-9A-Fa-f]+);'.encode(enc))) do
+    82|         case $1.encode(Encoding::US_ASCII)
+    83|         when 'apos'                then "'".encode(enc)
+    84|         when 'amp'                 then '&'.encode(enc)
+    85|         when 'quot'                then '"'.encode(enc)
+    86|         when 'gt'                  then '>'.encode(enc)
+    87|         when 'lt'                  then '<'.encode(enc)
+    88|         when /\A#0*(\d+)\z/        then $1.to_i.chr(enc)
+    89|         when /\A#x([0-9a-f]+)\z/i  then $1.hex.chr(enc)
+    90|         end
+    91|       end
+    92|       string.encode!(origenc) if origenc
+    93|       return string
+    94|     end
+    95|     return string unless string.include? '&'
+    96|     charlimit = case enc
+    97|                 when Encoding::UTF_8; 0x10ffff
+    98|                 when Encoding::ISO_8859_1; 256
+    99|                 else 128
+   100|                 end
+   101|     string = string.b
+   102|     string.gsub!(/&(apos|amp|quot|gt|lt|\#[0-9]+|\#[xX][0-9A-Fa-f]+);/) do
+   103|       match = $1.dup
+   104|       case match
+   105|       when 'apos'                then "'"
+   106|       when 'amp'                 then '&'
+   107|       when 'quot'                then '"'
+   108|       when 'gt'                  then '>'
+   109|       when 'lt'                  then '<'
+   110|       when /\A#0*(\d+)\z/
+   111|         n = $1.to_i
+   112|         if n < charlimit
+   113|           n.chr(enc)
+   114|         else
+   115|           "&##{$1};"
+   116|         end
+   117|       when /\A#x([0-9a-f]+)\z/i
+   118|         n = $1.hex
+   119|         if n < charlimit
+   120|           n.chr(enc)
+   121|         else
+   122|           "&#x#{$1};"
+   123|         end
+   124|       else
+   125|         "&#{match};"
+   126|       end
+   127|     end
+   128|     string.force_encoding enc
+   129|   end
+   130|   alias escape_html escapeHTML
+   131|   alias unescape_html unescapeHTML
+   132|   def escapeElement(string, *elements)
+   133|     elements = elements[0] if elements[0].kind_of?(Array)
+   134|     unless elements.empty?
+   135|       string.gsub(/<\/?(?:#{elements.join("|")})(?!\w)(?:.|\n)*?>/i) do
+   136|         CGI.escapeHTML($&)
+   137|       end
+   138|     else
+   139|       string
+   140|     end
+   141|   end
+   142|   def unescapeElement(string, *elements)
+   143|     elements = elements[0] if elements[0].kind_of?(Array)
+   144|     unless elements.empty?
+   145|       string.gsub(/&lt;\/?(?:#{elements.join("|")})(?!\w)(?:.|\n)*?&gt;/i) do
+   146|         unescapeHTML($&)
+   147|       end
+   148|     else
+   149|       string
+   150|     end
+   151|   end
+   152|   alias escape_element escapeElement
+   153|   alias unescape_element unescapeElement
+   154|   def rfc1123_date(time)
+   155|     time.getgm.strftime("%a, %d %b %Y %T GMT")
+   156|   end
+   157|   def pretty(string, shift = "  ")
+   158|     lines = string.gsub(/(?!\A)<.*?>/m, "\n\\0").gsub(/<.*?>(?!\n)/m, "\\0\n")
+   159|     end_pos = 0
+   160|     while end_pos = lines.index(/^<\/(\w+)/, end_pos)
+   161|       element = $1.dup
+   162|       start_pos = lines.rindex(/^\s*<#{element}/i, end_pos)
+   163|       lines[start_pos ... end_pos] = "__" + lines[start_pos ... end_pos].gsub(/\n(?!\z)/, "\n" + shift) + "__"
+   164|     end
+   165|     lines.gsub(/^((?:#{Regexp::quote(shift)})*)__(?=<\/?\w)/, '\1')
+   166|   end
+   167|   alias h escapeHTML
+   168| end
+

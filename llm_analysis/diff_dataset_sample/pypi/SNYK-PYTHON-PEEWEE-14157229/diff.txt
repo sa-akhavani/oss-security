@@ -1,0 +1,162 @@
+--- a/peewee.py
++++ b/peewee.py
+@@ -63,21 +63,21 @@
+     pg3_errors = None
+ mysql_passwd = False
+ try:
+     import pymysql as mysql
+ except ImportError:
+     try:
+         import MySQLdb as mysql
+         mysql_passwd = True
+     except ImportError:
+         mysql = None
+-__version__ = '3.18.3'
++__version__ = '3.18.2'
+ __all__ = [
+     'AnyField',
+     'AsIs',
+     'AutoField',
+     'BareField',
+     'BigAutoField',
+     'BigBitField',
+     'BigIntegerField',
+     'BinaryUUIDField',
+     'BitField',
+
+--- a/playhouse/postgres_ext.py
++++ b/playhouse/postgres_ext.py
+@@ -37,21 +37,20 @@
+ ACONTAINED_BY = '<@'
+ ACONTAINS_ANY = '&&'
+ TS_MATCH = '@@'
+ JSONB_CONTAINS = '@>'
+ JSONB_CONTAINED_BY = '<@'
+ JSONB_CONTAINS_KEY = '?'
+ JSONB_CONTAINS_ANY_KEY = '?|'
+ JSONB_CONTAINS_ALL_KEYS = '?&'
+ JSONB_EXISTS = '?'
+ JSONB_REMOVE = '-'
+-JSONB_PATH = '#>'
+ class _LookupNode(ColumnBase):
+     def __init__(self, node, parts):
+         self.node = node
+         self.parts = parts
+         super(_LookupNode, self).__init__()
+     def clone(self):
+         return type(self)(self.node, list(self.parts))
+     def __hash__(self):
+         return hash((self.__class__.__name__, id(self)))
+ class _JsonLookupBase(_LookupNode):
+@@ -76,22 +75,20 @@
+             self.as_json(True),
+             JSONB_CONTAINS_ANY_KEY,
+             Value(list(keys), unpack=False))
+     def contains_all(self, *keys):
+         return Expression(
+             self.as_json(True),
+             JSONB_CONTAINS_ALL_KEYS,
+             Value(list(keys), unpack=False))
+     def has_key(self, key):
+         return Expression(self.as_json(True), JSONB_CONTAINS_KEY, key)
+-    def path(self, *keys):
+-        return JsonPath(self.as_json(True), keys)
+ class JsonLookup(_JsonLookupBase):
+     def __getitem__(self, value):
+         return JsonLookup(self.node, self.parts + [value], self._as_json)
+     def __sql__(self, ctx):
+         ctx.sql(self.node)
+         for part in self.parts[:-1]:
+             ctx.literal('->').sql(part)
+         if self.parts:
+             (ctx
+              .literal('->' if self._as_json else '->>')
+
+--- a/playhouse/shortcuts.py
++++ b/playhouse/shortcuts.py
+@@ -58,28 +58,29 @@
+                     only=only,
+                     exclude=exclude,
+                     max_depth=max_depth - 1))
+             data[name] = accum
+     for field in model._meta.sorted_fields:
+         if should_skip(field):
+             continue
+         field_data = model.__data__.get(field.name)
+         if isinstance(field, ForeignKeyField) and recurse:
+             if field_data is not None:
++                seen.add(field)
+                 rel_obj = getattr(model, field.name)
+                 field_data = model_to_dict(
+                     rel_obj,
+                     recurse=recurse,
+                     backrefs=backrefs,
+                     only=only,
+                     exclude=exclude,
+-                    seen=seen | set((field,)),
++                    seen=seen,
+                     max_depth=max_depth - 1)
+             else:
+                 field_data = None
+         data[field.name] = field_data
+     if extra_attrs:
+         for attr_name in extra_attrs:
+             attr = getattr(model, attr_name)
+             if callable_(attr):
+                 data[attr_name] = attr()
+             else:
+@@ -192,25 +193,23 @@
+     )
+     def __init__(self, *args, **kwargs):
+         super(ReconnectMixin, self).__init__(*args, **kwargs)
+         self._reconnect_errors = {}
+         for exc_class, err_fragment in self.reconnect_errors:
+             self._reconnect_errors.setdefault(exc_class, [])
+             self._reconnect_errors[exc_class].append(err_fragment.lower())
+     def execute_sql(self, sql, params=None, commit=None):
+         if commit is not None:
+             __deprecated__('"commit" has been deprecated and is a no-op.')
+-        return self._reconnect(super(ReconnectMixin, self).execute_sql,
+-                               sql, params)
+-    def begin(self, *args, **kwargs):
+-        return self._reconnect(super(ReconnectMixin, self).begin,
+-                               *args, **kwargs)
++        return self._reconnect(super(ReconnectMixin, self).execute_sql, sql, params)
++    def begin(self):
++        return self._reconnect(super(ReconnectMixin, self).begin)
+     def _reconnect(self, func, *args, **kwargs):
+         try:
+             return func(*args, **kwargs)
+         except Exception as exc:
+             if self.in_transaction():
+                 raise exc
+             exc_class = type(exc)
+             if exc_class not in self._reconnect_errors:
+                 raise exc
+             exc_repr = str(exc).lower()
+
+--- a/playhouse/sqlite_ext.py
++++ b/playhouse/sqlite_ext.py
+@@ -426,21 +426,21 @@
+             cls.lucene,
+             explicit_ordering)
+ _alphabet = 'abcdefghijklmnopqrstuvwxyz'
+ _alphanum = (set('\t ,"(){}*:_+0123456789') |
+              set(_alphabet) |
+              set(_alphabet.upper()) |
+              set((chr(26),)))
+ _invalid_ascii = set(chr(p) for p in range(128) if chr(p) not in _alphanum)
+ del _alphabet
+ del _alphanum
+-_quote_re = re.compile(r'[^\s"]+|"[^"\\]*(?:\\.[^"\\]*)*"')
++_quote_re = re.compile(r'(?:[^\s"]|"(?:\\.|[^"])*")+')
+ class FTS5Model(BaseFTSModel):
+     """
+     Requires SQLite >= 3.9.0.
+     Table options:
+     content: table name of external content, or empty string for "contentless"
+     content_rowid: column name of external content primary key
+     prefix: integer(s). Ex: '2' or '2 3 4'
+     tokenize: porter, unicode61, ascii. Ex: 'porter unicode61'
+     The unicode tokenizer supports the following parameters:
+     * remove_diacritics (1 or 0, default is 1)

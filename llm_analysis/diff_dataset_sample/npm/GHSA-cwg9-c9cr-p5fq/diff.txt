@@ -1,0 +1,1390 @@
+--- a/packages/core/src/electron-main/electron-main-application-module.ts
++++ b/packages/core/src/electron-main/electron-main-application-module.ts
+@@ -17,28 +17,26 @@
+ import { v4 } from 'uuid';
+ import { bindContributionProvider } from '../common/contribution-provider';
+ import { JsonRpcConnectionHandler } from '../common/messaging/proxy-factory';
+ import { ElectronSecurityToken } from '../electron-common/electron-token';
+ import { ElectronMainWindowService, electronMainWindowServicePath } from '../electron-common/electron-main-window-service';
+ import { ElectronMainApplication, ElectronMainApplicationContribution, ElectronMainProcessArgv } from './electron-main-application';
+ import { ElectronMainWindowServiceImpl } from './electron-main-window-service-impl';
+ import { ElectronMessagingContribution } from './messaging/electron-messaging-contribution';
+ import { ElectronMessagingService } from './messaging/electron-messaging-service';
+ import { ElectronConnectionHandler } from '../electron-common/messaging/electron-connection-handler';
+-import { ElectronSecurityTokenService } from './electron-security-token-service';
+ const electronSecurityToken: ElectronSecurityToken = { value: v4() };
+ (global as any)[ElectronSecurityToken] = electronSecurityToken;
+ export default new ContainerModule(bind => {
+     bind(ElectronMainApplication).toSelf().inSingletonScope();
+     bind(ElectronMessagingContribution).toSelf().inSingletonScope();
+     bind(ElectronSecurityToken).toConstantValue(electronSecurityToken);
+-    bind(ElectronSecurityTokenService).toSelf().inSingletonScope();
+     bindContributionProvider(bind, ElectronConnectionHandler);
+     bindContributionProvider(bind, ElectronMessagingService.Contribution);
+     bindContributionProvider(bind, ElectronMainApplicationContribution);
+     bind(ElectronMainApplicationContribution).toService(ElectronMessagingContribution);
+     bind(ElectronMainWindowService).to(ElectronMainWindowServiceImpl).inSingletonScope();
+     bind(ElectronConnectionHandler).toDynamicValue(context =>
+         new JsonRpcConnectionHandler(electronMainWindowServicePath,
+             () => context.container.get(ElectronMainWindowService))
+     ).inSingletonScope();
+     bind(ElectronMainProcessArgv).toSelf().inSingletonScope();
+
+--- a/packages/core/src/electron-main/electron-main-application.ts
++++ b/packages/core/src/electron-main/electron-main-application.ts
+@@ -7,33 +7,32 @@
+  *
+  * This Source Code may also be made available under the following Secondary
+  * Licenses when the conditions for such availability set forth in the Eclipse
+  * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+  * with the GNU Classpath Exception which is available at
+  * https://www.gnu.org/software/classpath/license.html.
+  *
+  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+  ********************************************************************************/
+ import { inject, injectable, named } from 'inversify';
+-import { screen, globalShortcut, app, BrowserWindow, BrowserWindowConstructorOptions, Event as ElectronEvent } from 'electron';
++import { session, screen, globalShortcut, app, BrowserWindow, BrowserWindowConstructorOptions, Event as ElectronEvent } from 'electron';
+ import * as path from 'path';
+ import { Argv } from 'yargs';
+ import { AddressInfo } from 'net';
+ import { promises as fs } from 'fs';
+ import { fork, ForkOptions } from 'child_process';
+ import { FrontendApplicationConfig } from '@theia/application-package/lib/application-props';
+ import URI from '../common/uri';
+ import { FileUri } from '../node/file-uri';
+ import { Deferred } from '../common/promise-util';
+ import { MaybePromise } from '../common/types';
+ import { ContributionProvider } from '../common/contribution-provider';
+-import { ElectronSecurityTokenService } from './electron-security-token-service';
+ import { ElectronSecurityToken } from '../electron-common/electron-token';
+ const Storage = require('electron-store');
+ const createYargs: (argv?: string[], cwd?: string) => Argv = require('yargs/yargs');
+ /**
+  * Theia tracks the maximized state of Electron Browser Windows.
+  */
+ export interface TheiaBrowserWindowOptions extends BrowserWindowConstructorOptions {
+     isMaximized?: boolean;
+ }
+ /**
+@@ -125,41 +124,38 @@
+         };
+     }
+ }
+ @injectable()
+ export class ElectronMainApplication {
+     @inject(ContributionProvider)
+     @named(ElectronMainApplicationContribution)
+     protected readonly contributions: ContributionProvider<ElectronMainApplicationContribution>;
+     @inject(ElectronMainApplicationGlobals)
+     protected readonly globals: ElectronMainApplicationGlobals;
++    @inject(ElectronSecurityToken)
++    protected electronSecurityToken: ElectronSecurityToken;
+     @inject(ElectronMainProcessArgv)
+     protected processArgv: ElectronMainProcessArgv;
+-    @inject(ElectronSecurityTokenService)
+-    protected electronSecurityTokenService: ElectronSecurityTokenService;
+-    @inject(ElectronSecurityToken)
+-    protected readonly electronSecurityToken: ElectronSecurityToken;
+     protected readonly electronStore = new Storage();
+-    protected readonly _backendPort = new Deferred<number>();
+-    readonly backendPort = this._backendPort.promise;
+-    protected _config: FrontendApplicationConfig | undefined;
++    protected readonly backendPort = new Deferred<number>();
++    protected _config: FrontendApplicationConfig;
+     get config(): FrontendApplicationConfig {
+         if (!this._config) {
+             throw new Error('You have to start the application first.');
+         }
+         return this._config;
+     }
+     async start(config: FrontendApplicationConfig): Promise<void> {
+         this._config = config;
+         this.hookApplicationEvents();
+         const port = await this.startBackend();
+-        this._backendPort.resolve(port);
++        this.backendPort.resolve(port);
+         await app.whenReady();
+         await this.attachElectronSecurityToken(port);
+         await this.startContributions();
+         await this.launch({
+             secondInstance: false,
+             argv: this.processArgv.getProcessArgvWithoutBin(process.argv),
+             cwd: process.cwd()
+         });
+     }
+     protected async launch(params: ElectronMainExecutionParams): Promise<void> {
+@@ -230,22 +226,22 @@
+                 console.error(`Could not resolve the workspace path. "${options.file}" is not a valid 'file' option. Falling back to the default workspace location.`);
+             }
+             if (workspacePath === undefined) {
+                 await this.openDefaultWindow();
+             } else {
+                 await this.openWindowWithWorkspace(workspacePath);
+             }
+         }
+     }
+     protected async createWindowUri(): Promise<URI> {
+-        return FileUri.create(this.globals.THEIA_FRONTEND_HTML_PATH)
+-            .withQuery(`port=${await this.backendPort}`);
++        const port = await this.backendPort.promise;
++        return FileUri.create(this.globals.THEIA_FRONTEND_HTML_PATH).withQuery(`port=${port}`);
+     }
+     protected getDefaultWindowState(): BrowserWindowConstructorOptions {
+         const { bounds } = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+         const height = Math.floor(bounds.height * (2 / 3));
+         const width = Math.floor(bounds.width * (2 / 3));
+         const y = Math.floor(bounds.y + (bounds.height - height) / 2);
+         const x = Math.floor(bounds.x + (bounds.width - width) / 2);
+         return { width, height, x, y };
+     }
+     /**
+@@ -347,21 +343,26 @@
+     }
+     protected async getForkOptions(): Promise<ForkOptions> {
+         return {
+             env: {
+                 ...process.env,
+                 [ElectronSecurityToken]: JSON.stringify(this.electronSecurityToken),
+             },
+         };
+     }
+     protected async attachElectronSecurityToken(port: number): Promise<void> {
+-        await this.electronSecurityTokenService.setElectronSecurityTokenCookie(`http://localhost:${port}`);
++        session.defaultSession.cookies.set({
++            url: `http://localhost:${port}/`,
++            name: ElectronSecurityToken,
++            value: JSON.stringify(this.electronSecurityToken),
++            httpOnly: true
++        });
+     }
+     protected hookApplicationEvents(): void {
+         app.on('will-quit', this.onWillQuit.bind(this));
+         app.on('second-instance', this.onSecondInstance.bind(this));
+         app.on('window-all-closed', this.onWindowAllClosed.bind(this));
+     }
+     protected onWillQuit(event: ElectronEvent): void {
+         this.stopContributions();
+     }
+     protected async onSecondInstance(event: ElectronEvent, argv: string[], cwd: string): Promise<void> {
+
+--- a/packages/core/src/electron-main/electron-security-token-service.ts
++++ b//dev/null
+@@ -1,31 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import { session } from 'electron';
+-import { inject, injectable } from 'inversify';
+-import { ElectronSecurityToken } from '../electron-common/electron-token';
+-@injectable()
+-export class ElectronSecurityTokenService {
+-    @inject(ElectronSecurityToken)
+-    protected readonly electronSecurityToken: ElectronSecurityToken;
+-    async setElectronSecurityTokenCookie(url: string): Promise<void> {
+-        await session.defaultSession.cookies.set({
+-            url,
+-            name: ElectronSecurityToken,
+-            value: JSON.stringify(this.electronSecurityToken),
+-            httpOnly: true
+-        });
+-    }
+-}
+
+--- a/packages/core/src/electron-node/hosting/electron-backend-hosting-module.ts
++++ b//dev/null
+@@ -1,22 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import { ContainerModule } from 'inversify';
+-import { WsRequestValidatorContribution } from '../../node/ws-request-validators';
+-import { ElectronWsOriginValidator } from './electron-ws-origin-validator';
+-export default new ContainerModule(bind => {
+-    bind(ElectronWsOriginValidator).toSelf().inSingletonScope();
+-    bind(WsRequestValidatorContribution).toService(ElectronWsOriginValidator);
+-});
+
+--- a/packages/core/src/electron-node/hosting/electron-ws-origin-validator.ts
++++ b//dev/null
+@@ -1,24 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import * as http from 'http';
+-import { injectable } from 'inversify';
+-import { WsRequestValidatorContribution } from '../../node/ws-request-validators';
+-@injectable()
+-export class ElectronWsOriginValidator implements WsRequestValidatorContribution {
+-    allowWsUpgrade(request: http.IncomingMessage): boolean {
+-        return request.headers.origin === 'file://';
+-    }
+-}
+
+--- a/packages/core/src/electron-node/token/electron-token-backend-module.ts
++++ b/packages/core/src/electron-node/token/electron-token-backend-module.ts
+@@ -7,20 +7,21 @@
+  *
+  * This Source Code may also be made available under the following Secondary
+  * Licenses when the conditions for such availability set forth in the Eclipse
+  * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+  * with the GNU Classpath Exception which is available at
+  * https://www.gnu.org/software/classpath/license.html.
+  *
+  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+  ********************************************************************************/
+ import { ContainerModule } from 'inversify';
+-import { BackendApplicationContribution } from '../../node';
+-import { WsRequestValidatorContribution } from '../../node/ws-request-validators';
++import { BackendApplicationContribution, MessagingService } from '../../node';
++import { MessagingContribution } from '../../node/messaging/messaging-contribution';
+ import { ElectronTokenBackendContribution } from './electron-token-backend-contribution';
++import { ElectronMessagingContribution } from './electron-token-messaging-contribution';
+ import { ElectronTokenValidator } from './electron-token-validator';
+ export default new ContainerModule((bind, unbind, isBound, rebind) => {
+-    bind(ElectronTokenBackendContribution).toSelf().inSingletonScope();
+-    bind(BackendApplicationContribution).toService(ElectronTokenBackendContribution);
+-    bind(ElectronTokenValidator).toSelf().inSingletonScope();
+-    bind(WsRequestValidatorContribution).toService(ElectronTokenValidator);
++    bind<ElectronTokenValidator>(ElectronTokenValidator).toSelf().inSingletonScope();
++    bind<ElectronTokenBackendContribution>(ElectronTokenBackendContribution).toSelf().inSingletonScope();
++    bind<BackendApplicationContribution>(BackendApplicationContribution).toService(ElectronTokenBackendContribution);
++    rebind<MessagingContribution>(MessagingService.Identifier).to(ElectronMessagingContribution).inSingletonScope();
+ });
+
+--- a/packages/core/src/electron-node/token/electron-token-messaging-contribution.ts
++++ b/packages/core/src/electron-node/token/electron-token-messaging-contribution.ts
+@@ -13,21 +13,20 @@
+  *
+  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+  ********************************************************************************/
+ import * as net from 'net';
+ import * as http from 'http';
+ import { injectable, inject } from 'inversify';
+ import { MessagingContribution } from '../../node/messaging/messaging-contribution';
+ import { ElectronTokenValidator } from './electron-token-validator';
+ /**
+  * Override the browser MessagingContribution class to refuse connections that do not include a specific token.
+- * @deprecated since 1.8.0
+  */
+ @injectable()
+ export class ElectronMessagingContribution extends MessagingContribution {
+     @inject(ElectronTokenValidator)
+     protected readonly tokenValidator: ElectronTokenValidator;
+     /**
+      * Only allow token-bearers.
+      */
+     protected handleHttpUpgrade(request: http.IncomingMessage, socket: net.Socket, head: Buffer): void {
+         if (this.tokenValidator.allowRequest(request)) {
+
+--- a/packages/core/src/electron-node/token/electron-token-validator.ts
++++ b/packages/core/src/electron-node/token/electron-token-validator.ts
+@@ -9,37 +9,28 @@
+  * Licenses when the conditions for such availability set forth in the Eclipse
+  * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+  * with the GNU Classpath Exception which is available at
+  * https://www.gnu.org/software/classpath/license.html.
+  *
+  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+  ********************************************************************************/
+ import * as http from 'http';
+ import * as cookie from 'cookie';
+ import * as crypto from 'crypto';
+-import { injectable, postConstruct } from 'inversify';
+-import { MaybePromise } from '../../common';
++import { injectable } from 'inversify';
+ import { ElectronSecurityToken } from '../../electron-common/electron-token';
+-import { WsRequestValidatorContribution } from '../../node/ws-request-validators';
+ /**
+  * On Electron, we want to make sure that only Electron's browser-windows access the backend services.
+  */
+ @injectable()
+-export class ElectronTokenValidator implements WsRequestValidatorContribution {
+-    protected electronSecurityToken: ElectronSecurityToken;
+-    @postConstruct()
+-    protected postConstruct(): void {
+-        this.electronSecurityToken = this.getToken();
+-    }
+-    allowWsUpgrade(request: http.IncomingMessage): MaybePromise<boolean> {
+-        return this.allowRequest(request);
+-    }
++export class ElectronTokenValidator {
++    protected electronSecurityToken: ElectronSecurityToken = this.getToken();
+     /**
+      * Expects the token to be passed via cookies by default.
+      */
+     allowRequest(request: http.IncomingMessage): boolean {
+         const cookieHeader = request.headers.cookie;
+         if (typeof cookieHeader === 'string') {
+             const token = cookie.parse(cookieHeader)[ElectronSecurityToken];
+             if (typeof token === 'string') {
+                 return this.isTokenValid(JSON.parse(token));
+             }
+
+--- a/packages/core/src/node/backend-application-module.ts
++++ b/packages/core/src/node/backend-application-module.ts
+@@ -21,21 +21,20 @@
+ } from '../common';
+ import { BackendApplication, BackendApplicationContribution, BackendApplicationCliContribution } from './backend-application';
+ import { CliManager, CliContribution } from './cli';
+ import { IPCConnectionProvider } from './messaging';
+ import { ApplicationServerImpl } from './application-server';
+ import { ApplicationServer, applicationPath } from '../common/application-protocol';
+ import { EnvVariablesServer, envVariablesPath } from './../common/env-variables';
+ import { EnvVariablesServerImpl } from './env-variables';
+ import { ConnectionContainerModule } from './messaging/connection-container-module';
+ import { QuickPickService, quickPickServicePath } from '../common/quick-pick-service';
+-import { WsRequestValidator, WsRequestValidatorContribution } from './ws-request-validators';
+ decorate(injectable(), ApplicationPackage);
+ const commandConnectionModule = ConnectionContainerModule.create(({ bindFrontendService }) => {
+     bindFrontendService(commandServicePath, CommandService);
+ });
+ const messageConnectionModule = ConnectionContainerModule.create(({ bind, bindFrontendService }) => {
+     bindFrontendService(messageServicePath, MessageClient);
+     bind(MessageService).toSelf().inSingletonScope();
+ });
+ const quickPickConnectionModule = ConnectionContainerModule.create(({ bindFrontendService }) => {
+     bindFrontendService(quickPickServicePath, QuickPickService);
+@@ -62,13 +61,11 @@
+     bind(ConnectionHandler).toDynamicValue(ctx =>
+         new JsonRpcConnectionHandler(envVariablesPath, () => {
+             const envVariablesServer = ctx.container.get<EnvVariablesServer>(EnvVariablesServer);
+             return envVariablesServer;
+         })
+     ).inSingletonScope();
+     bind(ApplicationPackage).toDynamicValue(({ container }) => {
+         const { projectPath } = container.get(BackendApplicationCliContribution);
+         return new ApplicationPackage({ projectPath });
+     }).inSingletonScope();
+-    bind(WsRequestValidator).toSelf().inSingletonScope();
+-    bindContributionProvider(bind, WsRequestValidatorContribution);
+ });
+
+--- a/packages/core/src/node/hosting/backend-application-hosts.ts
++++ b//dev/null
+@@ -1,55 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import { injectable, postConstruct } from 'inversify';
+-/**
+- * **Important: This component is not bound on Electron.**
+- *
+- * Component handling the different hosts the Theia backend should be reachable at.
+- *
+- * Hosts should be set through the `THEIA_HOSTS` environment variable as a comma-separated list of hosts.
+- *
+- * If you do not set this variable, we'll consider that we don't know where the application is hosted at.
+- */
+-@injectable()
+-export class BackendApplicationHosts {
+-    protected readonly _hosts = new Set<string>();
+-    /**
+-     * Set of domains that the application is supposed to be reachable at.
+-     * If the set is empty it means that we don't know where we are hosted.
+-     * You can check for this with `.hasKnownHosts()`.
+-     */
+-    get hosts(): ReadonlySet<string> {
+-        return this._hosts;
+-    }
+-    @postConstruct()
+-    protected postConstruct(): void {
+-        const theiaHostsEnv = process.env['THEIA_HOSTS'];
+-        if (theiaHostsEnv) {
+-            theiaHostsEnv.split(',').forEach(host => {
+-                const trimmed = host.trim();
+-                if (trimmed.length > 0) {
+-                    this._hosts.add(trimmed);
+-                }
+-            });
+-        }
+-    }
+-    /**
+-     * Do we know where we are hosted?
+-     */
+-    hasKnownHosts(): boolean {
+-        return this._hosts.size > 0;
+-    }
+-}
+
+--- a/packages/core/src/node/hosting/backend-hosting-module.ts
++++ b//dev/null
+@@ -1,24 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import { ContainerModule } from 'inversify';
+-import { WsRequestValidatorContribution } from '../ws-request-validators';
+-import { BackendApplicationHosts } from './backend-application-hosts';
+-import { WsOriginValidator } from './ws-origin-validator';
+-export default new ContainerModule(bind => {
+-    bind(BackendApplicationHosts).toSelf().inSingletonScope();
+-    bind(WsOriginValidator).toSelf().inSingletonScope();
+-    bind(WsRequestValidatorContribution).toService(WsOriginValidator);
+-});
+
+--- a/packages/core/src/node/hosting/ws-origin-validator.ts
++++ b//dev/null
+@@ -1,32 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import * as http from 'http';
+-import { inject, injectable } from 'inversify';
+-import * as url from 'url';
+-import { WsRequestValidatorContribution } from '../ws-request-validators';
+-import { BackendApplicationHosts } from './backend-application-hosts';
+-@injectable()
+-export class WsOriginValidator implements WsRequestValidatorContribution {
+-    @inject(BackendApplicationHosts)
+-    protected readonly backendApplicationHosts: BackendApplicationHosts;
+-    allowWsUpgrade(request: http.IncomingMessage): boolean {
+-        if (!this.backendApplicationHosts.hasKnownHosts() || !request.headers.origin) {
+-            return true;
+-        }
+-        const origin = url.parse(request.headers.origin);
+-        return this.backendApplicationHosts.hosts.has(origin.host!);
+-    }
+-}
+
+--- a/packages/core/src/node/messaging/messaging-contribution.ts
++++ b/packages/core/src/node/messaging/messaging-contribution.ts
+@@ -23,32 +23,29 @@
+ import { createWebSocketConnection } from 'vscode-ws-jsonrpc/lib/socket/connection';
+ import { IConnection } from 'vscode-ws-jsonrpc/lib/server/connection';
+ import * as launch from 'vscode-ws-jsonrpc/lib/server/launch';
+ import { ContributionProvider, ConnectionHandler, bindContributionProvider } from '../../common';
+ import { WebSocketChannel } from '../../common/messaging/web-socket-channel';
+ import { BackendApplicationContribution } from '../backend-application';
+ import { MessagingService, WebSocketChannelConnection } from './messaging-service';
+ import { ConsoleLogger } from './logger';
+ import { ConnectionContainerModule } from './connection-container-module';
+ import Route = require('route-parser');
+-import { WsRequestValidator } from '../ws-request-validators';
+ export const MessagingContainer = Symbol('MessagingContainer');
+ @injectable()
+ export class MessagingContribution implements BackendApplicationContribution, MessagingService {
+     @inject(MessagingContainer)
+     protected readonly container: interfaces.Container;
+     @inject(ContributionProvider) @named(ConnectionContainerModule)
+     protected readonly connectionModules: ContributionProvider<interfaces.ContainerModule>;
+     @inject(ContributionProvider) @named(MessagingService.Contribution)
+     protected readonly contributions: ContributionProvider<MessagingService.Contribution>;
+-    @inject(WsRequestValidator)
+-    protected readonly wsRequestValidator: WsRequestValidator;
+     protected webSocketServer: ws.Server | undefined;
+     protected readonly wsHandlers = new MessagingContribution.ConnectionHandlers<ws>();
+     protected readonly channelHandlers = new MessagingContribution.ConnectionHandlers<WebSocketChannel>();
+     @postConstruct()
+     protected init(): void {
+         this.ws(WebSocketChannel.wsPath, (_, socket) => this.handleChannels(socket));
+         for (const contribution of this.contributions.getContributions()) {
+             contribution.configure(this);
+         }
+     }
+@@ -95,34 +92,22 @@
+                 }
+                 socket.alive = false;
+                 socket.ping();
+             });
+         }, this.checkAliveTimeout);
+     }
+     /**
+      * Route HTTP upgrade requests to the WebSocket server.
+      */
+     protected handleHttpUpgrade(request: http.IncomingMessage, socket: net.Socket, head: Buffer): void {
+-        this.wsRequestValidator.allowWsUpgrade(request).then(allowed => {
+-            if (allowed) {
+-                this.webSocketServer!.handleUpgrade(request, socket, head, client => {
+-                    this.webSocketServer!.emit('connection', client, request);
+-                });
+-            } else {
+-                console.error(`refused a websocket connection: ${request.connection.remoteAddress}`);
+-                socket.write('HTTP/1.1 403 Forbidden\n\n');
+-                socket.destroy();
+-            }
+-        }, error => {
+-            console.error(error);
+-            socket.write('HTTP/1.1 500 Internal Error\n\n');
+-            socket.destroy();
++        this.webSocketServer!.handleUpgrade(request, socket, head, client => {
++            this.webSocketServer!.emit('connection', client, request);
+         });
+     }
+     protected handleConnection(socket: ws, request: http.IncomingMessage): void {
+         const pathname = request.url && url.parse(request.url).pathname;
+         if (pathname && !this.wsHandlers.route(pathname, socket)) {
+             console.error('Cannot find a ws handler for the path: ' + pathname);
+         }
+     }
+     protected handleChannels(socket: ws): void {
+         const channelHandlers = this.getConnectionChannelHandlers(socket);
+
+--- a/packages/core/src/node/ws-request-validators.ts
++++ b//dev/null
+@@ -1,51 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import { inject, injectable, named } from 'inversify';
+-import * as http from 'http';
+-import { ContributionProvider, MaybePromise } from '../common';
+-/**
+- * Bind components to this symbol to filter WebSocket connections.
+- */
+-export const WsRequestValidatorContribution = Symbol('RequestValidatorContribution');
+-export interface WsRequestValidatorContribution {
+-    /**
+-     * Return `false` to prevent the protocol upgrade from going through, blocking the WebSocket connection.
+-     *
+-     * @param request The HTTP connection upgrade request received by the server.
+-     */
+-    allowWsUpgrade(request: http.IncomingMessage): MaybePromise<boolean>;
+-}
+-/**
+- * Central handler of `WsRequestValidatorContribution`.
+- */
+-@injectable()
+-export class WsRequestValidator {
+-    @inject(ContributionProvider) @named(WsRequestValidatorContribution)
+-    protected readonly requestValidators: ContributionProvider<WsRequestValidatorContribution>;
+-    /**
+-     * Ask all bound `WsRequestValidatorContributions` if the WebSocket connection should be allowed or not.
+-     */
+-    async allowWsUpgrade(request: http.IncomingMessage): Promise<boolean> {
+-        return new Promise(async resolve => {
+-            await Promise.all(Array.from(this.requestValidators.getContributions(), async validator => {
+-                if (!await validator.allowWsUpgrade(request)) {
+-                    resolve(false); // bail on first refusal
+-                }
+-            }));
+-            resolve(true);
+-        });
+-    }
+-}
+
+--- a/packages/mini-browser/src/browser/environment/mini-browser-environment-module.ts
++++ b//dev/null
+@@ -1,22 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import { FrontendApplicationContribution } from '@theia/core/lib/browser';
+-import { ContainerModule } from 'inversify';
+-import { MiniBrowserEnvironment } from './mini-browser-environment';
+-export default new ContainerModule(bind => {
+-    bind(MiniBrowserEnvironment).toSelf().inSingletonScope();
+-    bind(FrontendApplicationContribution).toService(MiniBrowserEnvironment);
+-});
+
+--- a/packages/mini-browser/src/browser/environment/mini-browser-environment.ts
++++ b//dev/null
+@@ -1,51 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import { EnvVariablesServer } from '@theia/core/lib/common/env-variables';
+-import { Endpoint, FrontendApplicationContribution } from '@theia/core/lib/browser';
+-import { inject, injectable, postConstruct } from 'inversify';
+-import { MiniBrowserEndpoint } from '../../common/mini-browser-endpoint';
+-import { v4 } from 'uuid';
+-/**
+- * Fetch values from the backend's environment.
+- */
+-@injectable()
+-export class MiniBrowserEnvironment implements FrontendApplicationContribution {
+-    protected _hostPatternPromise: Promise<string>;
+-    protected _hostPattern: string;
+-    @inject(EnvVariablesServer)
+-    protected readonly environment: EnvVariablesServer;
+-    @postConstruct()
+-    protected postConstruct(): void {
+-        this._hostPatternPromise = this.environment.getValue(MiniBrowserEndpoint.HOST_PATTERN_ENV)
+-            .then(envVar => envVar?.value || MiniBrowserEndpoint.HOST_PATTERN_DEFAULT);
+-    }
+-    async onStart(): Promise<void> {
+-        this._hostPattern = await this._hostPatternPromise;
+-    }
+-    getEndpoint(uuid: string, hostname?: string): Endpoint {
+-        return new Endpoint({
+-            host: this._hostPattern
+-                .replace('{{uuid}}', uuid)
+-                .replace('{{hostname}}', hostname || this.getDefaultHostname()),
+-        });
+-    }
+-    getRandomEndpoint(): Endpoint {
+-        return this.getEndpoint(v4());
+-    }
+-    protected getDefaultHostname(): string {
+-        return self.location.host;
+-    }
+-}
+
+--- a/packages/mini-browser/src/browser/location-mapper-service.ts
++++ b/packages/mini-browser/src/browser/location-mapper-service.ts
+@@ -11,21 +11,20 @@
+  * with the GNU Classpath Exception which is available at
+  * https://www.gnu.org/software/classpath/license.html.
+  *
+  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+  ********************************************************************************/
+ import { inject, injectable, named } from 'inversify';
+ import URI from '@theia/core/lib/common/uri';
+ import { Endpoint } from '@theia/core/lib/browser';
+ import { MaybePromise, Prioritizeable } from '@theia/core/lib/common/types';
+ import { ContributionProvider } from '@theia/core/lib/common/contribution-provider';
+-import { MiniBrowserEnvironment } from './environment/mini-browser-environment';
+ /**
+  * Contribution for the `LocationMapperService`.
+  */
+ export const LocationMapper = Symbol('LocationMapper');
+ export interface LocationMapper {
+     /**
+      * Should return with a positive number if the current contribution can handle the given location.
+      * The number indicates the priority of the location mapper. If it is not a positive number, it means, the
+      * contribution cannot handle the location.
+      */
+@@ -95,35 +94,30 @@
+     }
+     map(location: string): MaybePromise<string> {
+         return `http://${location}`;
+     }
+ }
+ /**
+  * `file` URI location mapper.
+  */
+ @injectable()
+ export class FileLocationMapper implements LocationMapper {
+-    @inject(MiniBrowserEnvironment)
+-    protected readonly miniBrowserEnvironment: MiniBrowserEnvironment;
+     canHandle(location: string): MaybePromise<number> {
+         return location.startsWith('file://') ? 1 : 0;
+     }
+     map(location: string): MaybePromise<string> {
+         const uri = new URI(location);
+         if (uri.scheme !== 'file') {
+             throw new Error(`Only URIs with 'file' scheme can be mapped to an URL. URI was: ${uri}.`);
+         }
+         let rawLocation = uri.path.toString();
+         if (rawLocation.charAt(0) === '/') {
+             rawLocation = rawLocation.substr(1);
+         }
+-        return this.miniBrowserEnvironment.getRandomEndpoint().getRestUrl().resolve(rawLocation).toString();
++        return new MiniBrowserEndpoint().getRestUrl().resolve(rawLocation).toString();
+     }
+ }
+-/**
+- * @deprecated since 1.8.0
+- */
+ export class MiniBrowserEndpoint extends Endpoint {
+     constructor() {
+         super({ path: 'mini-browser' });
+     }
+ }
+
+--- a/packages/mini-browser/src/browser/mini-browser-open-handler.ts
++++ b/packages/mini-browser/src/browser/mini-browser-open-handler.ts
+@@ -70,26 +70,24 @@
+     protected readonly openerService: OpenerService;
+     @inject(LabelProvider)
+     protected readonly labelProvider: LabelProvider;
+     @inject(QuickInputService)
+     protected readonly quickInputService: QuickInputService;
+     @inject(MiniBrowserService)
+     protected readonly miniBrowserService: MiniBrowserService;
+     @inject(LocationMapperService)
+     protected readonly locationMapperService: LocationMapperService;
+     onStart(): void {
+-        this.miniBrowserService.supportedFileExtensions().then(entries => {
+-            entries.forEach(entry => {
+-                const { extension, priority } = entry;
+-                this.supportedExtensions.set(extension, priority);
+-            });
+-        });
++        (async () => (await this.miniBrowserService.supportedFileExtensions()).forEach(entry => {
++            const { extension, priority } = entry;
++            this.supportedExtensions.set(extension, priority);
++        }))();
+     }
+     canHandle(uri: URI): number {
+         const extension = uri.toString().split('.').pop();
+         if (extension) {
+             return this.supportedExtensions.get(extension.toLocaleLowerCase()) || 0;
+         }
+         return 0;
+     }
+     async open(uri: URI, options?: MiniBrowserOpenerOptions): Promise<MiniBrowser> {
+         const widget = await super.open(uri, options);
+
+--- a/packages/mini-browser/src/common/mini-browser-endpoint.ts
++++ b//dev/null
+@@ -1,26 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-/**
+- * The mini-browser can now serve content on its own host/origin.
+- *
+- * The virtual host can be configured with this `THEIA_MINI_BROWSER_HOST_PATTERN`
+- * environment variable. `{{hostname}}` reprensents the current host, and `{{uuid}}`
+- * will be replace by a random uuid value.
+- */
+-export namespace MiniBrowserEndpoint {
+-    export const HOST_PATTERN_ENV = 'THEIA_MINI_BROWSER_HOST_PATTERN';
+-    export const HOST_PATTERN_DEFAULT = '{{uuid}}.mini-browser.{{hostname}}';
+-}
+
+--- a/packages/mini-browser/src/electron-browser/environment/electron-mini-browser-environment-module.ts
++++ b//dev/null
+@@ -1,23 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import { FrontendApplicationContribution } from '@theia/core/lib/browser';
+-import { ContainerModule } from 'inversify';
+-import { MiniBrowserEnvironment } from '../../browser/environment/mini-browser-environment';
+-import { ElectronMiniBrowserEnvironment } from './electron-mini-browser-environment';
+-export default new ContainerModule(bind => {
+-    bind(MiniBrowserEnvironment).to(ElectronMiniBrowserEnvironment).inSingletonScope();
+-    bind(FrontendApplicationContribution).toService(MiniBrowserEnvironment);
+-});
+
+--- a/packages/mini-browser/src/electron-browser/environment/electron-mini-browser-environment.ts
++++ b//dev/null
+@@ -1,50 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import { Endpoint } from '@theia/core/lib/browser';
+-import { ElectronSecurityToken } from '@theia/core/lib/electron-common/electron-token';
+-import { remote } from 'electron';
+-import { inject, injectable } from 'inversify';
+-import { MiniBrowserEnvironment } from '../../browser/environment/mini-browser-environment';
+-@injectable()
+-export class ElectronMiniBrowserEnvironment extends MiniBrowserEnvironment {
+-    @inject(ElectronSecurityToken)
+-    protected readonly electronSecurityToken: ElectronSecurityToken;
+-    getEndpoint(uuid: string, hostname?: string): Endpoint {
+-        const endpoint = super.getEndpoint(uuid, hostname);
+-        remote.session.defaultSession.cookies.set({
+-            url: endpoint.getRestUrl().toString(true),
+-            name: ElectronSecurityToken,
+-            value: JSON.stringify(this.electronSecurityToken),
+-            httpOnly: true,
+-        });
+-        return endpoint;
+-    }
+-    protected getDefaultHostname(): string {
+-        const query = self.location.search
+-            .substr(1)
+-            .split('&')
+-            .map(entry => entry
+-                .split('=', 2)
+-                .map(element => decodeURIComponent(element))
+-            );
+-        for (const [key, value] of query) {
+-            if (key === 'port') {
+-                return `localhost:${value}`;
+-            }
+-        }
+-        throw new Error('could not resolve Electron\'s backend port');
+-    }
+-}
+
+--- a/packages/mini-browser/src/electron-main/mini-browser-electron-main-contribution.ts
++++ b//dev/null
+@@ -1,37 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import { ElectronMainApplication, ElectronMainApplicationContribution } from '@theia/core/lib/electron-main/electron-main-application';
+-import { ElectronSecurityTokenService } from '@theia/core/lib/electron-main/electron-security-token-service';
+-import { inject, injectable } from 'inversify';
+-import { MiniBrowserEndpoint } from '../common/mini-browser-endpoint';
+-/**
+- * Since the mini-browser might serve content from a new origin,
+- * we need to attach the ElectronSecurityToken for the Electron
+- * backend to accept HTTP requests.
+- */
+-@injectable()
+-export class MiniBrowserElectronMainContribution implements ElectronMainApplicationContribution {
+-    @inject(ElectronSecurityTokenService)
+-    protected readonly electronSecurityTokenService: ElectronSecurityTokenService;
+-    async onStart(app: ElectronMainApplication): Promise<void> {
+-        const url = this.getMiniBrowserEndpoint(await app.backendPort);
+-        await this.electronSecurityTokenService.setElectronSecurityTokenCookie(url);
+-    }
+-    protected getMiniBrowserEndpoint(port: number): string {
+-        const pattern = process.env[MiniBrowserEndpoint.HOST_PATTERN_ENV] ?? MiniBrowserEndpoint.HOST_PATTERN_DEFAULT;
+-        return 'http://' + pattern.replace('{{hostname}}', `localhost:${port}`);
+-    }
+-}
+
+--- a/packages/mini-browser/src/electron-main/mini-browser-electron-main-module.ts
++++ b//dev/null
+@@ -1,22 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import { ElectronMainApplicationContribution } from '@theia/core/lib/electron-main/electron-main-application';
+-import { ContainerModule } from 'inversify';
+-import { MiniBrowserElectronMainContribution } from './mini-browser-electron-main-contribution';
+-export default new ContainerModule(bind => {
+-    bind(MiniBrowserElectronMainContribution).toSelf().inSingletonScope();
+-    bind(ElectronMainApplicationContribution).toService(MiniBrowserElectronMainContribution);
+-});
+
+--- a/packages/mini-browser/src/node/mini-browser-backend-module.ts
++++ b/packages/mini-browser/src/node/mini-browser-backend-module.ts
+@@ -12,25 +12,21 @@
+  * https://www.gnu.org/software/classpath/license.html.
+  *
+  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+  ********************************************************************************/
+ import { ContainerModule } from 'inversify';
+ import { bindContributionProvider } from '@theia/core/lib/common/contribution-provider';
+ import { BackendApplicationContribution } from '@theia/core/lib/node/backend-application';
+ import { ConnectionHandler, JsonRpcConnectionHandler } from '@theia/core/lib/common';
+ import { MiniBrowserService, MiniBrowserServicePath } from '../common/mini-browser-service';
+ import { MiniBrowserEndpoint, MiniBrowserEndpointHandler, HtmlHandler, ImageHandler, PdfHandler, SvgHandler } from './mini-browser-endpoint';
+-import { WsRequestValidatorContribution } from '@theia/core/lib/node/ws-request-validators';
+-import { MiniBrowserWsRequestValidator } from './mini-browser-ws-validator';
+ export default new ContainerModule(bind => {
+     bind(MiniBrowserEndpoint).toSelf().inSingletonScope();
+     bind(BackendApplicationContribution).toService(MiniBrowserEndpoint);
+-    bind(MiniBrowserWsRequestValidator).toSelf().inSingletonScope();
+-    bind(WsRequestValidatorContribution).toService(MiniBrowserWsRequestValidator);
+     bind(MiniBrowserService).toService(MiniBrowserEndpoint);
+     bind(ConnectionHandler).toDynamicValue(context => new JsonRpcConnectionHandler(MiniBrowserServicePath, () => context.container.get(MiniBrowserService))).inSingletonScope();
+     bindContributionProvider(bind, MiniBrowserEndpointHandler);
+     bind(MiniBrowserEndpointHandler).to(HtmlHandler).inSingletonScope();
+     bind(MiniBrowserEndpointHandler).to(ImageHandler).inSingletonScope();
+     bind(MiniBrowserEndpointHandler).to(PdfHandler).inSingletonScope();
+     bind(MiniBrowserEndpointHandler).to(SvgHandler).inSingletonScope();
+ });
+
+--- a/packages/mini-browser/src/node/mini-browser-endpoint.ts
++++ b/packages/mini-browser/src/node/mini-browser-endpoint.ts
+@@ -6,33 +6,31 @@
+  * http://www.eclipse.org/legal/epl-2.0.
+  *
+  * This Source Code may also be made available under the following Secondary
+  * Licenses when the conditions for such availability set forth in the Eclipse
+  * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+  * with the GNU Classpath Exception which is available at
+  * https://www.gnu.org/software/classpath/license.html.
+  *
+  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+  ********************************************************************************/
+-const vhost = require('vhost');
+-import express = require('express');
+ import * as fs from 'fs-extra';
+ import { lookup } from 'mime-types';
+ import { injectable, inject, named } from 'inversify';
+ import { Application, Request, Response } from 'express';
++import URI from '@theia/core/lib/common/uri';
+ import { FileUri } from '@theia/core/lib/node/file-uri';
+ import { ILogger } from '@theia/core/lib/common/logger';
+ import { MaybePromise } from '@theia/core/lib/common/types';
+ import { ContributionProvider } from '@theia/core/lib/common/contribution-provider';
+ import { BackendApplicationContribution } from '@theia/core/lib/node/backend-application';
+ import { MiniBrowserService } from '../common/mini-browser-service';
+-import { MiniBrowserEndpoint as MiniBrowserEndpointNS } from '../common/mini-browser-endpoint';
+ /**
+  * The return type of the `FileSystem#resolveContent` method.
+  */
+ export interface FileStatWithContent {
+     /**
+      * The file stat.
+      */
+     readonly stat: fs.Stats & { uri: string };
+     /**
+      * The content of the file as a UTF-8 encoded string.
+@@ -56,53 +54,44 @@
+     priority(): number;
+     /**
+      * Responds back to the sender.
+      */
+     respond(statWithContent: FileStatWithContent, response: Response): MaybePromise<Response>;
+ }
+ @injectable()
+ export class MiniBrowserEndpoint implements BackendApplicationContribution, MiniBrowserService {
+     /**
+      * Endpoint path to handle the request for the given resource.
+-     *
+-     * @deprecated since 1.8.0
+      */
+     static HANDLE_PATH = '/mini-browser/';
+-    private attachRequestHandlerPromise: Promise<void>;
+     @inject(ILogger)
+     protected readonly logger: ILogger;
+     @inject(ContributionProvider)
+     @named(MiniBrowserEndpointHandler)
+     protected readonly contributions: ContributionProvider<MiniBrowserEndpointHandler>;
+     protected readonly handlers: Map<string, MiniBrowserEndpointHandler> = new Map();
+     configure(app: Application): void {
+-        this.attachRequestHandlerPromise = this.attachRequestHandler(app);
++        app.get(`${MiniBrowserEndpoint.HANDLE_PATH}*`, async (request, response) => this.response(await this.getUri(request), response));
+     }
+     async onStart(): Promise<void> {
+-        await Promise.all(Array.from(this.getContributions(), async handler => {
++        for (const handler of this.getContributions()) {
+             const extensions = await handler.supportedExtensions();
+             for (const extension of (Array.isArray(extensions) ? extensions : [extensions]).map(e => e.toLocaleLowerCase())) {
+                 const existingHandler = this.handlers.get(extension);
+                 if (!existingHandler || handler.priority > existingHandler.priority) {
+                     this.handlers.set(extension, handler);
+                 }
+             }
+-        }));
+-        await this.attachRequestHandlerPromise;
++        }
+     }
+     async supportedFileExtensions(): Promise<Readonly<{ extension: string, priority: number }>[]> {
+-        return Array.from(this.handlers.entries(), ([extension, handler]) => ({ extension, priority: handler.priority() }));
+-    }
+-    protected async attachRequestHandler(app: Application): Promise<void> {
+-        const miniBrowserApp = express();
+-        miniBrowserApp.get('*', async (request, response) => this.response(await this.getUri(request), response));
+-        app.use(vhost(await this.getVirtualHostRegExp(), miniBrowserApp));
++        return Array.from(this.handlers.entries()).map(([extension, handler]) => ({ extension, priority: handler.priority() }));
+     }
+     protected async response(uri: string, response: Response): Promise<Response> {
+         const exists = await fs.pathExists(FileUri.fsPath(uri));
+         if (!exists) {
+             return this.missingResourceHandler()(uri, response);
+         }
+         const statWithContent = await this.readContent(uri);
+         try {
+             if (!statWithContent.stat.isDirectory()) {
+                 const extension = uri.split('.').pop();
+@@ -117,21 +106,22 @@
+             }
+         } catch (e) {
+             return this.errorHandler()(e, uri, response);
+         }
+         return this.defaultHandler()(statWithContent, response);
+     }
+     protected getContributions(): MiniBrowserEndpointHandler[] {
+         return this.contributions.getContributions();
+     }
+     protected getUri(request: Request): MaybePromise<string> {
+-        return FileUri.create(request.path).toString(true);
++        const decodedPath = request.path.substr(MiniBrowserEndpoint.HANDLE_PATH.length);
++        return new URI(FileUri.create(decodedPath).toString(true)).toString(true);
+     }
+     protected async readContent(uri: string): Promise<FileStatWithContent> {
+         const fsPath = FileUri.fsPath(uri);
+         const [stat, content] = await Promise.all([fs.stat(fsPath), fs.readFile(fsPath, 'utf8')]);
+         return { stat: Object.assign(stat, { uri }), content };
+     }
+     protected errorHandler(): (error: any, uri: string, response: Response) => MaybePromise<Response> {
+         return async (error: any, uri: string, response: Response) => {
+             const details = error.toString ? error.toString() : error;
+             this.logger.error(`Error occurred while handling request for ${uri}. Details: ${details}`);
+@@ -161,28 +151,20 @@
+             const mimeType = lookup(FileUri.fsPath(statWithContent.stat.uri));
+             if (!mimeType) {
+                 this.logger.warn(`Cannot handle unexpected resource. URI: ${statWithContent.stat.uri}.`);
+                 response.contentType('application/octet-stream');
+             } else {
+                 response.contentType(mimeType);
+             }
+             return response.send(content);
+         };
+     }
+-    protected async getVirtualHostRegExp(): Promise<RegExp> {
+-        const pattern = process.env[MiniBrowserEndpointNS.HOST_PATTERN_ENV] ?? MiniBrowserEndpointNS.HOST_PATTERN_DEFAULT;
+-        const vhostRe = pattern
+-            .replace('.', '\\.')
+-            .replace('{{uuid}}', '.+')
+-            .replace('{{hostname}}', '.+');
+-        return new RegExp(vhostRe, 'i');
+-    }
+ }
+ const CODE_EDITOR_PRIORITY = 100;
+ /**
+  * Endpoint handler contribution for HTML files.
+  */
+ @injectable()
+ export class HtmlHandler implements MiniBrowserEndpointHandler {
+     supportedExtensions(): string[] {
+         return ['html', 'xhtml', 'htm'];
+     }
+
+--- a/packages/mini-browser/src/node/mini-browser-ws-validator.ts
++++ b//dev/null
+@@ -1,45 +0,0 @@
+-/********************************************************************************
+- * Copyright (C) 2020 Ericsson and others.
+- *
+- * This program and the accompanying materials are made available under the
+- * terms of the Eclipse Public License v. 2.0 which is available at
+- * http://www.eclipse.org/legal/epl-2.0.
+- *
+- * This Source Code may also be made available under the following Secondary
+- * Licenses when the conditions for such availability set forth in the Eclipse
+- * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+- * with the GNU Classpath Exception which is available at
+- * https://www.gnu.org/software/classpath/license.html.
+- *
+- * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+- ********************************************************************************/
+-import { WsRequestValidatorContribution } from '@theia/core/lib/node/ws-request-validators';
+-import * as http from 'http';
+-import { injectable, postConstruct } from 'inversify';
+-import * as url from 'url';
+-import { MiniBrowserEndpoint } from '../common/mini-browser-endpoint';
+-/**
+- * Prevents explicit WebSocket connections from the mini-browser virtual host.
+- */
+-@injectable()
+-export class MiniBrowserWsRequestValidator implements WsRequestValidatorContribution {
+-    protected miniBrowserHostRe: RegExp;
+-    @postConstruct()
+-    protected postConstruct(): void {
+-        const pattern = process.env[MiniBrowserEndpoint.HOST_PATTERN_ENV] || MiniBrowserEndpoint.HOST_PATTERN_DEFAULT;
+-        const vhostRe = pattern
+-            .replace('.', '\\.')
+-            .replace('{{uuid}}', '.+')
+-            .replace('{{hostname}}', '.+');
+-        this.miniBrowserHostRe = new RegExp(vhostRe, 'i');
+-    }
+-    async allowWsUpgrade(request: http.IncomingMessage): Promise<boolean> {
+-        if (request.headers.origin) {
+-            const origin = url.parse(request.headers.origin);
+-            if (origin.host && this.miniBrowserHostRe.test(origin.host)) {
+-                return false;
+-            }
+-        }
+-        return true;
+-    }
+-}
+
+--- a/packages/plugin-ext/src/main/node/plugin-ext-backend-module.ts
++++ b/packages/plugin-ext/src/main/node/plugin-ext-backend-module.ts
+@@ -9,21 +9,20 @@
+  * Licenses when the conditions for such availability set forth in the Eclipse
+  * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+  * with the GNU Classpath Exception which is available at
+  * https://www.gnu.org/software/classpath/license.html.
+  *
+  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+  ********************************************************************************/
+ import { interfaces } from 'inversify';
+ import { PluginApiContribution } from './plugin-service';
+ import { BackendApplicationContribution, CliContribution } from '@theia/core/lib/node';
+-import { WsRequestValidatorContribution } from '@theia/core/lib/node/ws-request-validators';
+ import { PluginsKeyValueStorage } from './plugins-key-value-storage';
+ import { PluginDeployerContribution } from './plugin-deployer-contribution';
+ import {
+     PluginDeployer, PluginDeployerResolver, PluginDeployerFileHandler,
+     PluginDeployerDirectoryHandler, PluginServer, pluginServerJsonRpcPath, PluginDeployerParticipant
+ } from '../../common/plugin-protocol';
+ import { PluginDeployerImpl } from './plugin-deployer-impl';
+ import { LocalDirectoryPluginDeployerResolver } from './resolvers/plugin-local-dir-resolver';
+ import { PluginTheiaFileHandler } from './handlers/plugin-theia-file-handler';
+ import { PluginTheiaDirectoryHandler } from './handlers/plugin-theia-directory-handler';
+@@ -32,21 +31,20 @@
+ import { ConnectionHandler, JsonRpcConnectionHandler, bindContributionProvider } from '@theia/core';
+ import { PluginPathsService, pluginPathsServicePath } from '../common/plugin-paths-protocol';
+ import { PluginPathsServiceImpl } from './paths/plugin-paths-service';
+ import { PluginServerHandler } from './plugin-server-handler';
+ import { PluginCliContribution } from './plugin-cli-contribution';
+ import { PluginTheiaEnvironment } from '../common/plugin-theia-environment';
+ import { PluginTheiaDeployerParticipant } from './plugin-theia-deployer-participant';
+ export function bindMainBackend(bind: interfaces.Bind): void {
+     bind(PluginApiContribution).toSelf().inSingletonScope();
+     bind(BackendApplicationContribution).toService(PluginApiContribution);
+-    bind(WsRequestValidatorContribution).toService(PluginApiContribution);
+     bindContributionProvider(bind, PluginDeployerParticipant);
+     bind(PluginDeployer).to(PluginDeployerImpl).inSingletonScope();
+     bind(PluginDeployerContribution).toSelf().inSingletonScope();
+     bind(BackendApplicationContribution).toService(PluginDeployerContribution);
+     bind(PluginDeployerResolver).to(LocalDirectoryPluginDeployerResolver).inSingletonScope();
+     bind(PluginDeployerResolver).to(GithubPluginDeployerResolver).inSingletonScope();
+     bind(PluginDeployerResolver).to(HttpPluginDeployerResolver).inSingletonScope();
+     bind(PluginTheiaEnvironment).toSelf().inSingletonScope();
+     bind(PluginTheiaDeployerParticipant).toSelf().inSingletonScope();
+     bind(PluginDeployerParticipant).toService(PluginTheiaDeployerParticipant);
+
+--- a/packages/plugin-ext/src/main/node/plugin-service.ts
++++ b/packages/plugin-ext/src/main/node/plugin-service.ts
+@@ -6,66 +6,45 @@
+  * http://www.eclipse.org/legal/epl-2.0.
+  *
+  * This Source Code may also be made available under the following Secondary
+  * Licenses when the conditions for such availability set forth in the Eclipse
+  * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+  * with the GNU Classpath Exception which is available at
+  * https://www.gnu.org/software/classpath/license.html.
+  *
+  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+  ********************************************************************************/
+-import * as http from 'http';
+ import * as path from 'path';
+-import * as url from 'url';
+ import connect = require('connect');
+ import serveStatic = require('serve-static');
+ const vhost = require('vhost');
+ import * as express from 'express';
+ import { BackendApplicationContribution } from '@theia/core/lib/node/backend-application';
+-import { injectable, postConstruct } from 'inversify';
++import { injectable } from 'inversify';
+ import { WebviewExternalEndpoint } from '../common/webview-protocol';
+ import { environment } from '@theia/application-package/lib/environment';
+-import { WsRequestValidatorContribution } from '@theia/core/lib/node/ws-request-validators';
+-import { MaybePromise } from '@theia/core/lib/common';
+ const pluginPath = (process.env.HOME || process.env.HOMEPATH || process.env.USERPROFILE) + './theia/plugins/';
+ @injectable()
+-export class PluginApiContribution implements BackendApplicationContribution, WsRequestValidatorContribution {
+-    protected webviewExternalEndpointRegExp: RegExp;
+-    @postConstruct()
+-    protected postConstruct(): void {
+-        const webviewExternalEndpoint = this.webviewExternalEndpoint();
+-        console.log(`Configuring to accept webviews on '${webviewExternalEndpoint}' hostname.`);
+-        this.webviewExternalEndpointRegExp = new RegExp(webviewExternalEndpoint, 'i');
+-    }
++export class PluginApiContribution implements BackendApplicationContribution {
+     configure(app: express.Application): void {
+         app.get('/plugin/:path(*)', (req, res) => {
+             const filePath: string = req.params.path;
+             res.sendFile(pluginPath + filePath);
+         });
+         const webviewApp = connect();
+         webviewApp.use('/webview', serveStatic(path.join(__dirname, '../../../src/main/browser/webview/pre')));
+-        app.use(vhost(this.webviewExternalEndpointRegExp, webviewApp));
++        const webviewExternalEndpoint = this.webviewExternalEndpoint();
++        console.log(`Configuring to accept webviews on '${webviewExternalEndpoint}' hostname.`);
++        app.use(vhost(new RegExp(webviewExternalEndpoint, 'i'), webviewApp));
+     }
+-    allowWsUpgrade(request: http.IncomingMessage): MaybePromise<boolean> {
+-        if (request.headers.origin) {
+-            const origin = url.parse(request.headers.origin);
+-            if (origin.host && this.webviewExternalEndpointRegExp.test(origin.host)) {
+-                return false;
+-            }
+-        }
+-        return true;
+-    }
+-    /**
+-     * Returns a RegExp pattern matching the expected WebView endpoint's host.
+-     */
+     protected webviewExternalEndpoint(): string {
+         let endpointPattern;
+         if (environment.electron.is()) {
+             endpointPattern = WebviewExternalEndpoint.defaultPattern;
+         } else {
+             endpointPattern = process.env[WebviewExternalEndpoint.pattern] || WebviewExternalEndpoint.defaultPattern;
+         }
+-        return `^${endpointPattern
++        return endpointPattern
+             .replace('{{uuid}}', '.+')
+-            .replace('{{hostname}}', '.+')}$`;
++            .replace('{{hostname}}', '.+');
+     }
+ }
+
+--- a/packages/preview/src/browser/preview-link-normalizer.ts
++++ b/packages/preview/src/browser/preview-link-normalizer.ts
+@@ -6,29 +6,27 @@
+  * http://www.eclipse.org/legal/epl-2.0.
+  *
+  * This Source Code may also be made available under the following Secondary
+  * Licenses when the conditions for such availability set forth in the Eclipse
+  * Public License v. 2.0 are satisfied: GNU General Public License, version 2
+  * with the GNU Classpath Exception which is available at
+  * https://www.gnu.org/software/classpath/license.html.
+  *
+  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+  ********************************************************************************/
+-import { injectable, inject } from 'inversify';
++import { injectable } from 'inversify';
+ import URI from '@theia/core/lib/common/uri';
+-import { MiniBrowserEnvironment } from '@theia/mini-browser/lib/browser/environment/mini-browser-environment';
++import { MiniBrowserEndpoint } from '@theia/mini-browser/lib/browser/location-mapper-service';
+ @injectable()
+ export class PreviewLinkNormalizer {
+     protected urlScheme = new RegExp('^[a-z][a-z|0-9|\+|\-|\.]*:', 'i');
+-    @inject(MiniBrowserEnvironment)
+-    protected readonly miniBrowserEnvironment: MiniBrowserEnvironment;
+     normalizeLink(documentUri: URI, link: string): string {
+         try {
+             if (!this.urlScheme.test(link)) {
+                 const location = documentUri.parent.resolve(link).path.toString();
+-                return this.miniBrowserEnvironment.getEndpoint('normalized-link').getRestUrl().resolve(location).toString();
++                return new MiniBrowserEndpoint().getRestUrl().resolve(location).toString();
+             }
+         } catch {
+         }
+         return link;
+     }
+ }

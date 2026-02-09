@@ -1,0 +1,4079 @@
+# ====================================================================
+# FILE: connections/infinispan/src/main/java/org/keycloak/connections/infinispan/DefaultInfinispanConnectionProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-19 ---
+     1| package org.keycloak.connections.infinispan;
+     2| import org.infinispan.Cache;
+     3| import org.infinispan.manager.EmbeddedCacheManager;
+     4| /**
+     5|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     6|  */
+     7| public class DefaultInfinispanConnectionProvider implements InfinispanConnectionProvider {
+     8|     private EmbeddedCacheManager cacheManager;
+     9|     public DefaultInfinispanConnectionProvider(EmbeddedCacheManager cacheManager) {
+    10|         this.cacheManager = cacheManager;
+    11|     }
+    12|     @Override
+    13|     public <K, V> Cache<K, V> getCache(String name) {
+    14|         return cacheManager.getCache(name);
+    15|     }
+    16|     @Override
+    17|     public void close() {
+    18|     }
+    19| }
+
+
+# ====================================================================
+# FILE: connections/infinispan/src/main/java/org/keycloak/connections/infinispan/DefaultInfinispanConnectionProviderFactory.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-98 ---
+     1| package org.keycloak.connections.infinispan;
+     2| import org.infinispan.configuration.cache.CacheMode;
+     3| import org.infinispan.configuration.cache.Configuration;
+     4| import org.infinispan.configuration.cache.ConfigurationBuilder;
+     5| import org.infinispan.configuration.global.GlobalConfigurationBuilder;
+     6| import org.infinispan.manager.DefaultCacheManager;
+     7| import org.infinispan.manager.EmbeddedCacheManager;
+     8| import org.jboss.logging.Logger;
+     9| import org.keycloak.Config;
+    10| import org.keycloak.models.KeycloakSession;
+    11| import javax.naming.InitialContext;
+    12| /**
+    13|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    14|  */
+    15| public class DefaultInfinispanConnectionProviderFactory implements InfinispanConnectionProviderFactory {
+    16|     protected static final Logger logger = Logger.getLogger(DefaultInfinispanConnectionProviderFactory.class);
+    17|     private Config.Scope config;
+    18|     private EmbeddedCacheManager cacheManager;
+    19|     private boolean containerManaged;
+    20|     @Override
+    21|     public InfinispanConnectionProvider create(KeycloakSession session) {
+    22|         lazyInit();
+    23|         return new DefaultInfinispanConnectionProvider(cacheManager);
+    24|     }
+    25|     @Override
+    26|     public void close() {
+    27|         if (cacheManager != null && !containerManaged) {
+    28|             cacheManager.stop();
+    29|         }
+    30|         cacheManager = null;
+    31|     }
+    32|     @Override
+    33|     public String getId() {
+    34|         return "default";
+    35|     }
+    36|     @Override
+    37|     public void init(Config.Scope config) {
+    38|         this.config = config;
+    39|     }
+    40|     private void lazyInit() {
+    41|         if (cacheManager == null) {
+    42|             synchronized (this) {
+    43|                 if (cacheManager == null) {
+    44|                     String cacheContainer = config.get("cacheContainer");
+    45|                     if (cacheContainer != null) {
+    46|                         initContainerManaged(cacheContainer);
+    47|                     } else {
+    48|                         initEmbedded();
+    49|                     }
+    50|                 }
+    51|             }
+    52|         }
+    53|     }
+    54|     private void initContainerManaged(String cacheContainerLookup) {
+    55|         try {
+    56|             cacheManager = (EmbeddedCacheManager) new InitialContext().lookup(cacheContainerLookup);
+    57|             containerManaged = true;
+    58|             logger.debugv("Using container managed Infinispan cache container, lookup={1}", cacheContainerLookup);
+    59|         } catch (Exception e) {
+    60|             throw new RuntimeException("Failed to retrieve cache container", e);
+    61|         }
+    62|     }
+    63|     private void initEmbedded() {
+    64|         GlobalConfigurationBuilder gcb = new GlobalConfigurationBuilder();
+    65|         boolean clustered = config.getBoolean("clustered", false);
+    66|         boolean async = config.getBoolean("async", true);
+    67|         if (clustered) {
+    68|             gcb.transport().defaultTransport();
+    69|         }
+    70|         cacheManager = new DefaultCacheManager(gcb.build());
+    71|         containerManaged = false;
+    72|         logger.debug("Started embedded Infinispan cache container");
+    73|         ConfigurationBuilder invalidationConfigBuilder = new ConfigurationBuilder();
+    74|         if (clustered) {
+    75|             invalidationConfigBuilder.clustering().cacheMode(async ? CacheMode.INVALIDATION_ASYNC : CacheMode.INVALIDATION_SYNC);
+    76|         }
+    77|         Configuration invalidationCacheConfiguration = invalidationConfigBuilder.build();
+    78|         cacheManager.defineConfiguration(InfinispanConnectionProvider.REALM_CACHE_NAME, invalidationCacheConfiguration);
+    79|         cacheManager.defineConfiguration(InfinispanConnectionProvider.USER_CACHE_NAME, invalidationCacheConfiguration);
+    80|         ConfigurationBuilder sessionConfigBuilder = new ConfigurationBuilder();
+    81|         if (clustered) {
+    82|             String sessionsMode = config.get("sessionsMode", "distributed");
+    83|             if (sessionsMode.equalsIgnoreCase("replicated")) {
+    84|                 sessionConfigBuilder.clustering().cacheMode(async ? CacheMode.REPL_ASYNC : CacheMode.REPL_SYNC);
+    85|             } else if (sessionsMode.equalsIgnoreCase("distributed")) {
+    86|                 sessionConfigBuilder.clustering().cacheMode(async ? CacheMode.DIST_ASYNC : CacheMode.DIST_SYNC);
+    87|             } else {
+    88|                 throw new RuntimeException("Invalid value for sessionsMode");
+    89|             }
+    90|             sessionConfigBuilder.clustering().hash()
+    91|                     .numOwners(config.getInt("sessionsOwners", 2))
+    92|                     .numSegments(config.getInt("sessionsSegments", 60)).build();
+    93|         }
+    94|         Configuration sessionCacheConfiguration = sessionConfigBuilder.build();
+    95|         cacheManager.defineConfiguration(InfinispanConnectionProvider.SESSION_CACHE_NAME, sessionCacheConfiguration);
+    96|         cacheManager.defineConfiguration(InfinispanConnectionProvider.LOGIN_FAILURE_CACHE_NAME, sessionCacheConfiguration);
+    97|     }
+    98| }
+
+
+# ====================================================================
+# FILE: connections/infinispan/src/main/java/org/keycloak/connections/infinispan/InfinispanConnectionProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-13 ---
+     1| package org.keycloak.connections.infinispan;
+     2| import org.infinispan.Cache;
+     3| import org.keycloak.provider.Provider;
+     4| /**
+     5|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     6|  */
+     7| public interface InfinispanConnectionProvider extends Provider {
+     8|     static final String REALM_CACHE_NAME = "realms";
+     9|     static final String USER_CACHE_NAME = "users";
+    10|     static final String SESSION_CACHE_NAME = "sessions";
+    11|     static final String LOGIN_FAILURE_CACHE_NAME = "loginFailures";
+    12|     <K, V> Cache<K, V> getCache(String name);
+    13| }
+
+
+# ====================================================================
+# FILE: connections/infinispan/src/main/java/org/keycloak/connections/infinispan/InfinispanConnectionProviderFactory.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-7 ---
+     1| package org.keycloak.connections.infinispan;
+     2| import org.keycloak.provider.ProviderFactory;
+     3| /**
+     4|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     5|  */
+     6| public interface InfinispanConnectionProviderFactory extends ProviderFactory<InfinispanConnectionProvider> {
+     7| }
+
+
+# ====================================================================
+# FILE: connections/infinispan/src/main/java/org/keycloak/connections/infinispan/InfinispanConnectionSpi.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-21 ---
+     1| package org.keycloak.connections.infinispan;
+     2| import org.keycloak.provider.Provider;
+     3| import org.keycloak.provider.ProviderFactory;
+     4| import org.keycloak.provider.Spi;
+     5| /**
+     6|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     7|  */
+     8| public class InfinispanConnectionSpi implements Spi {
+     9|     @Override
+    10|     public String getName() {
+    11|         return "connectionsInfinispan";
+    12|     }
+    13|     @Override
+    14|     public Class<? extends Provider> getProviderClass() {
+    15|         return InfinispanConnectionProvider.class;
+    16|     }
+    17|     @Override
+    18|     public Class<? extends ProviderFactory> getProviderFactoryClass() {
+    19|         return InfinispanConnectionProviderFactory.class;
+    20|     }
+    21| }
+
+
+# ====================================================================
+# FILE: connections/jpa-liquibase/src/main/java/org/keycloak/connections/jpa/updater/liquibase/LiquibaseJpaUpdaterProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-183 ---
+     1| package org.keycloak.connections.jpa.updater.liquibase;
+     2| import liquibase.Contexts;
+     3| import liquibase.Liquibase;
+     4| import liquibase.changelog.ChangeSet;
+     5| import liquibase.changelog.DatabaseChangeLog;
+     6| import liquibase.changelog.RanChangeSet;
+     7| import liquibase.database.Database;
+     8| import liquibase.database.DatabaseFactory;
+     9| import liquibase.database.core.DB2Database;
+    10| import liquibase.database.core.DerbyDatabase;
+    11| import liquibase.database.core.FirebirdDatabase;
+    12| import liquibase.database.core.H2Database;
+    13| import liquibase.database.core.HsqlDatabase;
+    14| import liquibase.database.core.InformixDatabase;
+    15| import liquibase.database.core.MSSQLDatabase;
+    16| import liquibase.database.core.MySQLDatabase;
+    17| import liquibase.database.core.OracleDatabase;
+    18| import liquibase.database.core.PostgresDatabase;
+    19| import liquibase.database.core.SQLiteDatabase;
+    20| import liquibase.database.core.SybaseASADatabase;
+    21| import liquibase.database.core.SybaseDatabase;
+    22| import liquibase.database.jvm.JdbcConnection;
+    23| import liquibase.exception.LiquibaseException;
+    24| import liquibase.logging.LogFactory;
+    25| import liquibase.logging.LogLevel;
+    26| import liquibase.resource.ClassLoaderResourceAccessor;
+    27| import liquibase.servicelocator.ServiceLocator;
+    28| import org.jboss.logging.Logger;
+    29| import org.keycloak.connections.jpa.updater.JpaUpdaterProvider;
+    30| import java.sql.Connection;
+    31| import java.sql.ResultSet;
+    32| import java.sql.SQLException;
+    33| import java.sql.Statement;
+    34| import java.util.List;
+    35| /**
+    36|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    37|  */
+    38| public class LiquibaseJpaUpdaterProvider implements JpaUpdaterProvider {
+    39|     private static final Logger logger = Logger.getLogger(LiquibaseJpaUpdaterProvider.class);
+    40|     private static final String CHANGELOG = "META-INF/jpa-changelog-master.xml";
+    41|     @Override
+    42|     public String getCurrentVersionSql() {
+    43|         return "SELECT ID from DATABASECHANGELOG ORDER BY DATEEXECUTED DESC LIMIT 1";
+    44|     }
+    45|     @Override
+    46|     public void update(Connection connection) {
+    47|         logger.debug("Starting database update");
+    48|         try {
+    49|             Liquibase liquibase = getLiquibase(connection);
+    50|             List<ChangeSet> changeSets = liquibase.listUnrunChangeSets((Contexts) null);
+    51|             if (!changeSets.isEmpty()) {
+    52|                 if (changeSets.get(0).getId().equals(FIRST_VERSION)) {
+    53|                     Statement statement = connection.createStatement();
+    54|                     try {
+    55|                         statement.executeQuery("SELECT id FROM REALM");
+    56|                         logger.infov("Updating database from {0} to {1}", FIRST_VERSION, changeSets.get(changeSets.size() - 1).getId());
+    57|                         liquibase.markNextChangeSetRan((Contexts) null);
+    58|                     } catch (SQLException e) {
+    59|                         logger.info("Initializing database schema");
+    60|                     }
+    61|                 } else {
+    62|                     if (logger.isDebugEnabled()) {
+    63|                         List<RanChangeSet> ranChangeSets = liquibase.getDatabase().getRanChangeSetList();
+    64|                         logger.debugv("Updating database from {0} to {1}", ranChangeSets.get(ranChangeSets.size() - 1).getId(), changeSets.get(changeSets.size() - 1).getId());
+    65|                     } else {
+    66|                         logger.infov("Updating database");
+    67|                     }
+    68|                 }
+    69|                 liquibase.update((Contexts) null);
+    70|             }
+    71|         } catch (Exception e) {
+    72|             throw new RuntimeException("Failed to update database", e);
+    73|         }
+    74|         logger.debug("Completed database update");
+    75|     }
+    76|     @Override
+    77|     public void validate(Connection connection) {
+    78|         try {
+    79|             Liquibase liquibase = getLiquibase(connection);
+    80|             liquibase.validate();
+    81|         } catch (Exception e) {
+    82|             throw new RuntimeException("Failed to validate database", e);
+    83|         }
+    84|     }
+    85|     private Liquibase getLiquibase(Connection connection) throws Exception {
+    86|         ServiceLocator sl = ServiceLocator.getInstance();
+    87|         if (!System.getProperties().containsKey("liquibase.scan.packages")) {
+    88|             if (sl.getPackages().remove("liquibase.core")) {
+    89|                 sl.addPackageToScan("liquibase.core.xml");
+    90|             }
+    91|             if (sl.getPackages().remove("liquibase.parser")) {
+    92|                 sl.addPackageToScan("liquibase.parser.core.xml");
+    93|             }
+    94|             if (sl.getPackages().remove("liquibase.serializer")) {
+    95|                 sl.addPackageToScan("liquibase.serializer.core.xml");
+    96|             }
+    97|             sl.getPackages().remove("liquibase.ext");
+    98|             sl.getPackages().remove("liquibase.sdk");
+    99|         }
+   100|         LogFactory.setInstance(new LogWrapper());
+   101|         Database database = DatabaseFactory.getInstance().findCorrectDatabaseImplementation(new JdbcConnection(connection));
+   102|         return new Liquibase(CHANGELOG, new ClassLoaderResourceAccessor(getClass().getClassLoader()), database);
+   103|     }
+   104|     @Override
+   105|     public void close() {
+   106|     }
+   107|     private static class LogWrapper extends LogFactory {
+   108|         private liquibase.logging.Logger logger = new liquibase.logging.Logger() {
+   109|             @Override
+   110|             public void setName(String name) {
+   111|             }
+   112|             @Override
+   113|             public void setLogLevel(String level) {
+   114|             }
+   115|             @Override
+   116|             public void setLogLevel(LogLevel level) {
+   117|             }
+   118|             @Override
+   119|             public void setLogLevel(String logLevel, String logFile) {
+   120|             }
+   121|             @Override
+   122|             public void severe(String message) {
+   123|                 LiquibaseJpaUpdaterProvider.logger.error(message);
+   124|             }
+   125|             @Override
+   126|             public void severe(String message, Throwable e) {
+   127|                 LiquibaseJpaUpdaterProvider.logger.error(message, e);
+   128|             }
+   129|             @Override
+   130|             public void warning(String message) {
+   131|                 LiquibaseJpaUpdaterProvider.logger.warn(message);
+   132|             }
+   133|             @Override
+   134|             public void warning(String message, Throwable e) {
+   135|                 LiquibaseJpaUpdaterProvider.logger.warn(message, e);
+   136|             }
+   137|             @Override
+   138|             public void info(String message) {
+   139|                 LiquibaseJpaUpdaterProvider.logger.debug(message);
+   140|             }
+   141|             @Override
+   142|             public void info(String message, Throwable e) {
+   143|                 LiquibaseJpaUpdaterProvider.logger.debug(message, e);
+   144|             }
+   145|             @Override
+   146|             public void debug(String message) {
+   147|                 LiquibaseJpaUpdaterProvider.logger.trace(message);
+   148|             }
+   149|             @Override
+   150|             public LogLevel getLogLevel() {
+   151|                 if (LiquibaseJpaUpdaterProvider.logger.isTraceEnabled()) {
+   152|                     return LogLevel.DEBUG;
+   153|                 } else if (LiquibaseJpaUpdaterProvider.logger.isDebugEnabled()) {
+   154|                     return LogLevel.INFO;
+   155|                 } else {
+   156|                     return LogLevel.WARNING;
+   157|                 }
+   158|             }
+   159|             @Override
+   160|             public void debug(String message, Throwable e) {
+   161|                 LiquibaseJpaUpdaterProvider.logger.trace(message, e);
+   162|             }
+   163|             @Override
+   164|             public void setChangeLog(DatabaseChangeLog databaseChangeLog) {
+   165|             }
+   166|             @Override
+   167|             public void setChangeSet(ChangeSet changeSet) {
+   168|             }
+   169|             @Override
+   170|             public int getPriority() {
+   171|                 return 0;
+   172|             }
+   173|         };
+   174|         @Override
+   175|         public liquibase.logging.Logger getLog(String name) {
+   176|             return logger;
+   177|         }
+   178|         @Override
+   179|         public liquibase.logging.Logger getLog() {
+   180|             return logger;
+   181|         }
+   182|     }
+   183| }
+
+
+# ====================================================================
+# FILE: connections/jpa-liquibase/src/main/java/org/keycloak/connections/jpa/updater/liquibase/LiquibaseJpaUpdaterProviderFactory.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-24 ---
+     1| package org.keycloak.connections.jpa.updater.liquibase;
+     2| import org.keycloak.Config;
+     3| import org.keycloak.connections.jpa.updater.JpaUpdaterProvider;
+     4| import org.keycloak.connections.jpa.updater.JpaUpdaterProviderFactory;
+     5| import org.keycloak.models.KeycloakSession;
+     6| /**
+     7|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     8|  */
+     9| public class LiquibaseJpaUpdaterProviderFactory implements JpaUpdaterProviderFactory {
+    10|     @Override
+    11|     public JpaUpdaterProvider create(KeycloakSession session) {
+    12|         return new LiquibaseJpaUpdaterProvider();
+    13|     }
+    14|     @Override
+    15|     public void init(Config.Scope config) {
+    16|     }
+    17|     @Override
+    18|     public void close() {
+    19|     }
+    20|     @Override
+    21|     public String getId() {
+    22|         return "liquibase";
+    23|     }
+    24| }
+
+
+# ====================================================================
+# FILE: connections/jpa-liquibase/src/main/java/org/keycloak/connections/jpa/updater/liquibase/custom/AddRealmCodeSecret.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-61 ---
+     1| package org.keycloak.connections.jpa.updater.liquibase.custom;
+     2| import liquibase.change.custom.CustomSqlChange;
+     3| import liquibase.database.Database;
+     4| import liquibase.database.jvm.JdbcConnection;
+     5| import liquibase.exception.CustomChangeException;
+     6| import liquibase.exception.SetupException;
+     7| import liquibase.exception.ValidationErrors;
+     8| import liquibase.resource.ResourceAccessor;
+     9| import liquibase.statement.SqlStatement;
+    10| import liquibase.statement.core.UpdateStatement;
+    11| import org.keycloak.models.utils.KeycloakModelUtils;
+    12| import java.sql.Connection;
+    13| import java.sql.ResultSet;
+    14| import java.util.ArrayList;
+    15| /**
+    16|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    17|  */
+    18| public class AddRealmCodeSecret implements CustomSqlChange {
+    19|     private String confirmationMessage;
+    20|     @Override
+    21|     public SqlStatement[] generateStatements(Database database) throws CustomChangeException {
+    22|         try {
+    23|             StringBuilder sb = new StringBuilder();
+    24|             sb.append("Generated codeSecret for realms: ");
+    25|             Connection connection = ((JdbcConnection) (database.getConnection())).getWrappedConnection();
+    26|             ResultSet resultSet = connection.createStatement().executeQuery("SELECT ID FROM REALM WHERE CODE_SECRET IS NULL");
+    27|             ArrayList<SqlStatement> statements = new ArrayList<SqlStatement>();
+    28|             while (resultSet.next()) {
+    29|                 String id = resultSet.getString(1);
+    30|                 UpdateStatement statement = new UpdateStatement(null, null, "REALM")
+    31|                         .addNewColumnValue("CODE_SECRET", KeycloakModelUtils.generateCodeSecret())
+    32|                         .setWhereClause("ID='" + id + "'");
+    33|                 statements.add(statement);
+    34|                 if (!resultSet.isFirst()) {
+    35|                     sb.append(", ");
+    36|                 }
+    37|                 sb.append(id);
+    38|             }
+    39|             if (!statements.isEmpty()) {
+    40|                 confirmationMessage = sb.toString();
+    41|             }
+    42|             return statements.toArray(new SqlStatement[statements.size()]);
+    43|         } catch (Exception e) {
+    44|             throw new CustomChangeException("Failed to add realm code secret", e);
+    45|         }
+    46|     }
+    47|     @Override
+    48|     public String getConfirmationMessage() {
+    49|         return confirmationMessage;
+    50|     }
+    51|     @Override
+    52|     public void setUp() throws SetupException {
+    53|     }
+    54|     @Override
+    55|     public void setFileOpener(ResourceAccessor resourceAccessor) {
+    56|     }
+    57|     @Override
+    58|     public ValidationErrors validate(Database database) {
+    59|         return null;
+    60|     }
+    61| }
+
+
+# ====================================================================
+# FILE: connections/jpa/src/main/java/org/keycloak/connections/jpa/DefaultJpaConnectionProviderFactory.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-146 ---
+     1| package org.keycloak.connections.jpa;
+     2| import org.hibernate.ejb.AvailableSettings;
+     3| import org.jboss.logging.Logger;
+     4| import org.keycloak.Config;
+     5| import org.keycloak.connections.jpa.updater.JpaUpdaterProvider;
+     6| import org.keycloak.models.KeycloakSession;
+     7| import javax.naming.InitialContext;
+     8| import javax.persistence.EntityManager;
+     9| import javax.persistence.EntityManagerFactory;
+    10| import javax.persistence.Persistence;
+    11| import javax.sql.DataSource;
+    12| import java.sql.Connection;
+    13| import java.sql.DriverManager;
+    14| import java.sql.ResultSet;
+    15| import java.sql.SQLException;
+    16| import java.util.HashMap;
+    17| import java.util.Map;
+    18| /**
+    19|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    20|  */
+    21| public class DefaultJpaConnectionProviderFactory implements JpaConnectionProviderFactory {
+    22|     private static final Logger logger = Logger.getLogger(DefaultJpaConnectionProviderFactory.class);
+    23|     private volatile EntityManagerFactory emf;
+    24|     private Config.Scope config;
+    25|     @Override
+    26|     public JpaConnectionProvider create(KeycloakSession session) {
+    27|         lazyInit(session);
+    28|         EntityManager em = emf.createEntityManager();
+    29|         em = PersistenceExceptionConverter.create(em);
+    30|         session.getTransaction().enlist(new JpaKeycloakTransaction(em));
+    31|         return new DefaultJpaConnectionProvider(em);
+    32|     }
+    33|     @Override
+    34|     public void close() {
+    35|         if (emf != null) {
+    36|             emf.close();
+    37|         }
+    38|     }
+    39|     @Override
+    40|     public String getId() {
+    41|         return "default";
+    42|     }
+    43|     @Override
+    44|     public void init(Config.Scope config) {
+    45|         this.config = config;
+    46|     }
+    47|     private void lazyInit(KeycloakSession session) {
+    48|         if (emf == null) {
+    49|             synchronized (this) {
+    50|                 if (emf == null) {
+    51|                     logger.debug("Initializing JPA connections");
+    52|                     Connection connection = null;
+    53|                     String unitName = config.get("unitName");
+    54|                     String databaseSchema = config.get("databaseSchema");
+    55|                     Map<String, Object> properties = new HashMap<String, Object>();
+    56|                     if (unitName == null) {
+    57|                         unitName = "keycloak-default";
+    58|                         String dataSource = config.get("dataSource");
+    59|                         if (dataSource != null) {
+    60|                             if (config.getBoolean("jta", false)) {
+    61|                                 properties.put(AvailableSettings.JTA_DATASOURCE, dataSource);
+    62|                             } else {
+    63|                                 properties.put(AvailableSettings.NON_JTA_DATASOURCE, dataSource);
+    64|                             }
+    65|                         } else {
+    66|                             properties.put(AvailableSettings.JDBC_URL, config.get("url"));
+    67|                             properties.put(AvailableSettings.JDBC_DRIVER, config.get("driver"));
+    68|                             String user = config.get("user");
+    69|                             if (user != null) {
+    70|                                 properties.put(AvailableSettings.JDBC_USER, user);
+    71|                             }
+    72|                             String password = config.get("password");
+    73|                             if (password != null) {
+    74|                                 properties.put(AvailableSettings.JDBC_PASSWORD, password);
+    75|                             }
+    76|                         }
+    77|                         String driverDialect = config.get("driverDialect");
+    78|                         if (driverDialect != null && driverDialect.length() > 0) {
+    79|                             properties.put("hibernate.dialect", driverDialect);
+    80|                         }
+    81|                         if (databaseSchema != null) {
+    82|                             if (databaseSchema.equals("development-update")) {
+    83|                                 properties.put("hibernate.hbm2ddl.auto", "update");
+    84|                                 databaseSchema = null;
+    85|                             } else if (databaseSchema.equals("development-validate")) {
+    86|                                 properties.put("hibernate.hbm2ddl.auto", "validate");
+    87|                                 databaseSchema = null;
+    88|                             }
+    89|                         }
+    90|                         properties.put("hibernate.show_sql", config.getBoolean("showSql", false));
+    91|                         properties.put("hibernate.format_sql", config.getBoolean("formatSql", true));
+    92|                     }
+    93|                     if (databaseSchema != null) {
+    94|                         logger.trace("Updating database");
+    95|                         JpaUpdaterProvider updater = session.getProvider(JpaUpdaterProvider.class);
+    96|                         connection = getConnection();
+    97|                         if (databaseSchema.equals("update")) {
+    98|                             String currentVersion = null;
+    99|                             try {
+   100|                                 ResultSet resultSet = connection.createStatement().executeQuery(updater.getCurrentVersionSql());
+   101|                                 if (resultSet.next()) {
+   102|                                     currentVersion = resultSet.getString(1);
+   103|                                 }
+   104|                             } catch (SQLException e) {
+   105|                             }
+   106|                             if (currentVersion == null || !JpaUpdaterProvider.LAST_VERSION.equals(currentVersion)) {
+   107|                                 updater.update(connection);
+   108|                             } else {
+   109|                                 logger.debug("Database is up to date");
+   110|                             }
+   111|                         } else if (databaseSchema.equals("validate")) {
+   112|                             updater.validate(connection);
+   113|                         } else {
+   114|                             throw new RuntimeException("Invalid value for databaseSchema: " + databaseSchema);
+   115|                         }
+   116|                         logger.trace("Database update completed");
+   117|                     }
+   118|                     logger.trace("Creating EntityManagerFactory");
+   119|                     emf = Persistence.createEntityManagerFactory(unitName, properties);
+   120|                     logger.trace("EntityManagerFactory created");
+   121|                     if (connection != null) {
+   122|                         try {
+   123|                             connection.close();
+   124|                         } catch (SQLException e) {
+   125|                             logger.warn(e);
+   126|                         }
+   127|                     }
+   128|                 }
+   129|             }
+   130|         }
+   131|     }
+   132|     private Connection getConnection() {
+   133|         try {
+   134|             String dataSourceLookup = config.get("dataSource");
+   135|             if (dataSourceLookup != null) {
+   136|                 DataSource dataSource = (DataSource) new InitialContext().lookup(dataSourceLookup);
+   137|                 return dataSource.getConnection();
+   138|             } else {
+   139|                 Class.forName(config.get("driver"));
+   140|                 return DriverManager.getConnection(config.get("url"), config.get("user"), config.get("password"));
+   141|             }
+   142|         } catch (Exception e) {
+   143|             throw new RuntimeException("Failed to connect to database", e);
+   144|         }
+   145|     }
+   146| }
+
+
+# ====================================================================
+# FILE: connections/jpa/src/main/java/org/keycloak/connections/jpa/updater/JpaUpdaterProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-13 ---
+     1| package org.keycloak.connections.jpa.updater;
+     2| import org.keycloak.provider.Provider;
+     3| import java.sql.Connection;
+     4| /**
+     5|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     6|  */
+     7| public interface JpaUpdaterProvider extends Provider {
+     8|     public String FIRST_VERSION = "1.0.0.Final";
+     9|     public String LAST_VERSION = "1.1.0.Beta1";
+    10|     public String getCurrentVersionSql();
+    11|     public void update(Connection connection);
+    12|     public void validate(Connection connection);
+    13| }
+
+
+# ====================================================================
+# FILE: connections/jpa/src/main/java/org/keycloak/connections/jpa/updater/JpaUpdaterProviderFactory.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-7 ---
+     1| package org.keycloak.connections.jpa.updater;
+     2| import org.keycloak.provider.ProviderFactory;
+     3| /**
+     4|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     5|  */
+     6| public interface JpaUpdaterProviderFactory extends ProviderFactory<JpaUpdaterProvider> {
+     7| }
+
+
+# ====================================================================
+# FILE: connections/jpa/src/main/java/org/keycloak/connections/jpa/updater/JpaUpdaterSpi.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-21 ---
+     1| package org.keycloak.connections.jpa.updater;
+     2| import org.keycloak.provider.Provider;
+     3| import org.keycloak.provider.ProviderFactory;
+     4| import org.keycloak.provider.Spi;
+     5| /**
+     6|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     7|  */
+     8| public class JpaUpdaterSpi implements Spi {
+     9|     @Override
+    10|     public String getName() {
+    11|         return "connectionsJpaUpdater";
+    12|     }
+    13|     @Override
+    14|     public Class<? extends Provider> getProviderClass() {
+    15|         return JpaUpdaterProvider.class;
+    16|     }
+    17|     @Override
+    18|     public Class<? extends ProviderFactory> getProviderFactoryClass() {
+    19|         return JpaUpdaterProviderFactory.class;
+    20|     }
+    21| }
+
+
+# ====================================================================
+# FILE: connections/mongo/src/main/java/org/keycloak/connections/mongo/DefaultMongoConnectionFactoryProvider.java
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-34 ---
+     1| package org.keycloak.connections.mongo;
+     2| import com.mongodb.DB;
+     3| import com.mongodb.MongoClient;
+     4| import com.mongodb.MongoClientOptions;
+     5| import com.mongodb.MongoCredential;
+     6| import com.mongodb.ServerAddress;
+     7| import org.jboss.logging.Logger;
+     8| import org.keycloak.Config;
+     9| import org.keycloak.connections.mongo.api.MongoStore;
+    10| import org.keycloak.connections.mongo.impl.MongoStoreImpl;
+    11| import org.keycloak.connections.mongo.impl.context.TransactionMongoStoreInvocationContext;
+    12| import org.keycloak.connections.mongo.updater.DefaultMongoUpdaterProvider;
+    13| import org.keycloak.models.KeycloakSession;
+    14| import java.lang.reflect.Method;
+    15| import java.util.Collections;
+    16| /**
+    17|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    18|  */
+    19| public class DefaultMongoConnectionFactoryProvider implements MongoConnectionProviderFactory {
+    20|     private String[] entities = new String[]{
+    21|             "org.keycloak.models.mongo.keycloak.entities.MongoRealmEntity",
+    22|             "org.keycloak.models.mongo.keycloak.entities.MongoUserEntity",
+    23|             "org.keycloak.models.mongo.keycloak.entities.MongoRoleEntity",
+    24|             "org.keycloak.models.entities.RequiredCredentialEntity",
+    25|             "org.keycloak.models.entities.CredentialEntity",
+    26|             "org.keycloak.models.entities.SocialLinkEntity",
+    27|             "org.keycloak.models.mongo.keycloak.entities.MongoApplicationEntity",
+    28|             "org.keycloak.models.mongo.keycloak.entities.MongoOAuthClientEntity",
+    29|             "org.keycloak.models.sessions.mongo.entities.MongoUsernameLoginFailureEntity",
+    30|             "org.keycloak.models.sessions.mongo.entities.MongoUserSessionEntity",
+    31|             "org.keycloak.models.sessions.mongo.entities.MongoClientSessionEntity",
+    32|             "org.keycloak.models.entities.UserFederationProviderEntity"
+    33|     };
+    34|     private static final Logger logger = Logger.getLogger(DefaultMongoConnectionFactoryProvider.class);
+
+# --- HUNK 2: Lines 38-138 ---
+    38|     private Config.Scope config;
+    39|     @Override
+    40|     public MongoConnectionProvider create(KeycloakSession session) {
+    41|         lazyInit();
+    42|         TransactionMongoStoreInvocationContext invocationContext = new TransactionMongoStoreInvocationContext(mongoStore);
+    43|         session.getTransaction().enlist(new MongoKeycloakTransaction(invocationContext));
+    44|         return new DefaultMongoConnectionProvider(db, mongoStore, invocationContext);
+    45|     }
+    46|     @Override
+    47|     public void init(Config.Scope config) {
+    48|         this.config = config;
+    49|     }
+    50|     private void lazyInit() {
+    51|         if (client == null) {
+    52|             synchronized (this) {
+    53|                 if (client == null) {
+    54|                     try {
+    55|                         String host = config.get("host", ServerAddress.defaultHost());
+    56|                         int port = config.getInt("port", ServerAddress.defaultPort());
+    57|                         String dbName = config.get("db", "keycloak");
+    58|                         String user = config.get("user");
+    59|                         String password = config.get("password");
+    60|                         MongoClientOptions clientOptions = getClientOptions();
+    61|                         if (user != null && password != null) {
+    62|                             MongoCredential credential = MongoCredential.createMongoCRCredential(user, dbName, password.toCharArray());
+    63|                             client = new MongoClient(new ServerAddress(host, port), Collections.singletonList(credential), clientOptions);
+    64|                         } else {
+    65|                             client = new MongoClient(new ServerAddress(host, port), clientOptions);
+    66|                         }
+    67|                         this.db = client.getDB(dbName);
+    68|                         String databaseSchema = config.get("databaseSchema");
+    69|                         if (databaseSchema != null) {
+    70|                             if (databaseSchema.equals("update")) {
+    71|                                 new DefaultMongoUpdaterProvider().update(db);
+    72|                             } else {
+    73|                                 throw new RuntimeException("Invalid value for databaseSchema: " + databaseSchema);
+    74|                             }
+    75|                         }
+    76|                         this.mongoStore = new MongoStoreImpl(db, getManagedEntities());
+    77|                         logger.debugv("Initialized mongo model. host: %s, port: %d, db: %s", host, port, dbName);
+    78|                     } catch (Exception e) {
+    79|                         throw new RuntimeException(e);
+    80|                     }
+    81|                 }
+    82|             }
+    83|         }
+    84|     }
+    85|     private Class[] getManagedEntities() throws ClassNotFoundException {
+    86|        Class[] entityClasses = new Class[entities.length];
+    87|         for (int i = 0; i < entities.length; i++) {
+    88|             entityClasses[i] = Thread.currentThread().getContextClassLoader().loadClass(entities[i]);
+    89|         }
+    90|         return entityClasses;
+    91|     }
+    92|     @Override
+    93|     public void close() {
+    94|         if (client != null) {
+    95|             client.close();
+    96|         }
+    97|     }
+    98|     @Override
+    99|     public String getId() {
+   100|         return "default";
+   101|     }
+   102|     protected MongoClientOptions getClientOptions() {
+   103|         MongoClientOptions.Builder builder = MongoClientOptions.builder();
+   104|         checkIntOption("connectionsPerHost", builder);
+   105|         checkIntOption("threadsAllowedToBlockForConnectionMultiplier", builder);
+   106|         checkIntOption("maxWaitTime", builder);
+   107|         checkIntOption("connectTimeout", builder);
+   108|         checkIntOption("socketTimeout", builder);
+   109|         checkBooleanOption("socketKeepAlive", builder);
+   110|         checkBooleanOption("autoConnectRetry", builder);
+   111|         if (config.getLong("maxAutoConnectRetryTime") != null) {
+   112|             builder.maxAutoConnectRetryTime(config.getLong("maxAutoConnectRetryTime"));
+   113|         }
+   114|         return builder.build();
+   115|     }
+   116|     protected void checkBooleanOption(String optionName, MongoClientOptions.Builder builder) {
+   117|         Boolean val = config.getBoolean(optionName);
+   118|         if (val != null) {
+   119|             try {
+   120|                 Method m = MongoClientOptions.Builder.class.getMethod(optionName, boolean.class);
+   121|                 m.invoke(builder, val);
+   122|             } catch (Exception e) {
+   123|                 throw new IllegalStateException("Problem configuring boolean option " + optionName + " for mongo client. Ensure you used correct value true or false and if this option is supported by mongo driver", e);
+   124|             }
+   125|         }
+   126|     }
+   127|     protected void checkIntOption(String optionName, MongoClientOptions.Builder builder) {
+   128|         Integer val = config.getInt(optionName);
+   129|         if (val != null) {
+   130|             try {
+   131|                 Method m = MongoClientOptions.Builder.class.getMethod(optionName, int.class);
+   132|                 m.invoke(builder, val);
+   133|             } catch (Exception e) {
+   134|                 throw new IllegalStateException("Problem configuring int option " + optionName + " for mongo client. Ensure you used correct value (number) and if this option is supported by mongo driver", e);
+   135|             }
+   136|         }
+   137|     }
+   138| }
+
+
+# ====================================================================
+# FILE: connections/mongo/src/main/java/org/keycloak/connections/mongo/impl/MongoStoreImpl.java
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-94 ---
+     1| package org.keycloak.connections.mongo.impl;
+     2| import com.mongodb.BasicDBList;
+     3| import com.mongodb.BasicDBObject;
+     4| import com.mongodb.DB;
+     5| import com.mongodb.DBCollection;
+     6| import com.mongodb.DBCursor;
+     7| import com.mongodb.DBObject;
+     8| import com.mongodb.MongoException;
+     9| import org.jboss.logging.Logger;
+    10| import org.keycloak.connections.mongo.api.MongoCollection;
+    11| import org.keycloak.connections.mongo.api.MongoEntity;
+    12| import org.keycloak.connections.mongo.api.MongoIdentifiableEntity;
+    13| import org.keycloak.connections.mongo.api.MongoStore;
+    14| import org.keycloak.connections.mongo.api.context.MongoStoreInvocationContext;
+    15| import org.keycloak.connections.mongo.api.context.MongoTask;
+    16| import org.keycloak.connections.mongo.api.types.Mapper;
+    17| import org.keycloak.connections.mongo.api.types.MapperContext;
+    18| import org.keycloak.connections.mongo.api.types.MapperRegistry;
+    19| import org.keycloak.connections.mongo.impl.types.BasicDBListMapper;
+    20| import org.keycloak.connections.mongo.impl.types.BasicDBObjectMapper;
+    21| import org.keycloak.connections.mongo.impl.types.BasicDBObjectToMapMapper;
+    22| import org.keycloak.connections.mongo.impl.types.EnumToStringMapper;
+    23| import org.keycloak.connections.mongo.impl.types.ListMapper;
+    24| import org.keycloak.connections.mongo.impl.types.MapMapper;
+    25| import org.keycloak.connections.mongo.impl.types.MongoEntityMapper;
+    26| import org.keycloak.connections.mongo.impl.types.SimpleMapper;
+    27| import org.keycloak.connections.mongo.impl.types.StringToEnumMapper;
+    28| import org.keycloak.models.ModelDuplicateException;
+    29| import org.keycloak.models.ModelException;
+    30| import org.keycloak.models.utils.KeycloakModelUtils;
+    31| import org.keycloak.models.utils.reflection.Property;
+    32| import org.keycloak.models.utils.reflection.PropertyQueries;
+    33| import java.util.ArrayList;
+    34| import java.util.Date;
+    35| import java.util.HashMap;
+    36| import java.util.List;
+    37| import java.util.Map;
+    38| import java.util.concurrent.ConcurrentHashMap;
+    39| import java.util.concurrent.ConcurrentMap;
+    40| /**
+    41|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+    42|  */
+    43| public class MongoStoreImpl implements MongoStore {
+    44|     private static final Class<?>[] SIMPLE_TYPES = { String.class, Integer.class, Boolean.class, Long.class, Double.class, Character.class, Date.class, byte[].class };
+    45|     private final DB database;
+    46|     private static final Logger logger = Logger.getLogger(MongoStoreImpl.class);
+    47|     private final MapperRegistry mapperRegistry;
+    48|     private ConcurrentMap<Class<?>, EntityInfo> entityInfoCache =
+    49|             new ConcurrentHashMap<Class<?>, EntityInfo>();
+    50|     public MongoStoreImpl(DB database, Class<?>[] managedEntityTypes) {
+    51|         this.database = database;
+    52|         mapperRegistry = new MapperRegistry();
+    53|         for (Class<?> simpleMapperClass : SIMPLE_TYPES) {
+    54|             SimpleMapper mapper = new SimpleMapper(simpleMapperClass);
+    55|             mapperRegistry.addAppObjectMapper(mapper);
+    56|             mapperRegistry.addDBObjectMapper(mapper);
+    57|         }
+    58|         mapperRegistry.addAppObjectMapper(new ListMapper(mapperRegistry, ArrayList.class));
+    59|         mapperRegistry.addAppObjectMapper(new ListMapper(mapperRegistry, List.class));
+    60|         mapperRegistry.addDBObjectMapper(new BasicDBListMapper(mapperRegistry));
+    61|         mapperRegistry.addAppObjectMapper(new MapMapper(HashMap.class));
+    62|         mapperRegistry.addAppObjectMapper(new MapMapper(Map.class));
+    63|         mapperRegistry.addDBObjectMapper(new BasicDBObjectToMapMapper());
+    64|         mapperRegistry.addAppObjectMapper(new EnumToStringMapper());
+    65|         mapperRegistry.addDBObjectMapper(new StringToEnumMapper());
+    66|         for (Class<?> type : managedEntityTypes) {
+    67|             getEntityInfo(type);
+    68|             mapperRegistry.addAppObjectMapper(new MongoEntityMapper(this, mapperRegistry, type));
+    69|             mapperRegistry.addDBObjectMapper(new BasicDBObjectMapper(this, mapperRegistry, type));
+    70|         }
+    71|     }
+    72|     protected void dropDatabase() {
+    73|         this.database.dropDatabase();
+    74|         logger.info("Database " + this.database.getName() + " dropped in MongoDB");
+    75|     }
+    76|     @Override
+    77|     public void insertEntity(MongoIdentifiableEntity entity, MongoStoreInvocationContext context) {
+    78|         Class<? extends MongoEntity> clazz = entity.getClass();
+    79|         EntityInfo entityInfo = getEntityInfo(clazz);
+    80|         BasicDBObject dbObject = mapperRegistry.convertApplicationObjectToDBObject(entity, BasicDBObject.class);
+    81|         DBCollection dbCollection = database.getCollection(entityInfo.getDbCollectionName());
+    82|         String currentId = entity.getId();
+    83|         if (currentId == null) {
+    84|             currentId = KeycloakModelUtils.generateId();
+    85|             entity.setId(currentId);
+    86|         }
+    87|         dbObject.put("_id", currentId);
+    88|         try {
+    89|             dbCollection.insert(dbObject);
+    90|         } catch (MongoException e) {
+    91|             throw convertException(e);
+    92|         }
+    93|         context.addCreatedEntity(entity);
+    94|     }
+
+# --- HUNK 2: Lines 172-223 ---
+   172|     }
+   173|     public <T extends MongoIdentifiableEntity> int countEntities(Class<T> type, DBObject query, MongoStoreInvocationContext context) {
+   174|         context.beforeDBSearch(type);
+   175|         DBCollection dbCollection = getDBCollectionForType(type);
+   176|         Long count = dbCollection.count(query);
+   177|         return count.intValue();
+   178|     }
+   179|     @Override
+   180|     public boolean removeEntity(MongoIdentifiableEntity entity, MongoStoreInvocationContext context) {
+   181|         return removeEntity(entity.getClass(), entity.getId(), context);
+   182|     }
+   183|     @Override
+   184|     public boolean removeEntity(Class<? extends MongoIdentifiableEntity> type, String id, MongoStoreInvocationContext context) {
+   185|         MongoIdentifiableEntity found = loadEntity(type, id, context);
+   186|         if (found == null) {
+   187|             return false;
+   188|         } else {
+   189|             DBCollection dbCollection = getDBCollectionForType(type);
+   190|             BasicDBObject dbQuery = new BasicDBObject("_id", id);
+   191|             dbCollection.remove(dbQuery);
+   192|             context.addRemovedEntity(found);
+   193|             return true;
+   194|         }
+   195|     }
+   196|     @Override
+   197|     public boolean removeEntities(Class<? extends MongoIdentifiableEntity> type, DBObject query, MongoStoreInvocationContext context) {
+   198|         List<? extends MongoIdentifiableEntity> foundObjects = loadEntities(type, query, context);
+   199|         if (foundObjects.size() == 0) {
+   200|             return false;
+   201|         } else {
+   202|             DBCollection dbCollection = getDBCollectionForType(type);
+   203|             dbCollection.remove(query);
+   204|             for (MongoIdentifiableEntity found : foundObjects) {
+   205|                 context.addRemovedEntity(found);;
+   206|             }
+   207|             return true;
+   208|         }
+   209|     }
+   210|     @Override
+   211|     public <S> boolean pushItemToList(final MongoIdentifiableEntity entity, final String listPropertyName, S itemToPush, boolean skipIfAlreadyPresent, MongoStoreInvocationContext context) {
+   212|         final Class<? extends MongoEntity> type = entity.getClass();
+   213|         EntityInfo entityInfo = getEntityInfo(type);
+   214|         Property<Object> listProperty = entityInfo.getPropertyByName(listPropertyName);
+   215|         if (listProperty == null) {
+   216|             throw new IllegalArgumentException("Property " + listPropertyName + " doesn't exist on object " + entity);
+   217|         }
+   218|         List<S> list = (List<S>)listProperty.getValue(entity);
+   219|         if (list == null) {
+   220|             list = new ArrayList<S>();
+   221|             listProperty.setValue(entity, list);
+   222|         }
+   223|         if (skipIfAlreadyPresent && list.contains(itemToPush)) {
+
+
+# ====================================================================
+# FILE: connections/mongo/src/main/java/org/keycloak/connections/mongo/impl/types/BasicDBObjectToMapMapper.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-38 ---
+     1| package org.keycloak.connections.mongo.impl.types;
+     2| import com.mongodb.BasicDBObject;
+     3| import org.keycloak.connections.mongo.api.types.Mapper;
+     4| import org.keycloak.connections.mongo.api.types.MapperContext;
+     5| import java.util.HashMap;
+     6| import java.util.Map;
+     7| /**
+     8|  * For now, there is support just for convert to Map<String, simpleType>
+     9|  *
+    10|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+    11|  */
+    12| public class BasicDBObjectToMapMapper implements Mapper<BasicDBObject, Map> {
+    13|     @Override
+    14|     public Map convertObject(MapperContext<BasicDBObject, Map> context) {
+    15|         BasicDBObject dbObjectToConvert = context.getObjectToConvert();
+    16|         HashMap<String, Object> result = new HashMap<String, Object>();
+    17|         for (Map.Entry<String, Object> entry : dbObjectToConvert.entrySet()) {
+    18|             String key = entry.getKey();
+    19|             Object value = entry.getValue();
+    20|             if (value instanceof Double && context.getGenericTypes().get(1) == Integer.class) {
+    21|                 value = ((Double)value).intValue();
+    22|             }
+    23|             if (key.contains(MapMapper.DOT_PLACEHOLDER)) {
+    24|                 key = key.replaceAll(MapMapper.DOT_PLACEHOLDER, ".");
+    25|             }
+    26|             result.put(key, value);
+    27|         }
+    28|         return result;
+    29|     }
+    30|     @Override
+    31|     public Class<? extends BasicDBObject> getTypeOfObjectToConvert() {
+    32|         return BasicDBObject.class;
+    33|     }
+    34|     @Override
+    35|     public Class<Map> getExpectedReturnType() {
+    36|         return Map.class;
+    37|     }
+    38| }
+
+
+# ====================================================================
+# FILE: connections/mongo/src/main/java/org/keycloak/connections/mongo/impl/types/MapMapper.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-41 ---
+     1| package org.keycloak.connections.mongo.impl.types;
+     2| import com.mongodb.BasicDBObject;
+     3| import org.keycloak.connections.mongo.api.types.Mapper;
+     4| import org.keycloak.connections.mongo.api.types.MapperContext;
+     5| import java.util.Map;
+     6| import java.util.Set;
+     7| /**
+     8|  * For now, we support just convert from Map<String, simpleType>
+     9|  *
+    10|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+    11|  */
+    12| public class MapMapper<T extends Map> implements Mapper<T, BasicDBObject> {
+    13|     static final String DOT_PLACEHOLDER = "###";
+    14|     private final Class<T> mapType;
+    15|     public MapMapper(Class<T> mapType) {
+    16|         this.mapType = mapType;
+    17|     }
+    18|     @Override
+    19|     public BasicDBObject convertObject(MapperContext<T, BasicDBObject> context) {
+    20|         T objectToConvert = context.getObjectToConvert();
+    21|         BasicDBObject dbObject = new BasicDBObject();
+    22|         Set<Map.Entry> entries = objectToConvert.entrySet();
+    23|         for (Map.Entry entry : entries) {
+    24|             String key = (String)entry.getKey();
+    25|             Object value = entry.getValue();
+    26|             if (key.contains(".")) {
+    27|                 key = key.replaceAll("\\.", DOT_PLACEHOLDER);
+    28|             }
+    29|             dbObject.put(key, value);
+    30|         }
+    31|         return dbObject;
+    32|     }
+    33|     @Override
+    34|     public Class<? extends T> getTypeOfObjectToConvert() {
+    35|         return mapType;
+    36|     }
+    37|     @Override
+    38|     public Class<BasicDBObject> getExpectedReturnType() {
+    39|         return BasicDBObject.class;
+    40|     }
+    41| }
+
+
+# ====================================================================
+# FILE: connections/mongo/src/main/java/org/keycloak/connections/mongo/updater/DefaultMongoUpdaterProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-85 ---
+     1| package org.keycloak.connections.mongo.updater;
+     2| import com.mongodb.BasicDBObject;
+     3| import com.mongodb.DB;
+     4| import com.mongodb.DBCollection;
+     5| import com.mongodb.DBCursor;
+     6| import com.mongodb.DBObject;
+     7| import org.jboss.logging.Logger;
+     8| import org.keycloak.connections.mongo.updater.updates.Update;
+     9| import org.keycloak.connections.mongo.updater.updates.Update1_0_0_Final;
+    10| import org.keycloak.connections.mongo.updater.updates.Update1_1_0_Beta1;
+    11| import java.util.Arrays;
+    12| import java.util.Collections;
+    13| import java.util.Date;
+    14| import java.util.HashSet;
+    15| import java.util.LinkedHashSet;
+    16| import java.util.LinkedList;
+    17| import java.util.List;
+    18| import java.util.Set;
+    19| /**
+    20|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    21|  */
+    22| public class DefaultMongoUpdaterProvider implements MongoUpdaterProvider {
+    23|     public static final Logger log = Logger.getLogger(DefaultMongoUpdaterProvider.class);
+    24|     public static final String CHANGE_LOG_COLLECTION = "databaseChangeLog";
+    25|     private Class<? extends Update>[] updates = new Class[]{
+    26|             Update1_0_0_Final.class,
+    27|             Update1_1_0_Beta1.class
+    28|     };
+    29|     @Override
+    30|     public void update(DB db) {
+    31|         log.debug("Starting database update");
+    32|         try {
+    33|             boolean changeLogExists = db.collectionExists(CHANGE_LOG_COLLECTION);
+    34|             boolean realmExists = db.collectionExists("realms");
+    35|             DBCollection changeLog = db.getCollection(CHANGE_LOG_COLLECTION);
+    36|             List<String> executed = new LinkedList<String>();
+    37|             if (!changeLogExists && realmExists) {
+    38|                 Update1_0_0_Final u = new Update1_0_0_Final();
+    39|                 executed.add(u.getId());
+    40|                 createLog(changeLog, u, 1);
+    41|             } else if (changeLogExists) {
+    42|                 DBCursor cursor = changeLog.find().sort(new BasicDBObject("orderExecuted", 1));
+    43|                 while (cursor.hasNext()) {
+    44|                     executed.add((String) cursor.next().get("_id"));
+    45|                 }
+    46|             }
+    47|             List<Update> updatesToRun = new LinkedList<Update>();
+    48|             for (Class<? extends Update> updateClass : updates) {
+    49|                 Update u = updateClass.newInstance();
+    50|                 if (!executed.contains(u.getId())) {
+    51|                     updatesToRun.add(u);
+    52|                 }
+    53|             }
+    54|             if (!updatesToRun.isEmpty()) {
+    55|                 if (executed.isEmpty()) {
+    56|                     log.info("Initializing database schema");
+    57|                 } else {
+    58|                     if (log.isDebugEnabled()) {
+    59|                         log.infov("Updating database from {0} to {1}", executed.get(executed.size() - 1), updatesToRun.get(updatesToRun.size() - 1).getId());
+    60|                     } else {
+    61|                         log.debugv("Updating database");
+    62|                     }
+    63|                 }
+    64|                 int order = executed.size();
+    65|                 for (Update u : updatesToRun) {
+    66|                     log.debugv("Executing updates for {0}", u.getId());
+    67|                     u.setLog(log);
+    68|                     u.setDb(db);
+    69|                     u.update();
+    70|                     createLog(changeLog, u, ++order);
+    71|                     log.debugv("Completed updates for {0}", u.getId());
+    72|                 }
+    73|             }
+    74|         } catch (Exception e) {
+    75|             throw new RuntimeException("Failed to update database", e);
+    76|         }
+    77|         log.debug("Completed database update");
+    78|     }
+    79|     private void createLog(DBCollection changeLog, Update update, int orderExecuted) {
+    80|         changeLog.insert(new BasicDBObject("_id", update.getId()).append("dateExecuted", new Date()).append("orderExecuted", orderExecuted));
+    81|     }
+    82|     @Override
+    83|     public void close() {
+    84|     }
+    85| }
+
+
+# ====================================================================
+# FILE: connections/mongo/src/main/java/org/keycloak/connections/mongo/updater/DefaultMongoUpdaterProviderFactory.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-22 ---
+     1| package org.keycloak.connections.mongo.updater;
+     2| import org.keycloak.Config;
+     3| import org.keycloak.models.KeycloakSession;
+     4| /**
+     5|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     6|  */
+     7| public class DefaultMongoUpdaterProviderFactory implements MongoUpdaterProviderFactory {
+     8|     @Override
+     9|     public MongoUpdaterProvider create(KeycloakSession session) {
+    10|         return new DefaultMongoUpdaterProvider();
+    11|     }
+    12|     @Override
+    13|     public void init(Config.Scope config) {
+    14|     }
+    15|     @Override
+    16|     public void close() {
+    17|     }
+    18|     @Override
+    19|     public String getId() {
+    20|         return "default";
+    21|     }
+    22| }
+
+
+# ====================================================================
+# FILE: connections/mongo/src/main/java/org/keycloak/connections/mongo/updater/MongoUpdaterProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-9 ---
+     1| package org.keycloak.connections.mongo.updater;
+     2| import com.mongodb.DB;
+     3| import org.keycloak.provider.Provider;
+     4| /**
+     5|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     6|  */
+     7| public interface MongoUpdaterProvider extends Provider {
+     8|     public void update(DB db);
+     9| }
+
+
+# ====================================================================
+# FILE: connections/mongo/src/main/java/org/keycloak/connections/mongo/updater/MongoUpdaterProviderFactory.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-7 ---
+     1| package org.keycloak.connections.mongo.updater;
+     2| import org.keycloak.provider.ProviderFactory;
+     3| /**
+     4|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     5|  */
+     6| public interface MongoUpdaterProviderFactory extends ProviderFactory<MongoUpdaterProvider> {
+     7| }
+
+
+# ====================================================================
+# FILE: connections/mongo/src/main/java/org/keycloak/connections/mongo/updater/MongoUpdaterSpi.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-21 ---
+     1| package org.keycloak.connections.mongo.updater;
+     2| import org.keycloak.provider.Provider;
+     3| import org.keycloak.provider.ProviderFactory;
+     4| import org.keycloak.provider.Spi;
+     5| /**
+     6|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     7|  */
+     8| public class MongoUpdaterSpi implements Spi {
+     9|     @Override
+    10|     public String getName() {
+    11|         return "connectionsMongoUpdater";
+    12|     }
+    13|     @Override
+    14|     public Class<? extends Provider> getProviderClass() {
+    15|         return MongoUpdaterProvider.class;
+    16|     }
+    17|     @Override
+    18|     public Class<? extends ProviderFactory> getProviderFactoryClass() {
+    19|         return MongoUpdaterProviderFactory.class;
+    20|     }
+    21| }
+
+
+# ====================================================================
+# FILE: connections/mongo/src/main/java/org/keycloak/connections/mongo/updater/updates/Update.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-45 ---
+     1| package org.keycloak.connections.mongo.updater.updates;
+     2| import com.mongodb.BasicDBObject;
+     3| import com.mongodb.DB;
+     4| import com.mongodb.DBCollection;
+     5| import org.jboss.logging.Logger;
+     6| import java.util.Arrays;
+     7| /**
+     8|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     9|  */
+    10| public abstract class Update {
+    11|     protected DB db;
+    12|     protected Logger log;
+    13|     public abstract String getId();
+    14|     public abstract void update() throws ClassNotFoundException;
+    15|     protected DBCollection createCollection(String name) {
+    16|         if (db.collectionExists(name)) {
+    17|             throw new RuntimeException("Failed to create collection {0}: collection already exists");
+    18|         }
+    19|         DBCollection col = db.getCollection(name);
+    20|         log.debugv("Created collection {0}", name);
+    21|         return col;
+    22|     }
+    23|     protected void ensureIndex(String name, String field, boolean unique, boolean sparse) {
+    24|         ensureIndex(name, new String[]{field}, unique, sparse);
+    25|     }
+    26|     protected void ensureIndex(String name, String[] fields, boolean unique, boolean sparse) {
+    27|         DBCollection col = db.getCollection(name);
+    28|         BasicDBObject o = new BasicDBObject();
+    29|         for (String f : fields) {
+    30|             o.append(f, 1);
+    31|         }
+    32|         col.ensureIndex(o, new BasicDBObject("unique", unique).append("sparse", sparse));
+    33|         log.debugv("Created index {0}, fields={1}, unique={2}, sparse={3}", name, Arrays.toString(fields), unique, sparse);
+    34|     }
+    35|     protected void deleteEntries(String collection) {
+    36|         db.getCollection(collection).remove(new BasicDBObject());
+    37|         log.debugv("Deleted entries from {0}", collection);
+    38|     }
+    39|     public void setLog(Logger log) {
+    40|         this.log = log;
+    41|     }
+    42|     public void setDb(DB db) {
+    43|         this.db = db;
+    44|     }
+    45| }
+
+
+# ====================================================================
+# FILE: connections/mongo/src/main/java/org/keycloak/connections/mongo/updater/updates/Update1_0_0_Final.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-31 ---
+     1| package org.keycloak.connections.mongo.updater.updates;
+     2| import com.mongodb.BasicDBObject;
+     3| import com.mongodb.DBCollection;
+     4| import org.keycloak.connections.mongo.updater.DefaultMongoUpdaterProvider;
+     5| /**
+     6|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     7|  */
+     8| public class Update1_0_0_Final extends Update {
+     9|     @Override
+    10|     public String getId() {
+    11|         return "1.0.0.Final";
+    12|     }
+    13|     @Override
+    14|     public void update() throws ClassNotFoundException {
+    15|         DBCollection realmsCollection = db.getCollection("realms");
+    16|         realmsCollection.ensureIndex(new BasicDBObject("name", 1), new BasicDBObject("unique", true));
+    17|         DefaultMongoUpdaterProvider.log.debugv("Created collection {0}", "realms");
+    18|         createCollection("users");
+    19|         ensureIndex("users", new String[] { "realmId", "username"}, true, false);
+    20|         ensureIndex("users", "emailIndex", true, true);
+    21|         createCollection("roles");
+    22|         ensureIndex("roles", "nameIndex", true, false);
+    23|         createCollection("applications");
+    24|         ensureIndex("applications", new String[]{"realmId", "name"}, true, false);
+    25|         createCollection("oauthClients");
+    26|         ensureIndex("oauthClients", new String[] { "realmId", "name"}, true, false);
+    27|         createCollection("userFailures");
+    28|         createCollection("sessions");
+    29|         createCollection("clientSessions");
+    30|     }
+    31| }
+
+
+# ====================================================================
+# FILE: connections/mongo/src/main/java/org/keycloak/connections/mongo/updater/updates/Update1_1_0_Beta1.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-34 ---
+     1| package org.keycloak.connections.mongo.updater.updates;
+     2| import com.mongodb.DBCollection;
+     3| import com.mongodb.DBCursor;
+     4| import com.mongodb.DBObject;
+     5| import com.mongodb.QueryBuilder;
+     6| import org.keycloak.models.utils.KeycloakModelUtils;
+     7| import java.util.Arrays;
+     8| /**
+     9|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    10|  */
+    11| public class Update1_1_0_Beta1 extends Update {
+    12|     @Override
+    13|     public String getId() {
+    14|         return "1.1.0.Beta1";
+    15|     }
+    16|     @Override
+    17|     public void update() {
+    18|         deleteEntries("clientSessions");
+    19|         deleteEntries("sessions");
+    20|         addRealmCodeSecret();
+    21|     }
+    22|     private void addRealmCodeSecret() {
+    23|         DBCollection realms = db.getCollection("realms");
+    24|         DBObject query = new QueryBuilder()
+    25|                 .and("codeSecret").is(null).get();
+    26|         DBCursor objects = realms.find(query);
+    27|         while (objects.hasNext()) {
+    28|             DBObject object = objects.next();
+    29|             object.put("codeSecret", KeycloakModelUtils.generateCodeSecret());
+    30|             realms.save(object);
+    31|             log.debugv("Added realm.codeSecret, id={0}", object.get("id"));
+    32|         }
+    33|     }
+    34| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/AbstractOAuthClient.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-39 ---
+     1| package org.keycloak;
+     2| import org.keycloak.enums.RelativeUrlsUsed;
+     3| import org.keycloak.util.KeycloakUriBuilder;
+     4| import java.util.Map;
+     5| import java.util.UUID;
+     6| import java.util.concurrent.atomic.AtomicLong;
+     7| /**
+     8|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+     9|  * @version $Revision: 1 $
+    10|  */
+    11| public class AbstractOAuthClient {
+    12|     private static final String OAUTH_TOKEN_REQUEST_STATE = "OAuth_Token_Request_State";
+    13|     private final AtomicLong counter = new AtomicLong();
+    14|     protected String clientId;
+    15|     protected Map<String, String> credentials;
+    16|     protected String authUrl;
+    17|     protected String codeUrl;
+    18|     protected String refreshUrl;
+    19|     protected RelativeUrlsUsed relativeUrlsUsed;
+    20|     protected String scope;
+    21|     protected String stateCookieName = OAUTH_TOKEN_REQUEST_STATE;
+    22|     protected String stateCookiePath;
+    23|     protected boolean isSecure;
+    24|     protected boolean publicClient;
+    25|     protected String getStateCode() {
+    26|         return counter.getAndIncrement() + "/" + UUID.randomUUID().toString();
+    27|     }
+    28|     public String getClientId() {
+    29|         return clientId;
+    30|     }
+    31|     public void setClientId(String clientId) {
+    32|         this.clientId = clientId;
+    33|     }
+    34|     public Map<String, String> getCredentials() {
+    35|         return credentials;
+    36|     }
+    37|     public void setCredentials(Map<String, String> credentials) {
+    38|         this.credentials = credentials;
+    39|     }
+
+# --- HUNK 2: Lines 62-94 ---
+    62|         this.scope = scope;
+    63|     }
+    64|     public String getStateCookieName() {
+    65|         return stateCookieName;
+    66|     }
+    67|     public void setStateCookieName(String stateCookieName) {
+    68|         this.stateCookieName = stateCookieName;
+    69|     }
+    70|     public String getStateCookiePath() {
+    71|         return stateCookiePath;
+    72|     }
+    73|     public void setStateCookiePath(String stateCookiePath) {
+    74|         this.stateCookiePath = stateCookiePath;
+    75|     }
+    76|     public boolean isPublicClient() {
+    77|         return publicClient;
+    78|     }
+    79|     public void setPublicClient(boolean publicClient) {
+    80|         this.publicClient = publicClient;
+    81|     }
+    82|     public RelativeUrlsUsed getRelativeUrlsUsed() {
+    83|         return relativeUrlsUsed;
+    84|     }
+    85|     public void setRelativeUrlsUsed(RelativeUrlsUsed relativeUrlsUsed) {
+    86|         this.relativeUrlsUsed = relativeUrlsUsed;
+    87|     }
+    88|     protected String stripOauthParametersFromRedirect(String uri) {
+    89|         KeycloakUriBuilder builder = KeycloakUriBuilder.fromUri(uri)
+    90|                 .replaceQueryParam(OAuth2Constants.CODE, null)
+    91|                 .replaceQueryParam(OAuth2Constants.STATE, null);
+    92|         return builder.build().toString();
+    93|     }
+    94| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/Config.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 77-123 ---
+    77|             return v != null ? Integer.parseInt(v) : defaultValue;
+    78|         }
+    79|         @Override
+    80|         public Long getLong(String key) {
+    81|             return getLong(key, null);
+    82|         }
+    83|         @Override
+    84|         public Long getLong(String key, Long defaultValue) {
+    85|             String v = get(key, null);
+    86|             return v != null ? Long.parseLong(v) : defaultValue;
+    87|         }
+    88|         @Override
+    89|         public Boolean getBoolean(String key) {
+    90|             return getBoolean(key, null);
+    91|         }
+    92|         @Override
+    93|         public Boolean getBoolean(String key, Boolean defaultValue) {
+    94|             String v = get(key, null);
+    95|             return v != null ? Boolean.parseBoolean(v) : defaultValue;
+    96|         }
+    97|         @Override
+    98|         public Scope scope(String... scope) {
+    99|             StringBuilder sb = new StringBuilder();
+   100|             sb.append(prefix + ".");
+   101|             for (String s : scope) {
+   102|                 sb.append(s);
+   103|                 sb.append(".");
+   104|             }
+   105|             return new SystemPropertiesScope(sb.toString());
+   106|         }
+   107|     }
+   108|     /**
+   109|      * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+   110|      */
+   111|     public static interface Scope {
+   112|         String get(String key);
+   113|         String get(String key, String defaultValue);
+   114|         String[] getArray(String key);
+   115|         Integer getInt(String key);
+   116|         Integer getInt(String key, Integer defaultValue);
+   117|         Long getLong(String key);
+   118|         Long getLong(String key, Long defaultValue);
+   119|         Boolean getBoolean(String key);
+   120|         Boolean getBoolean(String key, Boolean defaultValue);
+   121|         Scope scope(String... scope);
+   122|     }
+   123| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/KeycloakPrincipal.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-35 ---
+     1| package org.keycloak;
+     2| import java.io.Serializable;
+     3| import java.security.Principal;
+     4| /**
+     5|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+     6|  * @version $Revision: 1 $
+     7|  */
+     8| public class KeycloakPrincipal<T extends KeycloakSecurityContext> implements Principal, Serializable {
+     9|     protected final String name;
+    10|     protected final T context;
+    11|     public KeycloakPrincipal(String name, T context) {
+    12|         this.name = name;
+    13|         this.context = context;
+    14|     }
+    15|     public T getKeycloakSecurityContext() {
+    16|         return context;
+    17|     }
+    18|     @Override
+    19|     public String getName() {
+    20|         return name;
+    21|     }
+    22|     @Override
+    23|     public boolean equals(Object o) {
+    24|         if (this == o) return true;
+    25|         if (o == null || getClass() != o.getClass()) return false;
+    26|         KeycloakPrincipal that = (KeycloakPrincipal) o;
+    27|         if (!name.equals(that.name)) return false;
+    28|         return true;
+    29|     }
+    30|     @Override
+    31|     public int hashCode() {
+    32|         return name.hashCode();
+    33|     }
+    34|     @Override
+    35|     public String toString() {
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/KeycloakSecurityContext.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-58 ---
+     1| package org.keycloak;
+     2| import org.keycloak.representations.AccessToken;
+     3| import org.keycloak.representations.IDToken;
+     4| import org.keycloak.util.Base64Url;
+     5| import org.keycloak.util.JsonSerialization;
+     6| import java.io.IOException;
+     7| import java.io.ObjectInputStream;
+     8| import java.io.ObjectOutputStream;
+     9| import java.io.Serializable;
+    10| /**
+    11|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+    12|  * @version $Revision: 1 $
+    13|  */
+    14| public class KeycloakSecurityContext implements Serializable {
+    15|     protected String tokenString;
+    16|     protected String idTokenString;
+    17|     protected transient AccessToken token;
+    18|     protected transient IDToken idToken;
+    19|     public KeycloakSecurityContext() {
+    20|     }
+    21|     public KeycloakSecurityContext(String tokenString, AccessToken token, String idTokenString, IDToken idToken) {
+    22|         this.tokenString = tokenString;
+    23|         this.token = token;
+    24|         this.idToken = idToken;
+    25|         this.idTokenString = idTokenString;
+    26|     }
+    27|     public AccessToken getToken() {
+    28|         return token;
+    29|     }
+    30|     public String getTokenString() {
+    31|         return tokenString;
+    32|     }
+    33|     public IDToken getIdToken() {
+    34|         return idToken;
+    35|     }
+    36|     public String getIdTokenString() {
+    37|         return idTokenString;
+    38|     }
+    39|     public String getRealm() {
+    40|         return token.getIssuer();
+    41|     }
+    42|     private void writeObject(ObjectOutputStream out) throws IOException {
+    43|         out.defaultWriteObject();
+    44|     }
+    45|     private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+    46|         in.defaultReadObject();
+    47|         token = parseToken(tokenString, AccessToken.class);
+    48|         idToken = parseToken(idTokenString, IDToken.class);
+    49|     }
+    50|     private <T> T parseToken(String encoded, Class<T> clazz) throws IOException {
+    51|         if (encoded == null)
+    52|             return null;
+    53|         String[] parts = encoded.split("\\.");
+    54|         if (parts.length < 2 || parts.length > 3) throw new IllegalArgumentException("Parsing error");
+    55|         byte[] bytes = Base64Url.decode(parts[1]);
+    56|         return JsonSerialization.readValue(bytes, clazz);
+    57|     }
+    58| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/RSATokenVerifier.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 13-48 ---
+    13|         return verifyToken(tokenString, realmKey, realm, true);
+    14|     }
+    15|     public static AccessToken verifyToken(String tokenString, PublicKey realmKey, String realm, boolean checkActive) throws VerificationException {
+    16|         JWSInput input = null;
+    17|         try {
+    18|             input = new JWSInput(tokenString);
+    19|         } catch (Exception e) {
+    20|             throw new VerificationException("Couldn't parse token", e);
+    21|         }
+    22|         if (!isPublicKeyValid(input, realmKey)) throw new VerificationException("Invalid token signature.");
+    23|         AccessToken token;
+    24|         try {
+    25|             token = input.readJsonContent(AccessToken.class);
+    26|         } catch (IOException e) {
+    27|             throw new VerificationException("Couldn't parse token signature", e);
+    28|         }
+    29|         String user = token.getSubject();
+    30|         if (user == null) {
+    31|             throw new VerificationException("Token user was null.");
+    32|         }
+    33|         if (!realm.equals(token.getIssuer())) {
+    34|             throw new VerificationException("Token audience doesn't match domain.");
+    35|         }
+    36|         if (checkActive && !token.isActive()) {
+    37|             throw new VerificationException("Token is not active.");
+    38|         }
+    39|         return token;
+    40|     }
+    41|     private static boolean isPublicKeyValid(JWSInput input, PublicKey realmKey) throws VerificationException {
+    42|         try {
+    43|             return RSAProvider.verify(input, realmKey);
+    44|         } catch (Exception e) {
+    45|             throw new VerificationException("Token signature not validated.", e);
+    46|         }
+    47|     }
+    48| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/ServiceUrlConstants.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-16 ---
+     1| package org.keycloak;
+     2| /**
+     3|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+     4|  * @version $Revision: 1 $
+     5|  */
+     6| public interface ServiceUrlConstants {
+     7|     public static final String TOKEN_SERVICE_LOGIN_PATH = "/realms/{realm-name}/protocol/openid-connect/login";
+     8|     public static final String TOKEN_SERVICE_ACCESS_CODE_PATH = "/realms/{realm-name}/protocol/openid-connect/access/codes";
+     9|     public static final String TOKEN_SERVICE_REFRESH_PATH = "/realms/{realm-name}/protocol/openid-connect/refresh";
+    10|     public static final String TOKEN_SERVICE_LOGOUT_PATH = "/realms/{realm-name}/protocol/openid-connect/logout";
+    11|     public static final String TOKEN_SERVICE_DIRECT_GRANT_PATH = "/realms/{realm-name}/protocol/openid-connect/grants/access";
+    12|     public static final String ACCOUNT_SERVICE_PATH = "/realms/{realm-name}/account";
+    13|     public static final String REALM_INFO_PATH = "/realms/{realm-name}";
+    14|     public static final String CLIENTS_MANAGEMENT_REGISTER_NODE_PATH = "/realms/{realm-name}/clients-managements/register-node";
+    15|     public static final String CLIENTS_MANAGEMENT_UNREGISTER_NODE_PATH = "/realms/{realm-name}/clients-managements/unregister-node";
+    16| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/adapters/AdapterConstants.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-17 ---
+     1| package org.keycloak.adapters;
+     2| /**
+     3|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+     4|  * @version $Revision: 1 $
+     5|  */
+     6| public interface AdapterConstants {
+     7|     public static final String K_LOGOUT = "k_logout";
+     8|     public static final String K_VERSION = "k_version";
+     9|     public static final String K_PUSH_NOT_BEFORE = "k_push_not_before";
+    10|     public static final String K_TEST_AVAILABLE = "k_test_available";
+    11|     public static final String K_QUERY_BEARER_TOKEN = "k_query_bearer_token";
+    12|     String AUTH_DATA_PARAM_NAME = "org.keycloak.json.adapterConfig";
+    13|     public static final String APPLICATION_SESSION_STATE = "application_session_state";
+    14|     public static final String APPLICATION_SESSION_HOST = "application_session_host";
+    15|     public static final String APPLICATION_CLUSTER_HOST = "application_cluster_host";
+    16|     public static final String KEYCLOAK_ADAPTER_STATE_COOKIE = "KEYCLOAK_ADAPTER_STATE";
+    17| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/enums/RelativeUrlsUsed.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-31 ---
+     1| package org.keycloak.enums;
+     2| /**
+     3|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+     4|  */
+     5| public enum RelativeUrlsUsed {
+     6|     /**
+     7|      * Always use relative URI and resolve them later based on browser HTTP request
+     8|      */
+     9|     ALL_REQUESTS,
+    10|     /**
+    11|      * Use relative Uris just for browser requests and resolve those based on browser HTTP requests.
+    12|      * Backend request (like refresh token request, codeToToken request etc) will use the URI based on current hostname
+    13|      */
+    14|     BROWSER_ONLY,
+    15|     /**
+    16|      * Relative Uri not used. Configuration contains absolute URI
+    17|      */
+    18|     NEVER;
+    19|     public boolean useRelative(boolean isBrowserReq) {
+    20|         switch (this) {
+    21|             case ALL_REQUESTS:
+    22|                 return true;
+    23|             case NEVER:
+    24|                 return false;
+    25|             case BROWSER_ONLY:
+    26|                 return isBrowserReq;
+    27|             default:
+    28|                 return true;
+    29|         }
+    30|     }
+    31| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/enums/TokenStore.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-8 ---
+     1| package org.keycloak.enums;
+     2| /**
+     3|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+     4|  */
+     5| public enum TokenStore {
+     6|     SESSION,
+     7|     COOKIE
+     8| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/representations/AccessToken.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-34 ---
+     1| package org.keycloak.representations;
+     2| import org.codehaus.jackson.annotate.JsonIgnore;
+     3| import org.codehaus.jackson.annotate.JsonProperty;
+     4| import java.io.Serializable;
+     5| import java.util.HashMap;
+     6| import java.util.HashSet;
+     7| import java.util.Map;
+     8| import java.util.Set;
+     9| /**
+    10|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+    11|  * @version $Revision: 1 $
+    12|  */
+    13| public class AccessToken extends IDToken {
+    14|     public static class Access implements Serializable {
+    15|         @JsonProperty("roles")
+    16|         protected Set<String> roles;
+    17|         @JsonProperty("verify_caller")
+    18|         protected Boolean verifyCaller;
+    19|         public Access() {
+    20|         }
+    21|         public Access clone() {
+    22|             Access access = new Access();
+    23|             access.verifyCaller = verifyCaller;
+    24|             if (roles != null) {
+    25|                 access.roles = new HashSet<String>();
+    26|                 access.roles.addAll(roles);
+    27|             }
+    28|             return access;
+    29|         }
+    30|         public Set<String> getRoles() {
+    31|             return roles;
+    32|         }
+    33|         public Access roles(Set<String> roles) {
+    34|             this.roles = roles;
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/representations/adapters/action/GlobalRequestResult.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-50 ---
+     1| package org.keycloak.representations.adapters.action;
+     2| import java.util.ArrayList;
+     3| import java.util.List;
+     4| /**
+     5|  * Result of the "global" request (like push notBefore or logoutAll), which is send to all cluster nodes
+     6|  *
+     7|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+     8|  */
+     9| public class GlobalRequestResult {
+    10|     private List<String> successRequests;
+    11|     private List<String> failedRequests;
+    12|     public void addSuccessRequest(String reqUri) {
+    13|         if (successRequests == null) {
+    14|             successRequests = new ArrayList<String>();
+    15|         }
+    16|         successRequests.add(reqUri);
+    17|     }
+    18|     public void addFailedRequest(String reqUri) {
+    19|         if (failedRequests == null) {
+    20|             failedRequests = new ArrayList<String>();
+    21|         }
+    22|         failedRequests.add(reqUri);
+    23|     }
+    24|     public void addAllSuccessRequests(List<String> reqUris) {
+    25|         if (successRequests == null) {
+    26|             successRequests = new ArrayList<String>();
+    27|         }
+    28|         successRequests.addAll(reqUris);
+    29|     }
+    30|     public void addAllFailedRequests(List<String> reqUris) {
+    31|         if (failedRequests == null) {
+    32|             failedRequests = new ArrayList<String>();
+    33|         }
+    34|         failedRequests.addAll(reqUris);
+    35|     }
+    36|     public void addAll(GlobalRequestResult merged) {
+    37|         if (merged.getSuccessRequests() != null && merged.getSuccessRequests().size() > 0) {
+    38|             addAllSuccessRequests(merged.getSuccessRequests());
+    39|         }
+    40|         if (merged.getFailedRequests() != null && merged.getFailedRequests().size() > 0) {
+    41|             addAllFailedRequests(merged.getFailedRequests());
+    42|         }
+    43|     }
+    44|     public List<String> getSuccessRequests() {
+    45|         return successRequests;
+    46|     }
+    47|     public List<String> getFailedRequests() {
+    48|         return failedRequests;
+    49|     }
+    50| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/representations/adapters/action/LogoutAction.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-31 ---
+     1| package org.keycloak.representations.adapters.action;
+     2| import java.util.List;
+     3| /**
+     4|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+     5|  * @version $Revision: 1 $
+     6|  */
+     7| public class LogoutAction extends AdminAction {
+     8|     public static final String LOGOUT = "LOGOUT";
+     9|     protected List<String> adapterSessionIds;
+    10|     protected int notBefore;
+    11|     public LogoutAction() {
+    12|     }
+    13|     public LogoutAction(String id, int expiration, String resource, List<String> adapterSessionIds, int notBefore) {
+    14|         super(id, expiration, resource, LOGOUT);
+    15|         this.adapterSessionIds = adapterSessionIds;
+    16|         this.notBefore = notBefore;
+    17|     }
+    18|     public int getNotBefore() {
+    19|         return notBefore;
+    20|     }
+    21|     public void setNotBefore(int notBefore) {
+    22|         this.notBefore = notBefore;
+    23|     }
+    24|     public List<String> getAdapterSessionIds() {
+    25|         return adapterSessionIds;
+    26|     }
+    27|     @Override
+    28|     public boolean validate() {
+    29|         return LOGOUT.equals(action);
+    30|     }
+    31| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/representations/adapters/config/AdapterConfig.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-69 ---
+     1| package org.keycloak.representations.adapters.config;
+     2| import org.codehaus.jackson.annotate.JsonProperty;
+     3| import org.codehaus.jackson.annotate.JsonPropertyOrder;
+     4| /**
+     5|  * Configuration for Java based adapters
+     6|  *
+     7|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+     8|  * @version $Revision: 1 $
+     9|  */
+    10| @JsonPropertyOrder({"realm", "realm-public-key", "auth-server-url", "ssl-required",
+    11|         "resource", "public-client", "credentials",
+    12|         "use-resource-role-mappings",
+    13|         "enable-cors", "cors-max-age", "cors-allowed-methods",
+    14|         "expose-token", "bearer-only",
+    15|         "connection-pool-size",
+    16|         "allow-any-hostname", "disable-trust-manager", "truststore", "truststore-password",
+    17|         "client-keystore", "client-keystore-password", "client-key-password",
+    18|         "auth-server-url-for-backend-requests", "always-refresh-token",
+    19|         "register-node-at-startup", "register-node-period", "token-store", "principal-attribute"
+    20| })
+    21| public class AdapterConfig extends BaseAdapterConfig {
+    22|     @JsonProperty("allow-any-hostname")
+    23|     protected boolean allowAnyHostname;
+    24|     @JsonProperty("disable-trust-manager")
+    25|     protected boolean disableTrustManager;
+    26|     @JsonProperty("truststore")
+    27|     protected String truststore;
+    28|     @JsonProperty("truststore-password")
+    29|     protected String truststorePassword;
+    30|     @JsonProperty("client-keystore")
+    31|     protected String clientKeystore;
+    32|     @JsonProperty("client-keystore-password")
+    33|     protected String clientKeystorePassword;
+    34|     @JsonProperty("client-key-password")
+    35|     protected String clientKeyPassword;
+    36|     @JsonProperty("connection-pool-size")
+    37|     protected int connectionPoolSize = 20;
+    38|     @JsonProperty("auth-server-url-for-backend-requests")
+    39|     protected String authServerUrlForBackendRequests;
+    40|     @JsonProperty("always-refresh-token")
+    41|     protected boolean alwaysRefreshToken = false;
+    42|     @JsonProperty("register-node-at-startup")
+    43|     protected boolean registerNodeAtStartup = false;
+    44|     @JsonProperty("register-node-period")
+    45|     protected int registerNodePeriod = -1;
+    46|     @JsonProperty("token-store")
+    47|     protected String tokenStore;
+    48|     @JsonProperty("principal-attribute")
+    49|     protected String principalAttribute;
+    50|     public boolean isAllowAnyHostname() {
+    51|         return allowAnyHostname;
+    52|     }
+    53|     public void setAllowAnyHostname(boolean allowAnyHostname) {
+    54|         this.allowAnyHostname = allowAnyHostname;
+    55|     }
+    56|     public boolean isDisableTrustManager() {
+    57|         return disableTrustManager;
+    58|     }
+    59|     public void setDisableTrustManager(boolean disableTrustManager) {
+    60|         this.disableTrustManager = disableTrustManager;
+    61|     }
+    62|     public String getTruststore() {
+    63|         return truststore;
+    64|     }
+    65|     public void setTruststore(String truststore) {
+    66|         this.truststore = truststore;
+    67|     }
+    68|     public String getTruststorePassword() {
+    69|         return truststorePassword;
+
+# --- HUNK 2: Lines 78-134 ---
+    78|         this.clientKeystore = clientKeystore;
+    79|     }
+    80|     public String getClientKeystorePassword() {
+    81|         return clientKeystorePassword;
+    82|     }
+    83|     public void setClientKeystorePassword(String clientKeystorePassword) {
+    84|         this.clientKeystorePassword = clientKeystorePassword;
+    85|     }
+    86|     public String getClientKeyPassword() {
+    87|         return clientKeyPassword;
+    88|     }
+    89|     public void setClientKeyPassword(String clientKeyPassword) {
+    90|         this.clientKeyPassword = clientKeyPassword;
+    91|     }
+    92|     public int getConnectionPoolSize() {
+    93|         return connectionPoolSize;
+    94|     }
+    95|     public void setConnectionPoolSize(int connectionPoolSize) {
+    96|         this.connectionPoolSize = connectionPoolSize;
+    97|     }
+    98|     public String getAuthServerUrlForBackendRequests() {
+    99|         return authServerUrlForBackendRequests;
+   100|     }
+   101|     public void setAuthServerUrlForBackendRequests(String authServerUrlForBackendRequests) {
+   102|         this.authServerUrlForBackendRequests = authServerUrlForBackendRequests;
+   103|     }
+   104|     public boolean isAlwaysRefreshToken() {
+   105|         return alwaysRefreshToken;
+   106|     }
+   107|     public void setAlwaysRefreshToken(boolean alwaysRefreshToken) {
+   108|         this.alwaysRefreshToken = alwaysRefreshToken;
+   109|     }
+   110|     public boolean isRegisterNodeAtStartup() {
+   111|         return registerNodeAtStartup;
+   112|     }
+   113|     public void setRegisterNodeAtStartup(boolean registerNodeAtStartup) {
+   114|         this.registerNodeAtStartup = registerNodeAtStartup;
+   115|     }
+   116|     public int getRegisterNodePeriod() {
+   117|         return registerNodePeriod;
+   118|     }
+   119|     public void setRegisterNodePeriod(int registerNodePeriod) {
+   120|         this.registerNodePeriod = registerNodePeriod;
+   121|     }
+   122|     public String getTokenStore() {
+   123|         return tokenStore;
+   124|     }
+   125|     public void setTokenStore(String tokenStore) {
+   126|         this.tokenStore = tokenStore;
+   127|     }
+   128|     public String getPrincipalAttribute() {
+   129|         return principalAttribute;
+   130|     }
+   131|     public void setPrincipalAttribute(String principalAttribute) {
+   132|         this.principalAttribute = principalAttribute;
+   133|     }
+   134| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/representations/idm/ApplicationRepresentation.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-47 ---
+     1| package org.keycloak.representations.idm;
+     2| import java.util.List;
+     3| import java.util.Map;
+     4| /**
+     5|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+     6|  * @version $Revision: 1 $
+     7|  */
+     8| public class ApplicationRepresentation {
+     9|     protected String id;
+    10|     protected String name;
+    11|     protected String adminUrl;
+    12|     protected String baseUrl;
+    13|     protected Boolean surrogateAuthRequired;
+    14|     protected Boolean enabled;
+    15|     protected String secret;
+    16|     protected String[] defaultRoles;
+    17|     protected List<String> redirectUris;
+    18|     protected List<String> webOrigins;
+    19|     protected ClaimRepresentation claims;
+    20|     protected Integer notBefore;
+    21|     protected Boolean bearerOnly;
+    22|     protected Boolean publicClient;
+    23|     protected String protocol;
+    24|     protected Map<String, String> attributes;
+    25|     protected Boolean fullScopeAllowed;
+    26|     protected Integer nodeReRegistrationTimeout;
+    27|     protected Map<String, Integer> registeredNodes;
+    28|     public String getId() {
+    29|         return id;
+    30|     }
+    31|     public void setId(String id) {
+    32|         this.id = id;
+    33|     }
+    34|     public String getName() {
+    35|         return name;
+    36|     }
+    37|     public void setName(String name) {
+    38|         this.name = name;
+    39|     }
+    40|     public Boolean isEnabled() {
+    41|         return enabled;
+    42|     }
+    43|     public void setEnabled(Boolean enabled) {
+    44|         this.enabled = enabled;
+    45|     }
+    46|     public Boolean isSurrogateAuthRequired() {
+    47|         return surrogateAuthRequired;
+
+# --- HUNK 2: Lines 98-142 ---
+    98|         this.notBefore = notBefore;
+    99|     }
+   100|     public Boolean isBearerOnly() {
+   101|         return bearerOnly;
+   102|     }
+   103|     public void setBearerOnly(Boolean bearerOnly) {
+   104|         this.bearerOnly = bearerOnly;
+   105|     }
+   106|     public Boolean isPublicClient() {
+   107|         return publicClient;
+   108|     }
+   109|     public void setPublicClient(Boolean publicClient) {
+   110|         this.publicClient = publicClient;
+   111|     }
+   112|     public Boolean isFullScopeAllowed() {
+   113|         return fullScopeAllowed;
+   114|     }
+   115|     public void setFullScopeAllowed(Boolean fullScopeAllowed) {
+   116|         this.fullScopeAllowed = fullScopeAllowed;
+   117|     }
+   118|     public String getProtocol() {
+   119|         return protocol;
+   120|     }
+   121|     public void setProtocol(String protocol) {
+   122|         this.protocol = protocol;
+   123|     }
+   124|     public Map<String, String> getAttributes() {
+   125|         return attributes;
+   126|     }
+   127|     public void setAttributes(Map<String, String> attributes) {
+   128|         this.attributes = attributes;
+   129|     }
+   130|     public Integer getNodeReRegistrationTimeout() {
+   131|         return nodeReRegistrationTimeout;
+   132|     }
+   133|     public void setNodeReRegistrationTimeout(Integer nodeReRegistrationTimeout) {
+   134|         this.nodeReRegistrationTimeout = nodeReRegistrationTimeout;
+   135|     }
+   136|     public Map<String, Integer> getRegisteredNodes() {
+   137|         return registeredNodes;
+   138|     }
+   139|     public void setRegisteredNodes(Map<String, Integer> registeredNodes) {
+   140|         this.registeredNodes = registeredNodes;
+   141|     }
+   142| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/representations/idm/OAuthClientRepresentation.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-39 ---
+     1| package org.keycloak.representations.idm;
+     2| import java.util.List;
+     3| import java.util.Map;
+     4| /**
+     5|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+     6|  * @version $Revision: 1 $
+     7|  */
+     8| public class OAuthClientRepresentation {
+     9|     protected String id;
+    10|     protected String name;
+    11|     protected List<String> redirectUris;
+    12|     protected List<String> webOrigins;
+    13|     protected Boolean enabled;
+    14|     protected String secret;
+    15|     protected ClaimRepresentation claims;
+    16|     protected Integer notBefore;
+    17|     protected Boolean publicClient;
+    18|     protected String protocol;
+    19|     protected Map<String, String> attributes;
+    20|     protected Boolean directGrantsOnly;
+    21|     protected Boolean fullScopeAllowed;
+    22|     public String getId() {
+    23|         return id;
+    24|     }
+    25|     public void setId(String id) {
+    26|         this.id = id;
+    27|     }
+    28|     public String getName() {
+    29|         return name;
+    30|     }
+    31|     public void setName(String name) {
+    32|         this.name = name;
+    33|     }
+    34|     public Boolean isEnabled() {
+    35|         return enabled;
+    36|     }
+    37|     public void setEnabled(Boolean enabled) {
+    38|         this.enabled = enabled;
+    39|     }
+
+# --- HUNK 2: Lines 68-100 ---
+    68|         this.notBefore = notBefore;
+    69|     }
+    70|     public Boolean isPublicClient() {
+    71|         return publicClient;
+    72|     }
+    73|     public void setPublicClient(Boolean publicClient) {
+    74|         this.publicClient = publicClient;
+    75|     }
+    76|     public Boolean isDirectGrantsOnly() {
+    77|         return directGrantsOnly;
+    78|     }
+    79|     public void setDirectGrantsOnly(Boolean directGrantsOnly) {
+    80|         this.directGrantsOnly = directGrantsOnly;
+    81|     }
+    82|     public Boolean isFullScopeAllowed() {
+    83|         return fullScopeAllowed;
+    84|     }
+    85|     public void setFullScopeAllowed(Boolean fullScopeAllowed) {
+    86|         this.fullScopeAllowed = fullScopeAllowed;
+    87|     }
+    88|     public String getProtocol() {
+    89|         return protocol;
+    90|     }
+    91|     public void setProtocol(String protocol) {
+    92|         this.protocol = protocol;
+    93|     }
+    94|     public Map<String, String> getAttributes() {
+    95|         return attributes;
+    96|     }
+    97|     public void setAttributes(Map<String, String> attributes) {
+    98|         this.attributes = attributes;
+    99|     }
+   100| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/representations/idm/RealmRepresentation.java
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 19-79 ---
+    19|     protected Boolean enabled;
+    20|     protected String sslRequired;
+    21|     protected Boolean passwordCredentialGrantAllowed;
+    22|     protected Boolean registrationAllowed;
+    23|     protected Boolean rememberMe;
+    24|     protected Boolean verifyEmail;
+    25|     protected Boolean resetPasswordAllowed;
+    26|     protected Boolean social;
+    27|     protected Boolean updateProfileOnInitialSocialLogin;
+    28|     protected Boolean userCacheEnabled;
+    29|     protected Boolean realmCacheEnabled;
+    30|     protected Boolean bruteForceProtected;
+    31|     protected Integer maxFailureWaitSeconds;
+    32|     protected Integer minimumQuickLoginWaitSeconds;
+    33|     protected Integer waitIncrementSeconds;
+    34|     protected Long quickLoginCheckMilliSeconds;
+    35|     protected Integer maxDeltaTimeSeconds;
+    36|     protected Integer failureFactor;
+    37|     protected String privateKey;
+    38|     protected String publicKey;
+    39|     protected String certificate;
+    40|     protected String codeSecret;
+    41|     protected RolesRepresentation roles;
+    42|     protected List<String> defaultRoles;
+    43|     protected Set<String> requiredCredentials;
+    44|     protected String passwordPolicy;
+    45|     protected List<UserRepresentation> users;
+    46|     protected List<ScopeMappingRepresentation> scopeMappings;
+    47|     protected Map<String, List<ScopeMappingRepresentation>> applicationScopeMappings;
+    48|     protected List<ApplicationRepresentation> applications;
+    49|     protected List<OAuthClientRepresentation> oauthClients;
+    50|     protected Map<String, String> browserSecurityHeaders;
+    51|     protected Map<String, String> socialProviders;
+    52|     protected Map<String, String> smtpServer;
+    53|     protected List<UserFederationProviderRepresentation> userFederationProviders;
+    54|     protected String loginTheme;
+    55|     protected String accountTheme;
+    56|     protected String adminTheme;
+    57|     protected String emailTheme;
+    58|     protected Boolean eventsEnabled;
+    59|     protected Long eventsExpiration;
+    60|     protected List<String> eventsListeners;
+    61|     public String getId() {
+    62|         return id;
+    63|     }
+    64|     public void setId(String id) {
+    65|         this.id = id;
+    66|     }
+    67|     public String getRealm() {
+    68|         return realm;
+    69|     }
+    70|     public void setRealm(String realm) {
+    71|         this.realm = realm;
+    72|     }
+    73|     public List<UserRepresentation> getUsers() {
+    74|         return users;
+    75|     }
+    76|     public List<ApplicationRepresentation> getApplications() {
+    77|         return applications;
+    78|     }
+    79|     public ApplicationRepresentation resource(String name) {
+
+# --- HUNK 2: Lines 161-212 ---
+   161|         this.accessCodeLifespanUserAction = accessCodeLifespanUserAction;
+   162|     }
+   163|     public List<String> getDefaultRoles() {
+   164|         return defaultRoles;
+   165|     }
+   166|     public void setDefaultRoles(List<String> defaultRoles) {
+   167|         this.defaultRoles = defaultRoles;
+   168|     }
+   169|     public String getPrivateKey() {
+   170|         return privateKey;
+   171|     }
+   172|     public void setPrivateKey(String privateKey) {
+   173|         this.privateKey = privateKey;
+   174|     }
+   175|     public String getPublicKey() {
+   176|         return publicKey;
+   177|     }
+   178|     public void setPublicKey(String publicKey) {
+   179|         this.publicKey = publicKey;
+   180|     }
+   181|     public String getCertificate() {
+   182|         return certificate;
+   183|     }
+   184|     public void setCertificate(String certificate) {
+   185|         this.certificate = certificate;
+   186|     }
+   187|     public String getCodeSecret() {
+   188|         return codeSecret;
+   189|     }
+   190|     public void setCodeSecret(String codeSecret) {
+   191|         this.codeSecret = codeSecret;
+   192|     }
+   193|     public Boolean isPasswordCredentialGrantAllowed() {
+   194|         return passwordCredentialGrantAllowed;
+   195|     }
+   196|     public void setPasswordCredentialGrantAllowed(Boolean passwordCredentialGrantAllowed) {
+   197|         this.passwordCredentialGrantAllowed = passwordCredentialGrantAllowed;
+   198|     }
+   199|     public Boolean isRegistrationAllowed() {
+   200|         return registrationAllowed;
+   201|     }
+   202|     public void setRegistrationAllowed(Boolean registrationAllowed) {
+   203|         this.registrationAllowed = registrationAllowed;
+   204|     }
+   205|     public Boolean isRememberMe() {
+   206|         return rememberMe;
+   207|     }
+   208|     public void setRememberMe(Boolean rememberMe) {
+   209|         this.rememberMe = rememberMe;
+   210|     }
+   211|     public Boolean isRealmCacheEnabled() {
+   212|         return realmCacheEnabled;
+
+# --- HUNK 3: Lines 335-379 ---
+   335|         this.waitIncrementSeconds = waitIncrementSeconds;
+   336|     }
+   337|     public Long getQuickLoginCheckMilliSeconds() {
+   338|         return quickLoginCheckMilliSeconds;
+   339|     }
+   340|     public void setQuickLoginCheckMilliSeconds(Long quickLoginCheckMilliSeconds) {
+   341|         this.quickLoginCheckMilliSeconds = quickLoginCheckMilliSeconds;
+   342|     }
+   343|     public Integer getMaxDeltaTimeSeconds() {
+   344|         return maxDeltaTimeSeconds;
+   345|     }
+   346|     public void setMaxDeltaTimeSeconds(Integer maxDeltaTimeSeconds) {
+   347|         this.maxDeltaTimeSeconds = maxDeltaTimeSeconds;
+   348|     }
+   349|     public Integer getFailureFactor() {
+   350|         return failureFactor;
+   351|     }
+   352|     public void setFailureFactor(Integer failureFactor) {
+   353|         this.failureFactor = failureFactor;
+   354|     }
+   355|     public Boolean isEventsEnabled() {
+   356|         return eventsEnabled;
+   357|     }
+   358|     public void setEventsEnabled(boolean eventsEnabled) {
+   359|         this.eventsEnabled = eventsEnabled;
+   360|     }
+   361|     public Long getEventsExpiration() {
+   362|         return eventsExpiration;
+   363|     }
+   364|     public void setEventsExpiration(long eventsExpiration) {
+   365|         this.eventsExpiration = eventsExpiration;
+   366|     }
+   367|     public List<String> getEventsListeners() {
+   368|         return eventsListeners;
+   369|     }
+   370|     public void setEventsListeners(List<String> eventsListeners) {
+   371|         this.eventsListeners = eventsListeners;
+   372|     }
+   373|     public List<UserFederationProviderRepresentation> getUserFederationProviders() {
+   374|         return userFederationProviders;
+   375|     }
+   376|     public void setUserFederationProviders(List<UserFederationProviderRepresentation> userFederationProviders) {
+   377|         this.userFederationProviders = userFederationProviders;
+   378|     }
+   379| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/representations/idm/UserSessionRepresentation.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-60 ---
+     1| package org.keycloak.representations.idm;
+     2| import java.util.HashMap;
+     3| import java.util.HashSet;
+     4| import java.util.Map;
+     5| import java.util.Set;
+     6| /**
+     7|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+     8|  * @version $Revision: 1 $
+     9|  */
+    10| public class UserSessionRepresentation {
+    11|     private String id;
+    12|     private String user;
+    13|     private String ipAddress;
+    14|     private long start;
+    15|     private long lastAccess;
+    16|     private Map<String, String> applications = new HashMap<String, String>();
+    17|     private Map<String, String> clients = new HashMap<String, String>();
+    18|     public String getId() {
+    19|         return id;
+    20|     }
+    21|     public void setId(String id) {
+    22|         this.id = id;
+    23|     }
+    24|     public String getUser() {
+    25|         return user;
+    26|     }
+    27|     public void setUser(String user) {
+    28|         this.user = user;
+    29|     }
+    30|     public String getIpAddress() {
+    31|         return ipAddress;
+    32|     }
+    33|     public void setIpAddress(String ipAddress) {
+    34|         this.ipAddress = ipAddress;
+    35|     }
+    36|     public long getStart() {
+    37|         return start;
+    38|     }
+    39|     public void setStart(long start) {
+    40|         this.start = start;
+    41|     }
+    42|     public long getLastAccess() {
+    43|         return lastAccess;
+    44|     }
+    45|     public void setLastAccess(long lastAccess) {
+    46|         this.lastAccess = lastAccess;
+    47|     }
+    48|     public Map<String, String> getApplications() {
+    49|         return applications;
+    50|     }
+    51|     public void setApplications(Map<String, String> applications) {
+    52|         this.applications = applications;
+    53|     }
+    54|     public Map<String, String> getClients() {
+    55|         return clients;
+    56|     }
+    57|     public void setClients(Map<String, String> clients) {
+    58|         this.clients = clients;
+    59|     }
+    60| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/util/CertificateUtils.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-55 ---
+     1| package org.keycloak.util;
+     2| import org.bouncycastle.asn1.x509.X509Extensions;
+     3| import org.bouncycastle.x509.X509V1CertificateGenerator;
+     4| import org.bouncycastle.x509.X509V3CertificateGenerator;
+     5| import org.bouncycastle.x509.extension.AuthorityKeyIdentifierStructure;
+     6| import org.bouncycastle.x509.extension.SubjectKeyIdentifierStructure;
+     7| import javax.security.auth.x500.X500Principal;
+     8| import java.math.BigInteger;
+     9| import java.security.KeyPair;
+    10| import java.security.PrivateKey;
+    11| import java.security.cert.X509Certificate;
+    12| import java.util.Calendar;
+    13| import java.util.Date;
+    14| /**
+    15|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+    16|  * @version $Revision: 1 $
+    17|  */
+    18| public class CertificateUtils {
+    19|     public static X509Certificate generateV3Certificate(KeyPair keyPair, PrivateKey caPrivateKey, X509Certificate caCert, String subject) throws Exception {
+    20|         X509V3CertificateGenerator certGen = new X509V3CertificateGenerator();
+    21|         X500Principal subjectName = new X500Principal("CN=" + subject);
+    22|         BigInteger serialNumber = BigInteger.valueOf(System.currentTimeMillis());
+    23|         certGen.setSerialNumber(serialNumber);
+    24|         certGen.setIssuerDN(caCert.getSubjectX500Principal());
+    25|         certGen.setNotBefore(new Date(System.currentTimeMillis() - 100000));
+    26|         Calendar calendar = Calendar.getInstance();
+    27|         calendar.add(Calendar.YEAR, 10);
+    28|         certGen.setNotAfter(calendar.getTime());
+    29|         certGen.setSubjectDN(subjectName);
+    30|         certGen.setPublicKey(keyPair.getPublic());
+    31|         certGen.setSignatureAlgorithm("SHA256WithRSAEncryption");
+    32|         certGen.addExtension(X509Extensions.AuthorityKeyIdentifier, false,
+    33|                 new AuthorityKeyIdentifierStructure(caCert));
+    34|         certGen.addExtension(X509Extensions.SubjectKeyIdentifier, false,
+    35|                 new SubjectKeyIdentifierStructure(keyPair.getPublic()));
+    36|         X509Certificate cert = certGen.generate(caPrivateKey, "BC");   // note: private key of CA
+    37|         return cert;
+    38|     }
+    39|     public static X509Certificate generateV1SelfSignedCertificate(KeyPair keyPair, String subject) throws Exception {
+    40|         BigInteger serialNumber = BigInteger.valueOf(System.currentTimeMillis());
+    41|         X509V1CertificateGenerator certGen = new X509V1CertificateGenerator();
+    42|         X500Principal subjectPrincipal = new X500Principal("CN=" + subject);
+    43|         certGen.setSerialNumber(serialNumber);
+    44|         certGen.setIssuerDN(subjectPrincipal);
+    45|         certGen.setNotBefore(new Date(System.currentTimeMillis() - 100000));
+    46|         Calendar calendar = Calendar.getInstance();
+    47|         calendar.add(Calendar.YEAR, 10);
+    48|         certGen.setNotAfter(calendar.getTime());
+    49|         certGen.setSubjectDN(subjectPrincipal);
+    50|         certGen.setPublicKey(keyPair.getPublic());
+    51|         certGen.setSignatureAlgorithm("SHA256WithRSAEncryption");
+    52|         X509Certificate cert = certGen.generate(keyPair.getPrivate(), "BC");
+    53|         return cert;
+    54|     }
+    55| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/util/HostUtils.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-32 ---
+     1| package org.keycloak.util;
+     2| import java.net.InetAddress;
+     3| import java.net.UnknownHostException;
+     4| /**
+     5|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+     6|  */
+     7| public class HostUtils {
+     8|     public static String getHostName() {
+     9|         String jbossHostName = System.getProperty("jboss.host.name");
+    10|         if (jbossHostName != null) {
+    11|             return jbossHostName;
+    12|         } else {
+    13|             try {
+    14|                 return InetAddress.getLocalHost().getHostName();
+    15|             } catch (UnknownHostException uhe) {
+    16|                 throw new IllegalStateException(uhe);
+    17|             }
+    18|         }
+    19|     }
+    20|     public static String getIpAddress() {
+    21|         try {
+    22|             String jbossHostName = System.getProperty("jboss.host.name");
+    23|             if (jbossHostName != null) {
+    24|                 return InetAddress.getByName(jbossHostName).getHostAddress();
+    25|             } else {
+    26|                 return java.net.InetAddress.getLocalHost().getHostAddress();
+    27|             }
+    28|         } catch (UnknownHostException uhe) {
+    29|             throw new IllegalStateException(uhe);
+    30|         }
+    31|     }
+    32| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/util/JsonSerialization.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-48 ---
+     1| package org.keycloak.util;
+     2| import org.codehaus.jackson.map.ObjectMapper;
+     3| import org.codehaus.jackson.map.SerializationConfig;
+     4| import org.codehaus.jackson.map.annotate.JsonSerialize;
+     5| import java.io.IOException;
+     6| import java.io.InputStream;
+     7| import java.io.OutputStream;
+     8| /**
+     9|  * Utility class to handle simple JSON serializable for Keycloak.
+    10|  *
+    11|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+    12|  * @version $Revision: 1 $
+    13|  */
+    14| public class JsonSerialization {
+    15|     public static final ObjectMapper mapper = new ObjectMapper();
+    16|     public static final ObjectMapper prettyMapper = new ObjectMapper();
+    17|     public static final ObjectMapper sysPropertiesAwareMapper = new ObjectMapper(new SystemPropertiesJsonParserFactory());
+    18|     static {
+    19|         mapper.setSerializationInclusion(JsonSerialize.Inclusion.NON_NULL);
+    20|         prettyMapper.enable(SerializationConfig.Feature.INDENT_OUTPUT);
+    21|         prettyMapper.setSerializationInclusion(JsonSerialize.Inclusion.NON_NULL);
+    22|     }
+    23|     public static void writeValueToStream(OutputStream os, Object obj) throws IOException {
+    24|         mapper.writeValue(os, obj);
+    25|     }
+    26|     public static String writeValueAsString(Object obj) throws IOException {
+    27|         return mapper.writeValueAsString(obj);
+    28|     }
+    29|     public static byte[] writeValueAsBytes(Object obj) throws IOException {
+    30|         return mapper.writeValueAsBytes(obj);
+    31|     }
+    32|     public static <T> T readValue(byte[] bytes, Class<T> type) throws IOException {
+    33|         return mapper.readValue(bytes, type);
+    34|     }
+    35|     public static <T> T readValue(String bytes, Class<T> type) throws IOException {
+    36|         return mapper.readValue(bytes, type);
+    37|     }
+    38|     public static <T> T readValue(InputStream bytes, Class<T> type) throws IOException {
+    39|         return readValue(bytes, type, false);
+    40|     }
+    41|     public static <T> T readValue(InputStream bytes, Class<T> type, boolean replaceSystemProperties) throws IOException {
+    42|         if (replaceSystemProperties) {
+    43|             return sysPropertiesAwareMapper.readValue(bytes, type);
+    44|         } else {
+    45|             return mapper.readValue(bytes, type);
+    46|         }
+    47|     }
+    48| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/util/SystemPropertiesJsonParserFactory.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-40 ---
+     1| package org.keycloak.util;
+     2| import java.io.IOException;
+     3| import java.io.InputStream;
+     4| import java.io.Reader;
+     5| import org.codehaus.jackson.JsonParser;
+     6| import org.codehaus.jackson.io.IOContext;
+     7| import org.codehaus.jackson.map.MappingJsonFactory;
+     8| import org.codehaus.jackson.util.JsonParserDelegate;
+     9| /**
+    10|  * Provides replacing of system properties for parsed values
+    11|  *
+    12|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+    13|  */
+    14| public class SystemPropertiesJsonParserFactory extends MappingJsonFactory {
+    15|     @Override
+    16|     protected JsonParser _createJsonParser(byte[] data, int offset, int len, IOContext ctxt) throws IOException {
+    17|         JsonParser delegate = super._createJsonParser(data, offset, len, ctxt);
+    18|         return new SystemPropertiesAwareJsonParser(delegate);
+    19|     }
+    20|     @Override
+    21|     protected JsonParser _createJsonParser(Reader r, IOContext ctxt) throws IOException {
+    22|         JsonParser delegate = super._createJsonParser(r, ctxt);
+    23|         return new SystemPropertiesAwareJsonParser(delegate);
+    24|     }
+    25|     @Override
+    26|     protected JsonParser _createJsonParser(InputStream in, IOContext ctxt) throws IOException {
+    27|         JsonParser delegate = super._createJsonParser(in, ctxt);
+    28|         return new SystemPropertiesAwareJsonParser(delegate);
+    29|     }
+    30|     public static class SystemPropertiesAwareJsonParser extends JsonParserDelegate {
+    31|         public SystemPropertiesAwareJsonParser(JsonParser d) {
+    32|             super(d);
+    33|         }
+    34|         @Override
+    35|         public String getText() throws IOException {
+    36|             String orig = super.getText();
+    37|             return StringPropertyReplacer.replaceProperties(orig);
+    38|         }
+    39|     }
+    40| }
+
+
+# ====================================================================
+# FILE: core/src/main/java/org/keycloak/util/Time.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-17 ---
+     1| package org.keycloak.util;
+     2| import java.util.Date;
+     3| /**
+     4|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     5|  */
+     6| public class Time {
+     7|     private static int offset;
+     8|     public static int currentTime() {
+     9|         return ((int) (System.currentTimeMillis() / 1000)) + offset;
+    10|     }
+    11|     public static Date toDate(int time) {
+    12|         return new Date(((long) time ) * 1000);
+    13|     }
+    14|     public static void setOffset(int offset) {
+    15|         Time.offset = offset;
+    16|     }
+    17| }
+
+
+# ====================================================================
+# FILE: events/api/src/main/java/org/keycloak/events/Details.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-21 ---
+     1| package org.keycloak.events;
+     2| /**
+     3|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     4|  */
+     5| public interface Details {
+     6|     String EMAIL = "email";
+     7|     String PREVIOUS_EMAIL = "previous_email";
+     8|     String UPDATED_EMAIL = "updated_email";
+     9|     String CODE_ID = "code_id";
+    10|     String REDIRECT_URI = "redirect_uri";
+    11|     String RESPONSE_TYPE = "response_type";
+    12|     String AUTH_METHOD = "auth_method";
+    13|     String REGISTER_METHOD = "register_method";
+    14|     String USERNAME = "username";
+    15|     String REMEMBER_ME = "remember_me";
+    16|     String TOKEN_ID = "token_id";
+    17|     String REFRESH_TOKEN_ID = "refresh_token_id";
+    18|     String VALIDATE_ACCESS_TOKEN = "validate_access_token";
+    19|     String UPDATED_REFRESH_TOKEN_ID = "updated_refresh_token_id";
+    20|     String NODE_HOST = "node_host";
+    21| }
+
+
+# ====================================================================
+# FILE: events/api/src/main/java/org/keycloak/events/Errors.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-33 ---
+     1| package org.keycloak.events;
+     2| /**
+     3|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     4|  */
+     5| public interface Errors {
+     6|     String REALM_DISABLED = "realm_disabled";
+     7|     String CLIENT_NOT_FOUND = "client_not_found";
+     8|     String CLIENT_DISABLED = "client_disabled";
+     9|     String INVALID_CLIENT_CREDENTIALS = "invalid_client_credentials";
+    10|     String INVALID_CLIENT = "invalid_client";
+    11|     String USER_NOT_FOUND = "user_not_found";
+    12|     String USER_DISABLED = "user_disabled";
+    13|     String USER_TEMPORARILY_DISABLED = "user_temporarily_disabled";
+    14|     String INVALID_USER_CREDENTIALS = "invalid_user_credentials";
+    15|     String USERNAME_MISSING = "username_missing";
+    16|     String USERNAME_IN_USE = "username_in_use";
+    17|     String EMAIL_IN_USE = "email_in_use";
+    18|     String INVALID_REDIRECT_URI = "invalid_redirect_uri";
+    19|     String INVALID_CODE = "invalid_code";
+    20|     String INVALID_TOKEN = "invalid_token";
+    21|     String INVALID_SIGNATURE = "invalid_signature";
+    22|     String INVALID_REGISTRATION = "invalid_registration";
+    23|     String INVALID_FORM = "invalid_form";
+    24|     String REGISTRATION_DISABLED = "registration_disabled";
+    25|     String REJECTED_BY_USER = "rejected_by_user";
+    26|     String NOT_ALLOWED = "not_allowed";
+    27|     String SOCIAL_PROVIDER_NOT_FOUND = "social_provider_not_found";
+    28|     String SOCIAL_ID_IN_USE = "social_id_in_use";
+    29|     String STATE_PARAM_NOT_FOUND = "state_param_not_found";
+    30|     String SSL_REQUIRED = "ssl_required";
+    31|     String USER_NOT_LOGGED_IN = "user_not_logged_in";
+    32|     String USER_SESSION_NOT_FOUND = "user_session_not_found";
+    33| }
+
+
+# ====================================================================
+# FILE: events/api/src/main/java/org/keycloak/events/EventType.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 17-43 ---
+    17|     REFRESH_TOKEN_ERROR,
+    18|     SOCIAL_LINK,
+    19|     SOCIAL_LINK_ERROR,
+    20|     REMOVE_SOCIAL_LINK,
+    21|     REMOVE_SOCIAL_LINK_ERROR,
+    22|     UPDATE_EMAIL,
+    23|     UPDATE_EMAIL_ERROR,
+    24|     UPDATE_PROFILE,
+    25|     UPDATE_PROFILE_ERROR,
+    26|     UPDATE_PASSWORD,
+    27|     UPDATE_PASSWORD_ERROR,
+    28|     UPDATE_TOTP,
+    29|     UPDATE_TOTP_ERROR,
+    30|     VERIFY_EMAIL,
+    31|     VERIFY_EMAIL_ERROR,
+    32|     REMOVE_TOTP,
+    33|     REMOVE_TOTP_ERROR,
+    34|     SEND_VERIFY_EMAIL,
+    35|     SEND_VERIFY_EMAIL_ERROR,
+    36|     SEND_RESET_PASSWORD,
+    37|     SEND_RESET_PASSWORD_ERROR,
+    38|     RESET_PASSWORD,
+    39|     RESET_PASSWORD_ERROR,
+    40|     INVALID_SIGNATURE_ERROR,
+    41|     REGISTER_NODE,
+    42|     UNREGISTER_NODE
+    43| }
+
+
+# ====================================================================
+# FILE: events/email/src/main/java/org/keycloak/events/email/EmailEventListenerProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-27 ---
+     1| package org.keycloak.events.email;
+     2| import org.jboss.logging.Logger;
+     3| import org.keycloak.email.EmailException;
+     4| import org.keycloak.email.EmailProvider;
+     5| import org.keycloak.events.Event;
+     6| import org.keycloak.events.EventListenerProvider;
+     7| import org.keycloak.events.EventType;
+     8| import org.keycloak.models.KeycloakSession;
+     9| import org.keycloak.models.RealmModel;
+    10| import org.keycloak.models.RealmProvider;
+    11| import org.keycloak.models.UserModel;
+    12| import java.util.Set;
+    13| /**
+    14|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    15|  */
+    16| public class EmailEventListenerProvider implements EventListenerProvider {
+    17|     private static final Logger log = Logger.getLogger(EmailEventListenerProvider.class);
+    18|     private KeycloakSession session;
+    19|     private RealmProvider model;
+    20|     private EmailProvider emailProvider;
+    21|     private Set<EventType> includedEvents;
+    22|     public EmailEventListenerProvider(KeycloakSession session, EmailProvider emailProvider, Set<EventType> includedEvents) {
+    23|         this.session = session;
+    24|         this.model = session.realms();
+    25|         this.emailProvider = emailProvider;
+    26|         this.includedEvents = includedEvents;
+    27|     }
+
+
+# ====================================================================
+# FILE: events/email/src/main/java/org/keycloak/events/email/EmailEventListenerProviderFactory.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-26 ---
+     1| package org.keycloak.events.email;
+     2| import org.keycloak.Config;
+     3| import org.keycloak.email.EmailProvider;
+     4| import org.keycloak.events.EventListenerProvider;
+     5| import org.keycloak.events.EventListenerProviderFactory;
+     6| import org.keycloak.events.EventType;
+     7| import org.keycloak.models.KeycloakSession;
+     8| import java.util.Collections;
+     9| import java.util.HashSet;
+    10| import java.util.Set;
+    11| /**
+    12|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    13|  */
+    14| public class EmailEventListenerProviderFactory implements EventListenerProviderFactory {
+    15|     private static final Set<EventType> SUPPORTED_EVENTS = new HashSet<EventType>();
+    16|     static {
+    17|         Collections.addAll(SUPPORTED_EVENTS, EventType.LOGIN_ERROR, EventType.UPDATE_PASSWORD, EventType.REMOVE_TOTP, EventType.UPDATE_TOTP);
+    18|     }
+    19|     private Set<EventType> includedEvents = new HashSet<EventType>();
+    20|     @Override
+    21|     public EventListenerProvider create(KeycloakSession session) {
+    22|         EmailProvider emailProvider = session.getProvider(EmailProvider.class);
+    23|         return new EmailEventListenerProvider(session, emailProvider, includedEvents);
+    24|     }
+    25|     @Override
+    26|     public void init(Config.Scope config) {
+
+
+# ====================================================================
+# FILE: events/jboss-logging/src/main/java/org/keycloak/events/log/JBossLoggingEventListenerProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-24 ---
+     1| package org.keycloak.events.log;
+     2| import org.jboss.logging.Logger;
+     3| import org.keycloak.events.Event;
+     4| import org.keycloak.events.EventListenerProvider;
+     5| import java.util.Map;
+     6| /**
+     7|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     8|  */
+     9| public class JBossLoggingEventListenerProvider implements EventListenerProvider {
+    10|     private final Logger logger;
+    11|     public JBossLoggingEventListenerProvider(Logger logger) {
+    12|         this.logger = logger;
+    13|     }
+    14|     @Override
+    15|     public void onEvent(Event event) {
+    16|         Logger.Level level = event.getError() != null ? Logger.Level.WARN : Logger.Level.INFO;
+    17|         if (logger.isEnabled(level)) {
+    18|             StringBuilder sb = new StringBuilder();
+    19|             sb.append("type=");
+    20|             sb.append(event.getType());
+    21|             sb.append(", realmId=");
+    22|             sb.append(event.getRealmId());
+    23|             sb.append(", clientId=");
+    24|             sb.append(event.getClientId());
+
+
+# ====================================================================
+# FILE: events/jpa/src/main/java/org/keycloak/events/jpa/JpaEventStoreProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-27 ---
+     1| package org.keycloak.events.jpa;
+     2| import org.codehaus.jackson.map.ObjectMapper;
+     3| import org.codehaus.jackson.type.TypeReference;
+     4| import org.jboss.logging.Logger;
+     5| import org.keycloak.events.Event;
+     6| import org.keycloak.events.EventQuery;
+     7| import org.keycloak.events.EventStoreProvider;
+     8| import org.keycloak.events.EventType;
+     9| import javax.persistence.EntityManager;
+    10| import javax.persistence.EntityTransaction;
+    11| import java.io.IOException;
+    12| import java.util.Map;
+    13| import java.util.Set;
+    14| import java.util.UUID;
+    15| /**
+    16|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    17|  */
+    18| public class JpaEventStoreProvider implements EventStoreProvider {
+    19|     private static final ObjectMapper mapper = new ObjectMapper();
+    20|     private static final TypeReference<Map<String, String>> mapType = new TypeReference<Map<String, String>>() {
+    21|     };
+    22|     private static final Logger logger = Logger.getLogger(JpaEventStoreProvider.class);
+    23|     private EntityManager em;
+    24|     private EntityTransaction tx;
+    25|     private Set<EventType> includedEvents;
+    26|     public JpaEventStoreProvider(EntityManager em, Set<EventType> includedEvents) {
+    27|         this.em = em;
+
+
+# ====================================================================
+# FILE: events/jpa/src/main/java/org/keycloak/events/jpa/JpaEventStoreProviderFactory.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-26 ---
+     1| package org.keycloak.events.jpa;
+     2| import org.keycloak.Config;
+     3| import org.keycloak.connections.jpa.JpaConnectionProvider;
+     4| import org.keycloak.events.EventStoreProvider;
+     5| import org.keycloak.events.EventStoreProviderFactory;
+     6| import org.keycloak.events.EventType;
+     7| import org.keycloak.models.KeycloakSession;
+     8| import java.util.HashSet;
+     9| import java.util.Set;
+    10| /**
+    11|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    12|  */
+    13| public class JpaEventStoreProviderFactory implements EventStoreProviderFactory {
+    14|     public static final String ID = "jpa";
+    15|     private Set<EventType> includedEvents = new HashSet<EventType>();
+    16|     @Override
+    17|     public EventStoreProvider create(KeycloakSession session) {
+    18|         JpaConnectionProvider connection = session.getProvider(JpaConnectionProvider.class);
+    19|         return new JpaEventStoreProvider(connection.getEntityManager(), includedEvents);
+    20|     }
+    21|     @Override
+    22|     public void init(Config.Scope config) {
+    23|         String[] include = config.getArray("include-events");
+    24|         if (include != null) {
+    25|             for (String i : include) {
+    26|                 includedEvents.add(EventType.valueOf(i.toUpperCase()));
+
+
+# ====================================================================
+# FILE: events/mongo/src/main/java/org/keycloak/events/mongo/MongoEventStoreProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-27 ---
+     1| package org.keycloak.events.mongo;
+     2| import com.mongodb.BasicDBObject;
+     3| import com.mongodb.DBCollection;
+     4| import com.mongodb.DBObject;
+     5| import org.keycloak.events.Event;
+     6| import org.keycloak.events.EventQuery;
+     7| import org.keycloak.events.EventStoreProvider;
+     8| import org.keycloak.events.EventType;
+     9| import java.util.HashMap;
+    10| import java.util.Map;
+    11| import java.util.Set;
+    12| /**
+    13|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    14|  */
+    15| public class MongoEventStoreProvider implements EventStoreProvider {
+    16|     private DBCollection events;
+    17|     private Set<EventType> includedEvents;
+    18|     public MongoEventStoreProvider(DBCollection events, Set<EventType> includedEvents) {
+    19|         this.events = events;
+    20|         this.includedEvents = includedEvents;
+    21|     }
+    22|     @Override
+    23|     public EventQuery createQuery() {
+    24|         return new MongoEventQuery(events);
+    25|     }
+    26|     @Override
+    27|     public void clear() {
+
+
+# ====================================================================
+# FILE: events/mongo/src/main/java/org/keycloak/events/mongo/MongoEventStoreProviderFactory.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-29 ---
+     1| package org.keycloak.events.mongo;
+     2| import com.mongodb.DBCollection;
+     3| import com.mongodb.WriteConcern;
+     4| import org.jboss.logging.Logger;
+     5| import org.keycloak.Config;
+     6| import org.keycloak.connections.mongo.MongoConnectionProvider;
+     7| import org.keycloak.events.EventStoreProvider;
+     8| import org.keycloak.events.EventStoreProviderFactory;
+     9| import org.keycloak.events.EventType;
+    10| import org.keycloak.models.KeycloakSession;
+    11| import java.util.HashSet;
+    12| import java.util.Set;
+    13| /**
+    14|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    15|  */
+    16| public class MongoEventStoreProviderFactory implements EventStoreProviderFactory {
+    17|     protected static final Logger logger = Logger.getLogger(MongoEventStoreProviderFactory.class);
+    18|     public static final String ID = "mongo";
+    19|     private Set<EventType> includedEvents = new HashSet<EventType>();
+    20|     @Override
+    21|     public EventStoreProvider create(KeycloakSession session) {
+    22|         MongoConnectionProvider connection = session.getProvider(MongoConnectionProvider.class);
+    23|         DBCollection collection = connection.getDB().getCollection("events");
+    24|         collection.setWriteConcern(WriteConcern.UNACKNOWLEDGED);
+    25|         return new MongoEventStoreProvider(collection, includedEvents);
+    26|     }
+    27|     @Override
+    28|     public void init(Config.Scope config) {
+    29|         String[] include = config.getArray("include-events");
+
+
+# ====================================================================
+# FILE: examples/demo-template/admin-access-app/src/main/java/org/keycloak/example/AdminClient.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-38 ---
+     1| package org.keycloak.example;
+     2| import org.apache.http.HttpEntity;
+     3| import org.apache.http.HttpResponse;
+     4| import org.apache.http.NameValuePair;
+     5| import org.apache.http.client.HttpClient;
+     6| import org.apache.http.client.entity.UrlEncodedFormEntity;
+     7| import org.apache.http.client.methods.HttpGet;
+     8| import org.apache.http.client.methods.HttpPost;
+     9| import org.apache.http.message.BasicNameValuePair;
+    10| import org.keycloak.OAuth2Constants;
+    11| import org.keycloak.ServiceUrlConstants;
+    12| import org.keycloak.adapters.HttpClientBuilder;
+    13| import org.keycloak.representations.AccessTokenResponse;
+    14| import org.keycloak.representations.idm.RoleRepresentation;
+    15| import org.keycloak.util.HostUtils;
+    16| import org.keycloak.util.JsonSerialization;
+    17| import org.keycloak.util.KeycloakUriBuilder;
+    18| import org.keycloak.util.UriUtils;
+    19| import javax.servlet.http.HttpServletRequest;
+    20| import java.io.ByteArrayOutputStream;
+    21| import java.io.IOException;
+    22| import java.io.InputStream;
+    23| import java.util.ArrayList;
+    24| import java.util.List;
+    25| /**
+    26|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+    27|  * @version $Revision: 1 $
+    28|  */
+    29| public class AdminClient {
+    30|     static class TypedList extends ArrayList<RoleRepresentation> {
+    31|     }
+    32|     public static class Failure extends Exception {
+    33|         private int status;
+    34|         public Failure(int status) {
+    35|             this.status = status;
+    36|         }
+    37|         public int getStatus() {
+    38|             return status;
+
+# --- HUNK 2: Lines 121-148 ---
+   121|             try {
+   122|                 HttpResponse response = client.execute(get);
+   123|                 if (response.getStatusLine().getStatusCode() != 200) {
+   124|                     throw new Failure(response.getStatusLine().getStatusCode());
+   125|                 }
+   126|                 HttpEntity entity = response.getEntity();
+   127|                 InputStream is = entity.getContent();
+   128|                 try {
+   129|                     return JsonSerialization.readValue(is, TypedList.class);
+   130|                 } finally {
+   131|                     is.close();
+   132|                 }
+   133|             } catch (IOException e) {
+   134|                 throw new RuntimeException(e);
+   135|             }
+   136|         } finally {
+   137|             client.getConnectionManager().shutdown();
+   138|         }
+   139|     }
+   140|     public static String getBaseUrl(HttpServletRequest request) {
+   141|         String useHostname = request.getServletContext().getInitParameter("useHostname");
+   142|         if (useHostname != null && "true".equalsIgnoreCase(useHostname)) {
+   143|             return "http://" + HostUtils.getHostName() + ":8080";
+   144|         } else {
+   145|             return UriUtils.getOrigin(request.getRequestURL().toString());
+   146|         }
+   147|     }
+   148| }
+
+
+# ====================================================================
+# FILE: examples/demo-template/customer-app/src/main/java/org/keycloak/example/AdminClient.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-58 ---
+     1| package org.keycloak.example;
+     2| import org.apache.http.HttpEntity;
+     3| import org.apache.http.HttpResponse;
+     4| import org.apache.http.client.HttpClient;
+     5| import org.apache.http.client.methods.HttpGet;
+     6| import org.keycloak.KeycloakSecurityContext;
+     7| import org.keycloak.adapters.AdapterUtils;
+     8| import org.keycloak.adapters.HttpClientBuilder;
+     9| import org.keycloak.representations.idm.RoleRepresentation;
+    10| import org.keycloak.util.JsonSerialization;
+    11| import javax.servlet.http.HttpServletRequest;
+    12| import java.io.IOException;
+    13| import java.io.InputStream;
+    14| import java.util.ArrayList;
+    15| import java.util.List;
+    16| /**
+    17|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+    18|  * @version $Revision: 1 $
+    19|  */
+    20| public class AdminClient {
+    21|     static class TypedList extends ArrayList<RoleRepresentation> {
+    22|     }
+    23|     public static class Failure extends Exception {
+    24|         private int status;
+    25|         public Failure(int status) {
+    26|             this.status = status;
+    27|         }
+    28|         public int getStatus() {
+    29|             return status;
+    30|         }
+    31|     }
+    32|     public static List<RoleRepresentation> getRealmRoles(HttpServletRequest req) throws Failure {
+    33|         KeycloakSecurityContext session = (KeycloakSecurityContext) req.getAttribute(KeycloakSecurityContext.class.getName());
+    34|         HttpClient client = new HttpClientBuilder()
+    35|                 .disableTrustManager().build();
+    36|         try {
+    37|             HttpGet get = new HttpGet(AdapterUtils.getOrigin(req.getRequestURL().toString(), session) + "/auth/admin/realms/demo/roles");
+    38|             get.addHeader("Authorization", "Bearer " + session.getTokenString());
+    39|             try {
+    40|                 HttpResponse response = client.execute(get);
+    41|                 if (response.getStatusLine().getStatusCode() != 200) {
+    42|                     throw new Failure(response.getStatusLine().getStatusCode());
+    43|                 }
+    44|                 HttpEntity entity = response.getEntity();
+    45|                 InputStream is = entity.getContent();
+    46|                 try {
+    47|                     return JsonSerialization.readValue(is, TypedList.class);
+    48|                 } finally {
+    49|                     is.close();
+    50|                 }
+    51|             } catch (IOException e) {
+    52|                 throw new RuntimeException(e);
+    53|             }
+    54|         } finally {
+    55|             client.getConnectionManager().shutdown();
+    56|         }
+    57|     }
+    58| }
+
+
+# ====================================================================
+# FILE: examples/demo-template/customer-app/src/main/java/org/keycloak/example/CustomerDatabaseClient.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-70 ---
+     1| package org.keycloak.example;
+     2| import org.apache.http.HttpEntity;
+     3| import org.apache.http.HttpResponse;
+     4| import org.apache.http.client.HttpClient;
+     5| import org.apache.http.client.methods.HttpGet;
+     6| import org.keycloak.KeycloakSecurityContext;
+     7| import org.keycloak.adapters.AdapterUtils;
+     8| import org.keycloak.adapters.HttpClientBuilder;
+     9| import org.keycloak.representations.IDToken;
+    10| import org.keycloak.util.JsonSerialization;
+    11| import javax.servlet.http.HttpServletRequest;
+    12| import javax.servlet.http.HttpSession;
+    13| import java.io.IOException;
+    14| import java.io.InputStream;
+    15| import java.util.ArrayList;
+    16| import java.util.List;
+    17| /**
+    18|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+    19|  * @version $Revision: 1 $
+    20|  */
+    21| public class CustomerDatabaseClient {
+    22|     static class TypedList extends ArrayList<String> {
+    23|     }
+    24|     public static class Failure extends Exception {
+    25|         private int status;
+    26|         public Failure(int status) {
+    27|             this.status = status;
+    28|         }
+    29|         public int getStatus() {
+    30|             return status;
+    31|         }
+    32|     }
+    33|     public static IDToken getIDToken(HttpServletRequest req) {
+    34|         KeycloakSecurityContext session = (KeycloakSecurityContext) req.getAttribute(KeycloakSecurityContext.class.getName());
+    35|         return session.getIdToken();
+    36|     }
+    37|     public static List<String> getCustomers(HttpServletRequest req) throws Failure {
+    38|         KeycloakSecurityContext session = (KeycloakSecurityContext) req.getAttribute(KeycloakSecurityContext.class.getName());
+    39|         HttpClient client = new HttpClientBuilder()
+    40|                 .disableTrustManager().build();
+    41|         try {
+    42|             HttpGet get = new HttpGet(AdapterUtils.getOrigin(req.getRequestURL().toString(), session) + "/database/customers");
+    43|             get.addHeader("Authorization", "Bearer " + session.getTokenString());
+    44|             try {
+    45|                 HttpResponse response = client.execute(get);
+    46|                 if (response.getStatusLine().getStatusCode() != 200) {
+    47|                     throw new Failure(response.getStatusLine().getStatusCode());
+    48|                 }
+    49|                 HttpEntity entity = response.getEntity();
+    50|                 InputStream is = entity.getContent();
+    51|                 try {
+    52|                     return JsonSerialization.readValue(is, TypedList.class);
+    53|                 } finally {
+    54|                     is.close();
+    55|                 }
+    56|             } catch (IOException e) {
+    57|                 throw new RuntimeException(e);
+    58|             }
+    59|         } finally {
+    60|             client.getConnectionManager().shutdown();
+    61|         }
+    62|     }
+    63|     public static String increaseAndGetCounter(HttpServletRequest req) {
+    64|         HttpSession session = req.getSession();
+    65|         Integer counter = (Integer)session.getAttribute("counter");
+    66|         counter = (counter == null) ? 1 : counter + 1;
+    67|         session.setAttribute("counter", counter);
+    68|         return String.valueOf(counter);
+    69|     }
+    70| }
+
+
+# ====================================================================
+# FILE: examples/demo-template/product-app/src/main/java/org/keycloak/example/oauth/ProductDatabaseClient.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-57 ---
+     1| package org.keycloak.example.oauth;
+     2| import org.apache.http.HttpEntity;
+     3| import org.apache.http.HttpResponse;
+     4| import org.apache.http.client.HttpClient;
+     5| import org.apache.http.client.methods.HttpGet;
+     6| import org.keycloak.KeycloakSecurityContext;
+     7| import org.keycloak.adapters.AdapterUtils;
+     8| import org.keycloak.adapters.HttpClientBuilder;
+     9| import org.keycloak.util.JsonSerialization;
+    10| import javax.servlet.http.HttpServletRequest;
+    11| import java.io.IOException;
+    12| import java.io.InputStream;
+    13| import java.util.ArrayList;
+    14| import java.util.List;
+    15| /**
+    16|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+    17|  * @version $Revision: 1 $
+    18|  */
+    19| public class ProductDatabaseClient
+    20| {
+    21|     static class TypedList extends ArrayList<String> {}
+    22|     public static class Failure extends Exception {
+    23|         private int status;
+    24|         public Failure(int status) {
+    25|             this.status = status;
+    26|         }
+    27|         public int getStatus() {
+    28|             return status;
+    29|         }
+    30|     }
+    31|     public static List<String> getProducts(HttpServletRequest req) throws Failure {
+    32|         KeycloakSecurityContext session = (KeycloakSecurityContext)req.getAttribute(KeycloakSecurityContext.class.getName());
+    33|         HttpClient client = new HttpClientBuilder()
+    34|                 .disableTrustManager().build();
+    35|         try {
+    36|             HttpGet get = new HttpGet(AdapterUtils.getOrigin(req.getRequestURL().toString(), session) + "/database/products");
+    37|             get.addHeader("Authorization", "Bearer " + session.getTokenString());
+    38|             try {
+    39|                 HttpResponse response = client.execute(get);
+    40|                 if (response.getStatusLine().getStatusCode() != 200) {
+    41|                     throw new Failure(response.getStatusLine().getStatusCode());
+    42|                 }
+    43|                 HttpEntity entity = response.getEntity();
+    44|                 InputStream is = entity.getContent();
+    45|                 try {
+    46|                     return JsonSerialization.readValue(is, TypedList.class);
+    47|                 } finally {
+    48|                     is.close();
+    49|                 }
+    50|             } catch (IOException e) {
+    51|                 throw new RuntimeException(e);
+    52|             }
+    53|         } finally {
+    54|             client.getConnectionManager().shutdown();
+    55|         }
+    56|     }
+    57| }
+
+
+# ====================================================================
+# FILE: examples/demo-template/third-party-cdi/src/main/java/org/keycloak/example/oauth/DatabaseClient.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-29 ---
+     1| package org.keycloak.example.oauth;
+     2| import org.apache.http.HttpEntity;
+     3| import org.apache.http.HttpResponse;
+     4| import org.apache.http.client.HttpClient;
+     5| import org.apache.http.client.methods.HttpGet;
+     6| import org.jboss.logging.Logger;
+     7| import org.keycloak.servlet.ServletOAuthClient;
+     8| import org.keycloak.util.JsonSerialization;
+     9| import org.keycloak.util.UriUtils;
+    10| import javax.enterprise.context.ApplicationScoped;
+    11| import javax.faces.application.FacesMessage;
+    12| import javax.faces.context.FacesContext;
+    13| import javax.inject.Inject;
+    14| import javax.inject.Named;
+    15| import javax.servlet.http.HttpServletRequest;
+    16| import javax.servlet.http.HttpServletResponse;
+    17| import java.io.IOException;
+    18| import java.io.InputStream;
+    19| import java.util.ArrayList;
+    20| import java.util.List;
+    21| /**
+    22|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+    23|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+    24|  * @version $Revision: 1 $
+    25|  */
+    26| @ApplicationScoped
+    27| @Named("databaseClient")
+    28| public class DatabaseClient {
+    29|     @Inject
+
+# --- HUNK 2: Lines 68-99 ---
+    68|                     try {
+    69|                         return JsonSerialization.readValue(is, TypedList.class);
+    70|                     } finally {
+    71|                         is.close();
+    72|                     }
+    73|                 case 401: facesContext.addMessage(null, new FacesMessage("Status: 401. Request not authenticated! You need to retrieve access token first."));
+    74|                     break;
+    75|                 case 403: facesContext.addMessage(null, new FacesMessage("Status: 403. Access token has insufficient privileges"));
+    76|                     break;
+    77|                 default: facesContext.addMessage(null, new FacesMessage("Status: " + response.getStatusLine() + ". Not able to retrieve data. See log for details"));
+    78|                     logger.warn("Error occured. Status: " + response.getStatusLine());
+    79|             }
+    80|             return null;
+    81|         } catch (IOException e) {
+    82|             e.printStackTrace();
+    83|             facesContext.addMessage(null, new FacesMessage("Unknown error. See log for details"));
+    84|             return null;
+    85|         }
+    86|     }
+    87|     public String getBaseUrl() {
+    88|         switch (oauthClient.getRelativeUrlsUsed()) {
+    89|             case ALL_REQUESTS:
+    90|                 return UriUtils.getOrigin(request.getRequestURL().toString());
+    91|             case BROWSER_ONLY:
+    92|                 return UriUtils.getOrigin(oauthClient.getCodeUrl());
+    93|             case NEVER:
+    94|                 return "";
+    95|             default:
+    96|                 return "";
+    97|         }
+    98|     }
+    99| }
+
+
+# ====================================================================
+# FILE: examples/demo-template/third-party/src/main/java/org/keycloak/example/oauth/ProductDatabaseClient.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-83 ---
+     1| package org.keycloak.example.oauth;
+     2| import org.apache.http.HttpEntity;
+     3| import org.apache.http.HttpResponse;
+     4| import org.apache.http.client.HttpClient;
+     5| import org.apache.http.client.methods.HttpGet;
+     6| import org.keycloak.adapters.ServerRequest;
+     7| import org.keycloak.representations.AccessTokenResponse;
+     8| import org.keycloak.servlet.ServletOAuthClient;
+     9| import org.keycloak.util.JsonSerialization;
+    10| import org.keycloak.util.UriUtils;
+    11| import javax.servlet.http.HttpServletRequest;
+    12| import javax.servlet.http.HttpServletResponse;
+    13| import java.io.IOException;
+    14| import java.io.InputStream;
+    15| import java.util.ArrayList;
+    16| import java.util.List;
+    17| /**
+    18|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+    19|  * @version $Revision: 1 $
+    20|  */
+    21| public class ProductDatabaseClient {
+    22|     public static class Failure extends Exception {
+    23|         private int status;
+    24|         public Failure(int status) {
+    25|             this.status = status;
+    26|         }
+    27|         public int getStatus() {
+    28|             return status;
+    29|         }
+    30|     }
+    31|     public static void redirect(HttpServletRequest request, HttpServletResponse response) {
+    32|         ServletOAuthClient oAuthClient = (ServletOAuthClient) request.getServletContext().getAttribute(ServletOAuthClient.class.getName());
+    33|         try {
+    34|             oAuthClient.redirectRelative("pull_data.jsp", request, response);
+    35|         } catch (IOException e) {
+    36|             throw new RuntimeException(e);
+    37|         }
+    38|     }
+    39|     static class TypedList extends ArrayList<String> {}
+    40|     public static AccessTokenResponse getTokenResponse(HttpServletRequest request) {
+    41|         ServletOAuthClient oAuthClient = (ServletOAuthClient) request.getServletContext().getAttribute(ServletOAuthClient.class.getName());
+    42|         try {
+    43|             return oAuthClient.getBearerToken(request);
+    44|         } catch (IOException e) {
+    45|             throw new RuntimeException(e);
+    46|         } catch (ServerRequest.HttpFailure failure) {
+    47|             throw new RuntimeException(failure);
+    48|         }
+    49|     }
+    50|     public static List<String> getProducts(HttpServletRequest request, String accessToken) throws Failure {
+    51|         ServletOAuthClient oAuthClient = (ServletOAuthClient) request.getServletContext().getAttribute(ServletOAuthClient.class.getName());
+    52|         HttpClient client = oAuthClient.getClient();
+    53|         HttpGet get = new HttpGet(getBaseUrl(oAuthClient, request) + "/database/products");
+    54|         get.addHeader("Authorization", "Bearer " + accessToken);
+    55|         try {
+    56|             HttpResponse response = client.execute(get);
+    57|             if (response.getStatusLine().getStatusCode() != 200) {
+    58|                 throw new Failure(response.getStatusLine().getStatusCode());
+    59|             }
+    60|             HttpEntity entity = response.getEntity();
+    61|             InputStream is = entity.getContent();
+    62|             try {
+    63|                 return JsonSerialization.readValue(is, TypedList.class);
+    64|             } finally {
+    65|                 is.close();
+    66|             }
+    67|         } catch (IOException e) {
+    68|             throw new RuntimeException(e);
+    69|         }
+    70|     }
+    71|     public static String getBaseUrl(ServletOAuthClient oAuthClient, HttpServletRequest request) {
+    72|         switch (oAuthClient.getRelativeUrlsUsed()) {
+    73|             case ALL_REQUESTS:
+    74|                 return UriUtils.getOrigin(request.getRequestURL().toString());
+    75|             case BROWSER_ONLY:
+    76|                 return UriUtils.getOrigin(oAuthClient.getCodeUrl());
+    77|             case NEVER:
+    78|                 return "";
+    79|             default:
+    80|                 return "";
+    81|         }
+    82|     }
+    83| }
+
+
+# ====================================================================
+# FILE: examples/multi-tenant/src/main/java/org/keycloak/example/multitenant/boundary/ProtectedServlet.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-52 ---
+     1| /*
+     2|  * Copyright 2014 Red Hat Inc. and/or its affiliates and other contributors
+     3|  * as indicated by the @author tags. All rights reserved.
+     4|  *
+     5|  * Licensed under the Apache License, Version 2.0 (the "License");
+     6|  * you may not use this file except in compliance with the License.
+     7|  * You may obtain a copy of the License at
+     8|  *
+     9|  *      http://www.apache.org/licenses/LICENSE-2.0
+    10|  *
+    11|  * Unless required by applicable law or agreed to in writing, software
+    12|  * distributed under the License is distributed on an "AS IS" BASIS,
+    13|  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    14|  * See the License for the specific language governing permissions and
+    15|  * limitations under the License.
+    16|  */
+    17| package org.keycloak.example.multitenant.boundary;
+    18| import java.io.IOException;
+    19| import java.io.PrintWriter;
+    20| import javax.servlet.ServletException;
+    21| import javax.servlet.annotation.WebServlet;
+    22| import javax.servlet.http.HttpServlet;
+    23| import javax.servlet.http.HttpServletRequest;
+    24| import javax.servlet.http.HttpServletResponse;
+    25| import org.keycloak.KeycloakPrincipal;
+    26| /**
+    27|  *
+    28|  * @author Juraci Paixão Kröhling <juraci at kroehling.de>
+    29|  */
+    30| @WebServlet(urlPatterns = "/*")
+    31| public class ProtectedServlet extends HttpServlet {
+    32|     @Override
+    33|     protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+    34|         String realm = req.getPathInfo().split("/")[1];
+    35|         if (realm.contains("?")) {
+    36|             realm = realm.split("\\?")[0];
+    37|         }
+    38|         if (req.getPathInfo().contains("logout")) {
+    39|             req.logout();
+    40|             resp.sendRedirect(req.getContextPath() + "/" + realm);
+    41|             return;
+    42|         }
+    43|         KeycloakPrincipal principal = (KeycloakPrincipal) req.getUserPrincipal();
+    44|         resp.setContentType("text/html");
+    45|         PrintWriter writer = resp.getWriter();
+    46|         writer.write("Realm: ");
+    47|         writer.write(principal.getKeycloakSecurityContext().getIdToken().getIssuer());
+    48|         writer.write("<br/>User: ");
+    49|         writer.write(principal.getKeycloakSecurityContext().getIdToken().getPreferredUsername());
+    50|         writer.write(String.format("<br/><a href=\"/multitenant/%s/logout\">Logout</a>", realm));
+    51|     }
+    52|  }
+
+
+# ====================================================================
+# FILE: examples/multi-tenant/src/main/java/org/keycloak/example/multitenant/control/PathBasedKeycloakConfigResolver.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-54 ---
+     1| /*
+     2|  * Copyright 2014 Red Hat Inc. and/or its affiliates and other contributors
+     3|  * as indicated by the @author tags. All rights reserved.
+     4|  *
+     5|  * Licensed under the Apache License, Version 2.0 (the "License");
+     6|  * you may not use this file except in compliance with the License.
+     7|  * You may obtain a copy of the License at
+     8|  *
+     9|  *      http://www.apache.org/licenses/LICENSE-2.0
+    10|  *
+    11|  * Unless required by applicable law or agreed to in writing, software
+    12|  * distributed under the License is distributed on an "AS IS" BASIS,
+    13|  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    14|  * See the License for the specific language governing permissions and
+    15|  * limitations under the License.
+    16|  */
+    17| package org.keycloak.example.multitenant.control;
+    18| import java.io.InputStream;
+    19| import java.util.HashMap;
+    20| import java.util.Map;
+    21| import java.util.concurrent.ConcurrentHashMap;
+    22| import org.keycloak.adapters.HttpFacade;
+    23| import org.keycloak.adapters.KeycloakConfigResolver;
+    24| import org.keycloak.adapters.KeycloakDeployment;
+    25| import org.keycloak.adapters.KeycloakDeploymentBuilder;
+    26| /**
+    27|  *
+    28|  * @author Juraci Paixão Kröhling <juraci at kroehling.de>
+    29|  */
+    30| public class PathBasedKeycloakConfigResolver implements KeycloakConfigResolver {
+    31|     private final Map<String, KeycloakDeployment> cache = new ConcurrentHashMap<String, KeycloakDeployment>();
+    32|     @Override
+    33|     public KeycloakDeployment resolve(HttpFacade.Request request) {
+    34|         String path = request.getURI();
+    35|         int multitenantIndex = path.indexOf("multitenant/");
+    36|         if (multitenantIndex == -1) {
+    37|             throw new IllegalStateException("Not able to resolve realm from the request path!");
+    38|         }
+    39|         String realm = path.substring(path.indexOf("multitenant/")).split("/")[1];
+    40|         if (realm.contains("?")) {
+    41|             realm = realm.split("\\?")[0];
+    42|         }
+    43|         KeycloakDeployment deployment = cache.get(realm);
+    44|         if (null == deployment) {
+    45|             InputStream is = getClass().getResourceAsStream("/" + realm + "-keycloak.json");
+    46|             if (is == null) {
+    47|                 throw new IllegalStateException("Not able to find the file /" + realm + "-keycloak.json");
+    48|             }
+    49|             deployment = KeycloakDeploymentBuilder.build(is);
+    50|             cache.put(realm, deployment);
+    51|         }
+    52|         return deployment;
+    53|     }
+    54| }
+
+
+# ====================================================================
+# FILE: examples/providers/event-listener-sysout/src/main/java/org/keycloak/examples/providers/events/SysoutEventListenerProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-23 ---
+     1| package org.keycloak.examples.providers.events;
+     2| import org.keycloak.events.Event;
+     3| import org.keycloak.events.EventListenerProvider;
+     4| import org.keycloak.events.EventType;
+     5| import java.util.Map;
+     6| import java.util.Set;
+     7| /**
+     8|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+     9|  */
+    10| public class SysoutEventListenerProvider implements EventListenerProvider {
+    11|     private Set<EventType> excludedEvents;
+    12|     public SysoutEventListenerProvider(Set<EventType> excludedEvents) {
+    13|         this.excludedEvents = excludedEvents;
+    14|     }
+    15|     @Override
+    16|     public void onEvent(Event event) {
+    17|         if (excludedEvents != null && excludedEvents.contains(event.getType())) {
+    18|             return;
+    19|         } else {
+    20|             System.out.println("EVENT: " + toString(event));
+    21|         }
+    22|     }
+    23|     private String toString(Event event) {
+
+
+# ====================================================================
+# FILE: examples/providers/event-store-mem/src/main/java/org/keycloak/examples/providers/events/MemEventStoreProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-24 ---
+     1| package org.keycloak.examples.providers.events;
+     2| import org.keycloak.events.Event;
+     3| import org.keycloak.events.EventQuery;
+     4| import org.keycloak.events.EventStoreProvider;
+     5| import org.keycloak.events.EventType;
+     6| import java.util.Iterator;
+     7| import java.util.LinkedList;
+     8| import java.util.List;
+     9| import java.util.Set;
+    10| /**
+    11|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    12|  */
+    13| public class MemEventStoreProvider implements EventStoreProvider {
+    14|     private final List<Event> events;
+    15|     private final Set<EventType> excludedEvents;
+    16|     public MemEventStoreProvider(List<Event> events, Set<EventType> excludedEvents) {
+    17|         this.events = events;
+    18|         this.excludedEvents = excludedEvents;
+    19|     }
+    20|     @Override
+    21|     public EventQuery createQuery() {
+    22|         return new MemEventQuery(new LinkedList<Event>(events));
+    23|     }
+    24|     @Override
+
+
+# ====================================================================
+# FILE: examples/providers/event-store-mem/src/main/java/org/keycloak/examples/providers/events/MemEventStoreProviderFactory.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-25 ---
+     1| package org.keycloak.examples.providers.events;
+     2| import org.keycloak.Config;
+     3| import org.keycloak.events.Event;
+     4| import org.keycloak.events.EventStoreProvider;
+     5| import org.keycloak.events.EventStoreProviderFactory;
+     6| import org.keycloak.events.EventType;
+     7| import org.keycloak.models.KeycloakSession;
+     8| import java.util.Collections;
+     9| import java.util.HashSet;
+    10| import java.util.LinkedList;
+    11| import java.util.List;
+    12| import java.util.Set;
+    13| /**
+    14|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+    15|  */
+    16| public class MemEventStoreProviderFactory implements EventStoreProviderFactory {
+    17|     private List<Event> events;
+    18|     private Set<EventType> excludedEvents;
+    19|     @Override
+    20|     public EventStoreProvider create(KeycloakSession session) {
+    21|         return new MemEventStoreProvider(events, excludedEvents);
+    22|     }
+    23|     @Override
+    24|     public void init(Config.Scope config) {
+    25|         events = Collections.synchronizedList(new LinkedList<Event>());
+
+
+# ====================================================================
+# FILE: export-import/export-import-api/src/main/java/org/keycloak/exportimport/util/ExportImportSessionTask.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-20 ---
+     1| package org.keycloak.exportimport.util;
+     2| import org.keycloak.models.KeycloakSession;
+     3| import org.keycloak.models.KeycloakSessionTask;
+     4| import java.io.IOException;
+     5| /**
+     6|  * Just to wrap {@link IOException}
+     7|  *
+     8|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+     9|  */
+    10| public abstract class ExportImportSessionTask implements KeycloakSessionTask {
+    11|     @Override
+    12|     public void run(KeycloakSession session) {
+    13|         try {
+    14|             runExportImportTask(session);
+    15|         } catch (IOException ioe) {
+    16|             throw new RuntimeException("Error during export/import: " + ioe.getMessage(), ioe);
+    17|         }
+    18|     }
+    19|     protected abstract void runExportImportTask(KeycloakSession session) throws IOException;
+    20| }
+
+
+# ====================================================================
+# FILE: export-import/export-import-dir/src/main/java/org/keycloak/exportimport/dir/DirImportProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-29 ---
+     1| package org.keycloak.exportimport.dir;
+     2| import org.jboss.logging.Logger;
+     3| import org.keycloak.Config;
+     4| import org.keycloak.exportimport.ImportProvider;
+     5| import org.keycloak.exportimport.Strategy;
+     6| import org.keycloak.exportimport.util.ExportImportSessionTask;
+     7| import org.keycloak.exportimport.util.ImportUtils;
+     8| import org.keycloak.models.KeycloakSession;
+     9| import org.keycloak.models.KeycloakSessionFactory;
+    10| import org.keycloak.models.utils.KeycloakModelUtils;
+    11| import org.keycloak.representations.idm.RealmRepresentation;
+    12| import org.keycloak.util.JsonSerialization;
+    13| import java.io.File;
+    14| import java.io.FileInputStream;
+    15| import java.io.FilenameFilter;
+    16| import java.io.IOException;
+    17| import java.util.ArrayList;
+    18| import java.util.List;
+    19| /**
+    20|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+    21|  */
+    22| public class DirImportProvider implements ImportProvider {
+    23|     private static final Logger logger = Logger.getLogger(DirImportProvider.class);
+    24|     private final File rootDirectory;
+    25|     public DirImportProvider() {
+    26|         String tempDir = System.getProperty("java.io.tmpdir");
+    27|         this.rootDirectory = new File(tempDir + "/keycloak-export");
+    28|         if (!this.rootDirectory .exists()) {
+    29|             throw new IllegalStateException("Directory " + this.rootDirectory + " doesn't exists");
+
+
+# ====================================================================
+# FILE: export-import/export-import-single-file/src/main/java/org/keycloak/exportimport/singlefile/SingleFileExportProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-28 ---
+     1| package org.keycloak.exportimport.singlefile;
+     2| import org.codehaus.jackson.map.ObjectMapper;
+     3| import org.jboss.logging.Logger;
+     4| import org.keycloak.exportimport.ExportProvider;
+     5| import org.keycloak.exportimport.util.ExportImportSessionTask;
+     6| import org.keycloak.exportimport.util.ExportUtils;
+     7| import org.keycloak.models.KeycloakSession;
+     8| import org.keycloak.models.KeycloakSessionFactory;
+     9| import org.keycloak.models.RealmModel;
+    10| import org.keycloak.models.utils.KeycloakModelUtils;
+    11| import org.keycloak.representations.idm.RealmRepresentation;
+    12| import org.keycloak.util.JsonSerialization;
+    13| import java.io.File;
+    14| import java.io.FileOutputStream;
+    15| import java.io.IOException;
+    16| import java.util.ArrayList;
+    17| import java.util.List;
+    18| /**
+    19|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+    20|  */
+    21| public class SingleFileExportProvider implements ExportProvider {
+    22|     private static final Logger logger = Logger.getLogger(SingleFileExportProvider.class);
+    23|     private File file;
+    24|     public SingleFileExportProvider(File file) {
+    25|         this.file = file;
+    26|     }
+    27|     public void setFile(File file) {
+    28|         this.file = file;
+
+
+# ====================================================================
+# FILE: export-import/export-import-single-file/src/main/java/org/keycloak/exportimport/singlefile/SingleFileImportProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-33 ---
+     1| package org.keycloak.exportimport.singlefile;
+     2| import org.jboss.logging.Logger;
+     3| import org.keycloak.exportimport.ImportProvider;
+     4| import org.keycloak.exportimport.Strategy;
+     5| import org.keycloak.exportimport.util.ExportImportSessionTask;
+     6| import org.keycloak.exportimport.util.ImportUtils;
+     7| import org.keycloak.models.KeycloakSession;
+     8| import org.keycloak.models.KeycloakSessionFactory;
+     9| import org.keycloak.models.utils.KeycloakModelUtils;
+    10| import org.keycloak.util.JsonSerialization;
+    11| import java.io.File;
+    12| import java.io.FileInputStream;
+    13| import java.io.IOException;
+    14| /**
+    15|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+    16|  */
+    17| public class SingleFileImportProvider implements ImportProvider {
+    18|     private static final Logger logger = Logger.getLogger(SingleFileImportProvider.class);
+    19|     private File file;
+    20|     public SingleFileImportProvider(File file) {
+    21|         this.file = file;
+    22|     }
+    23|     @Override
+    24|     public void importModel(KeycloakSessionFactory factory, final Strategy strategy) throws IOException {
+    25|         logger.infof("Full importing from file %s", this.file.getAbsolutePath());
+    26|         KeycloakModelUtils.runJobInTransaction(factory, new ExportImportSessionTask() {
+    27|             @Override
+    28|             protected void runExportImportTask(KeycloakSession session) throws IOException {
+    29|                 FileInputStream is = new FileInputStream(file);
+    30|                 ImportUtils.importFromStream(session, JsonSerialization.mapper, is, strategy);
+    31|             }
+    32|         });
+    33|     }
+
+
+# ====================================================================
+# FILE: export-import/export-import-zip/src/main/java/org/keycloak/exportimport/zip/ZipImportProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-33 ---
+     1| package org.keycloak.exportimport.zip;
+     2| import de.idyl.winzipaes.AesZipFileDecrypter;
+     3| import de.idyl.winzipaes.impl.AESDecrypter;
+     4| import de.idyl.winzipaes.impl.AESDecrypterBC;
+     5| import de.idyl.winzipaes.impl.ExtZipEntry;
+     6| import org.jboss.logging.Logger;
+     7| import org.keycloak.Config;
+     8| import org.keycloak.exportimport.ImportProvider;
+     9| import org.keycloak.exportimport.Strategy;
+    10| import org.keycloak.exportimport.util.ExportImportSessionTask;
+    11| import org.keycloak.exportimport.util.ImportUtils;
+    12| import org.keycloak.models.KeycloakSession;
+    13| import org.keycloak.models.KeycloakSessionFactory;
+    14| import org.keycloak.models.utils.KeycloakModelUtils;
+    15| import org.keycloak.representations.idm.RealmRepresentation;
+    16| import org.keycloak.util.JsonSerialization;
+    17| import java.io.ByteArrayInputStream;
+    18| import java.io.ByteArrayOutputStream;
+    19| import java.io.File;
+    20| import java.io.IOException;
+    21| import java.util.ArrayList;
+    22| import java.util.List;
+    23| import java.util.zip.DataFormatException;
+    24| /**
+    25|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+    26|  */
+    27| public class ZipImportProvider implements ImportProvider {
+    28|     private static final Logger logger = Logger.getLogger(ZipImportProvider.class);
+    29|     private final AesZipFileDecrypter decrypter;
+    30|     private final String password;
+    31|     public ZipImportProvider(File zipFile, String password) {
+    32|         try {
+    33|             if (!zipFile.exists()) {
+
+
+# ====================================================================
+# FILE: federation/ldap/src/main/java/org/keycloak/federation/ldap/LDAPFederationProvider.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 165-245 ---
+   165|     }
+   166|     @Override
+   167|     public boolean isValid(UserModel local) {
+   168|         try {
+   169|             User picketlinkUser = LDAPUtils.getUser(partitionManager, local.getUsername());
+   170|             if (picketlinkUser == null) {
+   171|                 return false;
+   172|             }
+   173|             return picketlinkUser.getId().equals(local.getAttribute(LDAP_ID));
+   174|         } catch (IdentityManagementException ie) {
+   175|             throw convertIDMException(ie);
+   176|         }
+   177|     }
+   178|     @Override
+   179|     public UserModel getUserByUsername(RealmModel realm, String username) {
+   180|         try {
+   181|             User picketlinkUser = LDAPUtils.getUser(partitionManager, username);
+   182|             if (picketlinkUser == null) {
+   183|                 return null;
+   184|             }
+   185|             if (!username.equals(picketlinkUser.getLoginName())) {
+   186|                 logger.warnf("User found in LDAP but with different username. LDAP username: %s, Searched username: %s", username, picketlinkUser.getLoginName());
+   187|                 return null;
+   188|             }
+   189|             return importUserFromPicketlink(realm, picketlinkUser);
+   190|         } catch (IdentityManagementException ie) {
+   191|             throw convertIDMException(ie);
+   192|         }
+   193|     }
+   194|     public IdentityManager getIdentityManager() {
+   195|         return partitionManager.createIdentityManager();
+   196|     }
+   197|     protected UserModel importUserFromPicketlink(RealmModel realm, User picketlinkUser) {
+   198|         String email = (picketlinkUser.getEmail() != null && picketlinkUser.getEmail().trim().length() > 0) ? picketlinkUser.getEmail() : null;
+   199|         if (picketlinkUser.getLoginName() == null) {
+   200|             throw new ModelException("User returned from LDAP has null username! Check configuration of your LDAP mappings. ID of user from LDAP: " + picketlinkUser.getId());
+   201|         }
+   202|         UserModel imported = session.userStorage().addUser(realm, picketlinkUser.getLoginName());
+   203|         imported.setEnabled(true);
+   204|         imported.setEmail(email);
+   205|         imported.setFirstName(picketlinkUser.getFirstName());
+   206|         imported.setLastName(picketlinkUser.getLastName());
+   207|         imported.setFederationLink(model.getId());
+   208|         imported.setAttribute(LDAP_ID, picketlinkUser.getId());
+   209|         return proxy(imported);
+   210|     }
+   211|     protected User queryByEmail(IdentityManager identityManager, String email) throws IdentityManagementException {
+   212|         return LDAPUtils.getUserByEmail(identityManager, email);
+   213|     }
+   214|     @Override
+   215|     public UserModel getUserByEmail(RealmModel realm, String email) {
+   216|         IdentityManager identityManager = getIdentityManager();
+   217|         try {
+   218|             User picketlinkUser = queryByEmail(identityManager, email);
+   219|             if (picketlinkUser == null) {
+   220|                 return null;
+   221|             }
+   222|             if (!email.equals(picketlinkUser.getEmail())) {
+   223|                 logger.warnf("User found in LDAP but with different email. LDAP email: %s, Searched email: %s", email, picketlinkUser.getEmail());
+   224|                 return null;
+   225|             }
+   226|             return importUserFromPicketlink(realm, picketlinkUser);
+   227|         } catch (IdentityManagementException ie) {
+   228|             throw convertIDMException(ie);
+   229|         }
+   230|     }
+   231|     @Override
+   232|     public void preRemove(RealmModel realm) {
+   233|     }
+   234|     @Override
+   235|     public void preRemove(RealmModel realm, RoleModel role) {
+   236|     }
+   237|     public boolean validPassword(String username, String password) {
+   238|         try {
+   239|             return LDAPUtils.validatePassword(partitionManager, username, password);
+   240|         } catch (IdentityManagementException ie) {
+   241|             throw convertIDMException(ie);
+   242|         }
+   243|     }
+   244|     @Override
+   245|     public boolean validCredentials(RealmModel realm, UserModel user, List<UserCredentialModel> input) {
+
+# --- HUNK 2: Lines 255-289 ---
+   255|     @Override
+   256|     public boolean validCredentials(RealmModel realm, UserModel user, UserCredentialModel... input) {
+   257|         for (UserCredentialModel cred : input) {
+   258|             if (cred.getType().equals(UserCredentialModel.PASSWORD)) {
+   259|                 return validPassword(user.getUsername(), cred.getValue());
+   260|             } else {
+   261|                 return false; // invalid cred type
+   262|             }
+   263|         }
+   264|         return true;
+   265|     }
+   266|     @Override
+   267|     public void close() {
+   268|     }
+   269|     protected void importPicketlinkUsers(RealmModel realm, List<User> users, UserFederationProviderModel fedModel) {
+   270|         for (User picketlinkUser : users) {
+   271|             String username = picketlinkUser.getLoginName();
+   272|             UserModel currentUser = session.userStorage().getUserByUsername(username, realm);
+   273|             if (currentUser == null) {
+   274|                 importUserFromPicketlink(realm, picketlinkUser);
+   275|                 logger.debugf("Added new user from LDAP: %s", username);
+   276|             } else {
+   277|                 if ((fedModel.getId().equals(currentUser.getFederationLink())) && (picketlinkUser.getId().equals(currentUser.getAttribute(LDAPFederationProvider.LDAP_ID)))) {
+   278|                     String email = (picketlinkUser.getEmail() != null && picketlinkUser.getEmail().trim().length() > 0) ? picketlinkUser.getEmail() : null;
+   279|                     currentUser.setEmail(email);
+   280|                     currentUser.setFirstName(picketlinkUser.getFirstName());
+   281|                     currentUser.setLastName(picketlinkUser.getLastName());
+   282|                     logger.debugf("Updated user from LDAP: %s", currentUser.getUsername());
+   283|                 } else {
+   284|                     logger.warnf("User '%s' is not updated during sync as he is not linked to federation provider '%s'", username, fedModel.getDisplayName());
+   285|                 }
+   286|             }
+   287|         }
+   288|     }
+   289| }
+
+
+# ====================================================================
+# FILE: federation/ldap/src/main/java/org/keycloak/federation/ldap/LDAPFederationProviderFactory.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-31 ---
+     1| package org.keycloak.federation.ldap;
+     2| import org.jboss.logging.Logger;
+     3| import org.keycloak.Config;
+     4| import org.keycloak.models.KeycloakSession;
+     5| import org.keycloak.models.KeycloakSessionFactory;
+     6| import org.keycloak.models.KeycloakSessionTask;
+     7| import org.keycloak.models.LDAPConstants;
+     8| import org.keycloak.models.RealmModel;
+     9| import org.keycloak.models.UserFederationProvider;
+    10| import org.keycloak.models.UserFederationProviderFactory;
+    11| import org.keycloak.models.UserFederationProviderModel;
+    12| import org.keycloak.models.utils.KeycloakModelUtils;
+    13| import org.keycloak.picketlink.PartitionManagerProvider;
+    14| import org.picketlink.idm.IdentityManager;
+    15| import org.picketlink.idm.PartitionManager;
+    16| import org.picketlink.idm.model.IdentityType;
+    17| import org.picketlink.idm.model.basic.User;
+    18| import org.picketlink.idm.query.IdentityQuery;
+    19| import java.util.Collections;
+    20| import java.util.Date;
+    21| import java.util.List;
+    22| import java.util.Set;
+    23| /**
+    24|  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+    25|  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+    26|  * @version $Revision: 1 $
+    27|  */
+    28| public class LDAPFederationProviderFactory implements UserFederationProviderFactory {
+    29|     private static final Logger logger = Logger.getLogger(LDAPFederationProviderFactory.class);
+    30|     public static final String PROVIDER_NAME = "ldap";
+    31|     @Override
+
+
+# ====================================================================
+# FILE: forms/account-freemarker/src/main/java/org/keycloak/account/freemarker/FreeMarkerAccountProvider.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 93-133 ---
+    93|         for (Map.Entry<String, List<String>> e : uriInfo.getQueryParameters().entrySet()) {
+    94|            baseUriBuilder.queryParam(e.getKey(), e.getValue().toArray());
+    95|         }
+    96|         URI baseQueryUri = baseUriBuilder.build();
+    97|         if (stateChecker != null) {
+    98|             attributes.put("stateChecker", stateChecker);
+    99|         }
+   100|         if (message != null) {
+   101|             attributes.put("message", new MessageBean(messages.containsKey(message) ? messages.getProperty(message) : message, messageType));
+   102|         }
+   103|         if (referrer != null) {
+   104|             attributes.put("referrer", new ReferrerBean(referrer));
+   105|         }
+   106|         attributes.put("url", new UrlBean(realm, theme, baseUri, baseQueryUri, uriInfo.getRequestUri(), stateChecker));
+   107|         attributes.put("features", new FeaturesBean(socialEnabled, eventsEnabled, passwordUpdateSupported));
+   108|         switch (page) {
+   109|             case ACCOUNT:
+   110|                 attributes.put("account", new AccountBean(user, profileFormData));
+   111|                 break;
+   112|             case TOTP:
+   113|                 attributes.put("totp", new TotpBean(realm, user, baseUri));
+   114|                 break;
+   115|             case SOCIAL:
+   116|                 attributes.put("social", new AccountSocialBean(session, realm, user, uriInfo.getBaseUri(), stateChecker));
+   117|                 break;
+   118|             case LOG:
+   119|                 attributes.put("log", new LogBean(events));
+   120|                 break;
+   121|             case SESSIONS:
+   122|                 attributes.put("sessions", new SessionsBean(realm, sessions));
+   123|                 break;
+   124|             case PASSWORD:
+   125|                 attributes.put("password", new PasswordBean(passwordSet));
+   126|         }
+   127|         try {
+   128|             String result = freeMarker.processTemplate(attributes, Templates.getTemplate(page), theme);
+   129|             Response.ResponseBuilder builder = Response.status(status).type(MediaType.TEXT_HTML).entity(result);
+   130|             BrowserSecurityHeaderSetup.headers(builder, realm);
+   131|             return builder.build();
+   132|         } catch (FreeMarkerException e) {
+   133|             logger.error("Failed to process template", e);
+

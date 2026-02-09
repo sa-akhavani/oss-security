@@ -1,0 +1,435 @@
+--- a/qutebrowser/__init__.py
++++ b/qutebrowser/__init__.py
+@@ -1,11 +1,11 @@
+ """A keyboard-driven, vim-like browser based on PyQt5."""
+ import os.path
+ __author__ = "Florian Bruhin"
+ __copyright__ = "Copyright 2014-2018 Florian Bruhin (The Compiler)"
+ __license__ = "GPL"
+ __maintainer__ = __author__
+ __email__ = "mail@qutebrowser.org"
+-__version_info__ = (1, 4, 1)
++__version_info__ = (1, 4, 0)
+ __version__ = '.'.join(str(e) for e in __version_info__)
+ __description__ = "A keyboard-driven, vim-like browser based on PyQt5."
+ basedir = os.path.dirname(os.path.realpath(__file__))
+
+--- a/qutebrowser/browser/qtnetworkdownloads.py
++++ b/qutebrowser/browser/qtnetworkdownloads.py
+@@ -1,20 +1,20 @@
+ """Download manager."""
+ import io
+ import os.path
+ import shutil
+ import functools
+ import attr
+ from PyQt5.QtCore import pyqtSlot, pyqtSignal, QTimer
+ from PyQt5.QtNetwork import QNetworkRequest, QNetworkReply
+ from qutebrowser.config import config
+-from qutebrowser.utils import message, usertypes, log, urlutils, utils, debug
++from qutebrowser.utils import message, usertypes, log, urlutils, utils
+ from qutebrowser.browser import downloads
+ from qutebrowser.browser.webkit import http
+ from qutebrowser.browser.webkit.network import networkmanager
+ @attr.s
+ class _RetryInfo:
+     request = attr.ib()
+     manager = attr.ib()
+ class DownloadItem(downloads.AbstractDownloadItem):
+     """A single download currently running.
+     There are multiple ways the data can flow from the QNetworkReply to the
+@@ -228,26 +228,21 @@
+             raise OSError("Reply is closed!")
+         try:
+             self.fileobj.write(self._reply.readAll())
+         except OSError as e:
+             self._die(e.strerror)
+     @pyqtSlot('QNetworkReply::NetworkError')
+     def _on_reply_error(self, code):
+         """Handle QNetworkReply errors."""
+         if code == QNetworkReply.OperationCanceledError:
+             return
+-        if self._reply is None:
+-            error = "Unknown error: {}".format(
+-                debug.qenum_key(QNetworkReply, code))
+-        else:
+-            error = self._reply.errorString()
+-        self._die(error)
++        self._die(self._reply.errorString())
+     @pyqtSlot()
+     def _on_read_timer_timeout(self):
+         """Read some bytes from the QNetworkReply periodically."""
+         if not self._reply.isOpen():
+             raise OSError("Reply is closed!")
+         data = self._reply.read(1024)
+         if data is not None:
+             self._buffer.write(data)
+     @pyqtSlot()
+     def _on_meta_data_changed(self):
+
+--- a/qutebrowser/browser/qutescheme.py
++++ b/qutebrowser/browser/qutescheme.py
+@@ -4,37 +4,30 @@
+     _HANDLERS: The handlers registered via decorators.
+ """
+ import html
+ import json
+ import os
+ import time
+ import textwrap
+ import mimetypes
+ import urllib
+ import collections
+-import base64
+-try:
+-    import secrets
+-except ImportError:
+-    secrets = None
+ import pkg_resources
+ from PyQt5.QtCore import QUrlQuery, QUrl
+-from PyQt5.QtNetwork import QNetworkReply
+ import qutebrowser
+ from qutebrowser.config import config, configdata, configexc, configdiff
+ from qutebrowser.utils import (version, utils, jinja, log, message, docutils,
+                                objreg, urlutils)
+ from qutebrowser.misc import objects
+ from qutebrowser.qt import sip
+ pyeval_output = ":pyeval was never called"
+ spawn_output = ":spawn was never called"
+-csrf_token = None
+ _HANDLERS = {}
+ class NoHandlerFound(Exception):
+     """Raised when no handler was found for the given URL."""
+     pass
+ class QuteSchemeOSError(Exception):
+     """Called when there was an OSError inside a handler."""
+     pass
+ class QuteSchemeError(Exception):
+     """Exception to signal that a handler should return an ErrorReply.
+     Attributes correspond to the arguments in
+@@ -323,36 +316,25 @@
+         return 'text/html', b'error: ' + msg.encode('utf-8')
+     try:
+         config.instance.set_str(option, value, save_yaml=True)
+         return 'text/html', b'ok'
+     except configexc.Error as e:
+         message.error(str(e))
+         return 'text/html', b'error: ' + str(e).encode('utf-8')
+ @add_handler('settings')
+ def qute_settings(url):
+     """Handler for qute://settings. View/change qute configuration."""
+-    global csrf_token
+     if url.path() == '/set':
+-        if url.password() != csrf_token:
+-            message.error("Invalid CSRF token for qute://settings!")
+-            raise QuteSchemeError("Invalid CSRF token!",
+-                                  QNetworkReply.ContentAccessDenied)
+         return _qute_settings_set(url)
+-    if secrets:
+-        csrf_token = secrets.token_urlsafe()
+-    else:
+-        token = base64.urlsafe_b64encode(os.urandom(32))
+-        csrf_token = token.rstrip(b'=').decode('ascii')
+     src = jinja.render('settings.html', title='settings',
+                        configdata=configdata,
+-                       confget=config.instance.get_str,
+-                       csrf_token=csrf_token)
++                       confget=config.instance.get_str)
+     return 'text/html', src
+ @add_handler('bindings')
+ def qute_bindings(_url):
+     """Handler for qute://bindings. View keybindings."""
+     bindings = {}
+     defaults = config.val.bindings.default
+     modes = set(defaults.keys()).union(config.val.bindings.commands)
+     modes.remove('normal')
+     modes = ['normal'] + sorted(list(modes))
+     for mode in modes:
+
+--- a/qutebrowser/browser/webengine/interceptor.py
++++ b/qutebrowser/browser/webengine/interceptor.py
+@@ -1,12 +1,11 @@
+ """A request interceptor taking care of adblocking and custom headers."""
+-from PyQt5.QtCore import QUrl
+ from PyQt5.QtWebEngineCore import (QWebEngineUrlRequestInterceptor,
+                                    QWebEngineUrlRequestInfo)
+ from qutebrowser.config import config
+ from qutebrowser.browser import shared
+ from qutebrowser.utils import utils, log, debug
+ class RequestInterceptor(QWebEngineUrlRequestInterceptor):
+     """Handle ad blocking and custom headers."""
+     def __init__(self, host_blocker, args, parent=None):
+         super().__init__(parent)
+         self._host_blocker = host_blocker
+@@ -31,30 +30,19 @@
+                                             info.resourceType())
+             navigation_type = debug.qenum_key(QWebEngineUrlRequestInfo,
+                                               info.navigationType())
+             log.webview.debug("{} {}, first-party {}, resource {}, "
+                               "navigation {}".format(
+                                   bytes(info.requestMethod()).decode('ascii'),
+                                   info.requestUrl().toDisplayString(),
+                                   info.firstPartyUrl().toDisplayString(),
+                                   resource_type, navigation_type))
+         url = info.requestUrl()
+-        firstparty = info.firstPartyUrl()
+-        if ((url.scheme(), url.host(), url.path()) ==
+-                ('qute', 'settings', '/set')):
+-            if (firstparty != QUrl('qute://settings/') or
+-                    info.resourceType() !=
+-                    QWebEngineUrlRequestInfo.ResourceTypeXhr):
+-                log.webview.warning("Blocking malicious request from {} to {}"
+-                                    .format(firstparty.toDisplayString(),
+-                                            url.toDisplayString()))
+-                info.block(True)
+-                return
+         if self._host_blocker.is_blocked(url):
+             log.webview.info("Request to {} blocked by host blocker.".format(
+                 url.host()))
+             info.block(True)
+         for header, value in shared.custom_headers(url=url):
+             info.setHttpHeader(header, value)
+         user_agent = config.instance.get('content.headers.user_agent', url=url)
+         if user_agent is not None:
+             info.setHttpHeader(b'User-Agent', user_agent.encode('ascii'))
+
+--- a/qutebrowser/browser/webengine/webenginequtescheme.py
++++ b/qutebrowser/browser/webengine/webenginequtescheme.py
+@@ -4,46 +4,32 @@
+                                    QWebEngineUrlRequestJob)
+ from qutebrowser.browser import qutescheme
+ from qutebrowser.utils import log, qtutils
+ class QuteSchemeHandler(QWebEngineUrlSchemeHandler):
+     """Handle qute://* requests on QtWebEngine."""
+     def install(self, profile):
+         """Install the handler for qute:// URLs on the given profile."""
+         profile.installUrlSchemeHandler(b'qute', self)
+         if qtutils.version_check('5.11', compiled=False):
+             profile.installUrlSchemeHandler(b'chrome-error', self)
+-            profile.installUrlSchemeHandler(b'chrome-extension', self)
+     def requestStarted(self, job):
+         """Handle a request for a qute: scheme.
+         This method must be reimplemented by all custom URL scheme handlers.
+         The request is asynchronous and does not need to be handled right away.
+         Args:
+             job: QWebEngineUrlRequestJob
+         """
+         url = job.requestUrl()
+-        if url.scheme() in ['chrome-error', 'chrome-extension']:
++        if url.scheme() == 'chrome-error':
+             job.fail(QWebEngineUrlRequestJob.UrlInvalid)
+             return
+-        try:
+-            initiator = job.initiator()
+-        except AttributeError:
+-            pass
+-        else:
+-            if initiator.isValid() and initiator.scheme() != 'qute':
+-                log.misc.warning("Blocking malicious request from {} to {}"
+-                                 .format(initiator.toDisplayString(),
+-                                         url.toDisplayString()))
+-                job.fail(QWebEngineUrlRequestJob.RequestDenied)
+-                return
+-        if job.requestMethod() != b'GET':
+-            job.fail(QWebEngineUrlRequestJob.RequestDenied)
+-            return
++        assert job.requestMethod() == b'GET'
+         assert url.scheme() == 'qute'
+         log.misc.debug("Got request for {}".format(url.toDisplayString()))
+         try:
+             mimetype, data = qutescheme.data_for_url(url)
+         except qutescheme.NoHandlerFound:
+             log.misc.debug("No handler found for {}".format(
+                 url.toDisplayString()))
+             job.fail(QWebEngineUrlRequestJob.UrlNotFound)
+         except qutescheme.QuteSchemeOSError:
+             log.misc.exception("OSError while handling qute://* URL")
+
+--- a/qutebrowser/browser/webkit/network/filescheme.py
++++ b/qutebrowser/browser/webkit/network/filescheme.py
+@@ -50,26 +50,24 @@
+     except OSError as e:
+         html = jinja.render('error.html',
+                             title="Error while reading directory",
+                             url='file:///{}'.format(path), error=str(e))
+         return html.encode('UTF-8', errors='xmlcharrefreplace')
+     files = get_file_list(path, all_files, os.path.isfile)
+     directories = get_file_list(path, all_files, os.path.isdir)
+     html = jinja.render('dirbrowser.html', title=title, url=path,
+                         parent=parent, files=files, directories=directories)
+     return html.encode('UTF-8', errors='xmlcharrefreplace')
+-def handler(request, _operation, _current_url):
++def handler(request):
+     """Handler for a file:// URL.
+     Args:
+         request: QNetworkRequest to answer to.
+-        _operation: The HTTP operation being done.
+-        _current_url: The page we're on currently.
+     Return:
+         A QNetworkReply for directories, None for files.
+     """
+     path = request.url().toLocalFile()
+     try:
+         if os.path.isdir(path):
+             data = dirbrowser_html(path)
+             return networkreply.FixedDataNetworkReply(
+                 request, data, 'text/html')
+         return None
+
+--- a/qutebrowser/browser/webkit/network/networkmanager.py
++++ b/qutebrowser/browser/webkit/network/networkmanager.py
+@@ -259,20 +259,26 @@
+         Return:
+             A QNetworkReply.
+         """
+         proxy_factory = objreg.get('proxy-factory', None)
+         if proxy_factory is not None:
+             proxy_error = proxy_factory.get_error()
+             if proxy_error is not None:
+                 return networkreply.ErrorNetworkReply(
+                     req, proxy_error, QNetworkReply.UnknownProxyError,
+                     self)
++        scheme = req.url().scheme()
++        if scheme in self._scheme_handlers:
++            result = self._scheme_handlers[scheme](req)
++            if result is not None:
++                result.setParent(self)
++                return result
+         for header, value in shared.custom_headers(url=req.url()):
+             req.setRawHeader(header, value)
+         host_blocker = objreg.get('host-blocker')
+         if host_blocker.is_blocked(req.url()):
+             log.webview.info("Request to {} blocked by host blocker.".format(
+                 req.url().host()))
+             return networkreply.ErrorNetworkReply(
+                 req, HOSTBLOCK_ERROR_STRING, QNetworkReply.ContentAccessDenied,
+                 self)
+         current_url = QUrl()
+@@ -284,18 +290,12 @@
+                 current_url = tab.url()
+             except (KeyError, RuntimeError):
+                 current_url = QUrl()
+         if 'log-requests' in self._args.debug_flags:
+             operation = debug.qenum_key(QNetworkAccessManager, op)
+             operation = operation.replace('Operation', '').upper()
+             log.webview.debug("{} {}, first-party {}".format(
+                 operation,
+                 req.url().toDisplayString(),
+                 current_url.toDisplayString()))
+-        scheme = req.url().scheme()
+-        if scheme in self._scheme_handlers:
+-            result = self._scheme_handlers[scheme](req, op, current_url)
+-            if result is not None:
+-                result.setParent(self)
+-                return result
+         self.set_referer(req, current_url)
+         return super().createRequest(op, req, outgoing_data)
+
+--- a/qutebrowser/browser/webkit/network/webkitqutescheme.py
++++ b/qutebrowser/browser/webkit/network/webkitqutescheme.py
+@@ -1,44 +1,28 @@
+ """QtWebKit specific qute://* handlers and glue code."""
+ import mimetypes
+-from PyQt5.QtCore import QUrl
+-from PyQt5.QtNetwork import QNetworkReply, QNetworkAccessManager
++from PyQt5.QtNetwork import QNetworkReply
+ from qutebrowser.browser import pdfjs, qutescheme
+ from qutebrowser.browser.webkit.network import networkreply
+ from qutebrowser.utils import log, usertypes, qtutils
+-def handler(request, operation, current_url):
++def handler(request):
+     """Scheme handler for qute:// URLs.
+     Args:
+         request: QNetworkRequest to answer to.
+-        operation: The HTTP operation being done.
+-        current_url: The page we're on currently.
+     Return:
+         A QNetworkReply.
+     """
+-    if operation != QNetworkAccessManager.GetOperation:
+-        return networkreply.ErrorNetworkReply(
+-            request, "Unsupported request type",
+-            QNetworkReply.ContentOperationNotPermittedError)
+-    url = request.url()
+-    if ((url.scheme(), url.host(), url.path()) ==
+-            ('qute', 'settings', '/set')):
+-        if current_url != QUrl('qute://settings/'):
+-            log.webview.warning("Blocking malicious request from {} to {}"
+-                                .format(current_url.toDisplayString(),
+-                                        url.toDisplayString()))
+-            return networkreply.ErrorNetworkReply(
+-                request, "Invalid qute://settings request",
+-                QNetworkReply.ContentAccessDenied)
+     try:
+-        mimetype, data = qutescheme.data_for_url(url)
++        mimetype, data = qutescheme.data_for_url(request.url())
+     except qutescheme.NoHandlerFound:
+-        errorstr = "No handler found for {}!".format(url.toDisplayString())
++        errorstr = "No handler found for {}!".format(
++            request.url().toDisplayString())
+         return networkreply.ErrorNetworkReply(
+             request, errorstr, QNetworkReply.ContentNotFoundError)
+     except qutescheme.QuteSchemeOSError as e:
+         return networkreply.ErrorNetworkReply(
+             request, str(e), QNetworkReply.ContentNotFoundError)
+     except qutescheme.QuteSchemeError as e:
+         return networkreply.ErrorNetworkReply(request, e.errorstring, e.error)
+     except qutescheme.Redirect as e:
+         qtutils.ensure_valid(e.url)
+         return networkreply.RedirectNetworkReply(e.url)
+
+--- a/qutebrowser/utils/version.py
++++ b/qutebrowser/utils/version.py
+@@ -372,21 +372,20 @@
+         ctx.doneCurrent()
+         if old_context and old_surface:
+             old_context.makeCurrent(old_surface)
+ def pastebin_version(pbclient=None):
+     """Pastebin the version and log the url to messages."""
+     def _yank_url(url):
+         utils.set_clipboard(url)
+         message.info("Version url {} yanked to clipboard.".format(url))
+     def _on_paste_version_success(url):
+         global pastebin_url
+-        url = url.strip()
+         _yank_url(url)
+         pbclient.deleteLater()
+         pastebin_url = url
+     def _on_paste_version_err(text):
+         message.error("Failed to pastebin version"
+                       " info: {}".format(text))
+         pbclient.deleteLater()
+     if pastebin_url:
+         _yank_url(pastebin_url)
+         return
+
+--- a/scripts/link_pyqt.py
++++ b/scripts/link_pyqt.py
+@@ -86,26 +86,21 @@
+         else:
+             return None
+     else:
+         raise ValueError("Unexpected output: {!r}".format(output))
+ def link_pyqt(executable, venv_path):
+     """Symlink the systemwide PyQt/sip into the venv.
+     Args:
+         executable: The python executable where the source files are present.
+         venv_path: The path to the virtualenv site-packages.
+     """
+-    try:
+-        get_lib_path(executable, 'PyQt5.sip')
+-    except Error:
+-        sip_file = get_lib_path(executable, 'sip')
+-    else:
+-        sip_file = None
++    sip_file = get_lib_path(executable, 'sip')
+     sipconfig_file = get_lib_path(executable, 'sipconfig', required=False)
+     pyqt_dir = os.path.dirname(get_lib_path(executable, 'PyQt5.QtCore'))
+     for path in [sip_file, sipconfig_file, pyqt_dir]:
+         if path is None:
+             continue
+         fn = os.path.basename(path)
+         dest = os.path.join(venv_path, fn)
+         if os.path.exists(dest):
+             if needs_update(path, dest):
+                 remove(dest)

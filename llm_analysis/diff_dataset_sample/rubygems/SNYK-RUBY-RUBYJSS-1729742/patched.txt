@@ -1,0 +1,1145 @@
+# ====================================================================
+# FILE: lib/jamf.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-32 ---
+     1| require 'English'
+     2| require 'json'
+     3| require 'yaml'
+     4| require 'pathname'
+     5| require 'time'
+     6| require 'singleton'
+     7| require 'open-uri'
+     8| require 'ipaddr'
+     9| require 'base64'
+    10| require 'shellwords'
+    11| require 'digest'
+    12| require 'open3'
+    13| require 'immutable-struct'
+    14| require 'jamf/configuration'
+    15| require 'jamf/exceptions'
+    16| require 'jamf/utility'
+    17| require 'jamf/validate'
+    18| require 'jamf/version'
+    19| require 'jamf/compatibility'
+    20| require 'jamf/ruby_extensions'
+    21| require 'jamf/api/connection'
+    22| module Jamf
+    23|   MINIMUM_RUBY_VERSION = '2.3'.freeze
+    24|   if Gem::Version.new(RUBY_VERSION) < Gem::Version.new(MINIMUM_RUBY_VERSION)
+    25|     raise "Can't use the JAMF module, ruby itself must be version #{MINIMUM_RUBY_VERSION} or greater."
+    26|   end
+    27|   autoload :JSONObject, 'jamf/api/base_classes/json_object'
+    28|   autoload :Resource, 'jamf/api/base_classes/resource'
+    29|   autoload :SingletonResource, 'jamf/api/base_classes/singleton_resource'
+    30|   autoload :CollectionResource, 'jamf/api/base_classes/collection_resource'
+    31|   autoload :Prestage, 'jamf/api/base_classes/prestage'
+    32|   autoload :ChangeLog, 'jamf/api/mixins/change_log'
+
+
+# ====================================================================
+# FILE: lib/jamf/client.rb
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 36-124 ---
+    36|       @url =~ %r{(https?)://(.+):(\d+)/}
+    37|       @protocol = Regexp.last_match(1)
+    38|       @server = Regexp.last_match(2)
+    39|       @port = Regexp.last_match(3)
+    40|       @url
+    41|     end
+    42|     def self.jss_server
+    43|       jss_url
+    44|       @server
+    45|     end
+    46|     def self.jss_protocol
+    47|       jss_url
+    48|       @protocol
+    49|     end
+    50|     def self.jss_port
+    51|       jss_url
+    52|       @port
+    53|     end
+    54|     def self.jamf_plist
+    55|       return {} unless JAMF_PLIST.file?
+    56|       Jamf.parse_plist JAMF_PLIST
+    57|     end
+    58|     def self.receipts
+    59|       raise JSS::NoSuchItemError, "The JAMF Receipts folder doesn't exist on this computer." unless RECEIPTS_FOLDER.exist?
+    60|       RECEIPTS_FOLDER.children.select(&:file?)
+    61|     end
+    62|     def self.jss_available?
+    63|       run_jamf :checkJSSConnection, '-retry 1'
+    64|       $CHILD_STATUS.exitstatus.zero?
+    65|     end
+    66|     def self.jss_record
+    67|       JSS::Computer.fetch udid: udid
+    68|     rescue JSS::NoSuchItemError
+    69|       nil
+    70|     end
+    71|     def self.udid
+    72|       hardware_data['platform_UUID']
+    73|     end
+    74|     def self.serial_number
+    75|       hardware_data['serial_number']
+    76|     end
+    77|     def self.hardware_data
+    78|       raw = `/usr/sbin/system_profiler SPHardwareDataType -xml 2>/dev/null`
+    79|       Jamf.parse_plist(raw)[0]['_items'][0]
+    80|     end
+    81|     def self.console_users
+    82|       output = `#{CONSOLE_USERS_SCUTIL_CMD}`
+    83|       userlines = output.lines.select { |l| l =~ /SessionUserNameKey\s*:/ }
+    84|       userlines.map! { |ul| ul.split(':').last.strip }
+    85|       userlines.reject { |un| un == ROOT_USER }
+    86|     end
+    87|     def self.primary_console_user
+    88|       `#{CONSOLE_USERS_SCUTIL_CMD}` =~ /^\s*Name : (\S+)$/
+    89|       user = Regexp.last_match(1)
+    90|       user == LOGINWINDOW_USER ? nil : user
+    91|     end
+    92|     def self.console_user
+    93|       primary_console_user
+    94|     end
+    95|     def self.self_service_users
+    96|       ss_userlines = `#{PS_USER_COMM}`.lines.select { |l| l.include? SELF_SERVICE_EXECUTABLE_END }
+    97|       ss_userlines.map { |ssl| ssl.split(' ').first }
+    98|     end
+    99|     def self.do_not_disturb?(user = nil)
+   100|       home = user ? homedir(user) : Dir.home
+   101|       myudid = udid
+   102|       nc_prefs_file = Pathname.new "#{home}/#{USER_PREFS_BYHOST_FOLDER}/com.apple.notificationcenterui.#{myudid}.plist"
+   103|       return nil unless nc_prefs_file.readable?
+   104|       Jamf.parse_plist(nc_prefs_file)['doNotDisturb']
+   105|     end
+   106|     def self.homedir(user)
+   107|       dir = `/usr/bin/dscl . -read /Users/#{user} NFSHomeDirectory 2>/dev/null`.chomp.split(': ').last
+   108|       dir ? Pathname.new(dir) : nil
+   109|     end
+   110|     def self.script_running_via_policy?
+   111|       root_ps_lines = `ps -u root -x -o pid -o ppid -o user -o command`.lines
+   112|       parent_pid, _parent_user, parent_command = parent_pid_user_and_cmd Process.pid, root_ps_lines
+   113|       return false unless parent_pid
+   114|       until parent_command =~ POLICY_SCRIPT_CMD_RE || parent_pid.nil?
+   115|         parent_pid, _parent_user, parent_command = parent_pid_user_and_cmd parent_pid, root_ps_lines
+   116|         return false if parent_pid.zero?
+   117|       end
+   118|       return false if parent_pid.nil?
+   119|       until parent_command =~ POLICY_CMD_RE || parent_pid.nil?
+   120|         parent_pid, _parent_user, parent_command = parent_pid_user_and_cmd parent_pid, root_ps_lines
+   121|         return false if parent_pid.zero?
+   122|       end
+   123|       !parent_pid.nil?
+   124|     end
+
+
+# ====================================================================
+# FILE: lib/jamf/client/management_action.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 14-48 ---
+    14|       management_action(msg, title: title, subtitle: subtitle, delay: delay)
+    15|     end
+    16|     private_class_method
+    17|     def self.force_alerts
+    18|       orig_flags = {}
+    19|       console_users.each do |user|
+    20|         orig_flags[user] = set_mgmt_action_ncprefs_flags user, NC_ALERT_STYLE_FLAGS, hup: false
+    21|       end
+    22|       system HUP_NOTIF_CTR_CMD unless orig_flags.empty?
+    23|       sleep 1
+    24|       orig_flags
+    25|     end
+    26|     def self.restore_alerts(orig_flags)
+    27|       orig_flags.each do |user, flags|
+    28|         set_mgmt_action_ncprefs_flags user, flags, hup: false
+    29|       end
+    30|       system HUP_NOTIF_CTR_CMD unless orig_flags.empty?
+    31|     end
+    32|     def self.set_mgmt_action_ncprefs_flags(user, flags, hup: true)
+    33|       plist = Pathname.new "/Users/#{user}/Library/Preferences/#{NCPREFS_DOMAIN}.plist"
+    34|       prefs = Jamf.parse_plist plist
+    35|       mgmt_action_setting = prefs['apps'].select { |a| a['bundle-id'] == MGMT_ACTION_BUNDLE_ID }.first
+    36|       if mgmt_action_setting
+    37|         orig_flags = mgmt_action_setting['flags']
+    38|         mgmt_action_setting['flags'] = flags
+    39|       else
+    40|         orig_flags = flags
+    41|         prefs['apps'] << { 'bundle-id' => MGMT_ACTION_BUNDLE_ID, 'flags' => flags }
+    42|       end
+    43|       plist.open('w') { |f| f.write Jamf.xml_plist_from(prefs) }
+    44|       system HUP_NOTIF_CTR_CMD if hup
+    45|       orig_flags
+    46|     end
+    47|   end # class Client
+    48| end # module
+
+
+# ====================================================================
+# FILE: lib/jamf/composer.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 5-56 ---
+     5|     PKG_BUNDLE_ID_PFX = 'ruby-jss-composer'.freeze
+     6|     HDI_UTIL = '/usr/bin/hdiutil'.freeze
+     7|     DEFAULT_OUT_DIR = Pathname.new '/Users/Shared'
+     8|     def self.mk_pkg(name, version, root, opts = {})
+     9|       raise NoSuchItemError, "Missing pkgbuild tool. Please make sure you're running 10.8 or later." unless PKGBUILD.executable?
+    10|       opts[:out_dir] ||= DEFAULT_OUT_DIR
+    11|       opts[:bundle_id_prefix] ||= PKG_BUNDLE_ID_PFX
+    12|       pkg_filename = name.end_with?('.pkg') ? name : name + '.pkg'
+    13|       pkg_id = opts[:pkg_id]
+    14|       pkg_id ||= opts[:bundle_id_prefix] + '.' + name
+    15|       pkg_out = "#{opts[:out_dir]}/#{pkg_filename}"
+    16|       pkg_ownership = opts[:preserve_ownership] ? 'preserve' : 'recommended'
+    17|       if opts[:signing_identity]
+    18|         signing = "--sign '#{opts[:signing_identity]}'"
+    19|         signing << " #{opts[:signing_options]}" if opts[:signing_options]
+    20|       else
+    21|         signing = ''
+    22|       end # if opts[:signing_identity]
+    23|       comp_plist_out = Pathname.new "/tmp/#{PKG_BUNDLE_ID_PFX}-#{pkg_filename}.plist"
+    24|       system "#{PKGBUILD} --analyze --root '#{root}' '#{comp_plist_out}'"
+    25|       comp_plist = Jamf.parse_plist comp_plist_out
+    26|       if comp_plist[0].nil?
+    27|         comp_plist_arg = ''
+    28|       else
+    29|         comp_plist.each do |bndl|
+    30|           bndl.delete 'ChildBundles' if bndl['ChildBundles']
+    31|           bndl['BundleOverwriteAction'] = 'upgrade'
+    32|           bndl['BundleIsVersionChecked'] = false
+    33|           bndl['BundleIsRelocatable'] = false
+    34|           bndl['BundleHasStrictIdentifier'] = false
+    35|         end
+    36|         comp_plist_out.open('w') { |f| f.write Jamf.xml_plist_from(comp_plist) }
+    37|         comp_plist_arg = "--component-plist '#{comp_plist_out}'"
+    38|       end
+    39|       begin
+    40|         it_built = system "#{PKGBUILD} --identifier '#{pkg_id}' --version '#{version}' --ownership #{pkg_ownership} --install-location / --root '#{root}' #{signing} #{comp_plist_arg} '#{pkg_out}' "
+    41|         raise 'There was an error building the .pkg' unless it_built
+    42|       ensure
+    43|         comp_plist_out.delete if comp_plist_out.exist?
+    44|       end
+    45|       Pathname.new pkg_out
+    46|     end # mk_dot_pkg
+    47|     def self.mk_dmg(name, root, out_dir = DEFAULT_OUT_DIR)
+    48|       dmg_filename = "#{name}.dmg"
+    49|       dmg_vol = name
+    50|       dmg_out = Pathname.new "#{out_dir}/#{dmg_filename}"
+    51|       if dmg_out.exist?
+    52|         mv_to = dmg_out.dirname + "#{dmg_out.basename}.#{Time.now.strftime('%Y%m%d%H%M%S')}"
+    53|         dmg_out.rename mv_to
+    54|       end # if dmg out exist
+    55|       system "#{HDI_UTIL} create -volname '#{dmg_vol}' -scrub -srcfolder '#{root}' '#{dmg_out}'"
+    56|       raise 'There was an error building the .dmg' unless $?.exitstatus.zero?
+
+
+# ====================================================================
+# FILE: lib/jamf/utility.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 40-99 ---
+    40|     end
+    41|     req_regexps.each { |re| return true if os_to_check =~ re }
+    42|     false
+    43|   end
+    44|   def self.to_s_and_a(somedata)
+    45|     case somedata
+    46|     when nil
+    47|       valstr = ''
+    48|       valarr = []
+    49|     when String
+    50|       valstr = somedata
+    51|       valarr = somedata.split(/,\s*/)
+    52|     when Array
+    53|       valstr = somedata.join ', '
+    54|       valarr = somedata
+    55|     else
+    56|       raise Jamf::InvalidDataError, 'Input must be a comma-separated String or an Array of Strings'
+    57|     end # case
+    58|     { stringform: valstr, arrayform: valarr }
+    59|   end # to_s_and_a
+    60|   def self.parse_plist(plist, symbol_keys: false)
+    61|     require 'cfpropertylist'
+    62|     case plist
+    63|     when String
+    64|       return CFPropertyList.native_types(CFPropertyList::List.new(data: plist).value, symbol_keys) if plist.include? '</plist>'
+    65|       plist = Pathname.new plist
+    66|     when Pathname
+    67|       true
+    68|     else
+    69|       raise ArgumentError, 'Argument must be a path (as a Pathname or String) or a String of XML'
+    70|     end # case plist
+    71|     raise JSS::MissingDataError, "No such file: #{plist}" unless plist.file?
+    72|     CFPropertyList.native_types(CFPropertyList::List.new(file: plist).value, symbol_keys)
+    73|   end # parse_plist
+    74|   def self.xml_plist_from(data)
+    75|     require 'cfpropertylist'
+    76|     plist = CFPropertyList::List.new
+    77|     plist.value = CFPropertyList.guess(data, convert_unknown_to_string: true)
+    78|     plist.to_str(CFPropertyList::List::FORMAT_XML)
+    79|   end
+    80|   def self.parse_time(a_datetime)
+    81|     return nil if NIL_DATES.include? a_datetime
+    82|     the_dt = DateTime.parse(a_datetime.to_s)
+    83|     usec = (the_dt.sec_fraction * 60 * 60 * 24 * (10**6)).to_i
+    84|     the_dt = DateTime.new(the_dt.year, the_dt.month, the_dt.day, the_dt.hour, the_dt.min, the_dt.sec, Jamf::TIME_ZONE_OFFSET) if the_dt.offset.zero?
+    85|     Time.at the_dt.strftime('%s').to_i, usec
+    86|   end # parse_time
+    87|   def self.epoch_to_time(epoch)
+    88|     return nil if NIL_DATES.include? epoch
+    89|     Time.at(epoch.to_i / 1000.0)
+    90|   end # parse_date
+    91|   def self.api_object_class(name)
+    92|     klass = api_object_names[name.downcase.to_sym]
+    93|     raise Jamf::InvalidDataError, "Unknown API Object Class: #{name}" unless klass
+    94|     klass
+    95|   end
+    96|   def self.api_object_names
+    97|     return @api_object_names if @api_object_names
+    98|     @api_object_names ||= {}
+    99|     JSS.constants.each do |const|
+
+
+# ====================================================================
+# FILE: lib/jss.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 3-42 ---
+     3|   if Gem::Version.new(RUBY_VERSION) < Gem::Version.new(MINIMUM_RUBY_VERSION)
+     4|     raise "Can't use the JSS module, ruby itself must be version #{MINIMUM_RUBY_VERSION} or greater."
+     5|   end
+     6|   require 'date'
+     7|   require 'singleton'
+     8|   require 'pathname'
+     9|   require 'fileutils'
+    10|   require 'open-uri'
+    11|   require 'ipaddr'
+    12|   require 'rexml/document'
+    13|   require 'base64'
+    14|   require 'shellwords'
+    15|   require 'digest'
+    16|   require 'yaml'
+    17|   require 'open3'
+    18|   require 'English'
+    19|   require 'json'
+    20|   require 'digest'
+    21|   require 'faraday'
+    22|   require 'faraday_middleware'
+    23|   require 'immutable-struct'
+    24|   require 'recursive-open-struct'
+    25|   MINIMUM_SERVER_VERSION = '10.4.0'.freeze
+    26|   TIME_ZONE_OFFSET =  Rational(Time.now.utc_offset, 60 * 60 * 24)
+    27|   TRUE_FALSE = [true, false].freeze
+    28|   NIL_DATES = [0, nil, '', '0'].freeze
+    29|   BLANK = ''.freeze
+    30|   @@stdin_lines = nil
+    31|   module Composer; end
+    32|   module Creatable; end
+    33|   module FileUpload; end
+    34|   module Locatable; end
+    35|   module Matchable; end
+    36|   module Purchasable; end
+    37|   module Updatable; end
+    38|   module Extendable; end
+    39|   module SelfServable; end
+    40|   module Categorizable; end
+    41|   module VPPable; end
+    42|   module Sitable; end
+
+
+# ====================================================================
+# FILE: lib/jss/api_connection.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 251-291 ---
+   251|       if SSL_PORTS.include? args[:port]
+   252|         args[:use_ssl] = true unless args[:use_ssl] == false
+   253|       end
+   254|       return unless args[:use_ssl]
+   255|       args[:verify_ssl] = args[:verify_cert] != false
+   256|       args[:ssl_version] ||= DFT_SSL_VERSION
+   257|       @ssl_options = {
+   258|         verify: args[:verify_ssl],
+   259|         version: args[:ssl_version]
+   260|       }
+   261|     end
+   262|     def handle_http_error
+   263|       return if @last_http_response.success?
+   264|       case @last_http_response.status
+   265|       when 404
+   266|         err = JSS::NoSuchItemError
+   267|         msg = 'Not Found'
+   268|       when 409
+   269|         err = JSS::ConflictError
+   270|         @last_http_response.body =~ /<p>(The server has not .*?)(<|$)/m
+   271|         Regexp.last_match(1) ||  @last_http_response.body =~ %r{<p>Error: (.*?)</p>}
+   272|         msg = Regexp.last_match(1)
+   273|       when 400
+   274|         err = JSS::BadRequestError
+   275|         @last_http_response.body =~ %r{>Bad Request</p>\n<p>(.*?)</p>\n<p>You can get technical detail}m
+   276|         msg = Regexp.last_match(1)
+   277|       when 401
+   278|         err = JSS::AuthorizationError
+   279|         msg = 'You are not authorized to do that.'
+   280|       when (500..599)
+   281|         err = JSS::APIRequestError
+   282|         msg = 'There was an internal server error'
+   283|       else
+   284|         err = JSS::APIRequestError
+   285|         msg = "There was a error processing your request, status: #{@last_http_response.status}"
+   286|       end
+   287|       raise err, msg
+   288|     end
+   289|     def create_connection(pw)
+   290|       Faraday.new(@rest_url, ssl: @ssl_options) do |cnx|
+   291|         cnx.basic_auth @user, pw
+
+
+# ====================================================================
+# FILE: lib/jss/api_object/configuration_profile.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 14-62 ---
+    14|     CATEGORY_SUBSET = :general
+    15|     CATEGORY_DATA_TYPE = Hash
+    16|     attr_reader :description
+    17|     attr_reader :uuid
+    18|     attr_reader :redeploy_on_update
+    19|     attr_reader :payloads
+    20|     def initialize(args = {})
+    21|       super
+    22|       @description = @main_subset[:description]
+    23|       @uuid = @main_subset[:uuid]
+    24|       @redeploy_on_update = @main_subset[:redeploy_on_update]
+    25|       @payloads = @main_subset[:payloads]
+    26|     end
+    27|     def description=(new_val)
+    28|       new_val = new_val.strip
+    29|       return nil if @self_service_description == new_val
+    30|       @description = new_val
+    31|       @need_to_update = true
+    32|     end # @param new_val[String] how should this be distributed to clients?
+    33|     def parsed_payloads
+    34|       JSS.parse_plist @payloads
+    35|     end
+    36|     def payload_content
+    37|       parsed_payloads['PayloadContent']
+    38|     end
+    39|     def payload_content=(new_content)
+    40|       payload_plist_data = parsed_payloads
+    41|       payload_plist_data['PayloadContent'] = new_content
+    42|       @payloads = JSS.xml_plist_from new_content
+    43|       @need_to_update = true
+    44|       @update_payloads = true
+    45|     end
+    46|     def payload_types
+    47|       payload_content.map { |p| p['PayloadType'] }
+    48|     end
+    49|     def update(redeploy_to_all: false)
+    50|       @redeploy_on_update = redeploy_to_all ? REDEPLOY_ALL : REDEPLOY_NEWLY_ASSIGNED
+    51|       super()
+    52|       @redeploy_on_update = REDEPLOY_NEWLY_ASSIGNED
+    53|       @update_payloads = nil
+    54|     end
+    55|     def save(redeploy_to_all: false)
+    56|       if @in_jss
+    57|         raise JSS::UnsupportedError, 'Updating this object in the JSS is currently not supported by ruby-jss' unless updatable?
+    58|         update redeploy_to_all: redeploy_to_all
+    59|       else
+    60|         raise JSS::UnsupportedError, 'Creating this object in the JSS is currently not supported by ruby-jss' unless creatable?
+    61|         create
+    62|       end
+
+
+# ====================================================================
+# FILE: lib/jss/api_object/network_segment.rb
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 117-167 ---
+   117|       @netboot_server = @init_data[:netboot_server]
+   118|       @override_buildings = @init_data[:override_buildings]
+   119|       @override_departments = @init_data[:override_departments]
+   120|       @swu_server = @init_data[:swu_server]
+   121|       @url = @init_data[:url]
+   122|     end # init
+   123|     def range
+   124|       @starting_address..@ending_address
+   125|     end
+   126|     def overlap?(other_segment)
+   127|       raise TypeError, 'Argument must be a JSS::NetworkSegment' unless \
+   128|         other_segment.is_a? JSS::NetworkSegment
+   129|       other_range = other_segment.range
+   130|       range.include?(other_range.begin) || range.include?(other_range.end)
+   131|     end
+   132|     def include?(thing)
+   133|       if thing.is_a? JSS::NetworkSegment
+   134|         @starting_address <= thing.range.begin && @ending_address >= thing.range.end
+   135|       else
+   136|         thing = IPAddr.new thing.to_s
+   137|         range.cover? thing
+   138|       end
+   139|     end
+   140|     alias cover? include?
+   141|     def ==(other)
+   142|       raise TypeError, 'Argument must be a JSS::NetworkSegment' unless \
+   143|         other.is_a? JSS::NetworkSegment
+   144|       range == other.range
+   145|     end
+   146|     def building=(newval)
+   147|       new =
+   148|         if newval.to_s.empty?
+   149|           JSS::BLANK
+   150|         else
+   151|           id = JSS::Building.valid_id newval
+   152|           raise JSS::MissingDataError, "No building matching '#{newval}'" unless id
+   153|           JSS::Building.map_all_ids_to(:name)[id]
+   154|         end
+   155|       @building = new
+   156|       @need_to_update = true
+   157|     end
+   158|     def override_buildings=(newval)
+   159|       raise JSS::InvalidDataError, 'New value must be boolean true or false' unless JSS::TRUE_FALSE.include? newval
+   160|       @override_buildings = newval
+   161|       @need_to_update = true
+   162|     end
+   163|     def department=(newval)
+   164|       new =
+   165|         if newval.to_s.empty?
+   166|           JSS::BLANK
+   167|         else
+
+# --- HUNK 2: Lines 173-225 ---
+   173|       @need_to_update = true
+   174|     end
+   175|     def override_departments=(newval)
+   176|       raise JSS::InvalidDataError, 'New value must be boolean true or false' unless JSS::TRUE_FALSE.include? newval
+   177|       @override_departments = newval
+   178|       @need_to_update = true
+   179|     end
+   180|     def distribution_point=(newval)
+   181|       new =
+   182|         if newval.to_s.empty?
+   183|           JSS::BLANK
+   184|         else
+   185|           id = JSS::DistributionPoint.valid_id newval
+   186|           raise JSS::MissingDataError, "No distribution_point matching '#{newval}' in the JSS" unless id
+   187|           JSS::DistributionPoint.map_all_ids_to(:name)[id]
+   188|         end
+   189|       @distribution_point = new
+   190|       @need_to_update = true
+   191|     end
+   192|     def netboot_server=(newval)
+   193|       new =
+   194|         if newval.to_s.empty?
+   195|           JSS::BLANK
+   196|         else
+   197|           id = JSS::NetBootServer.valid_id newval
+   198|           raise JSS::MissingDataError, "No netboot_server matching '#{newval}' in the JSS" unless id
+   199|           JSS::NetbootServer.map_all_ids_to(:name)[id]
+   200|         end
+   201|       @netboot_server = new
+   202|       @need_to_update = true
+   203|     end
+   204|     def swu_server=(newval)
+   205|       new =
+   206|         if newval.to_s.empty?
+   207|           JSS::BLANK
+   208|         else
+   209|           id = JSS::SoftwareUpdateServer.valid_id newval
+   210|           raise JSS::MissingDataError, "No swu_server matching '#{newval}' in the JSS" unless id
+   211|           JSS::SoftwareUpdateServer.map_all_ids_to(:name)[id]
+   212|         end
+   213|       @swu_server = new
+   214|       @need_to_update = true
+   215|     end
+   216|     def starting_address=(newval)
+   217|       self.class.validate_ip_range(newval, @ending_address)
+   218|       @starting_address = IPAddr.new newval.to_s
+   219|       @need_to_update = true
+   220|     end
+   221|     def ending_address=(newval)
+   222|       self.class.validate_ip_range(@starting_address, newval)
+   223|       @ending_address = IPAddr.new newval.to_s
+   224|       @need_to_update = true
+   225|     end
+
+
+# ====================================================================
+# FILE: lib/jss/api_object/policy.rb
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 146-186 ---
+   146|       0 => 'Zero',
+   147|       1 => 'One',
+   148|       2 => 'Two',
+   149|       3 => 'Three',
+   150|       6 => 'Six'
+   151|     }.freeze
+   152|     LOG_FLUSH_INTERVAL_PERIODS = {
+   153|       day: 'Days',
+   154|       days: 'Days',
+   155|       week: 'Weeks',
+   156|       weeks: 'Weeks',
+   157|       month: 'Months',
+   158|       months: 'Months',
+   159|       year: 'Years',
+   160|       years: 'Years'
+   161|     }.freeze
+   162|     OBJECT_HISTORY_OBJECT_TYPE = 3
+   163|     SITE_SUBSET = :general
+   164|     CATEGORY_SUBSET = :general
+   165|     CATEGORY_DATA_TYPE = Hash
+   166|     SCRIPT_PARAMETERS_AVAILABLE = %i[parameter4 parameter5 parameter6 parameter7 parameter8 parameter9 parameter10 parameter11].freeze
+   167|     def self.flush_logs(policy, older_than: 0, period: :days, computers: [], api: JSS.api)
+   168|       orig_timeout = api.cnx.options.timeout
+   169|       pol_id = valid_id policy
+   170|       raise JSS::NoSuchItemError, "No Policy identified by '#{policy}'." unless pol_id
+   171|       older_than = LOG_FLUSH_INTERVAL_INTEGERS[older_than]
+   172|       raise JSS::InvalidDataError, "older_than must be one of these integers: #{LOG_FLUSH_INTERVAL_INTEGERS.keys.join ', '}" unless older_than
+   173|       period = LOG_FLUSH_INTERVAL_PERIODS[period]
+   174|       raise JSS::InvalidDataError, "period must be one of these symbols: :#{LOG_FLUSH_INTERVAL_PERIODS.keys.join ', :'}" unless period
+   175|       computers = [computers] unless computers.is_a? Array
+   176|       api.timeout = 1800 unless orig_timeout && orig_timeout > 1800
+   177|       return api.delete_rsrc "#{LOG_FLUSH_RSRC}/policy/id/#{pol_id}/interval/#{older_than}+#{period}" if computers.empty?
+   178|       flush_logs_for_specific_computers pol_id, older_than, period, computers, api
+   179|     ensure
+   180|       api.timeout = orig_timeout
+   181|     end
+   182|     def self.flush_logs_for_specific_computers(pol_id, older_than, period, computers, api)
+   183|       xml_doc = REXML::Document.new JSS::APIConnection::XML_HEADER
+   184|       lf = xml_doc.add_element 'logflush'
+   185|       lf.add_element('log').text = 'policy'
+   186|       lf.add_element('log_id').text = pol_id.to_s
+
+# --- HUNK 2: Lines 611-661 ---
+   611|         name: name,
+   612|         priority: SCRIPT_PRIORITIES[opts[:priority]],
+   613|         parameter4: opts[:parameter4],
+   614|         parameter5: opts[:parameter5],
+   615|         parameter6: opts[:parameter6],
+   616|         parameter7: opts[:parameter7],
+   617|         parameter8: opts[:parameter8],
+   618|         parameter9: opts[:parameter9],
+   619|         parameter10: opts[:parameter10],
+   620|         parameter11: opts[:parameter11]
+   621|       }
+   622|       @scripts.insert opts[:position], script_data
+   623|       @need_to_update = true
+   624|       @scripts
+   625|     end
+   626|     def remove_script(identifier)
+   627|       removed = @scripts.delete_if { |s| s[:id] == identifier || s[:name] == identifier }
+   628|       @need_to_update = true if removed
+   629|       removed
+   630|     end
+   631|     def set_script_parameters(identifier, **opts)
+   632|       id = JSS::Script.valid_id identifier, api: @api
+   633|       raise JSS::NoSuchItemError, "No script matches '#{identifier}'" unless id
+   634|       script_data = @scripts.select { |s| s[:id] == id }[0]
+   635|       raise JSS::InvalidDataError, "Script #{id} is not configured. Use add_script method." unless script_data
+   636|       opts.each do |parameter, value|
+   637|         script_data[parameter] = value if SCRIPT_PARAMETERS_AVAILABLE.include? parameter
+   638|       end
+   639|       @need_to_update = true
+   640|       @scripts
+   641|     end # end set_script_parameter
+   642|     def directory_binding_ids
+   643|       @directory_bindings.map { |p| p[:id] }
+   644|     end
+   645|     def directory_binding_names
+   646|       @directory_bindings.map { |p| p[:name] }
+   647|     end
+   648|     def add_directory_binding(identifier, **opts)
+   649|       id = validate_directory_binding_opts identifier, opts
+   650|       return nil if @directory_bindings.map { |s| s[:id] }.include? id
+   651|       name = JSS::DirectoryBinding.map_all_ids_to(:name, api: @api)[id]
+   652|       directory_binding_data = {
+   653|         id: id,
+   654|         name: name
+   655|       }
+   656|       @directory_bindings.insert opts[:position], directory_binding_data
+   657|       @need_to_update = true
+   658|       @directory_bindings
+   659|     end
+   660|     def remove_directory_binding(identifier)
+   661|       removed = @directory_bindings.delete_if { |s| s[:id] == identifier || s[:name] == identifier }
+
+
+# ====================================================================
+# FILE: lib/jss/api_object/script.rb
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 2-58 ---
+     2|   class Script < JSS::APIObject
+     3|     include JSS::Creatable
+     4|     include JSS::Updatable
+     5|     include JSS::Categorizable
+     6|     RSRC_BASE = 'scripts'.freeze
+     7|     RSRC_LIST_KEY = :scripts
+     8|     RSRC_OBJECT_KEY = :script
+     9|     DIST_POINT_SCRIPTS_FOLDER = 'Scripts'.freeze
+    10|     PRIORITIES = ['Before', 'After', 'At Reboot'].freeze
+    11|     DEFAULT_PRIORITY = 'After'.freeze
+    12|     PARAMETER_KEYS = [:parameter4, :parameter5, :parameter6, :parameter7, :parameter8, :parameter9, :parameter10, :parameter11].freeze
+    13|     OBJECT_HISTORY_OBJECT_TYPE = 91
+    14|     CATEGORY_SUBSET = :top
+    15|     CATEGORY_DATA_TYPE = String
+    16|     attr_reader :filename
+    17|     attr_reader :os_requirements
+    18|     attr_reader :priority
+    19|     attr_reader :info
+    20|     attr_reader :notes
+    21|     attr_reader :parameters
+    22|     alias parameter_labels parameters
+    23|     alias parameter_descriptions parameters
+    24|     attr_reader :script_contents
+    25|     attr_reader :script_contents_encoded
+    26|     def initialize(args = {})
+    27|       super
+    28|       @filename = @init_data[:filename] || @name
+    29|       @info = @init_data[:info]
+    30|       @notes = @init_data[:notes]
+    31|       @os_requirements = @init_data[:os_requirements] ? JSS.to_s_and_a(@init_data[:os_requirements])[:arrayform] : []
+    32|       @parameters = @init_data[:parameters] ? @init_data[:parameters] : {}
+    33|       @priority = @init_data[:priority] || DEFAULT_PRIORITY
+    34|       @script_contents = @init_data[:script_contents]
+    35|       @script_contents_encoded = @init_data[:script_contents_encoded]
+    36|       if @script_contents && @script_contents_encoded.to_s.empty?
+    37|         @script_contents_encoded = Base64.encode64 @script_contents
+    38|       end
+    39|     end # initialize
+    40|     def filename=(new_val)
+    41|       new_val = nil if new_val == ''
+    42|       new_val = @name unless new_val
+    43|       return nil if new_val == @filename
+    44|       @filename = new_val
+    45|       @need_to_update = true
+    46|     end # filename=
+    47|     def name=(new_val)
+    48|       new_val = new_val.to_s
+    49|       return if new_val == @name
+    50|       raise JSS::MissingDataError, "Name can't be empty" if new_val.empty?
+    51|       raise JSS::AlreadyExistsError, "A script already exists with the name '#{new_val}'" if JSS::Script.all_names.include? new_val
+    52|       @filename = new_val if @filename == @name
+    53|       @name = new_val
+    54|       @rest_rsrc = "#{RSRC_BASE}/name/#{CGI.escape @name.to_s}" if @rest_rsrc.include? '/name/'
+    55|       @need_to_update = true
+    56|     end # name=
+    57|     def os_requirements=(new_val)
+    58|       new_val = [] if new_val.to_s.empty?
+
+# --- HUNK 2: Lines 90-190 ---
+    90|     end # notes=
+    91|     def parameters=(new_val)
+    92|       return nil if new_val == @parameters
+    93|       new_val = {} if new_val.nil? || (new_val == '')
+    94|       raise JSS::InvalidDataError, ':parameters must be a Hash with keys :parameter4 thru :parameter11' unless \
+    95|         new_val.is_a?(Hash) && ((new_val.keys & PARAMETER_KEYS) == new_val.keys)
+    96|       new_val.each do |_k, v|
+    97|         raise JSS::InvalidDataError, ':parameter values must be strings or nil' unless v.nil? || v.is_a?(String)
+    98|       end
+    99|       @parameters = new_val
+   100|       @need_to_update = true
+   101|     end # parameters=
+   102|     def set_parameter(param_num, new_val)
+   103|       raise JSS::NoSuchItemError, 'Parameter numbers must be from 4-11' unless (4..11).cover? param_num
+   104|       pkey = "parameter#{param_num}".to_sym
+   105|       raise JSS::InvalidDataError, 'parameter values must be strings or nil' unless new_val.nil? || new_val.is_a?(String)
+   106|       return nil if new_val == @parameters[pkey]
+   107|       @parameters[pkey] = new_val
+   108|       @need_to_update = true
+   109|     end
+   110|     alias set_parameter_label set_parameter
+   111|     alias set_parameter_description set_parameter
+   112|     def script_contents=(new_val)
+   113|       new_code = case new_val
+   114|                  when String
+   115|                    if new_val.start_with? '/'
+   116|                      Pathname.new(new_val).read
+   117|                    else
+   118|                      new_val
+   119|                    end # if
+   120|                  when Pathname
+   121|                    new_val.read
+   122|                  else
+   123|                    raise JSS::InvalidDataError, 'New code must be a String (path or code) or Pathname instance'
+   124|                  end # case
+   125|       raise JSS::InvalidDataError, "Script contents must start with '#!'" unless new_code.start_with? '#!'
+   126|       @script_contents = new_code
+   127|       @script_contents_encoded = Base64.encode64 @script_contents
+   128|       @need_to_update = true
+   129|     end
+   130|     def run(opts = {})
+   131|       raise JSS::MissingDataError, 'script_contents does not start with #!' unless @script_contents.to_s.start_with? '#!'
+   132|       opts[:target] ||= '/'
+   133|       opts[:computer_name] ||= JSS::Client.run_jamf('getComputerName')[/>(.)</, 1]
+   134|       opts[:username] ||= JSS::Client.console_user
+   135|       params = [opts[:target], opts[:computer_name], opts[:username]]
+   136|       params << opts[:p4]
+   137|       params << opts[:p5]
+   138|       params << opts[:p6]
+   139|       params << opts[:p7]
+   140|       params << opts[:p8]
+   141|       params << opts[:p9]
+   142|       params << opts[:p10]
+   143|       params << opts[:p11]
+   144|       params.map! &:to_s
+   145|       params.compact!
+   146|       params.delete_if &:empty?
+   147|       return_value = []
+   148|       require 'tmpdir'
+   149|       Dir.mktmpdir do |dir|
+   150|         executable = Pathname.new "#{dir}/#{@name}"
+   151|         executable.jss_touch
+   152|         executable.chmod 0o700
+   153|         executable.jss_save @script_contents
+   154|         cmd = [executable.to_s]
+   155|         cmd += params
+   156|         stdout_and_stderr_str, status = Open3.capture2e(*cmd)
+   157|         return_value << status.exitstatus
+   158|         return_value << stdout_and_stderr_str
+   159|       end # Dir.mktmpdirs
+   160|       return_value
+   161|     end # def run
+   162|     alias oses os_requirements
+   163|     alias oses= os_requirements=
+   164|     alias code script_contents
+   165|     alias code= script_contents=
+   166|     alias contents script_contents
+   167|     alias contents= script_contents=
+   168|     private
+   169|     def rest_xml
+   170|       doc = REXML::Document.new
+   171|       scpt = doc.add_element 'script'
+   172|       scpt.add_element('filename').text = @filename
+   173|       scpt.add_element('id').text = @id
+   174|       scpt.add_element('info').text = @info
+   175|       scpt.add_element('name').text = @name
+   176|       scpt.add_element('notes').text = @notes
+   177|       scpt.add_element('os_requirements').text = JSS.to_s_and_a(@os_requirements)[:stringform]
+   178|       scpt.add_element('priority').text = @priority
+   179|       add_category_to_xml(doc)
+   180|       if @parameters.empty?
+   181|         scpt.add_element('parameters').text = nil
+   182|       else
+   183|         pars = scpt.add_element('parameters')
+   184|         PARAMETER_KEYS.each { |p| pars.add_element(p.to_s).text = @parameters[p] }
+   185|       end
+   186|       scpt.add_element('script_contents_encoded').text = script_contents_encoded
+   187|       doc.to_s
+   188|     end # rest xml
+   189|   end # class Script
+   190| end # module
+
+
+# ====================================================================
+# FILE: lib/jss/api_object/user.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 11-51 ---
+    11|     OBJECT_HISTORY_OBJECT_TYPE = 53
+    12|     attr_reader :full_name
+    13|     attr_reader :email
+    14|     attr_reader :phone_number
+    15|     attr_reader :position
+    16|     attr_reader :ldap_server
+    17|     attr_reader :ldap_sever_id
+    18|     attr_reader :sites
+    19|     attr_reader :computers
+    20|     attr_reader :peripherals
+    21|     attr_reader :mobile_devices
+    22|     attr_reader :vpp_assignments
+    23|     attr_reader :total_vpp_code_count
+    24|     def initialize (args = {})
+    25|       super
+    26|       @full_name = @init_data[:full_name]
+    27|       @email = @init_data[:email]
+    28|       @phone_number = @init_data[:phone_number]
+    29|       @position = @init_data[:position]
+    30|       @ldap_server = JSS::APIObject.get_name @init_data[:ldap_server]
+    31|       @ldap_server_id = @init_data[:ldap_server][:id] unless @init_data[:ldap_server].nil?
+    32|       @sites = @init_data[:sites] ? @init_data[:sites]  : []
+    33|       if @init_data[:links]
+    34|         @computers = @init_data[:links][:computers]
+    35|         @peripherals = @init_data[:links][:peripherals]
+    36|         @mobile_devices = @init_data[:links][:mobile_devices]
+    37|         @vpp_assignments = @init_data[:links][:vpp_assignments]
+    38|         @total_vpp_code_count = @init_data[:links][:total_vpp_code_count]
+    39|       end
+    40|     end
+    41|     def full_name= (new_val)
+    42|       @full_name = new_val
+    43|       @need_to_update = true
+    44|     end
+    45|     def email= (new_val)
+    46|       @email = new_val
+    47|       @need_to_update = true
+    48|     end
+    49|     def phone_number= (new_val)
+    50|       @phone_number = new_val
+    51|       @need_to_update = true
+
+
+# ====================================================================
+# FILE: lib/jss/client/management_action.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 23-48 ---
+    23|       sleep 1
+    24|       orig_flags
+    25|     end
+    26|     def self.restore_alerts(orig_flags)
+    27|       orig_flags.each do |user, flags|
+    28|         set_mgmt_action_ncprefs_flags user, flags, hup: false
+    29|       end
+    30|       system HUP_NOTIF_CTR_CMD unless orig_flags.empty?
+    31|     end
+    32|     def self.set_mgmt_action_ncprefs_flags(user, flags, hup: true)
+    33|       plist = Pathname.new "/Users/#{user}/Library/Preferences/#{NCPREFS_DOMAIN}.plist"
+    34|       prefs = JSS.parse_plist plist
+    35|       mgmt_action_setting = prefs['apps'].select { |a| a['bundle-id'] == MGMT_ACTION_BUNDLE_ID }.first
+    36|       if mgmt_action_setting
+    37|         orig_flags = mgmt_action_setting['flags']
+    38|         mgmt_action_setting['flags'] = flags
+    39|       else
+    40|         orig_flags = flags
+    41|         prefs['apps'] << { 'bundle-id' => MGMT_ACTION_BUNDLE_ID, 'flags' => flags }
+    42|       end
+    43|       plist.open('w') { |f| f.write JSS.xml_plist_from(prefs) }
+    44|       system HUP_NOTIF_CTR_CMD if hup
+    45|       orig_flags
+    46|     end
+    47|   end # class Client
+    48| end # module
+
+
+# ====================================================================
+# FILE: lib/jss/composer.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 5-56 ---
+     5|     PKG_BUNDLE_ID_PFX = 'ruby-jss-composer'.freeze
+     6|     HDI_UTIL = '/usr/bin/hdiutil'.freeze
+     7|     DEFAULT_OUT_DIR = Pathname.new '/Users/Shared'
+     8|     def self.mk_pkg(name, version, root, opts = {})
+     9|       raise NoSuchItemError, "Missing pkgbuild tool. Please make sure you're running 10.8 or later." unless PKGBUILD.executable?
+    10|       opts[:out_dir] ||= DEFAULT_OUT_DIR
+    11|       opts[:bundle_id_prefix] ||= PKG_BUNDLE_ID_PFX
+    12|       pkg_filename = name.end_with?('.pkg') ? name : name + '.pkg'
+    13|       pkg_id = opts[:pkg_id]
+    14|       pkg_id ||= opts[:bundle_id_prefix] + '.' + name
+    15|       pkg_out = "#{opts[:out_dir]}/#{pkg_filename}"
+    16|       pkg_ownership = opts[:preserve_ownership] ? 'preserve' : 'recommended'
+    17|       if opts[:signing_identity]
+    18|         signing = "--sign '#{opts[:signing_identity]}'"
+    19|         signing << " #{opts[:signing_options]}" if opts[:signing_options]
+    20|       else
+    21|         signing = ''
+    22|       end # if opts[:signing_identity]
+    23|       comp_plist_out = Pathname.new "/tmp/#{PKG_BUNDLE_ID_PFX}-#{pkg_filename}.plist"
+    24|       system "#{PKGBUILD} --analyze --root '#{root}' '#{comp_plist_out}'"
+    25|       comp_plist = JSS.parse_plist comp_plist_out
+    26|       if comp_plist[0].nil?
+    27|         comp_plist_arg = ''
+    28|       else
+    29|         comp_plist.each do |bndl|
+    30|           bndl.delete 'ChildBundles' if bndl['ChildBundles']
+    31|           bndl['BundleOverwriteAction'] = 'upgrade'
+    32|           bndl['BundleIsVersionChecked'] = false
+    33|           bndl['BundleIsRelocatable'] = false
+    34|           bndl['BundleHasStrictIdentifier'] = false
+    35|         end
+    36|         comp_plist_out.open('w') { |f| f.write JSS.xml_plist_from(comp_plist) }
+    37|         comp_plist_arg = "--component-plist '#{comp_plist_out}'"
+    38|       end
+    39|       begin
+    40|         it_built = system "#{PKGBUILD} --identifier '#{pkg_id}' --version '#{version}' --ownership #{pkg_ownership} --install-location / --root '#{root}' #{signing} #{comp_plist_arg} '#{pkg_out}'"
+    41|         raise 'There was an error building the .pkg' unless it_built
+    42|       ensure
+    43|         comp_plist_out.delete if comp_plist_out.exist?
+    44|       end
+    45|       Pathname.new pkg_out
+    46|     end # mk_dot_pkg
+    47|     def self.mk_dmg(name, root, out_dir = DEFAULT_OUT_DIR)
+    48|       dmg_filename = "#{name}.dmg"
+    49|       dmg_vol = name
+    50|       dmg_out = Pathname.new "#{out_dir}/#{dmg_filename}"
+    51|       if dmg_out.exist?
+    52|         mv_to = dmg_out.dirname + "#{dmg_out.basename}.#{Time.now.strftime('%Y%m%d%H%M%S')}"
+    53|         dmg_out.rename mv_to
+    54|       end # if dmg out exist
+    55|       system "#{HDI_UTIL} create -volname '#{dmg_vol}' -scrub -srcfolder '#{root}' '#{dmg_out}'"
+    56|       raise 'There was an error building the .dmg' unless $?.exitstatus.zero?
+
+
+# ====================================================================
+# FILE: lib/jss/utility.rb
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-154 ---
+     1| module JSS
+     2|   OS_TEN_MAXS = {
+     3|       2 => 8,
+     4|       3 => 9,
+     5|       4 => 11,
+     6|       5 => 8,
+     7|       6 => 8,
+     8|       7 => 5,
+     9|       8 => 5,
+    10|       9 => 5,
+    11|       10 => 5,
+    12|       11 => 6,
+    13|       12 => 6,
+    14|       13 => 6,
+    15|       14 => 6,
+    16|       15 => 7
+    17|     }
+    18|   MAC_OS_MAXS = {
+    19|     11 => 12,
+    20|     12 => 12,
+    21|     13 => 12,
+    22|     14 => 12,
+    23|     15 => 12,
+    24|     16 => 12,
+    25|     17 => 12,
+    26|     18 => 12,
+    27|     19 => 12,
+    28|     20 => 12
+    29|   }
+    30|   def self.expand_min_os(min_os)
+    31|     min_os = min_os.delete '>='
+    32|     major, minor, maint = min_os.split('.')
+    33|     minor = 'x' if minor.nil? || minor == '0'
+    34|     maint = 'x' if maint.nil? || maint == '0'
+    35|     ok_oses = []
+    36|     if major == '10'
+    37|       if minor == '16'
+    38|         ok_oses << '10.16'
+    39|       else
+    40|         if maint == 'x'
+    41|           ok_oses << "10.#{minor}.x"
+    42|         else
+    43|           max_maint_for_minor = OS_TEN_MAXS[minor.to_i]
+    44|           (maint.to_i..max_maint_for_minor).each do |m|
+    45|             ok_oses << "#{major}.#{minor}.#{m}"
+    46|           end # each m
+    47|         end # if maint == x
+    48|         if minor.to_i < 15
+    49|           ((minor.to_i + 1)..15).each { |v| ok_oses << "10.#{v}.x" }
+    50|         end
+    51|         ok_oses << '10.16'
+    52|       end # if minor == 16
+    53|       major = '11'
+    54|       minor = 'x'
+    55|       maint = 'x'
+    56|     end # if major == 10
+    57|     if ['11', '11.x', '11.x.x', '11.0', '11.0.0'].include?(min_os) && !ok_oses.include?('10.16')
+    58|       ok_oses << '10.16'
+    59|     end
+    60|     if minor == 'x'
+    61|       ((major.to_i)..20).each { |v| ok_oses << "#{v}.x" }
+    62|     elsif maint == 'x'
+    63|       max_minor_for_major = MAC_OS_MAXS[major.to_i]
+    64|       ((minor.to_i)..max_minor_for_major).each do |m|
+    65|         ok_oses << "#{major}.#{m}.x"
+    66|       end # each m
+    67|       ((major.to_i + 1)..20).each { |v| ok_oses << "#{v}.x" }
+    68|     else
+    69|       ((maint.to_i)..10).each { |mnt| ok_oses << "#{major}.#{minor}.#{mnt}" }
+    70|       max_minor_for_major = MAC_OS_MAXS[major.to_i]
+    71|       ((minor.to_i + 1)..max_minor_for_major).each { |min| ok_oses << "#{major}.#{min}.x" }
+    72|       ((major.to_i + 1)..20).each { |v| ok_oses << "#{v}.x" }
+    73|     end
+    74|     ok_oses
+    75|   end # def self.expand_min_os(min_os)
+    76|   def self.processor_ok?(requirement, processor = nil)
+    77|     return true if requirement.to_s.empty? || requirement =~ /none/i
+    78|     processor ||= `/usr/bin/uname -p`
+    79|     requirement == (processor.to_s.include?('86') ? 'x86' : 'ppc')
+    80|   end
+    81|   def self.os_ok?(requirement, os_to_check = nil)
+    82|     return true if requirement.to_s =~ /none/i
+    83|     return true if requirement.to_s == 'n'
+    84|     requirement = JSS.to_s_and_a(requirement)[:arrayform]
+    85|     return true if requirement.empty?
+    86|     os_to_check ||= `/usr/bin/sw_vers -productVersion`.chomp
+    87|     req_regexps = requirement.map do |r|
+    88|       if r.end_with?('.x')
+    89|         /^#{r.chomp('.x').gsub('.', '\.')}\.?\d*$/
+    90|       elsif r =~ /^\d+\.\d+$/
+    91|         /^#{r.gsub('.', '\.')}(.0)?$/
+    92|       else
+    93|         /^#{r.gsub('.', '\.')}$/
+    94|       end
+    95|     end
+    96|     req_regexps.each { |re| return true if os_to_check =~ re }
+    97|     false
+    98|   end
+    99|   def self.to_s_and_a(somedata)
+   100|     case somedata
+   101|     when nil
+   102|       valstr = ''
+   103|       valarr = []
+   104|     when String
+   105|       valstr = somedata
+   106|       valarr = somedata.split(/,\s*/)
+   107|     when Array
+   108|       valstr = somedata.join ', '
+   109|       valarr = somedata
+   110|     else
+   111|       raise JSS::InvalidDataError, 'Input must be a comma-separated String or an Array of Strings'
+   112|     end # case
+   113|     { stringform: valstr, arrayform: valarr }
+   114|   end # to_s_and_a
+   115|   def self.parse_plist(plist, symbol_keys: false)
+   116|     require 'cfpropertylist'
+   117|     case plist
+   118|     when String
+   119|       return CFPropertyList.native_types(CFPropertyList::List.new(data: plist).value, symbol_keys) if plist.include? '</plist>'
+   120|       plist = Pathname.new plist
+   121|     when Pathname
+   122|       true
+   123|     else
+   124|       raise ArgumentError, 'Argument must be a path (as a Pathname or String) or a String of XML'
+   125|     end # case plist
+   126|     raise JSS::MissingDataError, "No such file: #{plist}" unless plist.file?
+   127|     CFPropertyList.native_types(CFPropertyList::List.new(file: plist).value, symbol_keys)
+   128|   end # parse_plist
+   129|   def self.xml_plist_from(data)
+   130|     require 'cfpropertylist'
+   131|     plist = CFPropertyList::List.new
+   132|     plist.value = CFPropertyList.guess(data, convert_unknown_to_string: true)
+   133|     plist.to_str(CFPropertyList::List::FORMAT_XML)
+   134|   end
+   135|   def self.parse_time(a_datetime)
+   136|     return nil if NIL_DATES.include? a_datetime
+   137|     the_dt = DateTime.parse(a_datetime.to_s)
+   138|     usec = (the_dt.sec_fraction * 60 * 60 * 24 * (10**6)).to_i
+   139|     the_dt = DateTime.new(the_dt.year, the_dt.month, the_dt.day, the_dt.hour, the_dt.min, the_dt.sec, JSS::TIME_ZONE_OFFSET) if the_dt.offset.zero?
+   140|     Time.at the_dt.strftime('%s').to_i, usec
+   141|   end # parse_time
+   142|   def self.parse_datetime(a_datetime)
+   143|     parse_time(a_datetime)
+   144|   end
+   145|   def self.epoch_to_time(epoch)
+   146|     return nil if NIL_DATES.include? epoch
+   147|     Time.at(epoch.to_i / 1000.0)
+   148|   end # parse_date
+   149|   def self.api_object_class(name)
+   150|     klass = api_object_names[name.downcase.to_sym]
+   151|     raise JSS::InvalidDataError, "Unknown API Object Class: #{name}" unless klass
+   152|     klass
+   153|   end
+   154|   def self.api_object_names
+
+
+# ====================================================================
+# FILE: lib/jss/version.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-3 ---
+     1| module JSS
+     2|   VERSION = '1.6.0'.freeze
+     3| end # module
+

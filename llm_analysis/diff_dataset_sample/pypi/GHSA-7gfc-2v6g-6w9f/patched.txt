@@ -1,0 +1,774 @@
+# ====================================================================
+# FILE: docs/conf.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-16 ---
+     1| import sys
+     2| extensions = ['sphinx.ext.autodoc']
+     3| templates_path = ['_templates']
+     4| source_suffix = '.txt'
+     5| master_doc = 'index'
+     6| project = 'Paste'
+     7| copyright = '2008, Ian Bicking'
+     8| version = '1.7'
+     9| release = '1.7.4'
+    10| today_fmt = '%B %d, %Y'
+    11| unused_docs = ['include/contact.txt', 'include/reference_header.txt']
+    12| pygments_style = 'sphinx'
+    13| html_style = 'default.css'
+    14| html_static_path = ['_static']
+    15| html_last_updated_fmt = '%b %d, %Y'
+    16| htmlhelp_basename = 'Pastedoc'
+
+
+# ====================================================================
+# FILE: paste/errordocument.py
+# Total hunks: 5
+# ====================================================================
+# --- HUNK 1: Lines 1-180 ---
+     1| """
+     2| Middleware to display error documents for certain status codes
+     3| The middleware in this module can be used to intercept responses with
+     4| specified status codes and internally forward the request to an appropriate
+     5| URL where the content can be displayed to the user as an error document.
+     6| """
+     7| import warnings
+     8| from urlparse import urlparse
+     9| from paste.recursive import ForwardRequestException, RecursiveMiddleware
+    10| from paste.util import converters
+    11| from paste.response import replace_header
+    12| def forward(app, codes):
+    13|     """
+    14|     Intercepts a response with a particular status code and returns the
+    15|     content from a specified URL instead.
+    16|     The arguments are:
+    17|     ``app``
+    18|         The WSGI application or middleware chain.
+    19|     ``codes``
+    20|         A dictionary of integer status codes and the URL to be displayed
+    21|         if the response uses that code.
+    22|     For example, you might want to create a static file to display a
+    23|     "File Not Found" message at the URL ``/error404.html`` and then use
+    24|     ``forward`` middleware to catch all 404 status codes and display the page
+    25|     you created. In this example ``app`` is your exisiting WSGI
+    26|     applicaiton::
+    27|         from paste.errordocument import forward
+    28|         app = forward(app, codes={404:'/error404.html'})
+    29|     """
+    30|     for code in codes:
+    31|         if not isinstance(code, int):
+    32|             raise TypeError('All status codes should be type int. '
+    33|                 '%s is not valid'%repr(code))
+    34|     def error_codes_mapper(code, message, environ, global_conf, codes):
+    35|         if codes.has_key(code):
+    36|             return codes[code]
+    37|         else:
+    38|             return None
+    39|     return RecursiveMiddleware(
+    40|         StatusBasedForward(
+    41|             app,
+    42|             error_codes_mapper,
+    43|             codes=codes,
+    44|         )
+    45|     )
+    46| class StatusKeeper(object):
+    47|     def __init__(self, app, status, url, headers):
+    48|         self.app = app
+    49|         self.status = status
+    50|         self.url = url
+    51|         self.headers = headers
+    52|     def __call__(self, environ, start_response):
+    53|         def keep_status_start_response(status, headers, exc_info=None):
+    54|             for header, value in headers:
+    55|                 if header.lower() == 'set-cookie':
+    56|                     self.headers.append((header, value))
+    57|                 else:
+    58|                     replace_header(self.headers, header, value)
+    59|             return start_response(self.status, self.headers, exc_info)
+    60|         parts = self.url.split('?')
+    61|         environ['PATH_INFO'] = parts[0]
+    62|         if len(parts) > 1:
+    63|             environ['QUERY_STRING'] = parts[1]
+    64|         else:
+    65|             environ['QUERY_STRING'] = ''
+    66|         return self.app(environ, keep_status_start_response)
+    67| class StatusBasedForward(object):
+    68|     """
+    69|     Middleware that lets you test a response against a custom mapper object to
+    70|     programatically determine whether to internally forward to another URL and
+    71|     if so, which URL to forward to.
+    72|     If you don't need the full power of this middleware you might choose to use
+    73|     the simpler ``forward`` middleware instead.
+    74|     The arguments are:
+    75|     ``app``
+    76|         The WSGI application or middleware chain.
+    77|     ``mapper``
+    78|         A callable that takes a status code as the
+    79|         first parameter, a message as the second, and accepts optional environ,
+    80|         global_conf and named argments afterwards. It should return a
+    81|         URL to forward to or ``None`` if the code is not to be intercepted.
+    82|     ``global_conf``
+    83|         Optional default configuration from your config file. If ``debug`` is
+    84|         set to ``true`` a message will be written to ``wsgi.errors`` on each
+    85|         internal forward stating the URL forwarded to.
+    86|     ``**params``
+    87|         Optional, any other configuration and extra arguments you wish to
+    88|         pass which will in turn be passed back to the custom mapper object.
+    89|     Here is an example where a ``404 File Not Found`` status response would be
+    90|     redirected to the URL ``/error?code=404&message=File%20Not%20Found``. This
+    91|     could be useful for passing the status code and message into another
+    92|     application to display an error document:
+    93|     .. code-block:: python
+    94|         from paste.errordocument import StatusBasedForward
+    95|         from paste.recursive import RecursiveMiddleware
+    96|         from urllib import urlencode
+    97|         def error_mapper(code, message, environ, global_conf, kw)
+    98|             if code in [404, 500]:
+    99|                 params = urlencode({'message':message, 'code':code})
+   100|                 url = '/error?'%(params)
+   101|                 return url
+   102|             else:
+   103|                 return None
+   104|         app = RecursiveMiddleware(
+   105|             StatusBasedForward(app, mapper=error_mapper),
+   106|         )
+   107|     """
+   108|     def __init__(self, app, mapper, global_conf=None, **params):
+   109|         if global_conf is None:
+   110|             global_conf = {}
+   111|         if global_conf:
+   112|             self.debug = converters.asbool(global_conf.get('debug', False))
+   113|         else:
+   114|             self.debug = False
+   115|         self.application = app
+   116|         self.mapper = mapper
+   117|         self.global_conf = global_conf
+   118|         self.params = params
+   119|     def __call__(self, environ, start_response):
+   120|         url = []
+   121|         def change_response(status, headers, exc_info=None):
+   122|             status_code = status.split(' ')
+   123|             try:
+   124|                 code = int(status_code[0])
+   125|             except (ValueError, TypeError):
+   126|                 raise Exception(
+   127|                     'StatusBasedForward middleware '
+   128|                     'received an invalid status code %s'%repr(status_code[0])
+   129|                 )
+   130|             message = ' '.join(status_code[1:])
+   131|             new_url = self.mapper(
+   132|                 code,
+   133|                 message,
+   134|                 environ,
+   135|                 self.global_conf,
+   136|                 **self.params
+   137|             )
+   138|             if not (new_url == None or isinstance(new_url, str)):
+   139|                 raise TypeError(
+   140|                     'Expected the url to internally '
+   141|                     'redirect to in the StatusBasedForward mapper'
+   142|                     'to be a string or None, not %s'%repr(new_url)
+   143|                 )
+   144|             if new_url:
+   145|                 url.append([new_url, status, headers])
+   146|             else:
+   147|                 return start_response(status, headers, exc_info)
+   148|         app_iter = self.application(environ, change_response)
+   149|         if url:
+   150|             if hasattr(app_iter, 'close'):
+   151|                 app_iter.close()
+   152|             def factory(app):
+   153|                 return StatusKeeper(app, status=url[0][1], url=url[0][0],
+   154|                                     headers=url[0][2])
+   155|             raise ForwardRequestException(factory=factory)
+   156|         else:
+   157|             return app_iter
+   158| def make_errordocument(app, global_conf, **kw):
+   159|     """
+   160|     Paste Deploy entry point to create a error document wrapper.
+   161|     Use like::
+   162|         [filter-app:main]
+   163|         use = egg:Paste#errordocument
+   164|         next = real-app
+   165|         500 = /lib/msg/500.html
+   166|         404 = /lib/msg/404.html
+   167|     """
+   168|     map = {}
+   169|     for status, redir_loc in kw.items():
+   170|         try:
+   171|             status = int(status)
+   172|         except ValueError:
+   173|             raise ValueError('Bad status code: %r' % status)
+   174|         map[status] = redir_loc
+   175|     forwarder = forward(app, map)
+   176|     return forwarder
+   177| __pudge_all__ = [
+   178|     'forward',
+   179|     'make_errordocument',
+   180|     'empty_error',
+
+# --- HUNK 2: Lines 200-266 ---
+   200|         warnings.warn(
+   201|             "errordocuments._StatusBasedRedirect has been deprecated; please "
+   202|             "use errordocuments.StatusBasedForward",
+   203|             DeprecationWarning, 2)
+   204|         if global_conf is None:
+   205|             global_conf = {}
+   206|         self.application = app
+   207|         self.mapper = mapper
+   208|         self.global_conf = global_conf
+   209|         self.kw = kw
+   210|         self.fallback_template = """
+   211|             <html>
+   212|             <head>
+   213|             <title>Error %(code)s</title>
+   214|             </html>
+   215|             <body>
+   216|             <h1>Error %(code)s</h1>
+   217|             <p>%(message)s</p>
+   218|             <hr>
+   219|             <p>
+   220|                 Additionally an error occurred trying to produce an
+   221|                 error document.  A description of the error was logged
+   222|                 to <tt>wsgi.errors</tt>.
+   223|             </p>
+   224|             </body>
+   225|             </html>
+   226|         """
+   227|     def __call__(self, environ, start_response):
+   228|         url = []
+   229|         code_message = []
+   230|         try:
+   231|             def change_response(status, headers, exc_info=None):
+   232|                 new_url = None
+   233|                 parts = status.split(' ')
+   234|                 try:
+   235|                     code = int(parts[0])
+   236|                 except (ValueError, TypeError):
+   237|                     raise Exception(
+   238|                         '_StatusBasedRedirect middleware '
+   239|                         'received an invalid status code %s'%repr(parts[0])
+   240|                     )
+   241|                 message = ' '.join(parts[1:])
+   242|                 new_url = self.mapper(
+   243|                     code,
+   244|                     message,
+   245|                     environ,
+   246|                     self.global_conf,
+   247|                     self.kw
+   248|                 )
+   249|                 if not (new_url == None or isinstance(new_url, str)):
+   250|                     raise TypeError(
+   251|                         'Expected the url to internally '
+   252|                         'redirect to in the _StatusBasedRedirect error_mapper'
+   253|                         'to be a string or None, not %s'%repr(new_url)
+   254|                     )
+   255|                 if new_url:
+   256|                     url.append(new_url)
+   257|                 code_message.append([code, message])
+   258|                 return start_response(status, headers, exc_info)
+   259|             app_iter = self.application(environ, change_response)
+   260|         except:
+   261|             try:
+   262|                 import sys
+   263|                 error = str(sys.exc_info()[1])
+   264|             except:
+   265|                 error = ''
+   266|             try:
+
+
+# ====================================================================
+# FILE: paste/httpexceptions.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 46-86 ---
+    46|         * 413 - HTTPRequestEntityTooLarge
+    47|         * 414 - HTTPRequestURITooLong
+    48|         * 415 - HTTPUnsupportedMediaType
+    49|         * 416 - HTTPRequestRangeNotSatisfiable
+    50|         * 417 - HTTPExpectationFailed
+    51|       HTTPServerError
+    52|         * 500 - HTTPInternalServerError
+    53|         * 501 - HTTPNotImplemented
+    54|         * 502 - HTTPBadGateway
+    55|         * 503 - HTTPServiceUnavailable
+    56|         * 504 - HTTPGatewayTimeout
+    57|         * 505 - HTTPVersionNotSupported
+    58| References:
+    59| .. [1] http://www.python.org/peps/pep-0333.html#error-handling
+    60| .. [2] http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.5
+    61| """
+    62| import types
+    63| from paste.wsgilib import catch_errors_app
+    64| from paste.response import has_header, header_value, replace_header
+    65| from paste.request import resolve_relative_url
+    66| from paste.util.quoting import strip_html, html_quote, no_quote, comment_quote
+    67| SERVER_NAME = 'WSGI Server'
+    68| TEMPLATE = """\
+    69| <html>\r
+    70|   <head><title>%(title)s</title></head>\r
+    71|   <body>\r
+    72|     <h1>%(title)s</h1>\r
+    73|     <p>%(body)s</p>\r
+    74|     <hr noshade>\r
+    75|     <div align="right">%(server)s</div>\r
+    76|   </body>\r
+    77| </html>\r
+    78| """
+    79| class HTTPException(Exception):
+    80|     """
+    81|     the HTTP exception base class
+    82|     This encapsulates an HTTP response that interrupts normal application
+    83|     flow; but one which is not necessarly an error condition. For
+    84|     example, codes in the 300's are exceptions in that they interrupt
+    85|     normal processing; however, they are not considered errors.
+    86|     This class is complicated by 4 factors:
+
+# --- HUNK 2: Lines 157-201 ---
+   157|             self.comment = comment
+   158|         Exception.__init__(self,"%s %s\n%s\n%s\n" % (
+   159|             self.code, self.title, self.explanation, self.detail))
+   160|     def make_body(self, environ, template, escfunc, comment_escfunc=None):
+   161|         comment_escfunc = comment_escfunc or escfunc
+   162|         args = {'explanation': escfunc(self.explanation),
+   163|                 'detail': escfunc(self.detail),
+   164|                 'comment': comment_escfunc(self.comment)}
+   165|         if HTTPException.template != self.template:
+   166|             for (k, v) in environ.items():
+   167|                 args[k] = escfunc(v)
+   168|             if self.headers:
+   169|                 for (k, v) in self.headers:
+   170|                     args[k.lower()] = escfunc(v)
+   171|         for key, value in args.items():
+   172|             if isinstance(value, unicode):
+   173|                 args[key] = value.encode('utf8', 'xmlcharrefreplace')
+   174|         return template % args
+   175|     def plain(self, environ):
+   176|         """ text/plain representation of the exception """
+   177|         body = self.make_body(environ, strip_html(self.template), comment_quote)
+   178|         return ('%s %s\r\n%s\r\n' % (self.code, self.title, body))
+   179|     def html(self, environ):
+   180|         """ text/html representation of the exception """
+   181|         body = self.make_body(environ, self.template, html_quote, comment_quote)
+   182|         return TEMPLATE % {
+   183|                    'title': self.title,
+   184|                    'code': self.code,
+   185|                    'server': SERVER_NAME,
+   186|                    'body': body }
+   187|     def prepare_content(self, environ):
+   188|         if self.headers:
+   189|             headers = list(self.headers)
+   190|         else:
+   191|             headers = []
+   192|         if 'html' in environ.get('HTTP_ACCEPT','') or \
+   193|             '*/*' in environ.get('HTTP_ACCEPT',''):
+   194|             replace_header(headers, 'content-type', 'text/html')
+   195|             content = self.html(environ)
+   196|         else:
+   197|             replace_header(headers, 'content-type', 'text/plain')
+   198|             content = self.plain(environ)
+   199|         if isinstance(content, unicode):
+   200|             content = content.encode('utf8')
+   201|             cur_content_type = (
+
+# --- HUNK 3: Lines 254-294 ---
+   254|     template = (
+   255|         '%(explanation)s <a href="%(location)s">%(location)s</a>;\r\n'
+   256|         'you should be redirected automatically.\r\n'
+   257|         '%(detail)s\r\n<!-- %(comment)s -->')
+   258|     def __init__(self, detail=None, headers=None, comment=None):
+   259|         assert isinstance(headers, (type(None), list))
+   260|         headers = headers or []
+   261|         location = header_value(headers,'location')
+   262|         if not location:
+   263|             location = detail
+   264|             detail = ''
+   265|             headers.append(('location', location))
+   266|         assert location, ("HTTPRedirection specified neither a "
+   267|                           "location in the headers nor did it "
+   268|                           "provide a detail argument.")
+   269|         HTTPRedirection.__init__(self, location, headers, comment)
+   270|         if detail is not None:
+   271|             self.detail = detail
+   272|     def relative_redirect(cls, dest_uri, environ, detail=None, headers=None, comment=None):
+   273|         """
+   274|         Create a redirect object with the dest_uri, which may be relative,
+   275|         considering it relative to the uri implied by the given environ.
+   276|         """
+   277|         location = resolve_relative_url(dest_uri, environ)
+   278|         headers = headers or []
+   279|         headers.append(('Location', location))
+   280|         return cls(detail=detail, headers=headers, comment=comment)
+   281|     relative_redirect = classmethod(relative_redirect)
+   282|     def location(self):
+   283|         for name, value in self.headers:
+   284|             if name.lower() == 'location':
+   285|                 return value
+   286|         else:
+   287|             raise KeyError("No location set for %s" % self)
+   288| class HTTPMultipleChoices(_HTTPMove):
+   289|     code = 300
+   290|     title = 'Multiple Choices'
+   291| class HTTPMovedPermanently(_HTTPMove):
+   292|     code = 301
+   293|     title = 'Moved Permanently'
+   294| class HTTPFound(_HTTPMove):
+
+
+# ====================================================================
+# FILE: paste/urlmap.py
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-27 ---
+     1| """
+     2| Map URL prefixes to WSGI applications.  See ``URLMap``
+     3| """
+     4| from UserDict import DictMixin
+     5| import re
+     6| import os
+     7| import cgi
+     8| from paste import httpexceptions
+     9| __all__ = ['URLMap', 'PathProxyURLMap']
+    10| def urlmap_factory(loader, global_conf, **local_conf):
+    11|     if 'not_found_app' in local_conf:
+    12|         not_found_app = local_conf.pop('not_found_app')
+    13|     else:
+    14|         not_found_app = global_conf.get('not_found_app')
+    15|     if not_found_app:
+    16|         not_found_app = loader.get_app(not_found_app, global_conf=global_conf)
+    17|     urlmap = URLMap(not_found_app=not_found_app)
+    18|     for path, app_name in local_conf.items():
+    19|         path = parse_path_expression(path)
+    20|         app = loader.get_app(app_name, global_conf=global_conf)
+    21|         urlmap[path] = app
+    22|     return urlmap
+    23| def parse_path_expression(path):
+    24|     """
+    25|     Parses a path expression like 'domain foobar.com port 20 /' or
+    26|     just '/foobar' for a path alone.  Returns as an address that
+    27|     URLMap likes.
+
+# --- HUNK 2: Lines 76-123 ---
+    76|     def __init__(self, not_found_app=None):
+    77|         self.applications = []
+    78|         if not not_found_app:
+    79|             not_found_app = self.not_found_app
+    80|         self.not_found_application = not_found_app
+    81|     norm_url_re = re.compile('//+')
+    82|     domain_url_re = re.compile('^(http|https)://')
+    83|     def not_found_app(self, environ, start_response):
+    84|         mapper = environ.get('paste.urlmap_object')
+    85|         if mapper:
+    86|             matches = [p for p, a in mapper.applications]
+    87|             extra = 'defined apps: %s' % (
+    88|                 ',\n  '.join(map(repr, matches)))
+    89|         else:
+    90|             extra = ''
+    91|         extra += '\nSCRIPT_NAME: %r' % environ.get('SCRIPT_NAME')
+    92|         extra += '\nPATH_INFO: %r' % environ.get('PATH_INFO')
+    93|         extra += '\nHTTP_HOST: %r' % environ.get('HTTP_HOST')
+    94|         app = httpexceptions.HTTPNotFound(
+    95|             environ['PATH_INFO'],
+    96|             comment=cgi.escape(extra)).wsgi_application
+    97|         return app(environ, start_response)
+    98|     def normalize_url(self, url, trim=True):
+    99|         if isinstance(url, (list, tuple)):
+   100|             domain = url[0]
+   101|             url = self.normalize_url(url[1])[1]
+   102|             return domain, url
+   103|         assert (not url or url.startswith('/')
+   104|                 or self.domain_url_re.search(url)), (
+   105|             "URL fragments must start with / or http:// (you gave %r)" % url)
+   106|         match = self.domain_url_re.search(url)
+   107|         if match:
+   108|             url = url[match.end():]
+   109|             if '/' in url:
+   110|                 domain, url = url.split('/', 1)
+   111|                 url = '/' + url
+   112|             else:
+   113|                 domain, url = url, ''
+   114|         else:
+   115|             domain = None
+   116|         url = self.norm_url_re.sub('/', url)
+   117|         if trim:
+   118|             url = url.rstrip('/')
+   119|         return domain, url
+   120|     def sort_apps(self):
+   121|         """
+   122|         Make sure applications are sorted with longest URLs first
+   123|         """
+
+# --- HUNK 3: Lines 131-171 ---
+   131|         apps.sort()
+   132|         self.applications = [desc for (sortable, desc) in apps]
+   133|     def __setitem__(self, url, app):
+   134|         if app is None:
+   135|             try:
+   136|                 del self[url]
+   137|             except KeyError:
+   138|                 pass
+   139|             return
+   140|         dom_url = self.normalize_url(url)
+   141|         if dom_url in self:
+   142|             del self[dom_url]
+   143|         self.applications.append((dom_url, app))
+   144|         self.sort_apps()
+   145|     def __getitem__(self, url):
+   146|         dom_url = self.normalize_url(url)
+   147|         for app_url, app in self.applications:
+   148|             if app_url == dom_url:
+   149|                 return app
+   150|         raise KeyError(
+   151|             "No application with the url %r (domain: %r; existing: %s)"
+   152|             % (url[1], url[0] or '*', self.applications))
+   153|     def __delitem__(self, url):
+   154|         url = self.normalize_url(url)
+   155|         for app_url, app in self.applications:
+   156|             if app_url == url:
+   157|                 self.applications.remove((app_url, app))
+   158|                 break
+   159|         else:
+   160|             raise KeyError(
+   161|                 "No application with the url %r" % (url,))
+   162|     def keys(self):
+   163|         return [app_url for app_url, app in self.applications]
+   164|     def __call__(self, environ, start_response):
+   165|         host = environ.get('HTTP_HOST', environ.get('SERVER_NAME')).lower()
+   166|         if ':' in host:
+   167|             host, port = host.split(':', 1)
+   168|         else:
+   169|             if environ['wsgi.url_scheme'] == 'http':
+   170|                 port = '80'
+   171|             else:
+
+# --- HUNK 4: Lines 187-217 ---
+   187|     This is a wrapper for URLMap that catches any strings that
+   188|     are passed in as applications; these strings are treated as
+   189|     filenames (relative to `base_path`) and are passed to the
+   190|     callable `builder`, which will return an application.
+   191|     This is intended for cases when configuration files can be
+   192|     treated as applications.
+   193|     `base_paste_url` is the URL under which all applications added through
+   194|     this wrapper must go.  Use ``""`` if you want this to not
+   195|     change incoming URLs.
+   196|     """
+   197|     def __init__(self, map, base_paste_url, base_path, builder):
+   198|         self.map = map
+   199|         self.base_paste_url = self.map.normalize_url(base_paste_url)
+   200|         self.base_path = base_path
+   201|         self.builder = builder
+   202|     def __setitem__(self, url, app):
+   203|         if isinstance(app, (str, unicode)):
+   204|             app_fn = os.path.join(self.base_path, app)
+   205|             app = self.builder(app_fn)
+   206|         url = self.map.normalize_url(url)
+   207|         url = (url[0] or self.base_paste_url[0],
+   208|                self.base_paste_url[1] + url[1])
+   209|         self.map[url] = app
+   210|     def __getattr__(self, attr):
+   211|         return getattr(self.map, attr)
+   212|     def not_found_application__get(self):
+   213|         return self.map.not_found_application
+   214|     def not_found_application__set(self, value):
+   215|         self.map.not_found_application = value
+   216|     not_found_application = property(not_found_application__get,
+   217|                                      not_found_application__set)
+
+
+# ====================================================================
+# FILE: paste/util/mimeparse.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-124 ---
+     1| """MIME-Type Parser
+     2| This module provides basic functions for handling mime-types. It can handle
+     3| matching mime-types against a list of media-ranges. See section 14.1 of
+     4| the HTTP specification [RFC 2616] for a complete explanation.
+     5|    http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.1
+     6| Contents:
+     7|     - parse_mime_type():   Parses a mime-type into its component parts.
+     8|     - parse_media_range(): Media-ranges are mime-types with wild-cards and a 'q' quality parameter.
+     9|     - quality():           Determines the quality ('q') of a mime-type when compared against a list of media-ranges.
+    10|     - quality_parsed():    Just like quality() except the second parameter must be pre-parsed.
+    11|     - best_match():        Choose the mime-type with the highest quality ('q') from a list of candidates.
+    12| """
+    13| __version__ = "0.1.2"
+    14| __author__ = 'Joe Gregorio'
+    15| __email__ = "joe@bitworking.org"
+    16| __credits__ = ""
+    17| def parse_mime_type(mime_type):
+    18|     """Carves up a mime-type and returns a tuple of the
+    19|        (type, subtype, params) where 'params' is a dictionary
+    20|        of all the parameters for the media range.
+    21|        For example, the media range 'application/xhtml;q=0.5' would
+    22|        get parsed into:
+    23|        ('application', 'xhtml', {'q', '0.5'})
+    24|        """
+    25|     parts = mime_type.split(";")
+    26|     params = dict([tuple([s.strip() for s in param.split("=")])\
+    27|             for param in parts[1:] ])
+    28|     full_type = parts[0].strip()
+    29|     if full_type == '*': full_type = '*/*'
+    30|     (type, subtype) = full_type.split("/")
+    31|     return (type.strip(), subtype.strip(), params)
+    32| def parse_media_range(range):
+    33|     """Carves up a media range and returns a tuple of the
+    34|        (type, subtype, params) where 'params' is a dictionary
+    35|        of all the parameters for the media range.
+    36|        For example, the media range 'application/*;q=0.5' would
+    37|        get parsed into:
+    38|        ('application', '*', {'q', '0.5'})
+    39|        In addition this function also guarantees that there
+    40|        is a value for 'q' in the params dictionary, filling it
+    41|        in with a proper default if necessary.
+    42|        """
+    43|     (type, subtype, params) = parse_mime_type(range)
+    44|     if not params.has_key('q') or not params['q'] or \
+    45|             not float(params['q']) or float(params['q']) > 1\
+    46|             or float(params['q']) < 0:
+    47|         params['q'] = '1'
+    48|     return (type, subtype, params)
+    49| def fitness_and_quality_parsed(mime_type, parsed_ranges):
+    50|     """Find the best match for a given mime-type against
+    51|        a list of media_ranges that have already been
+    52|        parsed by parse_media_range(). Returns a tuple of
+    53|        the fitness value and the value of the 'q' quality
+    54|        parameter of the best match, or (-1, 0) if no match
+    55|        was found. Just as for quality_parsed(), 'parsed_ranges'
+    56|        must be a list of parsed media ranges. """
+    57|     best_fitness = -1
+    58|     best_fit_q = 0
+    59|     (target_type, target_subtype, target_params) =\
+    60|             parse_media_range(mime_type)
+    61|     for (type, subtype, params) in parsed_ranges:
+    62|         if (type == target_type or type == '*' or target_type == '*') and \
+    63|                 (subtype == target_subtype or subtype == '*' or target_subtype == '*'):
+    64|             param_matches = reduce(lambda x, y: x+y, [1 for (key, value) in \
+    65|                     target_params.iteritems() if key != 'q' and \
+    66|                     params.has_key(key) and value == params[key]], 0)
+    67|             fitness = (type == target_type) and 100 or 0
+    68|             fitness += (subtype == target_subtype) and 10 or 0
+    69|             fitness += param_matches
+    70|             if fitness > best_fitness:
+    71|                 best_fitness = fitness
+    72|                 best_fit_q = params['q']
+    73|     return best_fitness, float(best_fit_q)
+    74| def quality_parsed(mime_type, parsed_ranges):
+    75|     """Find the best match for a given mime-type against
+    76|     a list of media_ranges that have already been
+    77|     parsed by parse_media_range(). Returns the
+    78|     'q' quality parameter of the best match, 0 if no
+    79|     match was found. This function bahaves the same as quality()
+    80|     except that 'parsed_ranges' must be a list of
+    81|     parsed media ranges. """
+    82|     return fitness_and_quality_parsed(mime_type, parsed_ranges)[1]
+    83| def quality(mime_type, ranges):
+    84|     """Returns the quality 'q' of a mime-type when compared
+    85|     against the media-ranges in ranges. For example:
+    86|     >>> quality('text/html','text/*;q=0.3, text/html;q=0.7, text/html;level=1, text/html;level=2;q=0.4, */*;q=0.5')
+    87|     0.7
+    88|     """
+    89|     parsed_ranges = [parse_media_range(r) for r in ranges.split(",")]
+    90|     return quality_parsed(mime_type, parsed_ranges)
+    91| def best_match(supported, header):
+    92|     """Takes a list of supported mime-types and finds the best
+    93|     match for all the media-ranges listed in header. The value of
+    94|     header must be a string that conforms to the format of the
+    95|     HTTP Accept: header. The value of 'supported' is a list of
+    96|     mime-types.
+    97|     >>> best_match(['application/xbel+xml', 'text/xml'], 'text/*;q=0.5,*/*; q=0.1')
+    98|     'text/xml'
+    99|     """
+   100|     parsed_header = [parse_media_range(r) for r in header.split(",")]
+   101|     weighted_matches = [(fitness_and_quality_parsed(mime_type, parsed_header), mime_type)\
+   102|             for mime_type in supported]
+   103|     weighted_matches.sort()
+   104|     return weighted_matches[-1][0][1] and weighted_matches[-1][1] or ''
+   105| def desired_matches(desired, header):
+   106|     """Takes a list of desired mime-types in the order the server prefers to
+   107|     send them regardless of the browsers preference.
+   108|     Browsers (such as Firefox) technically want XML over HTML depending on how
+   109|     one reads the specification. This function is provided for a server to
+   110|     declare a set of desired mime-types it supports, and returns a subset of
+   111|     the desired list in the same order should each one be Accepted by the
+   112|     browser.
+   113|     >>> sorted_match(['text/html', 'application/xml'], \
+   114|     ...     'text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png')
+   115|     ['text/html', 'application/xml']
+   116|     >>> sorted_match(['text/html', 'application/xml'], 'application/xml,application/json')
+   117|     ['application/xml']
+   118|     """
+   119|     matches = []
+   120|     parsed_ranges = [parse_media_range(r) for r in header.split(",")]
+   121|     for mimetype in desired:
+   122|         if quality_parsed(mimetype, parsed_ranges):
+   123|             matches.append(mimetype)
+   124|     return matches
+
+
+# ====================================================================
+# FILE: paste/util/quoting.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 43-73 ---
+    43|     u''
+    44|     >>> html_unquote('&blahblah;')
+    45|     u'&blahblah;'
+    46|     >>> html_unquote('\xe1\x80\xa9')
+    47|     u'\u1029'
+    48|     """
+    49|     if isinstance(s, str):
+    50|         if s == '':
+    51|             return u''
+    52|         s = s.decode(encoding or default_encoding)
+    53|     return _unquote_re.sub(_entity_subber, s)
+    54| def strip_html(s):
+    55|     s = re.sub('<.*?>', '', s)
+    56|     s = html_unquote(s)
+    57|     return s
+    58| def no_quote(s):
+    59|     """
+    60|     Quoting that doesn't do anything
+    61|     """
+    62|     return s
+    63| _comment_quote_re = re.compile(r'\-\s*\>')
+    64| def comment_quote(s):
+    65|     """
+    66|     Quote that makes sure text can't escape a comment
+    67|     """
+    68|     return _comment_quote_re.sub('-&gt', str(s))
+    69| url_quote = urllib.quote
+    70| url_unquote = urllib.unquote
+    71| if __name__ == '__main__':
+    72|     import doctest
+    73|     doctest.testmod()
+
+
+# ====================================================================
+# FILE: setup.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-22 ---
+     1| RELEASE = False
+     2| __version__ = '1.7.4'
+     3| from setuptools import setup, find_packages
+     4| import sys, os
+     5| sys.path.insert(0, os.path.join(os.path.dirname(__file__),
+     6|                                 'paste', 'util'))
+     7| import finddata
+     8| setup(name="Paste",
+     9|       version=__version__,
+    10|       description="Tools for using a Web Server Gateway Interface stack",
+    11|       long_description="""\
+    12| These provide several pieces of "middleware" (or filters) that can be nested to build web applications.  Each
+    13| piece of middleware uses the WSGI (`PEP 333`_) interface, and should
+    14| be compatible with other middleware based on those interfaces.
+    15| .. _PEP 333: http://www.python.org/peps/pep-0333.html
+    16| Includes these features...
+    17| Testing
+    18| -------
+    19| * A fixture for testing WSGI applications conveniently and in-process,
+    20|   in ``paste.fixture``
+    21| * A fixture for testing command-line applications, also in
+    22|   ``paste.fixture``
+

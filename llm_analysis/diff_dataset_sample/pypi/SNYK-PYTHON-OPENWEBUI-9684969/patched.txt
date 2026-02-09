@@ -1,0 +1,3380 @@
+# ====================================================================
+# FILE: backend/apps/audio/main.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 18-172 ---
+    18| from fastapi.middleware.cors import CORSMiddleware
+    19| from fastapi.responses import FileResponse
+    20| from pydantic import BaseModel
+    21| from config import (
+    22|     SRC_LOG_LEVELS,
+    23|     CACHE_DIR,
+    24|     WHISPER_MODEL,
+    25|     WHISPER_MODEL_DIR,
+    26|     WHISPER_MODEL_AUTO_UPDATE,
+    27|     DEVICE_TYPE,
+    28|     AUDIO_STT_OPENAI_API_BASE_URL,
+    29|     AUDIO_STT_OPENAI_API_KEY,
+    30|     AUDIO_TTS_OPENAI_API_BASE_URL,
+    31|     AUDIO_TTS_OPENAI_API_KEY,
+    32|     AUDIO_TTS_API_KEY,
+    33|     AUDIO_STT_ENGINE,
+    34|     AUDIO_STT_MODEL,
+    35|     AUDIO_TTS_ENGINE,
+    36|     AUDIO_TTS_MODEL,
+    37|     AUDIO_TTS_VOICE,
+    38|     AUDIO_TTS_SPLIT_ON,
+    39|     AppConfig,
+    40|     CORS_ALLOW_ORIGIN,
+    41| )
+    42| from constants import ERROR_MESSAGES
+    43| from utils.utils import (
+    44|     get_current_user,
+    45|     get_verified_user,
+    46|     get_admin_user,
+    47| )
+    48| log = logging.getLogger(__name__)
+    49| log.setLevel(SRC_LOG_LEVELS["AUDIO"])
+    50| app = FastAPI()
+    51| app.add_middleware(
+    52|     CORSMiddleware,
+    53|     allow_origins=CORS_ALLOW_ORIGIN,
+    54|     allow_credentials=True,
+    55|     allow_methods=["*"],
+    56|     allow_headers=["*"],
+    57| )
+    58| app.state.config = AppConfig()
+    59| app.state.config.STT_OPENAI_API_BASE_URL = AUDIO_STT_OPENAI_API_BASE_URL
+    60| app.state.config.STT_OPENAI_API_KEY = AUDIO_STT_OPENAI_API_KEY
+    61| app.state.config.STT_ENGINE = AUDIO_STT_ENGINE
+    62| app.state.config.STT_MODEL = AUDIO_STT_MODEL
+    63| app.state.config.TTS_OPENAI_API_BASE_URL = AUDIO_TTS_OPENAI_API_BASE_URL
+    64| app.state.config.TTS_OPENAI_API_KEY = AUDIO_TTS_OPENAI_API_KEY
+    65| app.state.config.TTS_ENGINE = AUDIO_TTS_ENGINE
+    66| app.state.config.TTS_MODEL = AUDIO_TTS_MODEL
+    67| app.state.config.TTS_VOICE = AUDIO_TTS_VOICE
+    68| app.state.config.TTS_API_KEY = AUDIO_TTS_API_KEY
+    69| app.state.config.TTS_SPLIT_ON = AUDIO_TTS_SPLIT_ON
+    70| whisper_device_type = DEVICE_TYPE if DEVICE_TYPE and DEVICE_TYPE == "cuda" else "cpu"
+    71| log.info(f"whisper_device_type: {whisper_device_type}")
+    72| SPEECH_CACHE_DIR = Path(CACHE_DIR).joinpath("./audio/speech/")
+    73| SPEECH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    74| class TTSConfigForm(BaseModel):
+    75|     OPENAI_API_BASE_URL: str
+    76|     OPENAI_API_KEY: str
+    77|     API_KEY: str
+    78|     ENGINE: str
+    79|     MODEL: str
+    80|     VOICE: str
+    81|     SPLIT_ON: str
+    82| class STTConfigForm(BaseModel):
+    83|     OPENAI_API_BASE_URL: str
+    84|     OPENAI_API_KEY: str
+    85|     ENGINE: str
+    86|     MODEL: str
+    87| class AudioConfigUpdateForm(BaseModel):
+    88|     tts: TTSConfigForm
+    89|     stt: STTConfigForm
+    90| from pydub import AudioSegment
+    91| from pydub.utils import mediainfo
+    92| def is_mp4_audio(file_path):
+    93|     """Check if the given file is an MP4 audio file."""
+    94|     if not os.path.isfile(file_path):
+    95|         print(f"File not found: {file_path}")
+    96|         return False
+    97|     info = mediainfo(file_path)
+    98|     if (
+    99|         info.get("codec_name") == "aac"
+   100|         and info.get("codec_type") == "audio"
+   101|         and info.get("codec_tag_string") == "mp4a"
+   102|     ):
+   103|         return True
+   104|     return False
+   105| def convert_mp4_to_wav(file_path, output_path):
+   106|     """Convert MP4 audio file to WAV format."""
+   107|     audio = AudioSegment.from_file(file_path, format="mp4")
+   108|     audio.export(output_path, format="wav")
+   109|     print(f"Converted {file_path} to {output_path}")
+   110| @app.get("/config")
+   111| async def get_audio_config(user=Depends(get_admin_user)):
+   112|     return {
+   113|         "tts": {
+   114|             "OPENAI_API_BASE_URL": app.state.config.TTS_OPENAI_API_BASE_URL,
+   115|             "OPENAI_API_KEY": app.state.config.TTS_OPENAI_API_KEY,
+   116|             "API_KEY": app.state.config.TTS_API_KEY,
+   117|             "ENGINE": app.state.config.TTS_ENGINE,
+   118|             "MODEL": app.state.config.TTS_MODEL,
+   119|             "VOICE": app.state.config.TTS_VOICE,
+   120|             "SPLIT_ON": app.state.config.TTS_SPLIT_ON,
+   121|         },
+   122|         "stt": {
+   123|             "OPENAI_API_BASE_URL": app.state.config.STT_OPENAI_API_BASE_URL,
+   124|             "OPENAI_API_KEY": app.state.config.STT_OPENAI_API_KEY,
+   125|             "ENGINE": app.state.config.STT_ENGINE,
+   126|             "MODEL": app.state.config.STT_MODEL,
+   127|         },
+   128|     }
+   129| @app.post("/config/update")
+   130| async def update_audio_config(
+   131|     form_data: AudioConfigUpdateForm, user=Depends(get_admin_user)
+   132| ):
+   133|     app.state.config.TTS_OPENAI_API_BASE_URL = form_data.tts.OPENAI_API_BASE_URL
+   134|     app.state.config.TTS_OPENAI_API_KEY = form_data.tts.OPENAI_API_KEY
+   135|     app.state.config.TTS_API_KEY = form_data.tts.API_KEY
+   136|     app.state.config.TTS_ENGINE = form_data.tts.ENGINE
+   137|     app.state.config.TTS_MODEL = form_data.tts.MODEL
+   138|     app.state.config.TTS_VOICE = form_data.tts.VOICE
+   139|     app.state.config.TTS_SPLIT_ON = form_data.tts.SPLIT_ON
+   140|     app.state.config.STT_OPENAI_API_BASE_URL = form_data.stt.OPENAI_API_BASE_URL
+   141|     app.state.config.STT_OPENAI_API_KEY = form_data.stt.OPENAI_API_KEY
+   142|     app.state.config.STT_ENGINE = form_data.stt.ENGINE
+   143|     app.state.config.STT_MODEL = form_data.stt.MODEL
+   144|     return {
+   145|         "tts": {
+   146|             "OPENAI_API_BASE_URL": app.state.config.TTS_OPENAI_API_BASE_URL,
+   147|             "OPENAI_API_KEY": app.state.config.TTS_OPENAI_API_KEY,
+   148|             "API_KEY": app.state.config.TTS_API_KEY,
+   149|             "ENGINE": app.state.config.TTS_ENGINE,
+   150|             "MODEL": app.state.config.TTS_MODEL,
+   151|             "VOICE": app.state.config.TTS_VOICE,
+   152|             "SPLIT_ON": app.state.config.TTS_SPLIT_ON,
+   153|         },
+   154|         "stt": {
+   155|             "OPENAI_API_BASE_URL": app.state.config.STT_OPENAI_API_BASE_URL,
+   156|             "OPENAI_API_KEY": app.state.config.STT_OPENAI_API_KEY,
+   157|             "ENGINE": app.state.config.STT_ENGINE,
+   158|             "MODEL": app.state.config.STT_MODEL,
+   159|         },
+   160|     }
+   161| @app.post("/speech")
+   162| async def speech(request: Request, user=Depends(get_verified_user)):
+   163|     body = await request.body()
+   164|     name = hashlib.sha256(body).hexdigest()
+   165|     file_path = SPEECH_CACHE_DIR.joinpath(f"{name}.mp3")
+   166|     file_body_path = SPEECH_CACHE_DIR.joinpath(f"{name}.json")
+   167|     if file_path.is_file():
+   168|         return FileResponse(file_path)
+   169|     if app.state.config.TTS_ENGINE == "openai":
+   170|         headers = {}
+   171|         headers["Authorization"] = f"Bearer {app.state.config.TTS_OPENAI_API_KEY}"
+   172|         headers["Content-Type"] = "application/json"
+
+
+# ====================================================================
+# FILE: backend/apps/images/main.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-38 ---
+     1| from fastapi import (
+     2|     FastAPI,
+     3|     Request,
+     4|     Depends,
+     5|     HTTPException,
+     6| )
+     7| from fastapi.middleware.cors import CORSMiddleware
+     8| from typing import Optional
+     9| from pydantic import BaseModel
+    10| from pathlib import Path
+    11| import mimetypes
+    12| import uuid
+    13| import base64
+    14| import json
+    15| import logging
+    16| import re
+    17| import requests
+    18| import asyncio
+    19| from utils.utils import (
+    20|     get_verified_user,
+    21|     get_admin_user,
+    22| )
+    23| from apps.images.utils.comfyui import (
+    24|     ComfyUIWorkflow,
+    25|     ComfyUIGenerateImageForm,
+    26|     comfyui_generate_image,
+    27| )
+    28| from constants import ERROR_MESSAGES
+    29| from config import (
+    30|     SRC_LOG_LEVELS,
+    31|     CACHE_DIR,
+    32|     IMAGE_GENERATION_ENGINE,
+    33|     ENABLE_IMAGE_GENERATION,
+    34|     AUTOMATIC1111_BASE_URL,
+    35|     AUTOMATIC1111_API_AUTH,
+    36|     COMFYUI_BASE_URL,
+    37|     COMFYUI_WORKFLOW,
+    38|     COMFYUI_WORKFLOW_NODES,
+
+# --- HUNK 2: Lines 423-464 ---
+   423|                 file_body_path = IMAGE_CACHE_DIR.joinpath(f"{image_filename}.json")
+   424|                 with open(file_body_path, "w") as f:
+   425|                     json.dump(form_data.model_dump(exclude_none=True), f)
+   426|             log.debug(f"images: {images}")
+   427|             return images
+   428|         elif (
+   429|             app.state.config.ENGINE == "automatic1111" or app.state.config.ENGINE == ""
+   430|         ):
+   431|             if form_data.model:
+   432|                 set_image_model(form_data.model)
+   433|             data = {
+   434|                 "prompt": form_data.prompt,
+   435|                 "batch_size": form_data.n,
+   436|                 "width": width,
+   437|                 "height": height,
+   438|             }
+   439|             if app.state.config.IMAGE_STEPS is not None:
+   440|                 data["steps"] = app.state.config.IMAGE_STEPS
+   441|             if form_data.negative_prompt is not None:
+   442|                 data["negative_prompt"] = form_data.negative_prompt
+   443|             r = await asyncio.to_thread(
+   444|                 requests.post,
+   445|                 url=f"{app.state.config.AUTOMATIC1111_BASE_URL}/sdapi/v1/txt2img",
+   446|                 json=data,
+   447|                 headers={"authorization": get_automatic1111_api_auth()},
+   448|             )
+   449|             res = r.json()
+   450|             log.debug(f"res: {res}")
+   451|             images = []
+   452|             for image in res["images"]:
+   453|                 image_filename = save_b64_image(image)
+   454|                 images.append({"url": f"/cache/image/generations/{image_filename}"})
+   455|                 file_body_path = IMAGE_CACHE_DIR.joinpath(f"{image_filename}.json")
+   456|                 with open(file_body_path, "w") as f:
+   457|                     json.dump({**data, "info": res["info"]}, f)
+   458|             return images
+   459|     except Exception as e:
+   460|         error = e
+   461|         if r != None:
+   462|             data = r.json()
+   463|             if "error" in data:
+   464|                 error = data["error"]["message"]
+
+
+# ====================================================================
+# FILE: backend/apps/ollama/main.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 91-152 ---
+    91|     app.state.config.OLLAMA_BASE_URLS = form_data.urls
+    92|     log.info(f"app.state.config.OLLAMA_BASE_URLS: {app.state.config.OLLAMA_BASE_URLS}")
+    93|     return {"OLLAMA_BASE_URLS": app.state.config.OLLAMA_BASE_URLS}
+    94| async def fetch_url(url):
+    95|     timeout = aiohttp.ClientTimeout(total=5)
+    96|     try:
+    97|         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+    98|             async with session.get(url) as response:
+    99|                 return await response.json()
+   100|     except Exception as e:
+   101|         log.error(f"Connection error: {e}")
+   102|         return None
+   103| async def cleanup_response(
+   104|     response: Optional[aiohttp.ClientResponse],
+   105|     session: Optional[aiohttp.ClientSession],
+   106| ):
+   107|     if response:
+   108|         response.close()
+   109|     if session:
+   110|         await session.close()
+   111| async def post_streaming_url(
+   112|     url: str, payload: Union[str, bytes], stream: bool = True, content_type=None
+   113| ):
+   114|     r = None
+   115|     try:
+   116|         session = aiohttp.ClientSession(
+   117|             trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+   118|         )
+   119|         r = await session.post(
+   120|             url,
+   121|             data=payload,
+   122|             headers={"Content-Type": "application/json"},
+   123|         )
+   124|         r.raise_for_status()
+   125|         if stream:
+   126|             headers = dict(r.headers)
+   127|             if content_type:
+   128|                 headers["Content-Type"] = content_type
+   129|             return StreamingResponse(
+   130|                 r.content,
+   131|                 status_code=r.status,
+   132|                 headers=headers,
+   133|                 background=BackgroundTask(
+   134|                     cleanup_response, response=r, session=session
+   135|                 ),
+   136|             )
+   137|         else:
+   138|             res = await r.json()
+   139|             await cleanup_response(r, session)
+   140|             return res
+   141|     except Exception as e:
+   142|         error_detail = "Open WebUI: Server Connection Error"
+   143|         if r is not None:
+   144|             try:
+   145|                 res = await r.json()
+   146|                 if "error" in res:
+   147|                     error_detail = f"Ollama: {res['error']}"
+   148|             except Exception:
+   149|                 error_detail = f"Ollama: {e}"
+   150|         raise HTTPException(
+   151|             status_code=r.status if r else 500,
+   152|             detail=error_detail,
+
+# --- HUNK 2: Lines 579-673 ---
+   579|         if model not in app.state.MODELS:
+   580|             raise HTTPException(
+   581|                 status_code=400,
+   582|                 detail=ERROR_MESSAGES.MODEL_NOT_FOUND(model),
+   583|             )
+   584|         url_idx = random.choice(app.state.MODELS[model]["urls"])
+   585|     url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+   586|     return url
+   587| @app.post("/api/chat")
+   588| @app.post("/api/chat/{url_idx}")
+   589| async def generate_chat_completion(
+   590|     form_data: GenerateChatCompletionForm,
+   591|     url_idx: Optional[int] = None,
+   592|     user=Depends(get_verified_user),
+   593| ):
+   594|     payload = {**form_data.model_dump(exclude_none=True)}
+   595|     log.debug(f"{payload = }")
+   596|     if "metadata" in payload:
+   597|         del payload["metadata"]
+   598|     model_id = form_data.model
+   599|     if app.state.config.ENABLE_MODEL_FILTER:
+   600|         if user.role == "user" and model_id not in app.state.config.MODEL_FILTER_LIST:
+   601|             raise HTTPException(
+   602|                 status_code=403,
+   603|                 detail="Model not found",
+   604|             )
+   605|     model_info = Models.get_model_by_id(model_id)
+   606|     if model_info:
+   607|         if model_info.base_model_id:
+   608|             payload["model"] = model_info.base_model_id
+   609|         params = model_info.params.model_dump()
+   610|         if params:
+   611|             if payload.get("options") is None:
+   612|                 payload["options"] = {}
+   613|             payload["options"] = apply_model_params_to_body_ollama(
+   614|                 params, payload["options"]
+   615|             )
+   616|             payload = apply_model_system_prompt_to_body(params, payload, user)
+   617|     if ":" not in payload["model"]:
+   618|         payload["model"] = f"{payload['model']}:latest"
+   619|     url = get_ollama_url(url_idx, payload["model"])
+   620|     log.info(f"url: {url}")
+   621|     log.debug(payload)
+   622|     return await post_streaming_url(
+   623|         f"{url}/api/chat", json.dumps(payload), content_type="application/x-ndjson"
+   624|     )
+   625| class OpenAIChatMessageContent(BaseModel):
+   626|     type: str
+   627|     model_config = ConfigDict(extra="allow")
+   628| class OpenAIChatMessage(BaseModel):
+   629|     role: str
+   630|     content: Union[str, OpenAIChatMessageContent]
+   631|     model_config = ConfigDict(extra="allow")
+   632| class OpenAIChatCompletionForm(BaseModel):
+   633|     model: str
+   634|     messages: list[OpenAIChatMessage]
+   635|     model_config = ConfigDict(extra="allow")
+   636| @app.post("/v1/chat/completions")
+   637| @app.post("/v1/chat/completions/{url_idx}")
+   638| async def generate_openai_chat_completion(
+   639|     form_data: dict,
+   640|     url_idx: Optional[int] = None,
+   641|     user=Depends(get_verified_user),
+   642| ):
+   643|     completion_form = OpenAIChatCompletionForm(**form_data)
+   644|     payload = {**completion_form.model_dump(exclude_none=True, exclude=["metadata"])}
+   645|     if "metadata" in payload:
+   646|         del payload["metadata"]
+   647|     model_id = completion_form.model
+   648|     if app.state.config.ENABLE_MODEL_FILTER:
+   649|         if user.role == "user" and model_id not in app.state.config.MODEL_FILTER_LIST:
+   650|             raise HTTPException(
+   651|                 status_code=403,
+   652|                 detail="Model not found",
+   653|             )
+   654|     model_info = Models.get_model_by_id(model_id)
+   655|     if model_info:
+   656|         if model_info.base_model_id:
+   657|             payload["model"] = model_info.base_model_id
+   658|         params = model_info.params.model_dump()
+   659|         if params:
+   660|             payload = apply_model_params_to_body_openai(params, payload)
+   661|             payload = apply_model_system_prompt_to_body(params, payload, user)
+   662|     if ":" not in payload["model"]:
+   663|         payload["model"] = f"{payload['model']}:latest"
+   664|     url = get_ollama_url(url_idx, payload["model"])
+   665|     log.info(f"url: {url}")
+   666|     return await post_streaming_url(
+   667|         f"{url}/v1/chat/completions",
+   668|         json.dumps(payload),
+   669|         stream=payload.get("stream", False),
+   670|     )
+   671| @app.get("/v1/models")
+   672| @app.get("/v1/models/{url_idx}")
+   673| async def get_openai_models(
+
+
+# ====================================================================
+# FILE: backend/apps/rag/main.py
+# Total hunks: 7
+# ====================================================================
+# --- HUNK 1: Lines 67-108 ---
+    67| from apps.rag.search.duckduckgo import search_duckduckgo
+    68| from apps.rag.search.tavily import search_tavily
+    69| from apps.rag.search.jina_search import search_jina
+    70| from utils.misc import (
+    71|     calculate_sha256,
+    72|     calculate_sha256_string,
+    73|     sanitize_filename,
+    74|     extract_folders_after_data_docs,
+    75| )
+    76| from utils.utils import get_verified_user, get_admin_user
+    77| from config import (
+    78|     AppConfig,
+    79|     ENV,
+    80|     SRC_LOG_LEVELS,
+    81|     UPLOAD_DIR,
+    82|     DOCS_DIR,
+    83|     CONTENT_EXTRACTION_ENGINE,
+    84|     TIKA_SERVER_URL,
+    85|     RAG_TOP_K,
+    86|     RAG_RELEVANCE_THRESHOLD,
+    87|     RAG_FILE_MAX_SIZE,
+    88|     RAG_FILE_MAX_COUNT,
+    89|     RAG_EMBEDDING_ENGINE,
+    90|     RAG_EMBEDDING_MODEL,
+    91|     RAG_EMBEDDING_MODEL_AUTO_UPDATE,
+    92|     RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE,
+    93|     ENABLE_RAG_HYBRID_SEARCH,
+    94|     ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION,
+    95|     RAG_RERANKING_MODEL,
+    96|     PDF_EXTRACT_IMAGES,
+    97|     RAG_RERANKING_MODEL_AUTO_UPDATE,
+    98|     RAG_RERANKING_MODEL_TRUST_REMOTE_CODE,
+    99|     RAG_OPENAI_API_BASE_URL,
+   100|     RAG_OPENAI_API_KEY,
+   101|     DEVICE_TYPE,
+   102|     CHROMA_CLIENT,
+   103|     CHUNK_SIZE,
+   104|     CHUNK_OVERLAP,
+   105|     RAG_TEMPLATE,
+   106|     ENABLE_RAG_LOCAL_WEB_FETCH,
+   107|     YOUTUBE_LOADER_LANGUAGE,
+   108|     ENABLE_RAG_WEB_SEARCH,
+
+# --- HUNK 2: Lines 112-153 ---
+   112|     GOOGLE_PSE_API_KEY,
+   113|     GOOGLE_PSE_ENGINE_ID,
+   114|     BRAVE_SEARCH_API_KEY,
+   115|     SERPSTACK_API_KEY,
+   116|     SERPSTACK_HTTPS,
+   117|     SERPER_API_KEY,
+   118|     SERPLY_API_KEY,
+   119|     TAVILY_API_KEY,
+   120|     RAG_WEB_SEARCH_RESULT_COUNT,
+   121|     RAG_WEB_SEARCH_CONCURRENT_REQUESTS,
+   122|     RAG_EMBEDDING_OPENAI_BATCH_SIZE,
+   123|     CORS_ALLOW_ORIGIN,
+   124| )
+   125| from constants import ERROR_MESSAGES
+   126| log = logging.getLogger(__name__)
+   127| log.setLevel(SRC_LOG_LEVELS["RAG"])
+   128| app = FastAPI()
+   129| app.state.config = AppConfig()
+   130| app.state.config.TOP_K = RAG_TOP_K
+   131| app.state.config.RELEVANCE_THRESHOLD = RAG_RELEVANCE_THRESHOLD
+   132| app.state.config.FILE_MAX_SIZE = RAG_FILE_MAX_SIZE
+   133| app.state.config.FILE_MAX_COUNT = RAG_FILE_MAX_COUNT
+   134| app.state.config.ENABLE_RAG_HYBRID_SEARCH = ENABLE_RAG_HYBRID_SEARCH
+   135| app.state.config.ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION = (
+   136|     ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION
+   137| )
+   138| app.state.config.CONTENT_EXTRACTION_ENGINE = CONTENT_EXTRACTION_ENGINE
+   139| app.state.config.TIKA_SERVER_URL = TIKA_SERVER_URL
+   140| app.state.config.CHUNK_SIZE = CHUNK_SIZE
+   141| app.state.config.CHUNK_OVERLAP = CHUNK_OVERLAP
+   142| app.state.config.RAG_EMBEDDING_ENGINE = RAG_EMBEDDING_ENGINE
+   143| app.state.config.RAG_EMBEDDING_MODEL = RAG_EMBEDDING_MODEL
+   144| app.state.config.RAG_EMBEDDING_OPENAI_BATCH_SIZE = RAG_EMBEDDING_OPENAI_BATCH_SIZE
+   145| app.state.config.RAG_RERANKING_MODEL = RAG_RERANKING_MODEL
+   146| app.state.config.RAG_TEMPLATE = RAG_TEMPLATE
+   147| app.state.config.OPENAI_API_BASE_URL = RAG_OPENAI_API_BASE_URL
+   148| app.state.config.OPENAI_API_KEY = RAG_OPENAI_API_KEY
+   149| app.state.config.PDF_EXTRACT_IMAGES = PDF_EXTRACT_IMAGES
+   150| app.state.config.YOUTUBE_LOADER_LANGUAGE = YOUTUBE_LOADER_LANGUAGE
+   151| app.state.YOUTUBE_LOADER_TRANSLATION = None
+   152| app.state.config.ENABLE_RAG_WEB_SEARCH = ENABLE_RAG_WEB_SEARCH
+   153| app.state.config.RAG_WEB_SEARCH_ENGINE = RAG_WEB_SEARCH_ENGINE
+
+# --- HUNK 3: Lines 310-470 ---
+   310|         f"Updating reranking model: {app.state.config.RAG_RERANKING_MODEL} to {form_data.reranking_model}"
+   311|     )
+   312|     try:
+   313|         app.state.config.RAG_RERANKING_MODEL = form_data.reranking_model
+   314|         update_reranking_model(app.state.config.RAG_RERANKING_MODEL, True)
+   315|         return {
+   316|             "status": True,
+   317|             "reranking_model": app.state.config.RAG_RERANKING_MODEL,
+   318|         }
+   319|     except Exception as e:
+   320|         log.exception(f"Problem updating reranking model: {e}")
+   321|         raise HTTPException(
+   322|             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+   323|             detail=ERROR_MESSAGES.DEFAULT(e),
+   324|         )
+   325| @app.get("/config")
+   326| async def get_rag_config(user=Depends(get_admin_user)):
+   327|     return {
+   328|         "status": True,
+   329|         "pdf_extract_images": app.state.config.PDF_EXTRACT_IMAGES,
+   330|         "file": {
+   331|             "max_size": app.state.config.FILE_MAX_SIZE,
+   332|             "max_count": app.state.config.FILE_MAX_COUNT,
+   333|         },
+   334|         "content_extraction": {
+   335|             "engine": app.state.config.CONTENT_EXTRACTION_ENGINE,
+   336|             "tika_server_url": app.state.config.TIKA_SERVER_URL,
+   337|         },
+   338|         "chunk": {
+   339|             "chunk_size": app.state.config.CHUNK_SIZE,
+   340|             "chunk_overlap": app.state.config.CHUNK_OVERLAP,
+   341|         },
+   342|         "youtube": {
+   343|             "language": app.state.config.YOUTUBE_LOADER_LANGUAGE,
+   344|             "translation": app.state.YOUTUBE_LOADER_TRANSLATION,
+   345|         },
+   346|         "web": {
+   347|             "ssl_verification": app.state.config.ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION,
+   348|             "search": {
+   349|                 "enabled": app.state.config.ENABLE_RAG_WEB_SEARCH,
+   350|                 "engine": app.state.config.RAG_WEB_SEARCH_ENGINE,
+   351|                 "searxng_query_url": app.state.config.SEARXNG_QUERY_URL,
+   352|                 "google_pse_api_key": app.state.config.GOOGLE_PSE_API_KEY,
+   353|                 "google_pse_engine_id": app.state.config.GOOGLE_PSE_ENGINE_ID,
+   354|                 "brave_search_api_key": app.state.config.BRAVE_SEARCH_API_KEY,
+   355|                 "serpstack_api_key": app.state.config.SERPSTACK_API_KEY,
+   356|                 "serpstack_https": app.state.config.SERPSTACK_HTTPS,
+   357|                 "serper_api_key": app.state.config.SERPER_API_KEY,
+   358|                 "serply_api_key": app.state.config.SERPLY_API_KEY,
+   359|                 "tavily_api_key": app.state.config.TAVILY_API_KEY,
+   360|                 "result_count": app.state.config.RAG_WEB_SEARCH_RESULT_COUNT,
+   361|                 "concurrent_requests": app.state.config.RAG_WEB_SEARCH_CONCURRENT_REQUESTS,
+   362|             },
+   363|         },
+   364|     }
+   365| class FileConfig(BaseModel):
+   366|     max_size: Optional[int] = None
+   367|     max_count: Optional[int] = None
+   368| class ContentExtractionConfig(BaseModel):
+   369|     engine: str = ""
+   370|     tika_server_url: Optional[str] = None
+   371| class ChunkParamUpdateForm(BaseModel):
+   372|     chunk_size: int
+   373|     chunk_overlap: int
+   374| class YoutubeLoaderConfig(BaseModel):
+   375|     language: list[str]
+   376|     translation: Optional[str] = None
+   377| class WebSearchConfig(BaseModel):
+   378|     enabled: bool
+   379|     engine: Optional[str] = None
+   380|     searxng_query_url: Optional[str] = None
+   381|     google_pse_api_key: Optional[str] = None
+   382|     google_pse_engine_id: Optional[str] = None
+   383|     brave_search_api_key: Optional[str] = None
+   384|     serpstack_api_key: Optional[str] = None
+   385|     serpstack_https: Optional[bool] = None
+   386|     serper_api_key: Optional[str] = None
+   387|     serply_api_key: Optional[str] = None
+   388|     tavily_api_key: Optional[str] = None
+   389|     result_count: Optional[int] = None
+   390|     concurrent_requests: Optional[int] = None
+   391| class WebConfig(BaseModel):
+   392|     search: WebSearchConfig
+   393|     web_loader_ssl_verification: Optional[bool] = None
+   394| class ConfigUpdateForm(BaseModel):
+   395|     pdf_extract_images: Optional[bool] = None
+   396|     file: Optional[FileConfig] = None
+   397|     content_extraction: Optional[ContentExtractionConfig] = None
+   398|     chunk: Optional[ChunkParamUpdateForm] = None
+   399|     youtube: Optional[YoutubeLoaderConfig] = None
+   400|     web: Optional[WebConfig] = None
+   401| @app.post("/config/update")
+   402| async def update_rag_config(form_data: ConfigUpdateForm, user=Depends(get_admin_user)):
+   403|     app.state.config.PDF_EXTRACT_IMAGES = (
+   404|         form_data.pdf_extract_images
+   405|         if form_data.pdf_extract_images is not None
+   406|         else app.state.config.PDF_EXTRACT_IMAGES
+   407|     )
+   408|     if form_data.file is not None:
+   409|         app.state.config.FILE_MAX_SIZE = form_data.file.max_size
+   410|         app.state.config.FILE_MAX_COUNT = form_data.file.max_count
+   411|     if form_data.content_extraction is not None:
+   412|         log.info(f"Updating text settings: {form_data.content_extraction}")
+   413|         app.state.config.CONTENT_EXTRACTION_ENGINE = form_data.content_extraction.engine
+   414|         app.state.config.TIKA_SERVER_URL = form_data.content_extraction.tika_server_url
+   415|     if form_data.chunk is not None:
+   416|         app.state.config.CHUNK_SIZE = form_data.chunk.chunk_size
+   417|         app.state.config.CHUNK_OVERLAP = form_data.chunk.chunk_overlap
+   418|     if form_data.youtube is not None:
+   419|         app.state.config.YOUTUBE_LOADER_LANGUAGE = form_data.youtube.language
+   420|         app.state.YOUTUBE_LOADER_TRANSLATION = form_data.youtube.translation
+   421|     if form_data.web is not None:
+   422|         app.state.config.ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION = (
+   423|             form_data.web.web_loader_ssl_verification
+   424|         )
+   425|         app.state.config.ENABLE_RAG_WEB_SEARCH = form_data.web.search.enabled
+   426|         app.state.config.RAG_WEB_SEARCH_ENGINE = form_data.web.search.engine
+   427|         app.state.config.SEARXNG_QUERY_URL = form_data.web.search.searxng_query_url
+   428|         app.state.config.GOOGLE_PSE_API_KEY = form_data.web.search.google_pse_api_key
+   429|         app.state.config.GOOGLE_PSE_ENGINE_ID = (
+   430|             form_data.web.search.google_pse_engine_id
+   431|         )
+   432|         app.state.config.BRAVE_SEARCH_API_KEY = (
+   433|             form_data.web.search.brave_search_api_key
+   434|         )
+   435|         app.state.config.SERPSTACK_API_KEY = form_data.web.search.serpstack_api_key
+   436|         app.state.config.SERPSTACK_HTTPS = form_data.web.search.serpstack_https
+   437|         app.state.config.SERPER_API_KEY = form_data.web.search.serper_api_key
+   438|         app.state.config.SERPLY_API_KEY = form_data.web.search.serply_api_key
+   439|         app.state.config.TAVILY_API_KEY = form_data.web.search.tavily_api_key
+   440|         app.state.config.RAG_WEB_SEARCH_RESULT_COUNT = form_data.web.search.result_count
+   441|         app.state.config.RAG_WEB_SEARCH_CONCURRENT_REQUESTS = (
+   442|             form_data.web.search.concurrent_requests
+   443|         )
+   444|     return {
+   445|         "status": True,
+   446|         "pdf_extract_images": app.state.config.PDF_EXTRACT_IMAGES,
+   447|         "file": {
+   448|             "max_size": app.state.config.FILE_MAX_SIZE,
+   449|             "max_count": app.state.config.FILE_MAX_COUNT,
+   450|         },
+   451|         "content_extraction": {
+   452|             "engine": app.state.config.CONTENT_EXTRACTION_ENGINE,
+   453|             "tika_server_url": app.state.config.TIKA_SERVER_URL,
+   454|         },
+   455|         "chunk": {
+   456|             "chunk_size": app.state.config.CHUNK_SIZE,
+   457|             "chunk_overlap": app.state.config.CHUNK_OVERLAP,
+   458|         },
+   459|         "youtube": {
+   460|             "language": app.state.config.YOUTUBE_LOADER_LANGUAGE,
+   461|             "translation": app.state.YOUTUBE_LOADER_TRANSLATION,
+   462|         },
+   463|         "web": {
+   464|             "ssl_verification": app.state.config.ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION,
+   465|             "search": {
+   466|                 "enabled": app.state.config.ENABLE_RAG_WEB_SEARCH,
+   467|                 "engine": app.state.config.RAG_WEB_SEARCH_ENGINE,
+   468|                 "searxng_query_url": app.state.config.SEARXNG_QUERY_URL,
+   469|                 "google_pse_api_key": app.state.config.GOOGLE_PSE_API_KEY,
+   470|                 "google_pse_engine_id": app.state.config.GOOGLE_PSE_ENGINE_ID,
+
+# --- HUNK 4: Lines 1161-1223 ---
+  1161|                                                     "tags": list(
+  1162|                                                         map(
+  1163|                                                             lambda name: {"name": name},
+  1164|                                                             tags,
+  1165|                                                         )
+  1166|                                                     )
+  1167|                                                 }
+  1168|                                             )
+  1169|                                             if len(tags)
+  1170|                                             else "{}"
+  1171|                                         ),
+  1172|                                     }
+  1173|                                 ),
+  1174|                             )
+  1175|                 except Exception as e:
+  1176|                     log.exception(e)
+  1177|                     pass
+  1178|         except Exception as e:
+  1179|             log.exception(e)
+  1180|     return True
+  1181| @app.post("/reset/db")
+  1182| def reset_vector_db(user=Depends(get_admin_user)):
+  1183|     CHROMA_CLIENT.reset()
+  1184| @app.post("/reset/uploads")
+  1185| def reset_upload_dir(user=Depends(get_admin_user)) -> bool:
+  1186|     folder = f"{UPLOAD_DIR}"
+  1187|     try:
+  1188|         if os.path.exists(folder):
+  1189|             for filename in os.listdir(folder):
+  1190|                 file_path = os.path.join(folder, filename)
+  1191|                 try:
+  1192|                     if os.path.isfile(file_path) or os.path.islink(file_path):
+  1193|                         os.unlink(file_path)  # Remove the file or link
+  1194|                     elif os.path.isdir(file_path):
+  1195|                         shutil.rmtree(file_path)  # Remove the directory
+  1196|                 except Exception as e:
+  1197|                     print(f"Failed to delete {file_path}. Reason: {e}")
+  1198|         else:
+  1199|             print(f"The directory {folder} does not exist")
+  1200|     except Exception as e:
+  1201|         print(f"Failed to process the directory {folder}. Reason: {e}")
+  1202|     return True
+  1203| @app.post("/reset")
+  1204| def reset(user=Depends(get_admin_user)) -> bool:
+  1205|     folder = f"{UPLOAD_DIR}"
+  1206|     for filename in os.listdir(folder):
+  1207|         file_path = os.path.join(folder, filename)
+  1208|         try:
+  1209|             if os.path.isfile(file_path) or os.path.islink(file_path):
+  1210|                 os.unlink(file_path)
+  1211|             elif os.path.isdir(file_path):
+  1212|                 shutil.rmtree(file_path)
+  1213|         except Exception as e:
+  1214|             log.error("Failed to delete %s. Reason: %s" % (file_path, e))
+  1215|     try:
+  1216|         CHROMA_CLIENT.reset()
+  1217|     except Exception as e:
+  1218|         log.exception(e)
+  1219|     return True
+  1220| class SafeWebBaseLoader(WebBaseLoader):
+  1221|     """WebBaseLoader with enhanced error handling for URLs."""
+  1222|     def lazy_load(self) -> Iterator[Document]:
+  1223|         """Lazy load text from the url(s) in web_path with error handling."""
+
+
+# ====================================================================
+# FILE: backend/apps/rag/utils.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 94-145 ---
+    94|         sorted_metadatas = []
+    95|     else:
+    96|         sorted_distances, sorted_documents, sorted_metadatas = zip(*combined)
+    97|         sorted_distances = list(sorted_distances)[:k]
+    98|         sorted_documents = list(sorted_documents)[:k]
+    99|         sorted_metadatas = list(sorted_metadatas)[:k]
+   100|     result = {
+   101|         "distances": [sorted_distances],
+   102|         "documents": [sorted_documents],
+   103|         "metadatas": [sorted_metadatas],
+   104|     }
+   105|     return result
+   106| def query_collection(
+   107|     collection_names: list[str],
+   108|     query: str,
+   109|     embedding_function,
+   110|     k: int,
+   111| ):
+   112|     results = []
+   113|     for collection_name in collection_names:
+   114|         if collection_name:
+   115|             try:
+   116|                 result = query_doc(
+   117|                     collection_name=collection_name,
+   118|                     query=query,
+   119|                     k=k,
+   120|                     embedding_function=embedding_function,
+   121|                 )
+   122|                 results.append(result)
+   123|             except Exception:
+   124|                 pass
+   125|         else:
+   126|             pass
+   127|     return merge_and_sort_query_results(results, k=k)
+   128| def query_collection_with_hybrid_search(
+   129|     collection_names: list[str],
+   130|     query: str,
+   131|     embedding_function,
+   132|     k: int,
+   133|     reranking_function,
+   134|     r: float,
+   135| ):
+   136|     results = []
+   137|     for collection_name in collection_names:
+   138|         try:
+   139|             result = query_doc_with_hybrid_search(
+   140|                 collection_name=collection_name,
+   141|                 query=query,
+   142|                 embedding_function=embedding_function,
+   143|                 k=k,
+   144|                 reranking_function=reranking_function,
+   145|                 r=r,
+
+# --- HUNK 2: Lines 192-232 ---
+   192|                 return f(query)
+   193|         return lambda query: generate_multiple(query, func)
+   194| def get_rag_context(
+   195|     files,
+   196|     messages,
+   197|     embedding_function,
+   198|     k,
+   199|     reranking_function,
+   200|     r,
+   201|     hybrid_search,
+   202| ):
+   203|     log.debug(f"files: {files} {messages} {embedding_function} {reranking_function}")
+   204|     query = get_last_user_message(messages)
+   205|     extracted_collections = []
+   206|     relevant_contexts = []
+   207|     for file in files:
+   208|         context = None
+   209|         collection_names = (
+   210|             file["collection_names"]
+   211|             if file["type"] == "collection"
+   212|             else [file["collection_name"]] if file["collection_name"] else []
+   213|         )
+   214|         collection_names = set(collection_names).difference(extracted_collections)
+   215|         if not collection_names:
+   216|             log.debug(f"skipping {file} as it has already been extracted")
+   217|             continue
+   218|         try:
+   219|             if file["type"] == "text":
+   220|                 context = file["content"]
+   221|             else:
+   222|                 if hybrid_search:
+   223|                     context = query_collection_with_hybrid_search(
+   224|                         collection_names=collection_names,
+   225|                         query=query,
+   226|                         embedding_function=embedding_function,
+   227|                         k=k,
+   228|                         reranking_function=reranking_function,
+   229|                         r=r,
+   230|                     )
+   231|                 else:
+   232|                     context = query_collection(
+
+
+# ====================================================================
+# FILE: backend/apps/webui/internal/db.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-53 ---
+     1| import os
+     2| import logging
+     3| import json
+     4| from contextlib import contextmanager
+     5| from typing import Optional, Any
+     6| from typing_extensions import Self
+     7| from sqlalchemy import create_engine, types, Dialect
+     8| from sqlalchemy.sql.type_api import _T
+     9| from sqlalchemy.ext.declarative import declarative_base
+    10| from sqlalchemy.orm import sessionmaker, scoped_session
+    11| from peewee_migrate import Router
+    12| from apps.webui.internal.wrappers import register_connection
+    13| from env import SRC_LOG_LEVELS, BACKEND_DIR, DATABASE_URL
+    14| log = logging.getLogger(__name__)
+    15| log.setLevel(SRC_LOG_LEVELS["DB"])
+    16| class JSONField(types.TypeDecorator):
+    17|     impl = types.Text
+    18|     cache_ok = True
+    19|     def process_bind_param(self, value: Optional[_T], dialect: Dialect) -> Any:
+    20|         return json.dumps(value)
+    21|     def process_result_value(self, value: Optional[_T], dialect: Dialect) -> Any:
+    22|         if value is not None:
+    23|             return json.loads(value)
+    24|     def copy(self, **kw: Any) -> Self:
+    25|         return JSONField(self.impl.length)
+    26|     def db_value(self, value):
+    27|         return json.dumps(value)
+    28|     def python_value(self, value):
+    29|         if value is not None:
+    30|             return json.loads(value)
+    31| def handle_peewee_migration(DATABASE_URL):
+    32|     try:
+    33|         db = register_connection(DATABASE_URL.replace("postgresql://", "postgres://"))
+    34|         migrate_dir = BACKEND_DIR / "apps" / "webui" / "internal" / "migrations"
+    35|         router = Router(db, logger=log, migrate_dir=migrate_dir)
+    36|         router.run()
+    37|         db.close()
+    38|     except Exception as e:
+    39|         log.error(f"Failed to initialize the database connection: {e}")
+    40|         raise
+    41|     finally:
+    42|         if db and not db.is_closed():
+    43|             db.close()
+    44|         assert db.is_closed(), "Database connection is still open."
+    45| handle_peewee_migration(DATABASE_URL)
+    46| SQLALCHEMY_DATABASE_URL = DATABASE_URL
+    47| if "sqlite" in SQLALCHEMY_DATABASE_URL:
+    48|     engine = create_engine(
+    49|         SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+    50|     )
+    51| else:
+    52|     engine = create_engine(SQLALCHEMY_DATABASE_URL, pool_pre_ping=True)
+    53| SessionLocal = sessionmaker(
+
+
+# ====================================================================
+# FILE: backend/apps/webui/internal/wrappers.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-44 ---
+     1| from contextvars import ContextVar
+     2| from peewee import *
+     3| from peewee import PostgresqlDatabase, InterfaceError as PeeWeeInterfaceError
+     4| import logging
+     5| from playhouse.db_url import connect, parse
+     6| from playhouse.shortcuts import ReconnectMixin
+     7| from env import SRC_LOG_LEVELS
+     8| log = logging.getLogger(__name__)
+     9| log.setLevel(SRC_LOG_LEVELS["DB"])
+    10| db_state_default = {"closed": None, "conn": None, "ctx": None, "transactions": None}
+    11| db_state = ContextVar("db_state", default=db_state_default.copy())
+    12| class PeeweeConnectionState(object):
+    13|     def __init__(self, **kwargs):
+    14|         super().__setattr__("_state", db_state)
+    15|         super().__init__(**kwargs)
+    16|     def __setattr__(self, name, value):
+    17|         self._state.get()[name] = value
+    18|     def __getattr__(self, name):
+    19|         value = self._state.get()[name]
+    20|         return value
+    21| class CustomReconnectMixin(ReconnectMixin):
+    22|     reconnect_errors = (
+    23|         (OperationalError, "termin"),
+    24|         (InterfaceError, "closed"),
+    25|         (PeeWeeInterfaceError, "closed"),
+    26|     )
+    27| class ReconnectingPostgresqlDatabase(CustomReconnectMixin, PostgresqlDatabase):
+    28|     pass
+    29| def register_connection(db_url):
+    30|     db = connect(db_url, unquote_password=True)
+    31|     if isinstance(db, PostgresqlDatabase):
+    32|         db.autoconnect = True
+    33|         db.reuse_if_open = True
+    34|         log.info("Connected to PostgreSQL database")
+    35|         connection = parse(db_url, unquote_password=True)
+    36|         db = ReconnectingPostgresqlDatabase(**connection)
+    37|         db.connect(reuse_if_open=True)
+    38|     elif isinstance(db, SqliteDatabase):
+    39|         db.autoconnect = True
+    40|         db.reuse_if_open = True
+    41|         log.info("Connected to SQLite database")
+    42|     else:
+    43|         raise ValueError("Unsupported database connection")
+    44|     return db
+
+
+# ====================================================================
+# FILE: backend/apps/webui/main.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 34-78 ---
+    34|     DEFAULT_USER_ROLE,
+    35|     ENABLE_SIGNUP,
+    36|     ENABLE_LOGIN_FORM,
+    37|     USER_PERMISSIONS,
+    38|     WEBHOOK_URL,
+    39|     WEBUI_AUTH_TRUSTED_EMAIL_HEADER,
+    40|     WEBUI_AUTH_TRUSTED_NAME_HEADER,
+    41|     JWT_EXPIRES_IN,
+    42|     WEBUI_BANNERS,
+    43|     ENABLE_COMMUNITY_SHARING,
+    44|     ENABLE_MESSAGE_RATING,
+    45|     AppConfig,
+    46|     OAUTH_USERNAME_CLAIM,
+    47|     OAUTH_PICTURE_CLAIM,
+    48|     OAUTH_EMAIL_CLAIM,
+    49|     CORS_ALLOW_ORIGIN,
+    50| )
+    51| from apps.socket.main import get_event_call, get_event_emitter
+    52| import inspect
+    53| import json
+    54| import logging
+    55| from typing import Iterator, Generator, AsyncGenerator
+    56| from pydantic import BaseModel
+    57| app = FastAPI()
+    58| log = logging.getLogger(__name__)
+    59| app.state.config = AppConfig()
+    60| app.state.config.ENABLE_SIGNUP = ENABLE_SIGNUP
+    61| app.state.config.ENABLE_LOGIN_FORM = ENABLE_LOGIN_FORM
+    62| app.state.config.JWT_EXPIRES_IN = JWT_EXPIRES_IN
+    63| app.state.AUTH_TRUSTED_EMAIL_HEADER = WEBUI_AUTH_TRUSTED_EMAIL_HEADER
+    64| app.state.AUTH_TRUSTED_NAME_HEADER = WEBUI_AUTH_TRUSTED_NAME_HEADER
+    65| app.state.config.SHOW_ADMIN_DETAILS = SHOW_ADMIN_DETAILS
+    66| app.state.config.ADMIN_EMAIL = ADMIN_EMAIL
+    67| app.state.config.DEFAULT_MODELS = DEFAULT_MODELS
+    68| app.state.config.DEFAULT_PROMPT_SUGGESTIONS = DEFAULT_PROMPT_SUGGESTIONS
+    69| app.state.config.DEFAULT_USER_ROLE = DEFAULT_USER_ROLE
+    70| app.state.config.USER_PERMISSIONS = USER_PERMISSIONS
+    71| app.state.config.WEBHOOK_URL = WEBHOOK_URL
+    72| app.state.config.BANNERS = WEBUI_BANNERS
+    73| app.state.config.ENABLE_COMMUNITY_SHARING = ENABLE_COMMUNITY_SHARING
+    74| app.state.config.ENABLE_MESSAGE_RATING = ENABLE_MESSAGE_RATING
+    75| app.state.config.OAUTH_USERNAME_CLAIM = OAUTH_USERNAME_CLAIM
+    76| app.state.config.OAUTH_PICTURE_CLAIM = OAUTH_PICTURE_CLAIM
+    77| app.state.config.OAUTH_EMAIL_CLAIM = OAUTH_EMAIL_CLAIM
+    78| app.state.MODELS = {}
+
+# --- HUNK 2: Lines 175-269 ---
+   175|     if isinstance(line, BaseModel):
+   176|         line = line.model_dump_json()
+   177|         line = f"data: {line}"
+   178|     if isinstance(line, dict):
+   179|         line = f"data: {json.dumps(line)}"
+   180|     try:
+   181|         line = line.decode("utf-8")
+   182|     except Exception:
+   183|         pass
+   184|     if line.startswith("data:"):
+   185|         return f"{line}\n\n"
+   186|     else:
+   187|         line = openai_chat_chunk_message_template(form_data["model"], line)
+   188|         return f"data: {json.dumps(line)}\n\n"
+   189| def get_pipe_id(form_data: dict) -> str:
+   190|     pipe_id = form_data["model"]
+   191|     if "." in pipe_id:
+   192|         pipe_id, _ = pipe_id.split(".", 1)
+   193|     print(pipe_id)
+   194|     return pipe_id
+   195| def get_function_params(function_module, form_data, user, extra_params=None):
+   196|     if extra_params is None:
+   197|         extra_params = {}
+   198|     pipe_id = get_pipe_id(form_data)
+   199|     sig = inspect.signature(function_module.pipe)
+   200|     params = {"body": form_data} | {
+   201|         k: v for k, v in extra_params.items() if k in sig.parameters
+   202|     }
+   203|     if "__user__" in params and hasattr(function_module, "UserValves"):
+   204|         user_valves = Functions.get_user_valves_by_id_and_user_id(pipe_id, user.id)
+   205|         try:
+   206|             params["__user__"]["valves"] = function_module.UserValves(**user_valves)
+   207|         except Exception as e:
+   208|             log.exception(e)
+   209|             params["__user__"]["valves"] = function_module.UserValves()
+   210|     return params
+   211| async def generate_function_chat_completion(form_data, user):
+   212|     model_id = form_data.get("model")
+   213|     model_info = Models.get_model_by_id(model_id)
+   214|     metadata = form_data.pop("metadata", {})
+   215|     files = metadata.get("files", [])
+   216|     tool_ids = metadata.get("tool_ids", [])
+   217|     if tool_ids is None:
+   218|         tool_ids = []
+   219|     __event_emitter__ = None
+   220|     __event_call__ = None
+   221|     __task__ = None
+   222|     if metadata:
+   223|         if all(k in metadata for k in ("session_id", "chat_id", "message_id")):
+   224|             __event_emitter__ = get_event_emitter(metadata)
+   225|             __event_call__ = get_event_call(metadata)
+   226|         __task__ = metadata.get("task", None)
+   227|     extra_params = {
+   228|         "__event_emitter__": __event_emitter__,
+   229|         "__event_call__": __event_call__,
+   230|         "__task__": __task__,
+   231|         "__files__": files,
+   232|         "__user__": {
+   233|             "id": user.id,
+   234|             "email": user.email,
+   235|             "name": user.name,
+   236|             "role": user.role,
+   237|         },
+   238|     }
+   239|     extra_params["__tools__"] = get_tools(
+   240|         app,
+   241|         tool_ids,
+   242|         user,
+   243|         {
+   244|             **extra_params,
+   245|             "__model__": app.state.MODELS[form_data["model"]],
+   246|             "__messages__": form_data["messages"],
+   247|             "__files__": files,
+   248|         },
+   249|     )
+   250|     if model_info:
+   251|         if model_info.base_model_id:
+   252|             form_data["model"] = model_info.base_model_id
+   253|         params = model_info.params.model_dump()
+   254|         form_data = apply_model_params_to_body_openai(params, form_data)
+   255|         form_data = apply_model_system_prompt_to_body(params, form_data, user)
+   256|     pipe_id = get_pipe_id(form_data)
+   257|     function_module = get_function_module(pipe_id)
+   258|     pipe = function_module.pipe
+   259|     params = get_function_params(function_module, form_data, user, extra_params)
+   260|     if form_data["stream"]:
+   261|         async def stream_content():
+   262|             try:
+   263|                 res = await execute_pipe(pipe, params)
+   264|                 if isinstance(res, StreamingResponse):
+   265|                     async for data in res.body_iterator:
+   266|                         yield data
+   267|                     return
+   268|                 if isinstance(res, dict):
+   269|                     yield f"data: {json.dumps(res)}\n\n"
+
+
+# ====================================================================
+# FILE: backend/apps/webui/models/auths.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-29 ---
+     1| from pydantic import BaseModel
+     2| from typing import Optional
+     3| import uuid
+     4| import logging
+     5| from sqlalchemy import String, Column, Boolean, Text
+     6| from utils.utils import verify_password
+     7| from apps.webui.models.users import UserModel, Users
+     8| from apps.webui.internal.db import Base, get_db
+     9| from env import SRC_LOG_LEVELS
+    10| log = logging.getLogger(__name__)
+    11| log.setLevel(SRC_LOG_LEVELS["MODELS"])
+    12| class Auth(Base):
+    13|     __tablename__ = "auth"
+    14|     id = Column(String, primary_key=True)
+    15|     email = Column(String)
+    16|     password = Column(Text)
+    17|     active = Column(Boolean)
+    18| class AuthModel(BaseModel):
+    19|     id: str
+    20|     email: str
+    21|     password: str
+    22|     active: bool = True
+    23| class Token(BaseModel):
+    24|     token: str
+    25|     token_type: str
+    26| class ApiKey(BaseModel):
+    27|     api_key: Optional[str] = None
+    28| class UserResponse(BaseModel):
+    29|     id: str
+
+
+# ====================================================================
+# FILE: backend/apps/webui/models/chats.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 169-223 ---
+   169|     def get_chat_list_by_user_id(
+   170|         self,
+   171|         user_id: str,
+   172|         include_archived: bool = False,
+   173|         skip: int = 0,
+   174|         limit: int = 50,
+   175|     ) -> list[ChatModel]:
+   176|         with get_db() as db:
+   177|             query = db.query(Chat).filter_by(user_id=user_id)
+   178|             if not include_archived:
+   179|                 query = query.filter_by(archived=False)
+   180|             all_chats = (
+   181|                 query.order_by(Chat.updated_at.desc())
+   182|                 .all()
+   183|             )
+   184|             return [ChatModel.model_validate(chat) for chat in all_chats]
+   185|     def get_chat_title_id_list_by_user_id(
+   186|         self,
+   187|         user_id: str,
+   188|         include_archived: bool = False,
+   189|         skip: Optional[int] = None,
+   190|         limit: Optional[int] = None,
+   191|     ) -> list[ChatTitleIdResponse]:
+   192|         with get_db() as db:
+   193|             query = db.query(Chat).filter_by(user_id=user_id)
+   194|             if not include_archived:
+   195|                 query = query.filter_by(archived=False)
+   196|             query = query.order_by(Chat.updated_at.desc()).with_entities(
+   197|                 Chat.id, Chat.title, Chat.updated_at, Chat.created_at
+   198|             )
+   199|             if limit:
+   200|                 query = query.limit(limit)
+   201|             if skip:
+   202|                 query = query.offset(skip)
+   203|             all_chats = query.all()
+   204|             return [
+   205|                 ChatTitleIdResponse.model_validate(
+   206|                     {
+   207|                         "id": chat[0],
+   208|                         "title": chat[1],
+   209|                         "updated_at": chat[2],
+   210|                         "created_at": chat[3],
+   211|                     }
+   212|                 )
+   213|                 for chat in all_chats
+   214|             ]
+   215|     def get_chat_list_by_chat_ids(
+   216|         self, chat_ids: list[str], skip: int = 0, limit: int = 50
+   217|     ) -> list[ChatModel]:
+   218|         with get_db() as db:
+   219|             all_chats = (
+   220|                 db.query(Chat)
+   221|                 .filter(Chat.id.in_(chat_ids))
+   222|                 .filter_by(archived=False)
+   223|                 .order_by(Chat.updated_at.desc())
+
+
+# ====================================================================
+# FILE: backend/apps/webui/models/documents.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-28 ---
+     1| from pydantic import BaseModel, ConfigDict
+     2| from typing import Optional
+     3| import time
+     4| import logging
+     5| from sqlalchemy import String, Column, BigInteger, Text
+     6| from apps.webui.internal.db import Base, get_db
+     7| import json
+     8| from env import SRC_LOG_LEVELS
+     9| log = logging.getLogger(__name__)
+    10| log.setLevel(SRC_LOG_LEVELS["MODELS"])
+    11| class Document(Base):
+    12|     __tablename__ = "document"
+    13|     collection_name = Column(String, primary_key=True)
+    14|     name = Column(String, unique=True)
+    15|     title = Column(Text)
+    16|     filename = Column(Text)
+    17|     content = Column(Text, nullable=True)
+    18|     user_id = Column(String)
+    19|     timestamp = Column(BigInteger)
+    20| class DocumentModel(BaseModel):
+    21|     model_config = ConfigDict(from_attributes=True)
+    22|     collection_name: str
+    23|     name: str
+    24|     title: str
+    25|     filename: str
+    26|     content: Optional[str] = None
+    27|     user_id: str
+    28|     timestamp: int  # timestamp in epoch
+
+
+# ====================================================================
+# FILE: backend/apps/webui/models/files.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-28 ---
+     1| from pydantic import BaseModel, ConfigDict
+     2| from typing import Union, Optional
+     3| import time
+     4| import logging
+     5| from sqlalchemy import Column, String, BigInteger, Text
+     6| from apps.webui.internal.db import JSONField, Base, get_db
+     7| import json
+     8| from env import SRC_LOG_LEVELS
+     9| log = logging.getLogger(__name__)
+    10| log.setLevel(SRC_LOG_LEVELS["MODELS"])
+    11| class File(Base):
+    12|     __tablename__ = "file"
+    13|     id = Column(String, primary_key=True)
+    14|     user_id = Column(String)
+    15|     filename = Column(Text)
+    16|     meta = Column(JSONField)
+    17|     created_at = Column(BigInteger)
+    18| class FileModel(BaseModel):
+    19|     id: str
+    20|     user_id: str
+    21|     filename: str
+    22|     meta: dict
+    23|     created_at: int  # timestamp in epoch
+    24|     model_config = ConfigDict(from_attributes=True)
+    25| class FileModelResponse(BaseModel):
+    26|     id: str
+    27|     user_id: str
+    28|     filename: str
+
+# --- HUNK 2: Lines 47-89 ---
+    47|                 db.add(result)
+    48|                 db.commit()
+    49|                 db.refresh(result)
+    50|                 if result:
+    51|                     return FileModel.model_validate(result)
+    52|                 else:
+    53|                     return None
+    54|             except Exception as e:
+    55|                 print(f"Error creating tool: {e}")
+    56|                 return None
+    57|     def get_file_by_id(self, id: str) -> Optional[FileModel]:
+    58|         with get_db() as db:
+    59|             try:
+    60|                 file = db.get(File, id)
+    61|                 return FileModel.model_validate(file)
+    62|             except Exception:
+    63|                 return None
+    64|     def get_files(self) -> list[FileModel]:
+    65|         with get_db() as db:
+    66|             return [FileModel.model_validate(file) for file in db.query(File).all()]
+    67|     def get_files_by_user_id(self, user_id: str) -> list[FileModel]:
+    68|         with get_db() as db:
+    69|             return [
+    70|                 FileModel.model_validate(file)
+    71|                 for file in db.query(File).filter_by(user_id=user_id).all()
+    72|             ]
+    73|     def delete_file_by_id(self, id: str) -> bool:
+    74|         with get_db() as db:
+    75|             try:
+    76|                 db.query(File).filter_by(id=id).delete()
+    77|                 db.commit()
+    78|                 return True
+    79|             except Exception:
+    80|                 return False
+    81|     def delete_all_files(self) -> bool:
+    82|         with get_db() as db:
+    83|             try:
+    84|                 db.query(File).delete()
+    85|                 db.commit()
+    86|                 return True
+    87|             except Exception:
+    88|                 return False
+    89| Files = FilesTable()
+
+
+# ====================================================================
+# FILE: backend/apps/webui/models/functions.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-30 ---
+     1| from pydantic import BaseModel, ConfigDict
+     2| from typing import Union, Optional
+     3| import time
+     4| import logging
+     5| from sqlalchemy import Column, String, Text, BigInteger, Boolean
+     6| from apps.webui.internal.db import JSONField, Base, get_db
+     7| from apps.webui.models.users import Users
+     8| import json
+     9| import copy
+    10| from env import SRC_LOG_LEVELS
+    11| log = logging.getLogger(__name__)
+    12| log.setLevel(SRC_LOG_LEVELS["MODELS"])
+    13| class Function(Base):
+    14|     __tablename__ = "function"
+    15|     id = Column(String, primary_key=True)
+    16|     user_id = Column(String)
+    17|     name = Column(Text)
+    18|     type = Column(Text)
+    19|     content = Column(Text)
+    20|     meta = Column(JSONField)
+    21|     valves = Column(JSONField)
+    22|     is_active = Column(Boolean)
+    23|     is_global = Column(Boolean)
+    24|     updated_at = Column(BigInteger)
+    25|     created_at = Column(BigInteger)
+    26| class FunctionMeta(BaseModel):
+    27|     description: Optional[str] = None
+    28|     manifest: Optional[dict] = {}
+    29| class FunctionModel(BaseModel):
+    30|     id: str
+
+
+# ====================================================================
+# FILE: backend/apps/webui/models/models.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-26 ---
+     1| import logging
+     2| from typing import Optional, List
+     3| from pydantic import BaseModel, ConfigDict
+     4| from sqlalchemy import Column, BigInteger, Text
+     5| from apps.webui.internal.db import Base, JSONField, get_db
+     6| from env import SRC_LOG_LEVELS
+     7| import time
+     8| log = logging.getLogger(__name__)
+     9| log.setLevel(SRC_LOG_LEVELS["MODELS"])
+    10| class ModelParams(BaseModel):
+    11|     model_config = ConfigDict(extra="allow")
+    12|     pass
+    13| class ModelMeta(BaseModel):
+    14|     profile_image_url: Optional[str] = "/static/favicon.png"
+    15|     description: Optional[str] = None
+    16|     """
+    17|         User-facing description of the model.
+    18|     """
+    19|     capabilities: Optional[dict] = None
+    20|     model_config = ConfigDict(extra="allow")
+    21|     pass
+    22| class Model(Base):
+    23|     __tablename__ = "model"
+    24|     id = Column(Text, primary_key=True)
+    25|     """
+    26|         The model's id as used in the API. If set to an existing model, it will override the model.
+
+
+# ====================================================================
+# FILE: backend/apps/webui/models/tags.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-29 ---
+     1| from pydantic import BaseModel, ConfigDict
+     2| from typing import Optional
+     3| import json
+     4| import uuid
+     5| import time
+     6| import logging
+     7| from sqlalchemy import String, Column, BigInteger, Text
+     8| from apps.webui.internal.db import Base, get_db
+     9| from env import SRC_LOG_LEVELS
+    10| log = logging.getLogger(__name__)
+    11| log.setLevel(SRC_LOG_LEVELS["MODELS"])
+    12| class Tag(Base):
+    13|     __tablename__ = "tag"
+    14|     id = Column(String, primary_key=True)
+    15|     name = Column(String)
+    16|     user_id = Column(String)
+    17|     data = Column(Text, nullable=True)
+    18| class ChatIdTag(Base):
+    19|     __tablename__ = "chatidtag"
+    20|     id = Column(String, primary_key=True)
+    21|     tag_name = Column(String)
+    22|     chat_id = Column(String)
+    23|     user_id = Column(String)
+    24|     timestamp = Column(BigInteger)
+    25| class TagModel(BaseModel):
+    26|     id: str
+    27|     name: str
+    28|     user_id: str
+    29|     data: Optional[str] = None
+
+
+# ====================================================================
+# FILE: backend/apps/webui/models/tools.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-30 ---
+     1| from pydantic import BaseModel, ConfigDict
+     2| from typing import Optional
+     3| import time
+     4| import logging
+     5| from sqlalchemy import String, Column, BigInteger, Text
+     6| from apps.webui.internal.db import Base, JSONField, get_db
+     7| from apps.webui.models.users import Users
+     8| import json
+     9| import copy
+    10| from env import SRC_LOG_LEVELS
+    11| log = logging.getLogger(__name__)
+    12| log.setLevel(SRC_LOG_LEVELS["MODELS"])
+    13| class Tool(Base):
+    14|     __tablename__ = "tool"
+    15|     id = Column(String, primary_key=True)
+    16|     user_id = Column(String)
+    17|     name = Column(Text)
+    18|     content = Column(Text)
+    19|     specs = Column(JSONField)
+    20|     meta = Column(JSONField)
+    21|     valves = Column(JSONField)
+    22|     updated_at = Column(BigInteger)
+    23|     created_at = Column(BigInteger)
+    24| class ToolMeta(BaseModel):
+    25|     description: Optional[str] = None
+    26|     manifest: Optional[dict] = {}
+    27| class ToolModel(BaseModel):
+    28|     id: str
+    29|     user_id: str
+    30|     name: str
+
+
+# ====================================================================
+# FILE: backend/apps/webui/routers/auths.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 127-171 ---
+   127|             expires_delta=parse_duration(request.app.state.config.JWT_EXPIRES_IN),
+   128|         )
+   129|         response.set_cookie(
+   130|             key="token",
+   131|             value=token,
+   132|             httponly=True,  # Ensures the cookie is not accessible via JavaScript
+   133|         )
+   134|         return {
+   135|             "token": token,
+   136|             "token_type": "Bearer",
+   137|             "id": user.id,
+   138|             "email": user.email,
+   139|             "name": user.name,
+   140|             "role": user.role,
+   141|             "profile_image_url": user.profile_image_url,
+   142|         }
+   143|     else:
+   144|         raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+   145| @router.post("/signup", response_model=SigninResponse)
+   146| async def signup(request: Request, response: Response, form_data: SignupForm):
+   147|     if (
+   148|         not request.app.state.config.ENABLE_SIGNUP
+   149|         and request.app.state.config.ENABLE_LOGIN_FORM
+   150|         and WEBUI_AUTH
+   151|     ):
+   152|         raise HTTPException(
+   153|             status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED
+   154|         )
+   155|     if not validate_email_format(form_data.email.lower()):
+   156|         raise HTTPException(
+   157|             status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.INVALID_EMAIL_FORMAT
+   158|         )
+   159|     if Users.get_user_by_email(form_data.email.lower()):
+   160|         raise HTTPException(400, detail=ERROR_MESSAGES.EMAIL_TAKEN)
+   161|     try:
+   162|         role = (
+   163|             "admin"
+   164|             if Users.get_num_users() == 0
+   165|             else request.app.state.config.DEFAULT_USER_ROLE
+   166|         )
+   167|         hashed = get_password_hash(form_data.password)
+   168|         user = Auths.insert_new_auth(
+   169|             form_data.email.lower(),
+   170|             hashed,
+   171|             form_data.name,
+
+
+# ====================================================================
+# FILE: backend/apps/webui/routers/files.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 58-171 ---
+    58|                         "path": file_path,
+    59|                     },
+    60|                 }
+    61|             ),
+    62|         )
+    63|         if file:
+    64|             return file
+    65|         else:
+    66|             raise HTTPException(
+    67|                 status_code=status.HTTP_400_BAD_REQUEST,
+    68|                 detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
+    69|             )
+    70|     except Exception as e:
+    71|         log.exception(e)
+    72|         raise HTTPException(
+    73|             status_code=status.HTTP_400_BAD_REQUEST,
+    74|             detail=ERROR_MESSAGES.DEFAULT(e),
+    75|         )
+    76| @router.get("/", response_model=list[FileModel])
+    77| async def list_files(user=Depends(get_verified_user)):
+    78|     if user.role == "admin":
+    79|         files = Files.get_files()
+    80|     else:
+    81|         files = Files.get_files_by_user_id(user.id)
+    82|     return files
+    83| @router.delete("/all")
+    84| async def delete_all_files(user=Depends(get_admin_user)):
+    85|     result = Files.delete_all_files()
+    86|     if result:
+    87|         folder = f"{UPLOAD_DIR}"
+    88|         try:
+    89|             if os.path.exists(folder):
+    90|                 for filename in os.listdir(folder):
+    91|                     file_path = os.path.join(folder, filename)
+    92|                     try:
+    93|                         if os.path.isfile(file_path) or os.path.islink(file_path):
+    94|                             os.unlink(file_path)  # Remove the file or link
+    95|                         elif os.path.isdir(file_path):
+    96|                             shutil.rmtree(file_path)  # Remove the directory
+    97|                     except Exception as e:
+    98|                         print(f"Failed to delete {file_path}. Reason: {e}")
+    99|             else:
+   100|                 print(f"The directory {folder} does not exist")
+   101|         except Exception as e:
+   102|             print(f"Failed to process the directory {folder}. Reason: {e}")
+   103|         return {"message": "All files deleted successfully"}
+   104|     else:
+   105|         raise HTTPException(
+   106|             status_code=status.HTTP_400_BAD_REQUEST,
+   107|             detail=ERROR_MESSAGES.DEFAULT("Error deleting files"),
+   108|         )
+   109| @router.get("/{id}", response_model=Optional[FileModel])
+   110| async def get_file_by_id(id: str, user=Depends(get_verified_user)):
+   111|     file = Files.get_file_by_id(id)
+   112|     if file and (file.user_id == user.id or user.role == "admin"):
+   113|         return file
+   114|     else:
+   115|         raise HTTPException(
+   116|             status_code=status.HTTP_404_NOT_FOUND,
+   117|             detail=ERROR_MESSAGES.NOT_FOUND,
+   118|         )
+   119| @router.get("/{id}/content", response_model=Optional[FileModel])
+   120| async def get_file_content_by_id(id: str, user=Depends(get_verified_user)):
+   121|     file = Files.get_file_by_id(id)
+   122|     if file and (file.user_id == user.id or user.role == "admin"):
+   123|         file_path = Path(file.meta["path"])
+   124|         if file_path.is_file():
+   125|             print(f"file_path: {file_path}")
+   126|             return FileResponse(file_path)
+   127|         else:
+   128|             raise HTTPException(
+   129|                 status_code=status.HTTP_404_NOT_FOUND,
+   130|                 detail=ERROR_MESSAGES.NOT_FOUND,
+   131|             )
+   132|     else:
+   133|         raise HTTPException(
+   134|             status_code=status.HTTP_404_NOT_FOUND,
+   135|             detail=ERROR_MESSAGES.NOT_FOUND,
+   136|         )
+   137| @router.get("/{id}/content/{file_name}", response_model=Optional[FileModel])
+   138| async def get_file_content_by_id(id: str, user=Depends(get_verified_user)):
+   139|     file = Files.get_file_by_id(id)
+   140|     if file and (file.user_id == user.id or user.role == "admin"):
+   141|         file_path = Path(file.meta["path"])
+   142|         if file_path.is_file():
+   143|             print(f"file_path: {file_path}")
+   144|             return FileResponse(file_path)
+   145|         else:
+   146|             raise HTTPException(
+   147|                 status_code=status.HTTP_404_NOT_FOUND,
+   148|                 detail=ERROR_MESSAGES.NOT_FOUND,
+   149|             )
+   150|     else:
+   151|         raise HTTPException(
+   152|             status_code=status.HTTP_404_NOT_FOUND,
+   153|             detail=ERROR_MESSAGES.NOT_FOUND,
+   154|         )
+   155| @router.delete("/{id}")
+   156| async def delete_file_by_id(id: str, user=Depends(get_verified_user)):
+   157|     file = Files.get_file_by_id(id)
+   158|     if file and (file.user_id == user.id or user.role == "admin"):
+   159|         result = Files.delete_file_by_id(id)
+   160|         if result:
+   161|             return {"message": "File deleted successfully"}
+   162|         else:
+   163|             raise HTTPException(
+   164|                 status_code=status.HTTP_400_BAD_REQUEST,
+   165|                 detail=ERROR_MESSAGES.DEFAULT("Error deleting file"),
+   166|             )
+   167|     else:
+   168|         raise HTTPException(
+   169|             status_code=status.HTTP_404_NOT_FOUND,
+   170|             detail=ERROR_MESSAGES.NOT_FOUND,
+   171|         )
+
+
+# ====================================================================
+# FILE: backend/apps/webui/routers/memories.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 21-113 ---
+    21| class AddMemoryForm(BaseModel):
+    22|     content: str
+    23| class MemoryUpdateModel(BaseModel):
+    24|     content: Optional[str] = None
+    25| @router.post("/add", response_model=Optional[MemoryModel])
+    26| async def add_memory(
+    27|     request: Request,
+    28|     form_data: AddMemoryForm,
+    29|     user=Depends(get_verified_user),
+    30| ):
+    31|     memory = Memories.insert_new_memory(user.id, form_data.content)
+    32|     memory_embedding = request.app.state.EMBEDDING_FUNCTION(memory.content)
+    33|     collection = CHROMA_CLIENT.get_or_create_collection(name=f"user-memory-{user.id}")
+    34|     collection.upsert(
+    35|         documents=[memory.content],
+    36|         ids=[memory.id],
+    37|         embeddings=[memory_embedding],
+    38|         metadatas=[{"created_at": memory.created_at}],
+    39|     )
+    40|     return memory
+    41| class QueryMemoryForm(BaseModel):
+    42|     content: str
+    43|     k: Optional[int] = 1
+    44| @router.post("/query")
+    45| async def query_memory(
+    46|     request: Request, form_data: QueryMemoryForm, user=Depends(get_verified_user)
+    47| ):
+    48|     query_embedding = request.app.state.EMBEDDING_FUNCTION(form_data.content)
+    49|     collection = CHROMA_CLIENT.get_or_create_collection(name=f"user-memory-{user.id}")
+    50|     results = collection.query(
+    51|         query_embeddings=[query_embedding],
+    52|         n_results=form_data.k,  # how many results to return
+    53|     )
+    54|     return results
+    55| @router.post("/reset", response_model=bool)
+    56| async def reset_memory_from_vector_db(
+    57|     request: Request, user=Depends(get_verified_user)
+    58| ):
+    59|     CHROMA_CLIENT.delete_collection(f"user-memory-{user.id}")
+    60|     collection = CHROMA_CLIENT.get_or_create_collection(name=f"user-memory-{user.id}")
+    61|     memories = Memories.get_memories_by_user_id(user.id)
+    62|     for memory in memories:
+    63|         memory_embedding = request.app.state.EMBEDDING_FUNCTION(memory.content)
+    64|         collection.upsert(
+    65|             documents=[memory.content],
+    66|             ids=[memory.id],
+    67|             embeddings=[memory_embedding],
+    68|         )
+    69|     return True
+    70| @router.delete("/delete/user", response_model=bool)
+    71| async def delete_memory_by_user_id(user=Depends(get_verified_user)):
+    72|     result = Memories.delete_memories_by_user_id(user.id)
+    73|     if result:
+    74|         try:
+    75|             CHROMA_CLIENT.delete_collection(f"user-memory-{user.id}")
+    76|         except Exception as e:
+    77|             log.error(e)
+    78|         return True
+    79|     return False
+    80| @router.post("/{memory_id}/update", response_model=Optional[MemoryModel])
+    81| async def update_memory_by_id(
+    82|     memory_id: str,
+    83|     request: Request,
+    84|     form_data: MemoryUpdateModel,
+    85|     user=Depends(get_verified_user),
+    86| ):
+    87|     memory = Memories.update_memory_by_id(memory_id, form_data.content)
+    88|     if memory is None:
+    89|         raise HTTPException(status_code=404, detail="Memory not found")
+    90|     if form_data.content is not None:
+    91|         memory_embedding = request.app.state.EMBEDDING_FUNCTION(form_data.content)
+    92|         collection = CHROMA_CLIENT.get_or_create_collection(
+    93|             name=f"user-memory-{user.id}"
+    94|         )
+    95|         collection.upsert(
+    96|             documents=[form_data.content],
+    97|             ids=[memory.id],
+    98|             embeddings=[memory_embedding],
+    99|             metadatas=[
+   100|                 {"created_at": memory.created_at, "updated_at": memory.updated_at}
+   101|             ],
+   102|         )
+   103|     return memory
+   104| @router.delete("/{memory_id}", response_model=bool)
+   105| async def delete_memory_by_id(memory_id: str, user=Depends(get_verified_user)):
+   106|     result = Memories.delete_memory_by_id_and_user_id(memory_id, user.id)
+   107|     if result:
+   108|         collection = CHROMA_CLIENT.get_or_create_collection(
+   109|             name=f"user-memory-{user.id}"
+   110|         )
+   111|         collection.delete(ids=[memory_id])
+   112|         return True
+   113|     return False
+
+
+# ====================================================================
+# FILE: backend/apps/webui/utils.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-92 ---
+     1| from importlib import util
+     2| import os
+     3| import re
+     4| import sys
+     5| import subprocess
+     6| from apps.webui.models.tools import Tools
+     7| from apps.webui.models.functions import Functions
+     8| from config import TOOLS_DIR, FUNCTIONS_DIR
+     9| def extract_frontmatter(file_path):
+    10|     """
+    11|     Extract frontmatter as a dictionary from the specified file path.
+    12|     """
+    13|     frontmatter = {}
+    14|     frontmatter_started = False
+    15|     frontmatter_ended = False
+    16|     frontmatter_pattern = re.compile(r"^\s*([a-z_]+):\s*(.*)\s*$", re.IGNORECASE)
+    17|     try:
+    18|         with open(file_path, "r", encoding="utf-8") as file:
+    19|             first_line = file.readline()
+    20|             if first_line.strip() != '"""':
+    21|                 return {}
+    22|             frontmatter_started = True
+    23|             for line in file:
+    24|                 if '"""' in line:
+    25|                     if frontmatter_started:
+    26|                         frontmatter_ended = True
+    27|                         break
+    28|                 if frontmatter_started and not frontmatter_ended:
+    29|                     match = frontmatter_pattern.match(line)
+    30|                     if match:
+    31|                         key, value = match.groups()
+    32|                         frontmatter[key.strip()] = value.strip()
+    33|     except FileNotFoundError:
+    34|         print(f"Error: The file {file_path} does not exist.")
+    35|         return {}
+    36|     except Exception as e:
+    37|         print(f"An error occurred: {e}")
+    38|         return {}
+    39|     return frontmatter
+    40| def load_toolkit_module_by_id(toolkit_id):
+    41|     toolkit_path = os.path.join(TOOLS_DIR, f"{toolkit_id}.py")
+    42|     if not os.path.exists(toolkit_path):
+    43|         tool = Tools.get_tool_by_id(toolkit_id)
+    44|         if tool:
+    45|             with open(toolkit_path, "w") as file:
+    46|                 file.write(tool.content)
+    47|         else:
+    48|             raise Exception(f"Toolkit not found: {toolkit_id}")
+    49|     spec = util.spec_from_file_location(toolkit_id, toolkit_path)
+    50|     module = util.module_from_spec(spec)
+    51|     frontmatter = extract_frontmatter(toolkit_path)
+    52|     try:
+    53|         install_frontmatter_requirements(frontmatter.get("requirements", ""))
+    54|         spec.loader.exec_module(module)
+    55|         print(f"Loaded module: {module.__name__}")
+    56|         if hasattr(module, "Tools"):
+    57|             return module.Tools(), frontmatter
+    58|         else:
+    59|             raise Exception("No Tools class found")
+    60|     except Exception as e:
+    61|         print(f"Error loading module: {toolkit_id}")
+    62|         os.rename(toolkit_path, f"{toolkit_path}.error")
+    63|         raise e
+    64| def load_function_module_by_id(function_id):
+    65|     function_path = os.path.join(FUNCTIONS_DIR, f"{function_id}.py")
+    66|     if not os.path.exists(function_path):
+    67|         function = Functions.get_function_by_id(function_id)
+    68|         if function:
+    69|             with open(function_path, "w") as file:
+    70|                 file.write(function.content)
+    71|         else:
+    72|             raise Exception(f"Function not found: {function_id}")
+    73|     spec = util.spec_from_file_location(function_id, function_path)
+    74|     module = util.module_from_spec(spec)
+    75|     frontmatter = extract_frontmatter(function_path)
+    76|     try:
+    77|         install_frontmatter_requirements(frontmatter.get("requirements", ""))
+    78|         spec.loader.exec_module(module)
+    79|         print(f"Loaded module: {module.__name__}")
+    80|         if hasattr(module, "Pipe"):
+    81|             return module.Pipe(), "pipe", frontmatter
+    82|         elif hasattr(module, "Filter"):
+    83|             return module.Filter(), "filter", frontmatter
+    84|         elif hasattr(module, "Action"):
+    85|             return module.Action(), "action", frontmatter
+    86|         else:
+    87|             raise Exception("No Function class found")
+    88|     except Exception as e:
+    89|         print(f"Error loading module: {function_id}")
+    90|         os.rename(function_path, f"{function_path}.error")
+    91|         raise e
+    92| def install_frontmatter_requirements(requirements):
+
+
+# ====================================================================
+# FILE: backend/config.py
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-224 ---
+     1| from sqlalchemy import create_engine, Column, Integer, DateTime, JSON, func
+     2| from contextlib import contextmanager
+     3| import os
+     4| import sys
+     5| import logging
+     6| import importlib.metadata
+     7| import pkgutil
+     8| from urllib.parse import urlparse
+     9| from datetime import datetime
+    10| import chromadb
+    11| from chromadb import Settings
+    12| from typing import TypeVar, Generic
+    13| from pydantic import BaseModel
+    14| from typing import Optional
+    15| from pathlib import Path
+    16| import json
+    17| import yaml
+    18| import requests
+    19| import shutil
+    20| from apps.webui.internal.db import Base, get_db
+    21| from constants import ERROR_MESSAGES
+    22| from env import (
+    23|     ENV,
+    24|     VERSION,
+    25|     SAFE_MODE,
+    26|     GLOBAL_LOG_LEVEL,
+    27|     SRC_LOG_LEVELS,
+    28|     BASE_DIR,
+    29|     DATA_DIR,
+    30|     BACKEND_DIR,
+    31|     FRONTEND_BUILD_DIR,
+    32|     WEBUI_NAME,
+    33|     WEBUI_URL,
+    34|     WEBUI_FAVICON_URL,
+    35|     WEBUI_BUILD_HASH,
+    36|     CONFIG_DATA,
+    37|     DATABASE_URL,
+    38|     CHANGELOG,
+    39|     WEBUI_AUTH,
+    40|     WEBUI_AUTH_TRUSTED_EMAIL_HEADER,
+    41|     WEBUI_AUTH_TRUSTED_NAME_HEADER,
+    42|     WEBUI_SECRET_KEY,
+    43|     WEBUI_SESSION_COOKIE_SAME_SITE,
+    44|     WEBUI_SESSION_COOKIE_SECURE,
+    45|     log,
+    46| )
+    47| class EndpointFilter(logging.Filter):
+    48|     def filter(self, record: logging.LogRecord) -> bool:
+    49|         return record.getMessage().find("/health") == -1
+    50| logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
+    51| def run_migrations():
+    52|     print("Running migrations")
+    53|     try:
+    54|         from alembic.config import Config
+    55|         from alembic import command
+    56|         alembic_cfg = Config("alembic.ini")
+    57|         command.upgrade(alembic_cfg, "head")
+    58|     except Exception as e:
+    59|         print(f"Error: {e}")
+    60| run_migrations()
+    61| class Config(Base):
+    62|     __tablename__ = "config"
+    63|     id = Column(Integer, primary_key=True)
+    64|     data = Column(JSON, nullable=False)
+    65|     version = Column(Integer, nullable=False, default=0)
+    66|     created_at = Column(DateTime, nullable=False, server_default=func.now())
+    67|     updated_at = Column(DateTime, nullable=True, onupdate=func.now())
+    68| def load_json_config():
+    69|     with open(f"{DATA_DIR}/config.json", "r") as file:
+    70|         return json.load(file)
+    71| def save_to_db(data):
+    72|     with get_db() as db:
+    73|         existing_config = db.query(Config).first()
+    74|         if not existing_config:
+    75|             new_config = Config(data=data, version=0)
+    76|             db.add(new_config)
+    77|         else:
+    78|             existing_config.data = data
+    79|             existing_config.updated_at = datetime.now()
+    80|             db.add(existing_config)
+    81|         db.commit()
+    82| if os.path.exists(f"{DATA_DIR}/config.json"):
+    83|     data = load_json_config()
+    84|     save_to_db(data)
+    85|     os.rename(f"{DATA_DIR}/config.json", f"{DATA_DIR}/old_config.json")
+    86| def save_config():
+    87|     try:
+    88|         with open(f"{DATA_DIR}/config.json", "w") as f:
+    89|             json.dump(CONFIG_DATA, f, indent="\t")
+    90|     except Exception as e:
+    91|         log.exception(e)
+    92| DEFAULT_CONFIG = {
+    93|     "version": 0,
+    94|     "ui": {
+    95|         "default_locale": "",
+    96|         "prompt_suggestions": [
+    97|             {
+    98|                 "title": [
+    99|                     "Help me study",
+   100|                     "vocabulary for a college entrance exam",
+   101|                 ],
+   102|                 "content": "Help me study vocabulary: write a sentence for me to fill in the blank, and I'll try to pick the correct option.",
+   103|             },
+   104|             {
+   105|                 "title": [
+   106|                     "Give me ideas",
+   107|                     "for what to do with my kids' art",
+   108|                 ],
+   109|                 "content": "What are 5 creative things I could do with my kids' art? I don't want to throw them away, but it's also so much clutter.",
+   110|             },
+   111|             {
+   112|                 "title": ["Tell me a fun fact", "about the Roman Empire"],
+   113|                 "content": "Tell me a random fun fact about the Roman Empire",
+   114|             },
+   115|             {
+   116|                 "title": [
+   117|                     "Show me a code snippet",
+   118|                     "of a website's sticky header",
+   119|                 ],
+   120|                 "content": "Show me a code snippet of a website's sticky header in CSS and JavaScript.",
+   121|             },
+   122|             {
+   123|                 "title": [
+   124|                     "Explain options trading",
+   125|                     "if I'm familiar with buying and selling stocks",
+   126|                 ],
+   127|                 "content": "Explain options trading in simple terms if I'm familiar with buying and selling stocks.",
+   128|             },
+   129|             {
+   130|                 "title": ["Overcome procrastination", "give me tips"],
+   131|                 "content": "Could you start by asking me about instances when I procrastinate the most and then give me some suggestions to overcome it?",
+   132|             },
+   133|             {
+   134|                 "title": [
+   135|                     "Grammar check",
+   136|                     "rewrite it for better readability ",
+   137|                 ],
+   138|                 "content": 'Check the following sentence for grammar and clarity: "[sentence]". Rewrite it for better readability while maintaining its original meaning.',
+   139|             },
+   140|         ],
+   141|     },
+   142| }
+   143| def get_config():
+   144|     with get_db() as db:
+   145|         config_entry = db.query(Config).order_by(Config.id.desc()).first()
+   146|         return config_entry.data if config_entry else DEFAULT_CONFIG
+   147| CONFIG_DATA = get_config()
+   148| def get_config_value(config_path: str):
+   149|     path_parts = config_path.split(".")
+   150|     cur_config = CONFIG_DATA
+   151|     for key in path_parts:
+   152|         if key in cur_config:
+   153|             cur_config = cur_config[key]
+   154|         else:
+   155|             return None
+   156|     return cur_config
+   157| T = TypeVar("T")
+   158| class PersistentConfig(Generic[T]):
+   159|     def __init__(self, env_name: str, config_path: str, env_value: T):
+   160|         self.env_name = env_name
+   161|         self.config_path = config_path
+   162|         self.env_value = env_value
+   163|         self.config_value = get_config_value(config_path)
+   164|         if self.config_value is not None:
+   165|             log.info(f"'{env_name}' loaded from the latest database entry")
+   166|             self.value = self.config_value
+   167|         else:
+   168|             self.value = env_value
+   169|     def __str__(self):
+   170|         return str(self.value)
+   171|     @property
+   172|     def __dict__(self):
+   173|         raise TypeError(
+   174|             "PersistentConfig object cannot be converted to dict, use config_get or .value instead."
+   175|         )
+   176|     def __getattribute__(self, item):
+   177|         if item == "__dict__":
+   178|             raise TypeError(
+   179|                 "PersistentConfig object cannot be converted to dict, use config_get or .value instead."
+   180|             )
+   181|         return super().__getattribute__(item)
+   182|     def save(self):
+   183|         log.info(f"Saving '{self.env_name}' to the database")
+   184|         path_parts = self.config_path.split(".")
+   185|         sub_config = CONFIG_DATA
+   186|         for key in path_parts[:-1]:
+   187|             if key not in sub_config:
+   188|                 sub_config[key] = {}
+   189|             sub_config = sub_config[key]
+   190|         sub_config[path_parts[-1]] = self.value
+   191|         save_to_db(CONFIG_DATA)
+   192|         self.config_value = self.value
+   193| class AppConfig:
+   194|     _state: dict[str, PersistentConfig]
+   195|     def __init__(self):
+   196|         super().__setattr__("_state", {})
+   197|     def __setattr__(self, key, value):
+   198|         if isinstance(value, PersistentConfig):
+   199|             self._state[key] = value
+   200|         else:
+   201|             self._state[key].value = value
+   202|             self._state[key].save()
+   203|     def __getattr__(self, key):
+   204|         return self._state[key].value
+   205| JWT_EXPIRES_IN = PersistentConfig(
+   206|     "JWT_EXPIRES_IN", "auth.jwt_expiry", os.environ.get("JWT_EXPIRES_IN", "-1")
+   207| )
+   208| ENABLE_OAUTH_SIGNUP = PersistentConfig(
+   209|     "ENABLE_OAUTH_SIGNUP",
+   210|     "oauth.enable_signup",
+   211|     os.environ.get("ENABLE_OAUTH_SIGNUP", "False").lower() == "true",
+   212| )
+   213| OAUTH_MERGE_ACCOUNTS_BY_EMAIL = PersistentConfig(
+   214|     "OAUTH_MERGE_ACCOUNTS_BY_EMAIL",
+   215|     "oauth.merge_accounts_by_email",
+   216|     os.environ.get("OAUTH_MERGE_ACCOUNTS_BY_EMAIL", "False").lower() == "true",
+   217| )
+   218| OAUTH_PROVIDERS = {}
+   219| GOOGLE_CLIENT_ID = PersistentConfig(
+   220|     "GOOGLE_CLIENT_ID",
+   221|     "oauth.google.client_id",
+   222|     os.environ.get("GOOGLE_CLIENT_ID", ""),
+   223| )
+   224| GOOGLE_CLIENT_SECRET = PersistentConfig(
+
+# --- HUNK 2: Lines 674-766 ---
+   674|     ),
+   675| )
+   676| SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD = PersistentConfig(
+   677|     "SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD",
+   678|     "task.search.prompt_length_threshold",
+   679|     int(
+   680|         os.environ.get(
+   681|             "SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD",
+   682|             100,
+   683|         )
+   684|     ),
+   685| )
+   686| TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE = PersistentConfig(
+   687|     "TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE",
+   688|     "task.tools.prompt_template",
+   689|     os.environ.get(
+   690|         "TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE",
+   691|         """Available Tools: {{TOOLS}}\nReturn an empty string if no tools match the query. If a function tool matches, construct and return a JSON object in the format {\"name\": \"functionName\", \"parameters\": {\"requiredFunctionParamKey\": \"requiredFunctionParamValue\"}} using the appropriate tool and its parameters. Only return the object and limit the response to the JSON object without additional text.""",
+   692|     ),
+   693| )
+   694| CONTENT_EXTRACTION_ENGINE = PersistentConfig(
+   695|     "CONTENT_EXTRACTION_ENGINE",
+   696|     "rag.CONTENT_EXTRACTION_ENGINE",
+   697|     os.environ.get("CONTENT_EXTRACTION_ENGINE", "").lower(),
+   698| )
+   699| TIKA_SERVER_URL = PersistentConfig(
+   700|     "TIKA_SERVER_URL",
+   701|     "rag.tika_server_url",
+   702|     os.getenv("TIKA_SERVER_URL", "http://tika:9998"),  # Default for sidecar deployment
+   703| )
+   704| CHROMA_DATA_PATH = f"{DATA_DIR}/vector_db"
+   705| CHROMA_TENANT = os.environ.get("CHROMA_TENANT", chromadb.DEFAULT_TENANT)
+   706| CHROMA_DATABASE = os.environ.get("CHROMA_DATABASE", chromadb.DEFAULT_DATABASE)
+   707| CHROMA_HTTP_HOST = os.environ.get("CHROMA_HTTP_HOST", "")
+   708| CHROMA_HTTP_PORT = int(os.environ.get("CHROMA_HTTP_PORT", "8000"))
+   709| CHROMA_HTTP_HEADERS = os.environ.get("CHROMA_HTTP_HEADERS", "")
+   710| if CHROMA_HTTP_HEADERS:
+   711|     CHROMA_HTTP_HEADERS = dict(
+   712|         [pair.split("=") for pair in CHROMA_HTTP_HEADERS.split(",")]
+   713|     )
+   714| else:
+   715|     CHROMA_HTTP_HEADERS = None
+   716| CHROMA_HTTP_SSL = os.environ.get("CHROMA_HTTP_SSL", "false").lower() == "true"
+   717| RAG_TOP_K = PersistentConfig(
+   718|     "RAG_TOP_K", "rag.top_k", int(os.environ.get("RAG_TOP_K", "5"))
+   719| )
+   720| RAG_RELEVANCE_THRESHOLD = PersistentConfig(
+   721|     "RAG_RELEVANCE_THRESHOLD",
+   722|     "rag.relevance_threshold",
+   723|     float(os.environ.get("RAG_RELEVANCE_THRESHOLD", "0.0")),
+   724| )
+   725| ENABLE_RAG_HYBRID_SEARCH = PersistentConfig(
+   726|     "ENABLE_RAG_HYBRID_SEARCH",
+   727|     "rag.enable_hybrid_search",
+   728|     os.environ.get("ENABLE_RAG_HYBRID_SEARCH", "").lower() == "true",
+   729| )
+   730| RAG_FILE_MAX_COUNT = PersistentConfig(
+   731|     "RAG_FILE_MAX_COUNT",
+   732|     "rag.file.max_count",
+   733|     (
+   734|         int(os.environ.get("RAG_FILE_MAX_COUNT"))
+   735|         if os.environ.get("RAG_FILE_MAX_COUNT")
+   736|         else None
+   737|     ),
+   738| )
+   739| RAG_FILE_MAX_SIZE = PersistentConfig(
+   740|     "RAG_FILE_MAX_SIZE",
+   741|     "rag.file.max_size",
+   742|     (
+   743|         int(os.environ.get("RAG_FILE_MAX_SIZE"))
+   744|         if os.environ.get("RAG_FILE_MAX_SIZE")
+   745|         else None
+   746|     ),
+   747| )
+   748| ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION = PersistentConfig(
+   749|     "ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION",
+   750|     "rag.enable_web_loader_ssl_verification",
+   751|     os.environ.get("ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION", "True").lower() == "true",
+   752| )
+   753| RAG_EMBEDDING_ENGINE = PersistentConfig(
+   754|     "RAG_EMBEDDING_ENGINE",
+   755|     "rag.embedding_engine",
+   756|     os.environ.get("RAG_EMBEDDING_ENGINE", ""),
+   757| )
+   758| PDF_EXTRACT_IMAGES = PersistentConfig(
+   759|     "PDF_EXTRACT_IMAGES",
+   760|     "rag.pdf_extract_images",
+   761|     os.environ.get("PDF_EXTRACT_IMAGES", "False").lower() == "true",
+   762| )
+   763| RAG_EMBEDDING_MODEL = PersistentConfig(
+   764|     "RAG_EMBEDDING_MODEL",
+   765|     "rag.embedding_model",
+   766|     os.environ.get("RAG_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
+
+# --- HUNK 3: Lines 1128-1152 ---
+  1128| AUDIO_TTS_API_KEY = PersistentConfig(
+  1129|     "AUDIO_TTS_API_KEY",
+  1130|     "audio.tts.api_key",
+  1131|     os.getenv("AUDIO_TTS_API_KEY", ""),
+  1132| )
+  1133| AUDIO_TTS_ENGINE = PersistentConfig(
+  1134|     "AUDIO_TTS_ENGINE",
+  1135|     "audio.tts.engine",
+  1136|     os.getenv("AUDIO_TTS_ENGINE", ""),
+  1137| )
+  1138| AUDIO_TTS_MODEL = PersistentConfig(
+  1139|     "AUDIO_TTS_MODEL",
+  1140|     "audio.tts.model",
+  1141|     os.getenv("AUDIO_TTS_MODEL", "tts-1"),  # OpenAI default model
+  1142| )
+  1143| AUDIO_TTS_VOICE = PersistentConfig(
+  1144|     "AUDIO_TTS_VOICE",
+  1145|     "audio.tts.voice",
+  1146|     os.getenv("AUDIO_TTS_VOICE", "alloy"),  # OpenAI default voice
+  1147| )
+  1148| AUDIO_TTS_SPLIT_ON = PersistentConfig(
+  1149|     "AUDIO_TTS_SPLIT_ON",
+  1150|     "audio.tts.split_on",
+  1151|     os.getenv("AUDIO_TTS_SPLIT_ON", "punctuation"),
+  1152| )
+
+
+# ====================================================================
+# FILE: backend/env.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-142 ---
+     1| from pathlib import Path
+     2| import os
+     3| import logging
+     4| import sys
+     5| import json
+     6| import importlib.metadata
+     7| import pkgutil
+     8| from urllib.parse import urlparse
+     9| from datetime import datetime
+    10| import markdown
+    11| from bs4 import BeautifulSoup
+    12| from constants import ERROR_MESSAGES
+    13| BACKEND_DIR = Path(__file__).parent  # the path containing this file
+    14| BASE_DIR = BACKEND_DIR.parent  # the path containing the backend/
+    15| print(BASE_DIR)
+    16| try:
+    17|     from dotenv import load_dotenv, find_dotenv
+    18|     load_dotenv(find_dotenv(str(BASE_DIR / ".env")))
+    19| except ImportError:
+    20|     print("dotenv not installed, skipping...")
+    21| log_levels = ["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"]
+    22| GLOBAL_LOG_LEVEL = os.environ.get("GLOBAL_LOG_LEVEL", "").upper()
+    23| if GLOBAL_LOG_LEVEL in log_levels:
+    24|     logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL, force=True)
+    25| else:
+    26|     GLOBAL_LOG_LEVEL = "INFO"
+    27| log = logging.getLogger(__name__)
+    28| log.info(f"GLOBAL_LOG_LEVEL: {GLOBAL_LOG_LEVEL}")
+    29| log_sources = [
+    30|     "AUDIO",
+    31|     "COMFYUI",
+    32|     "CONFIG",
+    33|     "DB",
+    34|     "IMAGES",
+    35|     "MAIN",
+    36|     "MODELS",
+    37|     "OLLAMA",
+    38|     "OPENAI",
+    39|     "RAG",
+    40|     "WEBHOOK",
+    41| ]
+    42| SRC_LOG_LEVELS = {}
+    43| for source in log_sources:
+    44|     log_env_var = source + "_LOG_LEVEL"
+    45|     SRC_LOG_LEVELS[source] = os.environ.get(log_env_var, "").upper()
+    46|     if SRC_LOG_LEVELS[source] not in log_levels:
+    47|         SRC_LOG_LEVELS[source] = GLOBAL_LOG_LEVEL
+    48|     log.info(f"{log_env_var}: {SRC_LOG_LEVELS[source]}")
+    49| log.setLevel(SRC_LOG_LEVELS["CONFIG"])
+    50| WEBUI_NAME = os.environ.get("WEBUI_NAME", "Open WebUI")
+    51| if WEBUI_NAME != "Open WebUI":
+    52|     WEBUI_NAME += " (Open WebUI)"
+    53| WEBUI_URL = os.environ.get("WEBUI_URL", "http://localhost:3000")
+    54| WEBUI_FAVICON_URL = "https://openwebui.com/favicon.png"
+    55| ENV = os.environ.get("ENV", "dev")
+    56| try:
+    57|     PACKAGE_DATA = json.loads((BASE_DIR / "package.json").read_text())
+    58| except Exception:
+    59|     try:
+    60|         PACKAGE_DATA = {"version": importlib.metadata.version("open-webui")}
+    61|     except importlib.metadata.PackageNotFoundError:
+    62|         PACKAGE_DATA = {"version": "0.0.0"}
+    63| VERSION = PACKAGE_DATA["version"]
+    64| def parse_section(section):
+    65|     items = []
+    66|     for li in section.find_all("li"):
+    67|         raw_html = str(li)
+    68|         text = li.get_text(separator=" ", strip=True)
+    69|         parts = text.split(": ", 1)
+    70|         title = parts[0].strip() if len(parts) > 1 else ""
+    71|         content = parts[1].strip() if len(parts) > 1 else text
+    72|         items.append({"title": title, "content": content, "raw": raw_html})
+    73|     return items
+    74| try:
+    75|     changelog_path = BASE_DIR / "CHANGELOG.md"
+    76|     with open(str(changelog_path.absolute()), "r", encoding="utf8") as file:
+    77|         changelog_content = file.read()
+    78| except Exception:
+    79|     changelog_content = (pkgutil.get_data("open_webui", "CHANGELOG.md") or b"").decode()
+    80| html_content = markdown.markdown(changelog_content)
+    81| soup = BeautifulSoup(html_content, "html.parser")
+    82| changelog_json = {}
+    83| for version in soup.find_all("h2"):
+    84|     version_number = version.get_text().strip().split(" - ")[0][1:-1]  # Remove brackets
+    85|     date = version.get_text().strip().split(" - ")[1]
+    86|     version_data = {"date": date}
+    87|     current = version.find_next_sibling()
+    88|     while current and current.name != "h2":
+    89|         if current.name == "h3":
+    90|             section_title = current.get_text().lower()  # e.g., "added", "fixed"
+    91|             section_items = parse_section(current.find_next_sibling("ul"))
+    92|             version_data[section_title] = section_items
+    93|         current = current.find_next_sibling()
+    94|     changelog_json[version_number] = version_data
+    95| CHANGELOG = changelog_json
+    96| SAFE_MODE = os.environ.get("SAFE_MODE", "false").lower() == "true"
+    97| WEBUI_BUILD_HASH = os.environ.get("WEBUI_BUILD_HASH", "dev-build")
+    98| DATA_DIR = Path(os.getenv("DATA_DIR", BACKEND_DIR / "data")).resolve()
+    99| FRONTEND_BUILD_DIR = Path(os.getenv("FRONTEND_BUILD_DIR", BASE_DIR / "build")).resolve()
+   100| RESET_CONFIG_ON_START = (
+   101|     os.environ.get("RESET_CONFIG_ON_START", "False").lower() == "true"
+   102| )
+   103| if RESET_CONFIG_ON_START:
+   104|     try:
+   105|         os.remove(f"{DATA_DIR}/config.json")
+   106|         with open(f"{DATA_DIR}/config.json", "w") as f:
+   107|             f.write("{}")
+   108|     except Exception:
+   109|         pass
+   110| try:
+   111|     CONFIG_DATA = json.loads((DATA_DIR / "config.json").read_text())
+   112| except Exception:
+   113|     CONFIG_DATA = {}
+   114| if os.path.exists(f"{DATA_DIR}/ollama.db"):
+   115|     os.rename(f"{DATA_DIR}/ollama.db", f"{DATA_DIR}/webui.db")
+   116|     log.info("Database migrated from Ollama-WebUI successfully.")
+   117| else:
+   118|     pass
+   119| DATABASE_URL = os.environ.get("DATABASE_URL", f"sqlite:///{DATA_DIR}/webui.db")
+   120| if "postgres://" in DATABASE_URL:
+   121|     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://")
+   122| WEBUI_AUTH = os.environ.get("WEBUI_AUTH", "True").lower() == "true"
+   123| WEBUI_AUTH_TRUSTED_EMAIL_HEADER = os.environ.get(
+   124|     "WEBUI_AUTH_TRUSTED_EMAIL_HEADER", None
+   125| )
+   126| WEBUI_AUTH_TRUSTED_NAME_HEADER = os.environ.get("WEBUI_AUTH_TRUSTED_NAME_HEADER", None)
+   127| WEBUI_SECRET_KEY = os.environ.get(
+   128|     "WEBUI_SECRET_KEY",
+   129|     os.environ.get(
+   130|         "WEBUI_JWT_SECRET_KEY", "t0p-s3cr3t"
+   131|     ),  # DEPRECATED: remove at next major version
+   132| )
+   133| WEBUI_SESSION_COOKIE_SAME_SITE = os.environ.get(
+   134|     "WEBUI_SESSION_COOKIE_SAME_SITE",
+   135|     os.environ.get("WEBUI_SESSION_COOKIE_SAME_SITE", "lax"),
+   136| )
+   137| WEBUI_SESSION_COOKIE_SECURE = os.environ.get(
+   138|     "WEBUI_SESSION_COOKIE_SECURE",
+   139|     os.environ.get("WEBUI_SESSION_COOKIE_SECURE", "false").lower() == "true",
+   140| )
+   141| if WEBUI_AUTH and WEBUI_SECRET_KEY == "":
+   142|     raise ValueError(ERROR_MESSAGES.ENV_VAR_NOT_FOUND)
+
+
+# ====================================================================
+# FILE: backend/main.py
+# Total hunks: 7
+# ====================================================================
+# --- HUNK 1: Lines 57-97 ---
+    57|     get_http_authorization_cred,
+    58|     get_password_hash,
+    59|     create_token,
+    60|     decode_token,
+    61| )
+    62| from utils.task import (
+    63|     title_generation_template,
+    64|     search_query_generation_template,
+    65|     tools_function_calling_generation_template,
+    66|     moa_response_generation_template,
+    67| )
+    68| from utils.tools import get_tools
+    69| from utils.misc import (
+    70|     get_last_user_message,
+    71|     add_or_update_system_message,
+    72|     prepend_to_first_user_message_content,
+    73|     parse_duration,
+    74| )
+    75| from apps.rag.utils import get_rag_context, rag_template
+    76| from config import (
+    77|     run_migrations,
+    78|     WEBUI_NAME,
+    79|     WEBUI_URL,
+    80|     WEBUI_AUTH,
+    81|     ENV,
+    82|     VERSION,
+    83|     CHANGELOG,
+    84|     FRONTEND_BUILD_DIR,
+    85|     CACHE_DIR,
+    86|     STATIC_DIR,
+    87|     DEFAULT_LOCALE,
+    88|     ENABLE_OPENAI_API,
+    89|     ENABLE_OLLAMA_API,
+    90|     ENABLE_MODEL_FILTER,
+    91|     MODEL_FILTER_LIST,
+    92|     GLOBAL_LOG_LEVEL,
+    93|     SRC_LOG_LEVELS,
+    94|     WEBHOOK_URL,
+    95|     ENABLE_ADMIN_EXPORT,
+    96|     WEBUI_BUILD_HASH,
+    97|     TASK_MODEL,
+
+# --- HUNK 2: Lines 124-163 ---
+   124|         try:
+   125|             return await super().get_response(path, scope)
+   126|         except (HTTPException, StarletteHTTPException) as ex:
+   127|             if ex.status_code == 404:
+   128|                 return await super().get_response("index.html", scope)
+   129|             else:
+   130|                 raise ex
+   131| print(
+   132|     rf"""
+   133|   ___                    __        __   _     _   _ ___ 
+   134|  / _ \ _ __   ___ _ __   \ \      / /__| |__ | | | |_ _|
+   135| | | | | '_ \ / _ \ '_ \   \ \ /\ / / _ \ '_ \| | | || | 
+   136| | |_| | |_) |  __/ | | |   \ V  V /  __/ |_) | |_| || | 
+   137|  \___/| .__/ \___|_| |_|    \_/\_/ \___|_.__/ \___/|___|
+   138|       |_|                                               
+   139| v{VERSION} - building the best open-source AI user interface.
+   140| {f"Commit: {WEBUI_BUILD_HASH}" if WEBUI_BUILD_HASH != "dev-build" else ""}
+   141| https://github.com/open-webui/open-webui
+   142| """
+   143| )
+   144| @asynccontextmanager
+   145| async def lifespan(app: FastAPI):
+   146|     run_migrations()
+   147|     yield
+   148| app = FastAPI(
+   149|     docs_url="/docs" if ENV == "dev" else None, redoc_url=None, lifespan=lifespan
+   150| )
+   151| app.state.config = AppConfig()
+   152| app.state.config.ENABLE_OPENAI_API = ENABLE_OPENAI_API
+   153| app.state.config.ENABLE_OLLAMA_API = ENABLE_OLLAMA_API
+   154| app.state.config.ENABLE_MODEL_FILTER = ENABLE_MODEL_FILTER
+   155| app.state.config.MODEL_FILTER_LIST = MODEL_FILTER_LIST
+   156| app.state.config.WEBHOOK_URL = WEBHOOK_URL
+   157| app.state.config.TASK_MODEL = TASK_MODEL
+   158| app.state.config.TASK_MODEL_EXTERNAL = TASK_MODEL_EXTERNAL
+   159| app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE = TITLE_GENERATION_PROMPT_TEMPLATE
+   160| app.state.config.SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE = (
+   161|     SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE
+   162| )
+   163| app.state.config.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD = (
+
+# --- HUNK 3: Lines 208-265 ---
+   208|         filter = Functions.get_function_by_id(filter_id)
+   209|         if not filter:
+   210|             continue
+   211|         if filter_id in webui_app.state.FUNCTIONS:
+   212|             function_module = webui_app.state.FUNCTIONS[filter_id]
+   213|         else:
+   214|             function_module, _, _ = load_function_module_by_id(filter_id)
+   215|             webui_app.state.FUNCTIONS[filter_id] = function_module
+   216|         if hasattr(function_module, "file_handler"):
+   217|             skip_files = function_module.file_handler
+   218|         if hasattr(function_module, "valves") and hasattr(function_module, "Valves"):
+   219|             valves = Functions.get_function_valves_by_id(filter_id)
+   220|             function_module.valves = function_module.Valves(
+   221|                 **(valves if valves else {})
+   222|             )
+   223|         if not hasattr(function_module, "inlet"):
+   224|             continue
+   225|         try:
+   226|             inlet = function_module.inlet
+   227|             sig = inspect.signature(inlet)
+   228|             params = {"body": body} | {
+   229|                 k: v
+   230|                 for k, v in {
+   231|                     **extra_params,
+   232|                     "__model__": model,
+   233|                     "__id__": filter_id,
+   234|                 }.items()
+   235|                 if k in sig.parameters
+   236|             }
+   237|             if "__user__" in params and hasattr(function_module, "UserValves"):
+   238|                 try:
+   239|                     params["__user__"]["valves"] = function_module.UserValves(
+   240|                         **Functions.get_user_valves_by_id_and_user_id(
+   241|                             filter_id, params["__user__"]["id"]
+   242|                         )
+   243|                     )
+   244|                 except Exception as e:
+   245|                     print(e)
+   246|             if inspect.iscoroutinefunction(inlet):
+   247|                 body = await inlet(**params)
+   248|             else:
+   249|                 body = inlet(**params)
+   250|         except Exception as e:
+   251|             print(f"Error: {e}")
+   252|             raise e
+   253|     if skip_files and "files" in body.get("metadata", {}):
+   254|         del body["metadata"]["files"]
+   255|     return body, {}
+   256| def get_tools_function_calling_payload(messages, task_model_id, content):
+   257|     user_message = get_last_user_message(messages)
+   258|     history = "\n".join(
+   259|         f"{message['role'].upper()}: \"\"\"{message['content']}\"\"\""
+   260|         for message in messages[::-1][:4]
+   261|     )
+   262|     prompt = f"History:\n{history}\nQuery: {user_message}"
+   263|     return {
+   264|         "model": task_model_id,
+   265|         "messages": [
+
+# --- HUNK 4: Lines 268-325 ---
+   268|         ],
+   269|         "stream": False,
+   270|         "metadata": {"task": str(TASKS.FUNCTION_CALLING)},
+   271|     }
+   272| async def get_content_from_response(response) -> Optional[str]:
+   273|     content = None
+   274|     if hasattr(response, "body_iterator"):
+   275|         async for chunk in response.body_iterator:
+   276|             data = json.loads(chunk.decode("utf-8"))
+   277|             content = data["choices"][0]["message"]["content"]
+   278|         if response.background is not None:
+   279|             await response.background()
+   280|     else:
+   281|         content = response["choices"][0]["message"]["content"]
+   282|     return content
+   283| async def chat_completion_tools_handler(
+   284|     body: dict, user: UserModel, extra_params: dict
+   285| ) -> tuple[dict, dict]:
+   286|     metadata = body.get("metadata", {})
+   287|     tool_ids = metadata.get("tool_ids", None)
+   288|     log.debug(f"{tool_ids=}")
+   289|     if not tool_ids:
+   290|         return body, {}
+   291|     skip_files = False
+   292|     contexts = []
+   293|     citations = []
+   294|     task_model_id = get_task_model_id(body["model"])
+   295|     tools = get_tools(
+   296|         webui_app,
+   297|         tool_ids,
+   298|         user,
+   299|         {
+   300|             **extra_params,
+   301|             "__model__": app.state.MODELS[task_model_id],
+   302|             "__messages__": body["messages"],
+   303|             "__files__": metadata.get("files", []),
+   304|         },
+   305|     )
+   306|     log.info(f"{tools=}")
+   307|     specs = [tool["spec"] for tool in tools.values()]
+   308|     tools_specs = json.dumps(specs)
+   309|     tools_function_calling_prompt = tools_function_calling_generation_template(
+   310|         app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE, tools_specs
+   311|     )
+   312|     log.info(f"{tools_function_calling_prompt=}")
+   313|     payload = get_tools_function_calling_payload(
+   314|         body["messages"], task_model_id, tools_function_calling_prompt
+   315|     )
+   316|     try:
+   317|         payload = filter_pipeline(payload, user)
+   318|     except Exception as e:
+   319|         raise e
+   320|     try:
+   321|         response = await generate_chat_completions(form_data=payload, user=user)
+   322|         log.debug(f"{response=}")
+   323|         content = await get_content_from_response(response)
+   324|         log.debug(f"{content=}")
+   325|         if not content:
+
+# --- HUNK 5: Lines 388-459 ---
+   388|         request,
+   389|         get_http_authorization_cred(request.headers.get("Authorization")),
+   390|     )
+   391|     return body, model, user
+   392| class ChatCompletionMiddleware(BaseHTTPMiddleware):
+   393|     async def dispatch(self, request: Request, call_next):
+   394|         if not is_chat_completion_request(request):
+   395|             return await call_next(request)
+   396|         log.debug(f"request.url.path: {request.url.path}")
+   397|         try:
+   398|             body, model, user = await get_body_and_model_and_user(request)
+   399|         except Exception as e:
+   400|             return JSONResponse(
+   401|                 status_code=status.HTTP_400_BAD_REQUEST,
+   402|                 content={"detail": str(e)},
+   403|             )
+   404|         metadata = {
+   405|             "chat_id": body.pop("chat_id", None),
+   406|             "message_id": body.pop("id", None),
+   407|             "session_id": body.pop("session_id", None),
+   408|             "tool_ids": body.get("tool_ids", None),
+   409|             "files": body.get("files", None),
+   410|         }
+   411|         body["metadata"] = metadata
+   412|         extra_params = {
+   413|             "__event_emitter__": get_event_emitter(metadata),
+   414|             "__event_call__": get_event_call(metadata),
+   415|             "__user__": {
+   416|                 "id": user.id,
+   417|                 "email": user.email,
+   418|                 "name": user.name,
+   419|                 "role": user.role,
+   420|             },
+   421|         }
+   422|         data_items = []
+   423|         contexts = []
+   424|         citations = []
+   425|         try:
+   426|             body, flags = await chat_completion_filter_functions_handler(
+   427|                 body, model, extra_params
+   428|             )
+   429|         except Exception as e:
+   430|             return JSONResponse(
+   431|                 status_code=status.HTTP_400_BAD_REQUEST,
+   432|                 content={"detail": str(e)},
+   433|             )
+   434|         metadata = {
+   435|             **metadata,
+   436|             "tool_ids": body.pop("tool_ids", None),
+   437|             "files": body.pop("files", None),
+   438|         }
+   439|         body["metadata"] = metadata
+   440|         try:
+   441|             body, flags = await chat_completion_tools_handler(body, user, extra_params)
+   442|             contexts.extend(flags.get("contexts", []))
+   443|             citations.extend(flags.get("citations", []))
+   444|         except Exception as e:
+   445|             log.exception(e)
+   446|         try:
+   447|             body, flags = await chat_completion_files_handler(body)
+   448|             contexts.extend(flags.get("contexts", []))
+   449|             citations.extend(flags.get("citations", []))
+   450|         except Exception as e:
+   451|             log.exception(e)
+   452|         if len(contexts) > 0:
+   453|             context_string = "/n".join(contexts).strip()
+   454|             prompt = get_last_user_message(body["messages"])
+   455|             if prompt is None:
+   456|                 raise Exception("No user message found")
+   457|             if model["owned_by"] == "ollama":
+   458|                 body["messages"] = prepend_to_first_user_message_content(
+   459|                     rag_template(
+
+# --- HUNK 6: Lines 747-792 ---
+   747|         if "pipeline" not in model or model["pipeline"].get("type", None) != "filter"
+   748|     ]
+   749|     if app.state.config.ENABLE_MODEL_FILTER:
+   750|         if user.role == "user":
+   751|             models = list(
+   752|                 filter(
+   753|                     lambda model: model["id"] in app.state.config.MODEL_FILTER_LIST,
+   754|                     models,
+   755|                 )
+   756|             )
+   757|             return {"data": models}
+   758|     return {"data": models}
+   759| @app.post("/api/chat/completions")
+   760| async def generate_chat_completions(form_data: dict, user=Depends(get_verified_user)):
+   761|     model_id = form_data["model"]
+   762|     if model_id not in app.state.MODELS:
+   763|         raise HTTPException(
+   764|             status_code=status.HTTP_404_NOT_FOUND,
+   765|             detail="Model not found",
+   766|         )
+   767|     if app.state.config.ENABLE_MODEL_FILTER:
+   768|         if user.role == "user" and model_id not in app.state.config.MODEL_FILTER_LIST:
+   769|             raise HTTPException(
+   770|                 status_code=status.HTTP_403_FORBIDDEN,
+   771|                 detail="Model not found",
+   772|             )
+   773|     model = app.state.MODELS[model_id]
+   774|     if model.get("pipe"):
+   775|         return await generate_function_chat_completion(form_data, user=user)
+   776|     if model["owned_by"] == "ollama":
+   777|         return await generate_ollama_chat_completion(form_data, user=user)
+   778|     else:
+   779|         return await generate_openai_chat_completion(form_data, user=user)
+   780| @app.post("/api/chat/completed")
+   781| async def chat_completed(form_data: dict, user=Depends(get_verified_user)):
+   782|     data = form_data
+   783|     model_id = data["model"]
+   784|     if model_id not in app.state.MODELS:
+   785|         raise HTTPException(
+   786|             status_code=status.HTTP_404_NOT_FOUND,
+   787|             detail="Model not found",
+   788|         )
+   789|     model = app.state.MODELS[model_id]
+   790|     sorted_filters = get_sorted_filters(model_id)
+   791|     if "pipeline" in model:
+   792|         sorted_filters = [model] + sorted_filters
+
+# --- HUNK 7: Lines 1466-1514 ---
+  1466|                 {
+  1467|                     "enable_web_search": rag_app.state.config.ENABLE_RAG_WEB_SEARCH,
+  1468|                     "enable_image_generation": images_app.state.config.ENABLED,
+  1469|                     "enable_community_sharing": webui_app.state.config.ENABLE_COMMUNITY_SHARING,
+  1470|                     "enable_message_rating": webui_app.state.config.ENABLE_MESSAGE_RATING,
+  1471|                     "enable_admin_export": ENABLE_ADMIN_EXPORT,
+  1472|                     "enable_admin_chat_access": ENABLE_ADMIN_CHAT_ACCESS,
+  1473|                 }
+  1474|                 if user is not None
+  1475|                 else {}
+  1476|             ),
+  1477|         },
+  1478|         **(
+  1479|             {
+  1480|                 "default_models": webui_app.state.config.DEFAULT_MODELS,
+  1481|                 "default_prompt_suggestions": webui_app.state.config.DEFAULT_PROMPT_SUGGESTIONS,
+  1482|                 "audio": {
+  1483|                     "tts": {
+  1484|                         "engine": audio_app.state.config.TTS_ENGINE,
+  1485|                         "voice": audio_app.state.config.TTS_VOICE,
+  1486|                         "split_on": audio_app.state.config.TTS_SPLIT_ON,
+  1487|                     },
+  1488|                     "stt": {
+  1489|                         "engine": audio_app.state.config.STT_ENGINE,
+  1490|                     },
+  1491|                 },
+  1492|                 "file": {
+  1493|                     "max_size": rag_app.state.config.FILE_MAX_SIZE,
+  1494|                     "max_count": rag_app.state.config.FILE_MAX_COUNT,
+  1495|                 },
+  1496|                 "permissions": {**webui_app.state.config.USER_PERMISSIONS},
+  1497|             }
+  1498|             if user is not None
+  1499|             else {}
+  1500|         ),
+  1501|     }
+  1502| @app.get("/api/config/model/filter")
+  1503| async def get_model_filter_config(user=Depends(get_admin_user)):
+  1504|     return {
+  1505|         "enabled": app.state.config.ENABLE_MODEL_FILTER,
+  1506|         "models": app.state.config.MODEL_FILTER_LIST,
+  1507|     }
+  1508| class ModelFilterConfigForm(BaseModel):
+  1509|     enabled: bool
+  1510|     models: list[str]
+  1511| @app.post("/api/config/model/filter")
+  1512| async def update_model_filter_config(
+  1513|     form_data: ModelFilterConfigForm, user=Depends(get_admin_user)
+  1514| ):
+
+
+# ====================================================================
+# FILE: backend/migrations/env.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-37 ---
+     1| import os
+     2| from logging.config import fileConfig
+     3| from sqlalchemy import engine_from_config
+     4| from sqlalchemy import pool
+     5| from alembic import context
+     6| from apps.webui.models.auths import Auth
+     7| from apps.webui.models.chats import Chat
+     8| from apps.webui.models.documents import Document
+     9| from apps.webui.models.memories import Memory
+    10| from apps.webui.models.models import Model
+    11| from apps.webui.models.prompts import Prompt
+    12| from apps.webui.models.tags import Tag, ChatIdTag
+    13| from apps.webui.models.tools import Tool
+    14| from apps.webui.models.users import User
+    15| from apps.webui.models.files import File
+    16| from apps.webui.models.functions import Function
+    17| from env import DATABASE_URL
+    18| config = context.config
+    19| if config.config_file_name is not None:
+    20|     fileConfig(config.config_file_name, disable_existing_loggers=False)
+    21| target_metadata = Auth.metadata
+    22| DB_URL = DATABASE_URL
+    23| if DB_URL:
+    24|     config.set_main_option("sqlalchemy.url", DB_URL.replace("%", "%%"))
+    25| def run_migrations_offline() -> None:
+    26|     """Run migrations in 'offline' mode.
+    27|     This configures the context with just a URL
+    28|     and not an Engine, though an Engine is acceptable
+    29|     here as well.  By skipping the Engine creation
+    30|     we don't even need a DBAPI to be available.
+    31|     Calls to context.execute() here emit the given string to the
+    32|     script output.
+    33|     """
+    34|     url = config.get_main_option("sqlalchemy.url")
+    35|     context.configure(
+    36|         url=url,
+    37|         target_metadata=target_metadata,
+
+
+# ====================================================================
+# FILE: backend/migrations/versions/ca81bd47c050_add_config_table.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-32 ---
+     1| """Add config table
+     2| Revision ID: ca81bd47c050
+     3| Revises: 7e5b5dc7342b
+     4| Create Date: 2024-08-25 15:26:35.241684
+     5| """
+     6| from typing import Sequence, Union
+     7| from alembic import op
+     8| import sqlalchemy as sa
+     9| import apps.webui.internal.db
+    10| revision: str = "ca81bd47c050"
+    11| down_revision: Union[str, None] = "7e5b5dc7342b"
+    12| branch_labels: Union[str, Sequence[str], None] = None
+    13| depends_on: Union[str, Sequence[str], None] = None
+    14| def upgrade():
+    15|     op.create_table(
+    16|         "config",
+    17|         sa.Column("id", sa.Integer, primary_key=True),
+    18|         sa.Column("data", sa.JSON(), nullable=False),
+    19|         sa.Column("version", sa.Integer, nullable=False),
+    20|         sa.Column(
+    21|             "created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()
+    22|         ),
+    23|         sa.Column(
+    24|             "updated_at",
+    25|             sa.DateTime(),
+    26|             nullable=True,
+    27|             server_default=sa.func.now(),
+    28|             onupdate=sa.func.now(),
+    29|         ),
+    30|     )
+    31| def downgrade():
+    32|     op.drop_table("config")
+
+
+# ====================================================================
+# FILE: backend/utils/misc.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 43-83 ---
+    43| ) -> list[dict]:
+    44|     for message in messages:
+    45|         if message["role"] == "user":
+    46|             if isinstance(message["content"], list):
+    47|                 for item in message["content"]:
+    48|                     if item["type"] == "text":
+    49|                         item["text"] = f"{content}\n{item['text']}"
+    50|             else:
+    51|                 message["content"] = f"{content}\n{message['content']}"
+    52|             break
+    53|     return messages
+    54| def add_or_update_system_message(content: str, messages: list[dict]):
+    55|     """
+    56|     Adds a new system message at the beginning of the messages list
+    57|     or updates the existing system message at the beginning.
+    58|     :param msg: The message to be added or appended.
+    59|     :param messages: The list of message dictionaries.
+    60|     :return: The updated list of message dictionaries.
+    61|     """
+    62|     if messages and messages[0].get("role") == "system":
+    63|         messages[0]["content"] = f"{content}\n{messages[0]['content']}"
+    64|     else:
+    65|         messages.insert(0, {"role": "system", "content": content})
+    66|     return messages
+    67| def openai_chat_message_template(model: str):
+    68|     return {
+    69|         "id": f"{model}-{str(uuid.uuid4())}",
+    70|         "created": int(time.time()),
+    71|         "model": model,
+    72|         "choices": [{"index": 0, "logprobs": None, "finish_reason": None}],
+    73|     }
+    74| def openai_chat_chunk_message_template(model: str, message: str) -> dict:
+    75|     template = openai_chat_message_template(model)
+    76|     template["object"] = "chat.completion.chunk"
+    77|     template["choices"][0]["delta"] = {"content": message}
+    78|     return template
+    79| def openai_chat_completion_message_template(model: str, message: str) -> dict:
+    80|     template = openai_chat_message_template(model)
+    81|     template["object"] = "chat.completion"
+    82|     template["choices"][0]["message"] = {"content": message, "role": "assistant"}
+    83|     template["choices"][0]["finish_reason"] = "stop"
+
+
+# ====================================================================
+# FILE: backend/utils/utils.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-46 ---
+     1| from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+     2| from fastapi import HTTPException, status, Depends, Request
+     3| from apps.webui.models.users import Users
+     4| from typing import Union, Optional
+     5| from constants import ERROR_MESSAGES
+     6| from passlib.context import CryptContext
+     7| from datetime import datetime, timedelta, UTC
+     8| import jwt
+     9| import uuid
+    10| import logging
+    11| from env import WEBUI_SECRET_KEY
+    12| logging.getLogger("passlib").setLevel(logging.ERROR)
+    13| SESSION_SECRET = WEBUI_SECRET_KEY
+    14| ALGORITHM = "HS256"
+    15| bearer_security = HTTPBearer(auto_error=False)
+    16| pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    17| def verify_password(plain_password, hashed_password):
+    18|     return (
+    19|         pwd_context.verify(plain_password, hashed_password) if hashed_password else None
+    20|     )
+    21| def get_password_hash(password):
+    22|     return pwd_context.hash(password)
+    23| def create_token(data: dict, expires_delta: Union[timedelta, None] = None) -> str:
+    24|     payload = data.copy()
+    25|     if expires_delta:
+    26|         expire = datetime.now(UTC) + expires_delta
+    27|         payload.update({"exp": expire})
+    28|     encoded_jwt = jwt.encode(payload, SESSION_SECRET, algorithm=ALGORITHM)
+    29|     return encoded_jwt
+    30| def decode_token(token: str) -> Optional[dict]:
+    31|     try:
+    32|         decoded = jwt.decode(token, SESSION_SECRET, algorithms=[ALGORITHM])
+    33|         return decoded
+    34|     except Exception:
+    35|         return None
+    36| def extract_token_from_auth_header(auth_header: str):
+    37|     return auth_header[len("Bearer ") :]
+    38| def create_api_key():
+    39|     key = str(uuid.uuid4()).replace("-", "")
+    40|     return f"sk-{key}"
+    41| def get_http_authorization_cred(auth_header: str):
+    42|     try:
+    43|         scheme, credentials = auth_header.split(" ")
+    44|         return HTTPAuthorizationCredentials(scheme=scheme, credentials=credentials)
+    45|     except Exception:
+    46|         raise ValueError(ERROR_MESSAGES.INVALID_TOKEN)
+
+
+# ====================================================================
+# FILE: src/lib/apis/audio/index.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 96-139 ---
+    96| 		body: JSON.stringify({
+    97| 			input: text,
+    98| 			voice: speaker,
+    99| 			...(model && { model })
+   100| 		})
+   101| 	})
+   102| 		.then(async (res) => {
+   103| 			if (!res.ok) throw await res.json();
+   104| 			return res;
+   105| 		})
+   106| 		.catch((err) => {
+   107| 			error = err.detail;
+   108| 			console.log(err);
+   109| 			return null;
+   110| 		});
+   111| 	if (error) {
+   112| 		throw error;
+   113| 	}
+   114| 	return res;
+   115| };
+   116| interface AvailableModelsResponse {
+   117| 	models: { name: string; id: string }[] | { id: string }[];
+   118| }
+   119| export const getModels = async (token: string = ''): Promise<AvailableModelsResponse> => {
+   120| 	let error = null;
+   121| 	const res = await fetch(`${AUDIO_API_BASE_URL}/models`, {
+   122| 		method: 'GET',
+   123| 		headers: {
+   124| 			'Content-Type': 'application/json',
+   125| 			Authorization: `Bearer ${token}`
+   126| 		}
+   127| 	})
+   128| 		.then(async (res) => {
+   129| 			if (!res.ok) throw await res.json();
+   130| 			return res.json();
+   131| 		})
+   132| 		.catch((err) => {
+   133| 			error = err.detail;
+   134| 			console.log(err);
+   135| 			return null;
+   136| 		});
+   137| 	if (error) {
+   138| 		throw error;
+   139| 	}
+
+
+# ====================================================================
+# FILE: src/lib/apis/memories/index.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 116-156 ---
+   116| 	})
+   117| 		.then(async (res) => {
+   118| 			if (!res.ok) throw await res.json();
+   119| 			return res.json();
+   120| 		})
+   121| 		.then((json) => {
+   122| 			return json;
+   123| 		})
+   124| 		.catch((err) => {
+   125| 			error = err.detail;
+   126| 			console.log(err);
+   127| 			return null;
+   128| 		});
+   129| 	if (error) {
+   130| 		throw error;
+   131| 	}
+   132| 	return res;
+   133| };
+   134| export const deleteMemoriesByUserId = async (token: string) => {
+   135| 	let error = null;
+   136| 	const res = await fetch(`${WEBUI_API_BASE_URL}/memories/delete/user`, {
+   137| 		method: 'DELETE',
+   138| 		headers: {
+   139| 			Accept: 'application/json',
+   140| 			'Content-Type': 'application/json',
+   141| 			authorization: `Bearer ${token}`
+   142| 		}
+   143| 	})
+   144| 		.then(async (res) => {
+   145| 			if (!res.ok) throw await res.json();
+   146| 			return res.json();
+   147| 		})
+   148| 		.then((json) => {
+   149| 			return json;
+   150| 		})
+   151| 		.catch((err) => {
+   152| 			error = err.detail;
+   153| 			console.log(err);
+   154| 			return null;
+   155| 		});
+   156| 	if (error) {
+
+
+# ====================================================================
+# FILE: src/lib/apis/rag/index.ts
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 327-389 ---
+   327| 			Accept: 'application/json',
+   328| 			authorization: `Bearer ${token}`
+   329| 		}
+   330| 	})
+   331| 		.then(async (res) => {
+   332| 			if (!res.ok) throw await res.json();
+   333| 			return res.json();
+   334| 		})
+   335| 		.catch((err) => {
+   336| 			error = err.detail;
+   337| 			return null;
+   338| 		});
+   339| 	if (error) {
+   340| 		throw error;
+   341| 	}
+   342| 	return res;
+   343| };
+   344| export const resetUploadDir = async (token: string) => {
+   345| 	let error = null;
+   346| 	const res = await fetch(`${RAG_API_BASE_URL}/reset/uploads`, {
+   347| 		method: 'POST',
+   348| 		headers: {
+   349| 			Accept: 'application/json',
+   350| 			authorization: `Bearer ${token}`
+   351| 		}
+   352| 	})
+   353| 		.then(async (res) => {
+   354| 			if (!res.ok) throw await res.json();
+   355| 			return res.json();
+   356| 		})
+   357| 		.catch((err) => {
+   358| 			error = err.detail;
+   359| 			return null;
+   360| 		});
+   361| 	if (error) {
+   362| 		throw error;
+   363| 	}
+   364| 	return res;
+   365| };
+   366| export const resetVectorDB = async (token: string) => {
+   367| 	let error = null;
+   368| 	const res = await fetch(`${RAG_API_BASE_URL}/reset/db`, {
+   369| 		method: 'POST',
+   370| 		headers: {
+   371| 			Accept: 'application/json',
+   372| 			authorization: `Bearer ${token}`
+   373| 		}
+   374| 	})
+   375| 		.then(async (res) => {
+   376| 			if (!res.ok) throw await res.json();
+   377| 			return res.json();
+   378| 		})
+   379| 		.catch((err) => {
+   380| 			error = err.detail;
+   381| 			return null;
+   382| 		});
+   383| 	if (error) {
+   384| 		throw error;
+   385| 	}
+   386| 	return res;
+   387| };
+   388| export const getEmbeddingConfig = async (token: string) => {
+   389| 	let error = null;
+
+
+# ====================================================================
+# FILE: src/lib/types/index.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-14 ---
+     1| export type Banner = {
+     2| 	id: string;
+     3| 	type: string;
+     4| 	title?: string;
+     5| 	content: string;
+     6| 	url?: string;
+     7| 	dismissible?: boolean;
+     8| 	timestamp: number;
+     9| };
+    10| export enum TTS_RESPONSE_SPLIT {
+    11| 	PUNCTUATION = 'punctuation',
+    12| 	PARAGRAPHS = 'paragraphs',
+    13| 	NONE = 'none'
+    14| }
+
+
+# ====================================================================
+# FILE: src/lib/utils/index.ts
+# Total hunks: 5
+# ====================================================================
+# --- HUNK 1: Lines 1-24 ---
+     1| import { v4 as uuidv4 } from 'uuid';
+     2| import sha256 from 'js-sha256';
+     3| import { WEBUI_BASE_URL } from '$lib/constants';
+     4| import { TTS_RESPONSE_SPLIT } from '$lib/types';
+     5| const convertLatexToSingleLine = (content) => {
+     6| 	const patterns = [
+     7| 		/(\$\$\s[\s\S]*?\s\$\$)/g, // Match $$ ... $$
+     8| 		/(\\\[[\s\S]*?\\\])/g, // Match \[ ... \]
+     9| 		/(\\begin\{[a-z]+\}[\s\S]*?\\end\{[a-z]+\})/g // Match \begin{...} ... \end{...}
+    10| 	];
+    11| 	patterns.forEach((pattern) => {
+    12| 		content = content.replace(pattern, (match) => {
+    13| 			return match.replace(/\s*\n\s*/g, ' ').trim();
+    14| 		});
+    15| 	});
+    16| 	return content;
+    17| };
+    18| export const replaceTokens = (content, char, user) => {
+    19| 	const charToken = /{{char}}/gi;
+    20| 	const userToken = /{{user}}/gi;
+    21| 	const videoIdToken = /{{VIDEO_FILE_ID_([a-f0-9-]+)}}/gi; // Regex to capture the video ID
+    22| 	const htmlIdToken = /{{HTML_FILE_ID_([a-f0-9-]+)}}/gi; // Regex to capture the HTML ID
+    23| 	if (char !== undefined && char !== null) {
+    24| 		content = content.replace(charToken, char);
+
+# --- HUNK 2: Lines 204-254 ---
+   204| 		? false
+   205| 		: current.localeCompare(latest, undefined, {
+   206| 				numeric: true,
+   207| 				sensitivity: 'case',
+   208| 				caseFirst: 'upper'
+   209| 			}) < 0;
+   210| };
+   211| export const findWordIndices = (text) => {
+   212| 	const regex = /\[([^\]]+)\]/g;
+   213| 	const matches = [];
+   214| 	let match;
+   215| 	while ((match = regex.exec(text)) !== null) {
+   216| 		matches.push({
+   217| 			word: match[1],
+   218| 			startIndex: match.index,
+   219| 			endIndex: regex.lastIndex - 1
+   220| 		});
+   221| 	}
+   222| 	return matches;
+   223| };
+   224| export const removeLastWordFromString = (inputString, wordString) => {
+   225| 	const words = inputString.split(' ');
+   226| 	if (words.at(-1) === wordString) {
+   227| 		words.pop();
+   228| 	}
+   229| 	let resultString = words.join(' ');
+   230| 	if (resultString !== '') {
+   231| 		resultString += ' ';
+   232| 	}
+   233| 	return resultString;
+   234| };
+   235| export const removeFirstHashWord = (inputString) => {
+   236| 	const words = inputString.split(' ');
+   237| 	const index = words.findIndex((word) => word.startsWith('#'));
+   238| 	if (index !== -1) {
+   239| 		words.splice(index, 1);
+   240| 	}
+   241| 	const resultString = words.join(' ');
+   242| 	return resultString;
+   243| };
+   244| export const transformFileName = (fileName) => {
+   245| 	const lowerCaseFileName = fileName.toLowerCase();
+   246| 	const sanitizedFileName = lowerCaseFileName.replace(/[^\w\s]/g, '');
+   247| 	const finalFileName = sanitizedFileName.replace(/\s+/g, '-');
+   248| 	return finalFileName;
+   249| };
+   250| export const calculateSHA256 = async (file) => {
+   251| 	const reader = new FileReader();
+   252| 	const readFile = new Promise((resolve, reject) => {
+   253| 		reader.onload = () => resolve(reader.result);
+   254| 		reader.onerror = reject;
+
+# --- HUNK 3: Lines 277-484 ---
+   277| 		navigator.geolocation.getCurrentPosition(resolve, reject);
+   278| 	}).catch((error) => {
+   279| 		console.error('Error getting user location:', error);
+   280| 		throw error;
+   281| 	});
+   282| 	if (!position) {
+   283| 		return 'Location not available';
+   284| 	}
+   285| 	const { latitude, longitude } = position.coords;
+   286| 	if (raw) {
+   287| 		return { latitude, longitude };
+   288| 	} else {
+   289| 		return `${latitude.toFixed(3)}, ${longitude.toFixed(3)} (lat, long)`;
+   290| 	}
+   291| };
+   292| const convertOpenAIMessages = (convo) => {
+   293| 	const mapping = convo['mapping'];
+   294| 	const messages = [];
+   295| 	let currentId = '';
+   296| 	let lastId = null;
+   297| 	for (const message_id in mapping) {
+   298| 		const message = mapping[message_id];
+   299| 		currentId = message_id;
+   300| 		try {
+   301| 			if (
+   302| 				messages.length == 0 &&
+   303| 				(message['message'] == null ||
+   304| 					(message['message']['content']['parts']?.[0] == '' &&
+   305| 						message['message']['content']['text'] == null))
+   306| 			) {
+   307| 				continue;
+   308| 			} else {
+   309| 				const new_chat = {
+   310| 					id: message_id,
+   311| 					parentId: lastId,
+   312| 					childrenIds: message['children'] || [],
+   313| 					role: message['message']?.['author']?.['role'] !== 'user' ? 'assistant' : 'user',
+   314| 					content:
+   315| 						message['message']?.['content']?.['parts']?.[0] ||
+   316| 						message['message']?.['content']?.['text'] ||
+   317| 						'',
+   318| 					model: 'gpt-3.5-turbo',
+   319| 					done: true,
+   320| 					context: null
+   321| 				};
+   322| 				messages.push(new_chat);
+   323| 				lastId = currentId;
+   324| 			}
+   325| 		} catch (error) {
+   326| 			console.log('Error with', message, '\nError:', error);
+   327| 		}
+   328| 	}
+   329| 	const history: Record<PropertyKey, (typeof messages)[number]> = {};
+   330| 	messages.forEach((obj) => (history[obj.id] = obj));
+   331| 	const chat = {
+   332| 		history: {
+   333| 			currentId: currentId,
+   334| 			messages: history // Need to convert this to not a list and instead a json object
+   335| 		},
+   336| 		models: ['gpt-3.5-turbo'],
+   337| 		messages: messages,
+   338| 		options: {},
+   339| 		timestamp: convo['create_time'],
+   340| 		title: convo['title'] ?? 'New Chat'
+   341| 	};
+   342| 	return chat;
+   343| };
+   344| const validateChat = (chat) => {
+   345| 	const messages = chat.messages;
+   346| 	if (messages.length === 0) {
+   347| 		return false;
+   348| 	}
+   349| 	const lastMessage = messages[messages.length - 1];
+   350| 	if (lastMessage.childrenIds.length !== 0) {
+   351| 		return false;
+   352| 	}
+   353| 	const firstMessage = messages[0];
+   354| 	if (firstMessage.parentId !== null) {
+   355| 		return false;
+   356| 	}
+   357| 	for (const message of messages) {
+   358| 		if (typeof message.content !== 'string') {
+   359| 			return false;
+   360| 		}
+   361| 	}
+   362| 	return true;
+   363| };
+   364| export const convertOpenAIChats = (_chats) => {
+   365| 	const chats = [];
+   366| 	let failed = 0;
+   367| 	for (const convo of _chats) {
+   368| 		const chat = convertOpenAIMessages(convo);
+   369| 		if (validateChat(chat)) {
+   370| 			chats.push({
+   371| 				id: convo['id'],
+   372| 				user_id: '',
+   373| 				title: convo['title'],
+   374| 				chat: chat,
+   375| 				timestamp: convo['timestamp']
+   376| 			});
+   377| 		} else {
+   378| 			failed++;
+   379| 		}
+   380| 	}
+   381| 	console.log(failed, 'Conversations could not be imported');
+   382| 	return chats;
+   383| };
+   384| export const isValidHttpUrl = (string: string) => {
+   385| 	let url;
+   386| 	try {
+   387| 		url = new URL(string);
+   388| 	} catch (_) {
+   389| 		return false;
+   390| 	}
+   391| 	return url.protocol === 'http:' || url.protocol === 'https:';
+   392| };
+   393| export const removeEmojis = (str: string) => {
+   394| 	const emojiRegex = /[\uD800-\uDBFF][\uDC00-\uDFFF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDE4F]/g;
+   395| 	return str.replace(emojiRegex, '');
+   396| };
+   397| export const removeFormattings = (str: string) => {
+   398| 	return str.replace(/(\*)(.*?)\1/g, '').replace(/(```)(.*?)\1/gs, '');
+   399| };
+   400| export const cleanText = (content: string) => {
+   401| 	return removeFormattings(removeEmojis(content.trim()));
+   402| };
+   403| const codeBlockRegex = /```[\s\S]*?```/g;
+   404| export const extractSentences = (text: string) => {
+   405| 	const codeBlocks: string[] = [];
+   406| 	let index = 0;
+   407| 	text = text.replace(codeBlockRegex, (match) => {
+   408| 		const placeholder = `\u0000${index}\u0000`; // Use a unique placeholder
+   409| 		codeBlocks[index++] = match;
+   410| 		return placeholder;
+   411| 	});
+   412| 	let sentences = text.split(/(?<=[.!?])\s+/);
+   413| 	sentences = sentences.map((sentence) => {
+   414| 		return sentence.replace(/\u0000(\d+)\u0000/g, (_, idx) => codeBlocks[idx]);
+   415| 	});
+   416| 	return sentences.map(cleanText).filter(Boolean);
+   417| };
+   418| export const extractParagraphsForAudio = (text: string) => {
+   419| 	const codeBlocks: string[] = [];
+   420| 	let index = 0;
+   421| 	text = text.replace(codeBlockRegex, (match) => {
+   422| 		const placeholder = `\u0000${index}\u0000`; // Use a unique placeholder
+   423| 		codeBlocks[index++] = match;
+   424| 		return placeholder;
+   425| 	});
+   426| 	let paragraphs = text.split(/\n+/);
+   427| 	paragraphs = paragraphs.map((paragraph) => {
+   428| 		return paragraph.replace(/\u0000(\d+)\u0000/g, (_, idx) => codeBlocks[idx]);
+   429| 	});
+   430| 	return paragraphs.map(cleanText).filter(Boolean);
+   431| };
+   432| export const extractSentencesForAudio = (text: string) => {
+   433| 	return extractSentences(text).reduce((mergedTexts, currentText) => {
+   434| 		const lastIndex = mergedTexts.length - 1;
+   435| 		if (lastIndex >= 0) {
+   436| 			const previousText = mergedTexts[lastIndex];
+   437| 			const wordCount = previousText.split(/\s+/).length;
+   438| 			const charCount = previousText.length;
+   439| 			if (wordCount < 4 || charCount < 50) {
+   440| 				mergedTexts[lastIndex] = previousText + ' ' + currentText;
+   441| 			} else {
+   442| 				mergedTexts.push(currentText);
+   443| 			}
+   444| 		} else {
+   445| 			mergedTexts.push(currentText);
+   446| 		}
+   447| 		return mergedTexts;
+   448| 	}, [] as string[]);
+   449| };
+   450| export const getMessageContentParts = (content: string, split_on: string = 'punctuation') => {
+   451| 	const messageContentParts: string[] = [];
+   452| 	switch (split_on) {
+   453| 		default:
+   454| 		case TTS_RESPONSE_SPLIT.PUNCTUATION:
+   455| 			messageContentParts.push(...extractSentencesForAudio(content));
+   456| 			break;
+   457| 		case TTS_RESPONSE_SPLIT.PARAGRAPHS:
+   458| 			messageContentParts.push(...extractParagraphsForAudio(content));
+   459| 			break;
+   460| 		case TTS_RESPONSE_SPLIT.NONE:
+   461| 			messageContentParts.push(cleanText(content));
+   462| 			break;
+   463| 	}
+   464| 	return messageContentParts;
+   465| };
+   466| export const blobToFile = (blob, fileName) => {
+   467| 	const file = new File([blob], fileName, { type: blob.type });
+   468| 	return file;
+   469| };
+   470| /**
+   471|  * @param {string} template - The template string containing placeholders.
+   472|  * @returns {string} The template string with the placeholders replaced by the prompt.
+   473|  */
+   474| export const promptTemplate = (
+   475| 	template: string,
+   476| 	user_name?: string,
+   477| 	user_location?: string
+   478| ): string => {
+   479| 	const currentDate = new Date();
+   480| 	const formattedDate =
+   481| 		currentDate.getFullYear() +
+   482| 		'-' +
+   483| 		String(currentDate.getMonth() + 1).padStart(2, '0') +
+   484| 		'-' +
+

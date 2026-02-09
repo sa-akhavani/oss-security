@@ -1,0 +1,248 @@
+# ====================================================================
+# FILE: bugsink/settings/development.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-85 ---
+     1| from .default import *  # noqa
+     2| from .default import BASE_DIR, LOGGING, DATABASES, I_AM_RUNNING
+     3| import os
+     4| from sentry_sdk_extensions.transport import MoreLoudlyFailingTransport
+     5| from bugsink.utils import deduce_allowed_hosts, eat_your_own_dogfood
+     6| SECRET_KEY = 'django-insecure-$@clhhieazwnxnha-_zah&(bieq%yux7#^07&xsvhn58t)8@xw'
+     7| DEBUG = True
+     8| if os.getenv("DB", "sqlite") == "mysql":
+     9|     DATABASES['default'] = {
+    10|         'ENGINE': 'django.db.backends.mysql',
+    11|         'NAME': 'bugsink',
+    12|         'USER': os.environ["DB_USER"],
+    13|         'PASSWORD': os.environ["DB_PASSWORD"],
+    14|     }
+    15| elif os.getenv("DB", "sqlite") == "postgres":
+    16|     DATABASES['default'] = {
+    17|         'ENGINE': 'django.db.backends.postgresql',
+    18|         'NAME': 'bugsink',
+    19|         'USER': os.environ["DB_USER"],
+    20|         'PASSWORD': os.environ["DB_PASSWORD"],
+    21|         'HOST': 'localhost',
+    22|     }
+    23| elif os.getenv("DB", "sqlite") == "sqlite":
+    24|     DATABASES["default"]["NAME"] = BASE_DIR / 'db.sqlite3'
+    25|     DATABASES["default"]["TEST"]["NAME"] = BASE_DIR / 'test.sqlite3'
+    26|     DATABASES["default"]["OPTIONS"]["query_timeout"] = 0.11  # canary config: fail-fast in development.
+    27|     DATABASES["snappea"]["NAME"] = BASE_DIR / 'snappea.sqlite3'
+    28|     DATABASES["snappea"]["OPTIONS"]["query_timeout"] = 0.12
+    29| else:
+    30|     raise ValueError("Unknown DB", os.getenv("DB"))
+    31| if not I_AM_RUNNING == "TEST":
+    32|     SENTRY_DSN = os.getenv("SENTRY_DSN")
+    33|     eat_your_own_dogfood(
+    34|         SENTRY_DSN,
+    35|         transport=MoreLoudlyFailingTransport,
+    36|     )
+    37| SNAPPEA = {
+    38|     "TASK_ALWAYS_EAGER": True,  # at least for (unit) tests, this is a requirement
+    39|     "NUM_WORKERS": 1,
+    40| }
+    41| EMAIL_HOST = os.getenv("EMAIL_HOST")
+    42| EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER")
+    43| EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD")
+    44| EMAIL_PORT = 587
+    45| EMAIL_USE_TLS = True
+    46| SERVER_EMAIL = DEFAULT_FROM_EMAIL = 'Klaas van Schelven <klaas@bugsink.com>'
+    47| BUGSINK = {
+    48|     "DIGEST_IMMEDIATELY": False,
+    49|     "BASE_URL": "http://bugsink:8000",  # no trailing slash
+    50|     "SITE_TITLE": "Bugsink",  # you can customize this as e.g. "My Bugsink" or "Bugsink for My Company"
+    51|     "USE_ADMIN": True,
+    52|     "VALIDATE_ON_DIGEST": "warn",
+    53|     "API_LOG_UNIMPLEMENTED_CALLS": True,
+    54|     "MAX_EVENTS_PER_PROJECT_PER_5_MINUTES": 1_000_000,
+    55|     "MAX_EVENTS_PER_PROJECT_PER_HOUR": 50_000_000,
+    56| }
+    57| if not I_AM_RUNNING == "TEST":
+    58|     BUGSINK["EVENT_STORAGES"] = {
+    59|         "local_flat_files": {
+    60|             "STORAGE": "events.storage.FileEventStorage",
+    61|             "OPTIONS": {
+    62|                 "basepath": os.path.join(BASE_DIR, "filestorage"),
+    63|             },
+    64|             "USE_FOR_WRITE": True,
+    65|         },
+    66|     }
+    67| LOGGING["formatters"]["look_below"] = {
+    68|     "format": "    {message} ↴",
+    69|     "style": "{",
+    70| }
+    71| LOGGING["handlers"]["look_below_in_stream"] = {
+    72|     "level": "INFO",
+    73|     "class": "logging.StreamHandler",
+    74|     "formatter": "look_below",
+    75|     "filters": ['require_debug_true'],
+    76| }
+    77| if I_AM_RUNNING == "SNAPPEA":
+    78|     LOGGING['loggers']['bugsink.performance']["handlers"] = ["snappea"]
+    79| else:
+    80|     LOGGING['loggers']['bugsink.performance']["handlers"] = ["look_below_in_stream"]
+    81| LOGGING["handlers"]["snappea"]["level"] = "DEBUG"
+    82| LOGGING["loggers"]["snappea"]["level"] = "DEBUG"
+    83| LOGGING["formatters"]["snappea"]["format"] = "{asctime} - {threadName} - {levelname:7} - {message}"
+    84| ALLOWED_HOSTS = deduce_allowed_hosts(BUGSINK["BASE_URL"])
+    85| NPM_BIN_PATH = os.getenv("NPM_BIN_PATH", "npm")
+
+
+# ====================================================================
+# FILE: bugsink/urls.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-63 ---
+     1| from django.conf import settings
+     2| from django.contrib import admin
+     3| from django.urls import include, path
+     4| from django.contrib.auth import views as auth_views
+     5| from django.views.generic import RedirectView, TemplateView
+     6| from alerts.views import debug_email as debug_alerts_email
+     7| from users.views import debug_email as debug_users_email
+     8| from teams.views import debug_email as debug_teams_email
+     9| from bugsink.app_settings import get_settings
+    10| from users.views import signup, confirm_email, resend_confirmation, request_reset_password, reset_password, preferences
+    11| from ingest.views import download_envelope
+    12| from files.views import chunk_upload, artifact_bundle_assemble, api_catch_all
+    13| from bugsink.decorators import login_exempt
+    14| from .views import home, trigger_error, favicon, settings_view, silence_email_system_warning, counts, health_check_ready
+    15| from .debug_views import csrf_debug
+    16| admin.site.site_header = get_settings().SITE_TITLE
+    17| admin.site.site_title = get_settings().SITE_TITLE
+    18| admin.site.index_title = "Admin"  # everyone calls this the "admin" anyway. Let's set the title accordingly.
+    19| urlpatterns = [
+    20|     path('', home, name='home'),
+    21|     path("health/ready", health_check_ready, name="health_check_ready"),
+    22|     path("accounts/signup/", signup, name="signup"),
+    23|     path("accounts/resend-confirmation/", resend_confirmation, name="resend_confirmation"),
+    24|     path("accounts/confirm-email/<str:token>/", confirm_email, name="confirm_email"),
+    25|     path("accounts/request-reset-password/", request_reset_password, name="request_reset_password"),
+    26|     path("accounts/reset-password/<str:token>/", reset_password, name="reset_password"),
+    27|     path("accounts/login/", auth_views.LoginView.as_view(template_name="bugsink/login.html"), name="login"),
+    28|     path("accounts/logout/", auth_views.LogoutView.as_view(template_name="users/logged_out.html"), name="logout"),
+    29|     path("accounts/preferences/", preferences, name="preferences"),
+    30|     path("users/", include("users.urls")),
+    31|     path("api/0/organizations/<slug:organization_slug>/chunk-upload/", chunk_upload, name="chunk_upload"),
+    32|     path("api/0/organizations/<slug:organization_slug>/artifactbundle/assemble/", artifact_bundle_assemble,
+    33|          name="artifact_bundle_assemble"),
+    34|     path('api/', include('ingest.urls')),
+    35|     path('api/<path:subpath>', api_catch_all, name='api_catch_all'),
+    36|     path('ingest/envelope/<str:envelope_id>/', download_envelope, name='download_envelope'),
+    37|     path('projects/', include('projects.urls')),
+    38|     path('teams/', include('teams.urls')),
+    39|     path('events/', include('events.urls')),
+    40|     path('issues/', include('issues.urls')),
+    41|     path('files/', include('files.urls')),
+    42|     path('orgredirect/organizations/:orgslug/settings/auth-tokens/',
+    43|          RedirectView.as_view(url='/bsmain/auth_tokens/', permanent=False)),
+    44|     path('bsmain/', include('bsmain.urls')),
+    45|     path('admin/', admin.site.urls),
+    46|     path('silence-email-system-warning/', silence_email_system_warning, name='silence_email_system_warning'),
+    47|     path('settings/', settings_view, name='settings'),
+    48|     path('counts/', counts, name='counts'),
+    49|     path('debug/csrf/', csrf_debug, name='csrf_debug'),
+    50|     path("favicon.ico", favicon),
+    51|     path("robots.txt", login_exempt(TemplateView.as_view(template_name="robots.txt", content_type="text/plain"))),
+    52| ]
+    53| if settings.DEBUG:
+    54|     urlpatterns += [
+    55|         path('debug-alerts-email/<str:template_name>/', debug_alerts_email),
+    56|         path('debug-users-email/<str:template_name>/', debug_users_email),
+    57|         path('debug-teams-email/<str:template_name>/', debug_teams_email),
+    58|         path('trigger-error/', trigger_error),
+    59|     ]
+    60| handler400 = "bugsink.views.bad_request"
+    61| handler403 = "bugsink.views.permission_denied"
+    62| handler404 = "bugsink.views.page_not_found"
+    63| handler500 = "bugsink.views.server_error"
+
+
+# ====================================================================
+# FILE: ingest/filestore.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-6 ---
+     1| import uuid
+     2| import os
+     3| from bugsink.app_settings import get_settings
+     4| def get_filename_for_event_id(event_id):
+     5|     event_id_normalized = uuid.UUID(event_id).hex
+     6|     return os.path.join(get_settings().INGEST_STORE_BASE_DIR, event_id_normalized)
+
+
+# ====================================================================
+# FILE: ingest/views.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-21 ---
+     1| import uuid
+     2| import hashlib
+     3| import os
+     4| import logging
+     5| import io
+     6| from datetime import datetime, timezone
+     7| import json
+     8| import jsonschema
+     9| import fastjsonschema
+    10| from django.conf import settings
+    11| from django.shortcuts import get_object_or_404
+    12| from django.db.models import Max, F
+    13| from django.views import View
+    14| from django.core import exceptions
+    15| from django.core.exceptions import ValidationError
+    16| from django.http import HttpResponse, JsonResponse
+    17| from django.views.decorators.csrf import csrf_exempt
+    18| from django.utils.decorators import method_decorator
+    19| from django.contrib.auth.decorators import user_passes_test
+    20| from compat.auth import parse_auth_header_value
+    21| from compat.dsn import get_sentry_key, build_dsn
+
+# --- HUNK 2: Lines 290-333 ---
+   290|             else DontStoreEnvelope(input_stream)
+   291|         try:
+   292|             return self._post2(request, input_stream, ingested_at, project_pk)
+   293|         finally:
+   294|             input_stream.store()
+   295|     def _post2(self, request, input_stream, ingested_at, project_pk=None):
+   296|         parser = StreamingEnvelopeParser(input_stream)
+   297|         envelope_headers = parser.get_envelope_headers()
+   298|         if "dsn" in envelope_headers:
+   299|             project = self.get_project(project_pk, get_sentry_key(envelope_headers["dsn"]))
+   300|         else:
+   301|             project = self.get_project_for_request(project_pk, request)
+   302|         if project.quota_exceeded_until is not None and ingested_at < project.quota_exceeded_until:
+   303|             return HttpResponse(status=HTTP_429_TOO_MANY_REQUESTS)
+   304|         def factory(item_headers):
+   305|             if item_headers.get("type") == "event":
+   306|                 if get_settings().DIGEST_IMMEDIATELY:
+   307|                     return MaxDataWriter("MAX_EVENT_SIZE", io.BytesIO())
+   308|                 if "event_id" not in envelope_headers:
+   309|                     raise ParseError("event_id not found in envelope headers")
+   310|                 try:
+   311|                     uuid.UUID(envelope_headers["event_id"])
+   312|                 except ValueError:
+   313|                     raise ParseError("event_id in envelope headers is not a valid UUID")
+   314|                 filename = get_filename_for_event_id(envelope_headers["event_id"])
+   315|                 os.makedirs(os.path.dirname(filename), exist_ok=True)
+   316|                 return MaxDataWriter("MAX_EVENT_SIZE", open(filename, 'wb'))
+   317|             return NullWriter()
+   318|         for item_headers, event_output_stream in parser.get_items(factory):
+   319|             try:
+   320|                 if item_headers.get("type") != "event":
+   321|                     logger.info("skipping non-event item: %s", item_headers.get("type"))
+   322|                     if item_headers.get("type") == "transaction":
+   323|                         logger.info("discarding the rest of the envelope")
+   324|                         break
+   325|                     continue
+   326|                 self.process_event(ingested_at, envelope_headers["event_id"], event_output_stream, project, request)
+   327|                 break  # From the spec of type=event: This Item may occur at most once per Envelope. once seen: done
+   328|             finally:
+   329|                 event_output_stream.close()
+   330|         return HttpResponse()
+   331| @user_passes_test(lambda u: u.is_superuser)
+   332| def download_envelope(request, envelope_id=None):
+   333|     envelope = get_object_or_404(Envelope, pk=envelope_id)
+

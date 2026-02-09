@@ -1,0 +1,241 @@
+# ====================================================================
+# FILE: jooby/src/main/java/org/jooby/Err.java
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 185-227 ---
+   185|  *       comment syntax for the file format. We also recommend that a
+   186|  *       file or class name and description of purpose be included on the
+   187|  *       same "printed page" as the copyright notice for easier
+   188|  *       identification within third-party archives.
+   189|  *
+   190|  *    Copyright 2014 Edgar Espina
+   191|  *
+   192|  *    Licensed under the Apache License, Version 2.0 (the "License");
+   193|  *    you may not use this file except in compliance with the License.
+   194|  *    You may obtain a copy of the License at
+   195|  *
+   196|  *        http://www.apache.org/licenses/LICENSE-2.0
+   197|  *
+   198|  *    Unless required by applicable law or agreed to in writing, software
+   199|  *    distributed under the License is distributed on an "AS IS" BASIS,
+   200|  *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   201|  *    See the License for the specific language governing permissions and
+   202|  *    limitations under the License.
+   203|  */
+   204| package org.jooby;
+   205| import java.util.LinkedHashMap;
+   206| import java.util.Map;
+   207| import java.util.Optional;
+   208| import com.typesafe.config.Config;
+   209| import org.jooby.funzy.Try;
+   210| import org.slf4j.Logger;
+   211| import org.slf4j.LoggerFactory;
+   212| import com.google.common.base.Throwables;
+   213| import javax.annotation.Nullable;
+   214| /**
+   215|  * An exception that carry a {@link Status}. The status field will be set in the HTTP
+   216|  * response.
+   217|  *
+   218|  * See {@link Err.Handler} for more details on how to deal with exceptions.
+   219|  *
+   220|  * @author edgar
+   221|  * @since 0.1.0
+   222|  */
+   223| @SuppressWarnings("serial")
+   224| public class Err extends RuntimeException {
+   225|   /**
+   226|    * Exception thrown from {@link MediaType#parse(String)} in case of encountering an invalid media
+   227|    * type specification String.
+
+# --- HUNK 2: Lines 255-300 ---
+   255|   }
+   256|   /**
+   257|    * Default err handler it does content negotation.
+   258|    *
+   259|    * On <code>text/html</code> requests the err handler creates an <code>err</code> view and use the
+   260|    * {@link Err#toMap()} result as model.
+   261|    *
+   262|    * @author edgar
+   263|    * @since 0.1.0
+   264|    */
+   265|   public static class DefHandler implements Err.Handler {
+   266|     /** Default err view. */
+   267|     public static final String VIEW = "err";
+   268|     /** logger, logs!. */
+   269|     private final Logger log = LoggerFactory.getLogger(Err.class);
+   270|     @Override
+   271|     public void handle(final Request req, final Response rsp, final Err ex) throws Throwable {
+   272|       log.error("execution of: {}{} resulted in exception\nRoute:\n{}\n\nStacktrace:",
+   273|           req.method(), req.path(), req.route().print(6), ex);
+   274|       Config conf = req.require(Config.class);
+   275|       boolean stackstrace = Try.apply(() -> conf.getBoolean("err.stacktrace"))
+   276|           .orElse(req.require(Env.class).name().equals("dev"));
+   277|       rsp.send(
+   278|           Results
+   279|               .when(MediaType.html, () -> Results.html(VIEW).put("err", ex.toMap(stackstrace)))
+   280|               .when(MediaType.all, () -> ex.toMap(stackstrace)));
+   281|     }
+   282|   }
+   283|   /**
+   284|    * Handle and render exceptions. Error handlers are executed in the order they were provided, the
+   285|    * first err handler that send an output wins!
+   286|    *
+   287|    * The default err handler does content negotation on error, see {@link DefHandler}.
+   288|    *
+   289|    * @author edgar
+   290|    * @since 0.1.0
+   291|    */
+   292|   public interface Handler {
+   293|     /**
+   294|      * Handle a route exception by properly logging the error and sending a err response to the
+   295|      * client.
+   296|      *
+   297|      * Please note you always get an {@link Err} whenever you throw it or not. For example if your
+   298|      * application throws an {@link IllegalArgumentException} exception you will get an {@link Err}
+   299|      * and you can retrieve the original exception by calling {@link Err#getCause()}.
+   300|      *
+
+
+# ====================================================================
+# FILE: jooby/src/main/java/org/jooby/internal/HttpHandlerImpl.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 511-551 ---
+   511|   private static String normalizeURI(final String uri) {
+   512|     int len = uri.length();
+   513|     return len > 1 && uri.charAt(len - 1) == '/' ? uri.substring(0, len - 1) : uri;
+   514|   }
+   515|   private static Route[] routes(final Set<Route.Definition> routeDefs, final String method,
+   516|       final String path, final MediaType type, final List<MediaType> accept) {
+   517|     List<Route> routes = findRoutes(routeDefs, method, path, type, accept);
+   518|     routes.add(RouteImpl.fallback((req, rsp, chain) -> {
+   519|       if (!rsp.status().isPresent()) {
+   520|         Err ex = handle406or415(routeDefs, method, path, type, accept);
+   521|         if (ex != null) {
+   522|           throw ex;
+   523|         }
+   524|         ex = handle405(routeDefs, method, path, type, accept);
+   525|         if (ex != null) {
+   526|           throw ex;
+   527|         }
+   528|         if (path.equals("/favicon.ico")) {
+   529|           rsp.status(Status.NOT_FOUND).end();
+   530|         } else {
+   531|           throw new Err(Status.NOT_FOUND, req.path(true));
+   532|         }
+   533|       }
+   534|     }, method, path, "err", accept));
+   535|     return routes.toArray(new Route[routes.size()]);
+   536|   }
+   537|   private static List<Route> findRoutes(final Set<Route.Definition> routeDefs, final String method,
+   538|       final String path, final MediaType type, final List<MediaType> accept) {
+   539|     List<Route> routes = new ArrayList<>();
+   540|     for (Route.Definition routeDef : routeDefs) {
+   541|       Optional<Route> route = routeDef.matches(method, path, type, accept);
+   542|       if (route.isPresent()) {
+   543|         routes.add(route.get());
+   544|       }
+   545|     }
+   546|     return routes;
+   547|   }
+   548|   private static Optional<WebSocket> findSockets(final Set<WebSocket.Definition> sockets,
+   549|       final String path) {
+   550|     for (WebSocket.Definition socketDef : sockets) {
+   551|       Optional<WebSocket> match = socketDef.matches(path);
+
+
+# ====================================================================
+# FILE: jooby/src/main/java/org/jooby/internal/RouteImpl.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 205-245 ---
+   205| import org.jooby.Err;
+   206| import org.jooby.MediaType;
+   207| import org.jooby.Request;
+   208| import org.jooby.Response;
+   209| import org.jooby.Route;
+   210| import org.jooby.Status;
+   211| import org.jooby.internal.mvc.MvcHandler;
+   212| import java.util.List;
+   213| import java.util.Map;
+   214| public class RouteImpl implements RouteWithFilter {
+   215|   private Definition route;
+   216|   private String path;
+   217|   private Map<Object, String> vars;
+   218|   private Filter filter;
+   219|   private List<MediaType> produces;
+   220|   private String method;
+   221|   private Source source;
+   222|   public static RouteWithFilter notFound(final String method, final String path) {
+   223|     return new FallbackRoute("404", method, path, MediaType.ALL, (req, rsp, chain) -> {
+   224|       if (!rsp.status().isPresent()) {
+   225|         throw new Err(Status.NOT_FOUND, req.path(true));
+   226|       }
+   227|     });
+   228|   }
+   229|   public static RouteWithFilter fallback(final Filter filter, final String method,
+   230|     final String path, final String name, final List<MediaType> produces) {
+   231|     return new FallbackRoute(name, method, path, produces, filter);
+   232|   }
+   233|   public RouteImpl(final Filter filter, final Definition route, final String method,
+   234|     final String path, final List<MediaType> produces, final Map<Object, String> vars,
+   235|     final Mapper<?> mapper, final Source source) {
+   236|     this.filter = filter;
+   237|     if (mapper != null) {
+   238|       if (filter instanceof Route.OneArgHandler) {
+   239|         this.filter = new MappedHandler((req, rsp) -> ((Route.OneArgHandler) filter).handle(req),
+   240|           mapper);
+   241|       } else if (filter instanceof Route.ZeroArgHandler) {
+   242|         this.filter = new MappedHandler((req, rsp) -> ((Route.ZeroArgHandler) filter).handle(),
+   243|           mapper);
+   244|       } else if (filter instanceof MvcHandler) {
+   245|         if (((MvcHandler) filter).method().getReturnType() == void.class) {
+
+
+# ====================================================================
+# FILE: modules/jooby-jetty/src/main/java/org/jooby/internal/jetty/JettyHandler.java
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 228-268 ---
+   228|   private String tmpdir;
+   229|   private MultipartConfigElement multiPartConfig;
+   230|   public JettyHandler(final HttpHandler dispatcher,
+   231|       final WebSocketServerFactory webSocketServerFactory, final String tmpdir,
+   232|       final int fileSizeThreshold) {
+   233|     this.dispatcher = dispatcher;
+   234|     this.webSocketServerFactory = webSocketServerFactory;
+   235|     this.tmpdir = tmpdir;
+   236|     this.multiPartConfig = new MultipartConfigElement(tmpdir, -1L, -1L, fileSizeThreshold);
+   237|     this.addManaged(webSocketServerFactory);
+   238|   }
+   239|   @Override
+   240|   public void handle(final String target, final Request baseRequest,
+   241|       final HttpServletRequest request, final HttpServletResponse response) throws IOException,
+   242|       ServletException {
+   243|     try {
+   244|       baseRequest.setHandled(true);
+   245|       String type = baseRequest.getContentType();
+   246|       boolean multipart = false;
+   247|       if (type != null && type.toLowerCase().startsWith(MediaType.multipart.name())) {
+   248|         baseRequest.setAttribute(Request.__MULTIPART_CONFIG_ELEMENT, multiPartConfig);
+   249|         multipart = true;
+   250|       }
+   251|       ServletServletRequest nreq = new ServletServletRequest(request, tmpdir, multipart)
+   252|           .with(upgrade(baseRequest, request, response, webSocketServerFactory));
+   253|       dispatcher.handle(nreq, new JettyResponse(nreq, response));
+   254|     } catch (IOException | ServletException | RuntimeException ex) {
+   255|       baseRequest.setHandled(false);
+   256|       log.error("execution of: " + target + " resulted in error", ex);
+   257|       throw ex;
+   258|     } catch (Throwable ex) {
+   259|       baseRequest.setHandled(false);
+   260|       log.error("execution of: " + target + " resulted in error", ex);
+   261|       throw new IllegalStateException(ex);
+   262|     }
+   263|   }
+   264|   private static ServletUpgrade upgrade(final Request baseRequest, final HttpServletRequest request,
+   265|       final HttpServletResponse response, final WebSocketServerFactory webSocketServerFactory) {
+   266|     return new ServletUpgrade() {
+   267|       @SuppressWarnings("unchecked")
+   268|       @Override
+

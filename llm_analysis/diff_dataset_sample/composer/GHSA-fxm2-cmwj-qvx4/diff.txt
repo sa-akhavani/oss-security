@@ -1,0 +1,300 @@
+--- a/phpmyfaq/admin/category.add.php
++++ b/phpmyfaq/admin/category.add.php
+@@ -7,21 +7,20 @@
+  * v. 2.0. If a copy of the MPL was not distributed with this file, You can
+  * obtain one at https://mozilla.org/MPL/2.0/.
+  *
+  * @package   phpMyFAQ
+  * @author    Thorsten Rinne <thorsten@phpmyfaq.de>
+  * @copyright 2003-2024 phpMyFAQ Team
+  * @license   https://www.mozilla.org/MPL/2.0/ Mozilla Public License Version 2.0
+  * @link      https://www.phpmyfaq.de
+  * @since     2003-12-20
+  */
+-use phpMyFAQ\Category;
+ use phpMyFAQ\Category\Permission;
+ use phpMyFAQ\Enums\PermissionType;
+ use phpMyFAQ\Filter;
+ use phpMyFAQ\Helper\UserHelper;
+ use phpMyFAQ\Language\LanguageCodes;
+ use phpMyFAQ\Session\Token;
+ use phpMyFAQ\Translation;
+ use phpMyFAQ\Template\TwigWrapper;
+ if (!defined('IS_VALID_PHPMYFAQ')) {
+     http_response_code(400);
+@@ -60,41 +59,26 @@
+         'ad_entry_all_groups' => Translation::get('ad_entry_all_groups'),
+         'ad_entry_restricted_groups' => Translation::get('ad_entry_restricted_groups'),
+         'msgSerpTitle' => Translation::get('msgSerpTitle'),
+         'msgSerpDescription' => Translation::get('msgSerpDescription'),
+         'restricted_groups' => ($faqConfig->get('security.permLevel') === 'medium') ?
+             $currentUser->perm->getAllGroupsOptions([], $user) : '',
+     ];
+     if ($parentId > 0) {
+         $userAllowed = $categoryPermission->get(Permission::USER, [$parentId]);
+         $groupsAllowed = $categoryPermission->get(Permission::GROUP, [$parentId]);
+-        if (!isset($category->categoryName[$parentId])) {
+-            $baseCategory = new Category($faqConfig, [], false);
+-            $baseCategory->setLanguage($faqConfig->getLanguage()->getLanguage());
+-            $parentCategoryData = $baseCategory->getCategoryData($parentId);
+-            if ($parentCategoryData->getId() > 0) {
+-                $parentCategoryLang = $parentCategoryData->getLang();
+-                $parentCategoryName = $parentCategoryData->getName();
+-            } else {
+-                $parentCategoryLang = $faqConfig->getLanguage()->getLanguage();
+-                $parentCategoryName = '';
+-            }
+-        } else {
+-            $parentCategoryLang = $category->categoryName[$parentId]['lang'];
+-            $parentCategoryName = $category->categoryName[$parentId]['name'];
+-        }
+         $templateVars = [
+             ...$templateVars,
+-            'categoryNameLangCode' => LanguageCodes::get($parentCategoryLang),
++            'categoryNameLangCode' => LanguageCodes::get($category->categoryName[$parentId]['lang']),
+             'userAllowed' => $categoryPermission->get(Permission::USER, [$parentId])[0],
+             'groupsAllowed' => $categoryPermission->get(Permission::GROUP, [$parentId]),
+-            'categoryName' => $parentCategoryName,
++            'categoryName' => $category->categoryName[$parentId]['name'],
+             'msgMainCategory' => Translation::get('msgMainCategory'),
+         ];
+     }
+     if ($faqConfig->get('security.permLevel') !== 'basic') {
+         $templateVars = [
+             ...$templateVars,
+             'groupsOptions' => $currentUser->perm->getAllGroupsOptions([], $currentUser),
+             'ad_categ_moderator' => Translation::get('ad_categ_moderator')
+         ];
+     }
+
+--- a/phpmyfaq/src/phpMyFAQ/Configuration.php
++++ b/phpmyfaq/src/phpMyFAQ/Configuration.php
+@@ -392,21 +392,21 @@
+             'core.elasticsearchConfig', // $ES
+             'core.pluginManager', // PluginManager
+         ];
+         foreach ($newConfigs as $name => $value) {
+             if ($name != 'main.phpMyFAQToken' && !in_array($name, $runtimeConfigs)) {
+                 $update = sprintf(
+                     "UPDATE %s%s SET config_value = '%s' WHERE config_name = '%s'",
+                     Database::getTablePrefix(),
+                     $this->tableName,
+                     $this->getDb()->escape(trim($value)),
+-                    $this->getDb()->escape($name)
++                    $name
+                 );
+                 $this->getDb()->query($update);
+                 if (isset($this->config[$name])) {
+                     unset($this->config[$name]);
+                 }
+             }
+         }
+         return true;
+     }
+     /**
+
+--- a/phpmyfaq/src/phpMyFAQ/Controller/Administration/UserController.php
++++ b/phpmyfaq/src/phpMyFAQ/Controller/Administration/UserController.php
+@@ -224,21 +224,21 @@
+      */
+     public function addUser(Request $request): JsonResponse
+     {
+         $this->userHasUserPermission();
+         $data = json_decode($request->getContent());
+         if (!Token::getInstance()->verifyToken('add-user', $data->csrf)) {
+             return $this->json(['error' => Translation::get('err_NotAuth')], Response::HTTP_UNAUTHORIZED);
+         }
+         $errorMessage = [];
+         $userName = Filter::filterVar($data->userName, FILTER_SANITIZE_SPECIAL_CHARS);
+-        $userRealName = trim(strip_tags((string) $data->realName));
++        $userRealName = Filter::filterVar($data->realName, FILTER_SANITIZE_SPECIAL_CHARS);
+         $userEmail = Filter::filterVar($data->email, FILTER_VALIDATE_EMAIL);
+         $automaticPassword = Filter::filterVar($data->automaticPassword, FILTER_VALIDATE_BOOLEAN);
+         $userPassword = Filter::filterVar($data->password, FILTER_SANITIZE_SPECIAL_CHARS);
+         $userPasswordConfirm = Filter::filterVar($data->passwordConfirm, FILTER_SANITIZE_SPECIAL_CHARS);
+         $userIsSuperAdmin = Filter::filterVar($data->isSuperAdmin, FILTER_VALIDATE_BOOLEAN);
+         $newUser = new User($this->configuration);
+         if (!$newUser->isValidLogin($userName)) {
+             $errorMessage[] = Translation::get('ad_user_error_loginInvalid');
+         }
+         if ($newUser->getUserByLogin($userName, false)) {
+@@ -279,21 +279,21 @@
+         $this->userHasPermission(PermissionType::USER_EDIT);
+         $data = json_decode($request->getContent());
+         if (!Token::getInstance()->verifyToken('update-user-data', $data->csrfToken)) {
+             return $this->json(['error' => Translation::get('err_NotAuth')], Response::HTTP_UNAUTHORIZED);
+         }
+         $userId = Filter::filterVar($data->userId, FILTER_VALIDATE_INT, 0);
+         if ($userId === 0) {
+             return $this->json(['error' => Translation::get('ad_user_error_noId')], Response::HTTP_BAD_REQUEST);
+         } else {
+             $userData = [];
+-            $userData['display_name'] = trim(strip_tags((string) $data->display_name));
++            $userData['display_name'] = Filter::filterVar($data->display_name, FILTER_SANITIZE_SPECIAL_CHARS);
+             $userData['email'] = Filter::filterVar($data->email, FILTER_VALIDATE_EMAIL);
+             $userData['last_modified'] = Filter::filterVar($data->last_modified, FILTER_SANITIZE_SPECIAL_CHARS);
+             $userStatus = Filter::filterVar($data->user_status, FILTER_SANITIZE_SPECIAL_CHARS, 'active');
+             $isSuperAdmin = Filter::filterVar($data->is_superadmin, FILTER_SANITIZE_SPECIAL_CHARS);
+             $deleteTwoFactor = Filter::filterVar($data->overwrite_twofactor, FILTER_SANITIZE_SPECIAL_CHARS);
+             $deleteTwoFactor = $deleteTwoFactor === 'on';
+             $user = new User($this->configuration);
+             $user->getUserById($userId, true);
+             $stats = $user->getStatus();
+             if ($deleteTwoFactor) {
+
+--- a/phpmyfaq/src/phpMyFAQ/Controller/Frontend/RegistrationController.php
++++ b/phpmyfaq/src/phpMyFAQ/Controller/Frontend/RegistrationController.php
+@@ -26,21 +26,21 @@
+ class RegistrationController extends AbstractController
+ {
+     /**
+      * @throws \JsonException
+      * @throws Exception
+      */
+     public function create(Request $request): JsonResponse
+     {
+         $registration = new RegistrationHelper($this->configuration);
+         $data = json_decode($request->getContent(), false, 512, JSON_THROW_ON_ERROR);
+-        $fullName = trim(strip_tags((string) $data->realname));
++        $fullName = trim((string) Filter::filterVar($data->realname, FILTER_SANITIZE_SPECIAL_CHARS));
+         $userName = trim((string) Filter::filterVar($data->name, FILTER_SANITIZE_SPECIAL_CHARS));
+         $email = trim((string) Filter::filterVar($data->email, FILTER_VALIDATE_EMAIL));
+         $isVisible = Filter::filterVar($data->isVisible, FILTER_SANITIZE_SPECIAL_CHARS) ?? false;
+         if (!$this->captchaCodeIsValid($request)) {
+             return $this->json(['error' => Translation::get('msgCaptcha')], Response::HTTP_BAD_REQUEST);
+         }
+         if (!$registration->isDomainAllowed($email)) {
+             return $this->json(['error' => 'The domain is not allowed.'], Response::HTTP_BAD_REQUEST);
+         }
+         if (!empty($userName) && !empty($email) && !empty($fullName)) {
+
+--- a/phpmyfaq/src/phpMyFAQ/Controller/Frontend/UserController.php
++++ b/phpmyfaq/src/phpMyFAQ/Controller/Frontend/UserController.php
+@@ -37,21 +37,21 @@
+     public function updateData(Request $request): JsonResponse
+     {
+         $this->userIsAuthenticated();
+         $user = CurrentUser::getCurrentUser($this->configuration);
+         $data = json_decode($request->getContent());
+         $csrfToken = Filter::filterVar($data->{'pmf-csrf-token'}, FILTER_SANITIZE_SPECIAL_CHARS);
+         if (!Token::getInstance()->verifyToken('ucp', $csrfToken)) {
+             return $this->json(['error' => Translation::get('ad_msg_noauth')], Response::HTTP_UNAUTHORIZED);
+         }
+         $userId = Filter::filterVar($data->userid, FILTER_VALIDATE_INT);
+-        $userName = trim(strip_tags((string) $data->name));
++        $userName = trim((string) Filter::filterVar($data->name, FILTER_SANITIZE_SPECIAL_CHARS));
+         $email = Filter::filterVar($data->email, FILTER_VALIDATE_EMAIL);
+         $isVisible = Filter::filterVar($data->{'is_visible'}, FILTER_SANITIZE_SPECIAL_CHARS);
+         $password = trim((string) Filter::filterVar($data->faqpassword, FILTER_SANITIZE_SPECIAL_CHARS));
+         $confirm = trim((string) Filter::filterVar($data->faqpassword_confirm, FILTER_SANITIZE_SPECIAL_CHARS));
+         $twoFactorEnabled = Filter::filterVar($data->twofactor_enabled ?? 'off', FILTER_SANITIZE_SPECIAL_CHARS);
+         $isAzureAdUser = $user->getUserAuthSource() === 'azure';
+         $isWebAuthnUser = $user->getUserAuthSource() === 'webauthn';
+         if ($userId !== $user->getUserId()) {
+             return $this->json(['error' => 'User ID mismatch!'], Response::HTTP_BAD_REQUEST);
+         }
+
+--- a/phpmyfaq/src/phpMyFAQ/Mail.php
++++ b/phpmyfaq/src/phpMyFAQ/Mail.php
+@@ -222,33 +222,30 @@
+         }
+         return $this->addEmailTo($target, $targetAlias, $address, $name);
+     }
+     /**
+      * Add an e-mail address to an array.
+      *
+      * @param array<string> $target Target array.
+      * @param string        $targetAlias Alias Target alias.
+      * @param string        $address User e-mail address.
+      * @param string|null   $name Username (optional).
++     * @throws Exception
+      * @return bool True if successful, false otherwise.
+      */
+     private function addEmailTo(array &$target, string $targetAlias, string $address, ?string $name = null): bool
+     {
+         if (!self::validateEmail($address)) {
+-            $this->configuration->getLogger()->error('"' . $address . '" is not a valid email address!');
+-            return false;
++            throw new Exception('"' . $address . '" is not a valid email address!');
+         }
+         if (array_key_exists($address, $target)) {
+-            $this->configuration->getLogger()->error(
+-                '"' . $address . '" has been already added in ' . $targetAlias . '!'
+-            );
+-            return false;
++            throw new Exception('"' . $address . '" has been already added in ' . $targetAlias . '!');
+         }
+         if (isset($name)) {
+             $name = str_replace(["\n", "\r"], '', $name);
+             $name = iconv_mime_encode($targetAlias, $name);
+             $name = '"' . str_replace('"', '\"', $name) . '"';
+         }
+         $target[$address] = $name;
+         if ('WIN' !== strtoupper(substr(PHP_OS, 0, 3))) {
+             return true;
+         }
+
+--- a/phpmyfaq/src/phpMyFAQ/System.php
++++ b/phpmyfaq/src/phpMyFAQ/System.php
+@@ -34,21 +34,21 @@
+      * Major version.
+      */
+     private const VERSION_MAJOR = 4;
+     /**
+      * Minor version.
+      */
+     private const VERSION_MINOR = 0;
+     /**
+      * Patch level.
+      */
+-    private const VERSION_PATCH_LEVEL = 14;
++    private const VERSION_PATCH_LEVEL = 13;
+     /**
+      * Pre-release version.
+      */
+     private const VERSION_PRE_RELEASE = '';
+     /**
+      * API version.
+      */
+     private const VERSION_API = '3.0';
+     /**
+      * Plugin version.
+
+--- a/phpmyfaq/src/phpMyFAQ/User/UserData.php
++++ b/phpmyfaq/src/phpMyFAQ/User/UserData.php
+@@ -59,27 +59,20 @@
+             'SELECT %s FROM %sfaquserdata WHERE user_id = %d',
+             $fields,
+             Database::getTablePrefix(),
+             $this->userId
+         );
+         $res = $this->configuration->getDb()->query($select);
+         if ($this->configuration->getDb()->numRows($res) != 1) {
+             return false;
+         }
+         $array = $this->configuration->getDb()->fetchArray($res);
+-        if (isset($array['display_name'])) {
+-            $array['display_name'] = html_entity_decode(
+-                $array['display_name'],
+-                ENT_QUOTES | ENT_HTML5 | ENT_SUBSTITUTE,
+-                'UTF-8'
+-            );
+-        }
+         return $singleReturn && $field != '*' ? $array[$field] : $array;
+     }
+     /**
+      * Returns the first result of the given key.
+      */
+     public function fetch(string $key, string $value): ?string
+     {
+         $select = sprintf(
+             "SELECT %s FROM %sfaquserdata WHERE %s = '%s'",
+             $key,
+
+--- a/scripts/version.sh
++++ b/scripts/version.sh
+@@ -1,3 +1,3 @@
+ if [ -z "${PMF_VERSION}" ]; then
+-    PMF_VERSION="4.0.14"
++    PMF_VERSION="4.0.13"
+ fi

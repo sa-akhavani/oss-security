@@ -1,0 +1,112 @@
+--- a/src/SharpCompress/Common/ExtractionMethods.cs
++++ b/src/SharpCompress/Common/ExtractionMethods.cs
+@@ -3,34 +3,26 @@
+ namespace SharpCompress.Common
+ {
+     internal static class ExtractionMethods
+     {
+         public static void WriteEntryToDirectory(IEntry entry,
+                                                  string destinationDirectory,
+                                                  ExtractionOptions? options,
+                                                  Action<string, ExtractionOptions?> write)
+         {
+             string destinationFileName;
++            string file = Path.GetFileName(entry.Key);
+             string fullDestinationDirectoryPath = Path.GetFullPath(destinationDirectory);
+-            if (fullDestinationDirectoryPath[fullDestinationDirectoryPath.Length - 1] != Path.DirectorySeparatorChar)
+-            {
+-                fullDestinationDirectoryPath += Path.DirectorySeparatorChar;
+-            }
+-            if (!Directory.Exists(fullDestinationDirectoryPath))
+-            {
+-                throw new ExtractionException($"Directory does not exist to extract to: {fullDestinationDirectoryPath}");
+-            }
+             options ??= new ExtractionOptions()
+             {
+                 Overwrite = true
+             };
+-            string file = Path.GetFileName(entry.Key);
+             if (options.ExtractFullPath)
+             {
+                 string folder = Path.GetDirectoryName(entry.Key)!;
+                 string destdir = Path.GetFullPath(Path.Combine(fullDestinationDirectoryPath, folder));
+                 if (!Directory.Exists(destdir))
+                 {
+                     if (!destdir.StartsWith(fullDestinationDirectoryPath, StringComparison.Ordinal))
+                     {
+                         throw new ExtractionException("Entry is trying to create a directory outside of the destination directory.");
+                     }
+
+--- a/src/SharpCompress/Common/Zip/SeekableZipHeaderFactory.cs
++++ b/src/SharpCompress/Common/Zip/SeekableZipHeaderFactory.cs
+@@ -84,21 +84,21 @@
+         {
+             if (stream.Length < MINIMUM_EOCD_LENGTH)
+             {
+                 throw new ArchiveException("Could not find Zip file Directory at the end of the file. File may be corrupted.");
+             }
+             int len = stream.Length < MAX_SEARCH_LENGTH_FOR_EOCD ? (int)stream.Length : MAX_SEARCH_LENGTH_FOR_EOCD;
+             byte[] needle = { 0x06, 0x05, 0x4b, 0x50 };
+             stream.Seek(-len, SeekOrigin.End);
+             byte[] seek = reader.ReadBytes(len);
+             Array.Reverse(seek);
+-            var max_search_area = len; // - MINIMUM_EOCD_LENGTH;
++            var max_search_area = len - MINIMUM_EOCD_LENGTH;
+             for( int pos_from_end = 0; pos_from_end < max_search_area; ++pos_from_end)
+             {
+                 if( IsMatch(seek, pos_from_end, needle) )
+                 {
+                     stream.Seek(-pos_from_end, SeekOrigin.End);
+                     return;
+                 }
+             }
+             throw new ArchiveException("Failed to locate the Zip Header");
+         }
+
+--- a/src/SharpCompress/Writers/Tar/TarWriter.cs
++++ b/src/SharpCompress/Writers/Tar/TarWriter.cs
+@@ -70,34 +70,40 @@
+             {
+                 throw new ArgumentException("Seekable stream is required if no size is given.");
+             }
+             long realSize = size ?? source.Length;
+             TarHeader header = new TarHeader(WriterOptions.ArchiveEncoding);
+             header.LastModifiedTime = modificationTime ?? TarHeader.EPOCH;
+             header.Name = NormalizeFilename(filename);
+             header.Size = realSize;
+             header.Write(OutputStream);
+             size = source.TransferTo(OutputStream);
+-            PadTo512(size.Value);
++            PadTo512(size.Value, false);
+         }
+-        private void PadTo512(long size)
++        private void PadTo512(long size, bool forceZeros)
+         {
+-            int zeros = unchecked((int)(((size + 511L) & ~511L) - size));
++            int zeros = (int)size % 512;
++            if (zeros == 0 && !forceZeros)
++            {
++                return;
++            }
++            zeros = 512 - zeros;
+             OutputStream.Write(stackalloc byte[zeros]);
+         }
+         protected override void Dispose(bool isDisposing)
+         {
+             if (isDisposing)
+             {
+                 if (finalizeArchiveOnClose)
+                 {
+-                    OutputStream.Write(stackalloc byte[1024]);
++                    PadTo512(0, true);
++                    PadTo512(0, true);
+                 }
+                 switch (OutputStream)
+                 {
+                     case BZip2Stream b:
+                         {
+                             b.Finish();
+                             break;
+                         }
+                     case LZipStream l:
+                         {

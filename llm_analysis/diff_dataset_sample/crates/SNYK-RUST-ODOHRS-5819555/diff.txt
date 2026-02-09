@@ -1,0 +1,158 @@
+--- a/examples/cli.rs
++++ b/examples/cli.rs
+@@ -1,12 +1,11 @@
+ use anyhow::{Context, Result};
+-use base64::{engine::general_purpose, Engine as _};
+ use clap::Parser;
+ use domain::base::{Dname as DnameO, Message, MessageBuilder, ParsedDname, Rtype};
+ use domain::rdata::AllRecordData;
+ use log::{info, trace};
+ use odoh_rs::*;
+ use rand::rngs::StdRng;
+ use rand::{Rng, SeedableRng};
+ use reqwest::{Client, RequestBuilder, Url};
+ type Dname = DnameO<Vec<u8>>;
+ const WELL_KNOWN_CONF_PATH: &str = "/.well-known/odohconfigs";
+@@ -34,30 +33,24 @@
+         help = "Target base URL",
+         default_value = "https://odoh.cloudflare-dns.com"
+     )]
+     service: Url,
+     #[clap(short, long, help = "Use user provided config, encoded in hexstring")]
+     configs: Option<String>,
+     #[clap(
+         name = "header",
+         long,
+         help = "Extra header to add, in \"key:value\" format, can appear multiple times",
++        long_help = "foo",
+         value_parser
+     )]
+     headers: Vec<String>,
+-    #[clap(
+-        name = "step",
+-        long,
+-        help = "Dump encrypted query and read the encrypted response from user instead",
+-        value_parser
+-    )]
+-    step: bool,
+ }
+ #[tokio::main]
+ async fn main() -> Result<()> {
+     env_logger::init();
+     let opts: Opts = Opts::parse();
+     let cli = Client::new();
+     let configs_bytes = if let Some(s) = opts.configs {
+         info!("Use user provided configs");
+         hex::decode(s).context("Invalid hex value of configs")?
+     } else {
+@@ -96,45 +89,34 @@
+     let query = ObliviousDoHMessagePlaintext::new(&msg, padding_len);
+     trace!(
+         "Encrypting DNS message with {} bytes of padding",
+         padding_len
+     );
+     let (query_enc, cli_secret) =
+         encrypt_query(&query, &config, &mut rng).context("failed to encrypt query")?;
+     let query_body = compose(&query_enc)
+         .context("failed to compose query body")?
+         .freeze();
+-    let mut resp_body = if opts.step {
+-        println!(
+-            "* Encrypted request in base64: {}\n* Paste the encrypted response in base64 below:",
+-            general_purpose::URL_SAFE.encode(&query_body)
+-        );
+-        let mut buffer = String::new();
+-        std::io::stdin().read_line(&mut buffer)?;
+-        println!("decoding [{}]", buffer.trim());
+-        general_purpose::URL_SAFE.decode(&buffer.trim())?.into()
+-    } else {
+-        trace!("Exchanging with server");
+-        let mut req_builder = cli
+-            .post(opts.service.join("/dns-query")?)
+-            .header("content-type", ODOH_HTTP_HEADER)
+-            .header("accept", ODOH_HTTP_HEADER);
+-        req_builder = add_headers(req_builder, &opts.headers);
+-        req_builder
+-            .body(query_body)
+-            .send()
+-            .await
+-            .context("failed to query target server")?
+-            .bytes()
+-            .await
+-            .context("failed to get response body")?
+-    };
++    trace!("Exchanging with server");
++    let mut req_builder = cli
++        .post(opts.service.join("/dns-query")?)
++        .header("content-type", ODOH_HTTP_HEADER)
++        .header("accept", ODOH_HTTP_HEADER);
++    req_builder = add_headers(req_builder, &opts.headers);
++    let mut resp_body = req_builder
++        .body(query_body)
++        .send()
++        .await
++        .context("failed to query target server")?
++        .bytes()
++        .await
++        .context("failed to get response body")?;
+     trace!("Decrypting DNS message");
+     let response_enc = parse(&mut resp_body).context("failed to parse response body")?;
+     let response_dec = decrypt_response(&query, &response_enc, cli_secret)
+         .context("failed to decrypt resopnse")?;
+     let msg_bytes = response_dec.into_msg();
+     let msg =
+         Message::from_octets(msg_bytes.as_ref()).context("failed to parse response message")?;
+     trace!("Printing DNS response");
+     for (rr, _) in msg.for_slice().iter().filter_map(|r| r.ok()) {
+         if rr.rtype() == Rtype::Opt {
+
+--- a/src/protocol.rs
++++ b/src/protocol.rs
+@@ -414,23 +414,20 @@
+     if query.msg_type != ObliviousDoHMessageType::Query {
+         return Err(Error::InvalidMessageType);
+     }
+     let key_id = key_pair.public().identifier()?;
+     let key_id_recv = &query.key_id;
+     if !key_id_recv.eq(&key_id) {
+         return Err(Error::KeyIdMismatch);
+     }
+     let server_sk = key_pair.private();
+     let key_size = <Kem as KemTrait>::PublicKey::size();
+-    if key_size > query.encrypted_msg.len() {
+-        return Err(Error::InvalidInputLength);
+-    }
+     let (enc, ct) = query.encrypted_msg.split_at(key_size);
+     let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(enc)?;
+     let mut recv_ctx = hpke::setup_receiver::<Aead, Kdf, Kem>(
+         &OpModeR::Base,
+         server_sk,
+         &encapped_key,
+         LABEL_QUERY,
+     )?;
+     let aad = build_aad(ObliviousDoHMessageType::Query, &key_id)?;
+     let plaintext = recv_ctx.open(ct, &aad)?;
+@@ -622,22 +619,11 @@
+         let last = query_bytes.len() - 1;
+         query_bytes[last] = 0x01;
+         assert_eq!(
+             Error::InvalidPadding,
+             parse::<ObliviousDoHMessagePlaintext, _>(&mut query_bytes.freeze()).unwrap_err()
+         );
+         let mut query = query;
+         query.padding = vec![1, 2].into();
+         assert_eq!(Error::InvalidPadding, compose(&query).unwrap_err());
+     }
+-    #[test]
+-    fn parse_encapsulated_key() {
+-        let mut rng = StdRng::from_seed([0; 32]);
+-        let key_pair = ObliviousDoHKeyPair::new(&mut rng);
+-        let query_enc = ObliviousDoHMessage {
+-            msg_type: ObliviousDoHMessageType::Query,
+-            key_id: key_pair.public().identifier().unwrap().to_vec().into(),
+-            encrypted_msg: b"too short".to_vec().into(),
+-        };
+-        assert!(decrypt_query(&query_enc, &key_pair).is_err());
+-    }
+-}
++}

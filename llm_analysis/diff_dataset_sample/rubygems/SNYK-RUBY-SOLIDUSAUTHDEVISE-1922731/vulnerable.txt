@@ -1,0 +1,154 @@
+# ====================================================================
+# FILE: app/models/spree/user.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-29 ---
+     1| require 'paranoia'
+     2| module Spree
+     3|   class User < Spree::Base
+     4|     include UserMethods
+     5|     devise :database_authenticatable, :registerable, :recoverable,
+     6|            :rememberable, :trackable, :validatable, :encryptable
+     7|     devise :confirmable if Spree::Auth::Config[:confirmable]
+     8|     acts_as_paranoid
+     9|     after_destroy :scramble_email_and_password
+    10|     def password=(new_password)
+    11|       generate_spree_api_key if new_password.present? && spree_api_key.present?
+    12|       super
+    13|     end
+    14|     before_validation :set_login
+    15|     scope :admin, -> { includes(:spree_roles).where("#{Role.table_name}.name" => "admin") }
+    16|     def self.admin_created?
+    17|       User.admin.count > 0
+    18|     end
+    19|     def admin?
+    20|       has_spree_role?('admin')
+    21|     end
+    22|     def confirmed?
+    23|       !!confirmed_at
+    24|     end
+    25|     protected
+    26|     def password_required?
+    27|       !persisted? || password.present? || password_confirmation.present?
+    28|     end
+    29|     private
+
+
+# ====================================================================
+# FILE: lib/controllers/frontend/spree/users_controller.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-40 ---
+     1| class Spree::UsersController < Spree::StoreController
+     2|   skip_before_action :set_current_order, only: :show, raise: false
+     3|   prepend_before_action :load_object, only: [:show, :edit, :update]
+     4|   prepend_before_action :authorize_actions, only: :new
+     5|   include Spree::Core::ControllerHelpers
+     6|   def show
+     7|     @orders = @user.orders.complete.order('completed_at desc')
+     8|   end
+     9|   def create
+    10|     @user = Spree::User.new(user_params)
+    11|     if @user.save
+    12|       if current_order
+    13|         session[:guest_token] = nil
+    14|       end
+    15|       redirect_back_or_default(root_url)
+    16|     else
+    17|       render :new
+    18|     end
+    19|   end
+    20|   def update
+    21|     if @user.update(user_params)
+    22|       spree_current_user.reload
+    23|       redirect_url = spree.account_url
+    24|       if params[:user][:password].present?
+    25|         if Spree::Auth::Config[:signout_after_password_change]
+    26|           redirect_url = spree.login_url
+    27|         else
+    28|           bypass_sign_in(@user)
+    29|         end
+    30|       end
+    31|       redirect_to redirect_url, notice: I18n.t('spree.account_updated')
+    32|     else
+    33|       render :edit
+    34|     end
+    35|   end
+    36|   private
+    37|   def user_params
+    38|     params.require(:user).permit(Spree::PermittedAttributes.user_attributes | [:email])
+    39|   end
+    40|   def load_object
+
+
+# ====================================================================
+# FILE: lib/spree/auth/version.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-5 ---
+     1| module Spree
+     2|   module Auth
+     3|     VERSION = '2.5.3'
+     4|   end
+     5| end
+
+
+# ====================================================================
+# FILE: spec/models/user_spec.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 22-74 ---
+    22|     it "does not generate a spree api key if password is empty" do
+    23|       user.generate_spree_api_key!
+    24|       expect {
+    25|         user.password = ""
+    26|         user.password_confirmation = ""
+    27|         user.save!
+    28|       }.not_to change(user, :spree_api_key)
+    29|     end
+    30|     it "does not generate a spree api key on password change if no key existed previously" do
+    31|       user.clear_spree_api_key!
+    32|       expect {
+    33|         user.password = "123456678"
+    34|         user.password_confirmation = "123456678"
+    35|         user.save!
+    36|       }.not_to change(user, :spree_api_key)
+    37|       expect(user.reload.spree_api_key).to be_nil
+    38|     end
+    39|   end
+    40|   describe '#destroy' do
+    41|     let(:user) { create(:user) }
+    42|     it 'acts_as_paranoid' do
+    43|       expect(described_class).to respond_to(:with_deleted)
+    44|       expect(user).to respond_to(:deleted_at)
+    45|     end
+    46|     context 'with same email address as previously deleted account' do
+    47|       it 'will allow users to register later' do
+    48|         user1 = build(:user)
+    49|         user1.save
+    50|         user2 = build(:user)
+    51|         user2.email = user1.email
+    52|         expect(user2.save).to be false
+    53|         expect(user2.errors.messages[:email].first).to eq "has already been taken"
+    54|         user1.destroy
+    55|         expect(user2.save).to be true
+    56|       end
+    57|     end
+    58|   end
+    59|   describe '#really_destroy!' do
+    60|     let(:user) { create(:user) }
+    61|     it 'removes the record from the database' do
+    62|       user.really_destroy!
+    63|       expect(Spree::User.with_deleted.exists?(id: user.id)).to eql false
+    64|     end
+    65|   end
+    66|   describe "confirmable" do
+    67|     it "loads Devise's :confirmable module when :confirmable is true", confirmable: true do
+    68|       expect(Spree::User.ancestors).to include(Devise::Models::Confirmable)
+    69|     end
+    70|     it "does not load Devise's :confirmable module when :confirmable is false", confirmable: false do
+    71|       expect(Spree::User.ancestors).not_to include(Devise::Models::Confirmable)
+    72|     end
+    73|   end
+    74| end
+

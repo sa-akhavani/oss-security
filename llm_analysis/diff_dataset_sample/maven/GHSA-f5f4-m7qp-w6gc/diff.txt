@@ -1,0 +1,144 @@
+--- a/jooby/src/main/java/org/jooby/Err.java
++++ b/jooby/src/main/java/org/jooby/Err.java
+@@ -195,24 +195,23 @@
+  *
+  *        http://www.apache.org/licenses/LICENSE-2.0
+  *
+  *    Unless required by applicable law or agreed to in writing, software
+  *    distributed under the License is distributed on an "AS IS" BASIS,
+  *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  *    See the License for the specific language governing permissions and
+  *    limitations under the License.
+  */
+ package org.jooby;
+-import java.util.*;
+-import java.util.function.BiFunction;
+-import java.util.function.Function;
+-import java.util.function.Supplier;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Optional;
+ import com.typesafe.config.Config;
+ import org.jooby.funzy.Try;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import com.google.common.base.Throwables;
+ import javax.annotation.Nullable;
+ /**
+  * An exception that carry a {@link Status}. The status field will be set in the HTTP
+  * response.
+  *
+@@ -266,32 +265,26 @@
+   public static class DefHandler implements Err.Handler {
+     /** Default err view. */
+     public static final String VIEW = "err";
+     /** logger, logs!. */
+     private final Logger log = LoggerFactory.getLogger(Err.class);
+     @Override
+     public void handle(final Request req, final Response rsp, final Err ex) throws Throwable {
+       log.error("execution of: {}{} resulted in exception\nRoute:\n{}\n\nStacktrace:",
+           req.method(), req.path(), req.route().print(6), ex);
+       Config conf = req.require(Config.class);
+-      Env env = req.require(Env.class);
+       boolean stackstrace = Try.apply(() -> conf.getBoolean("err.stacktrace"))
+-          .orElse(env.name().equals("dev"));
+-      Function<Object, String> xssFilter = env.xss("html").compose(Objects::toString);
+-      BiFunction<String, Object, String> escaper = (k, v) -> xssFilter.apply(v);
+-      Map<String, Object> details = ex.toMap(stackstrace);
+-      details.compute("message", escaper);
+-      details.compute("reason", escaper);
++          .orElse(req.require(Env.class).name().equals("dev"));
+       rsp.send(
+           Results
+-              .when(MediaType.html, () -> Results.html(VIEW).put("err", details))
+-              .when(MediaType.all, () -> details));
++              .when(MediaType.html, () -> Results.html(VIEW).put("err", ex.toMap(stackstrace)))
++              .when(MediaType.all, () -> ex.toMap(stackstrace)));
+     }
+   }
+   /**
+    * Handle and render exceptions. Error handlers are executed in the order they were provided, the
+    * first err handler that send an output wins!
+    *
+    * The default err handler does content negotation on error, see {@link DefHandler}.
+    *
+    * @author edgar
+    * @since 0.1.0
+
+--- a/jooby/src/main/java/org/jooby/internal/HttpHandlerImpl.java
++++ b/jooby/src/main/java/org/jooby/internal/HttpHandlerImpl.java
+@@ -521,21 +521,21 @@
+         if (ex != null) {
+           throw ex;
+         }
+         ex = handle405(routeDefs, method, path, type, accept);
+         if (ex != null) {
+           throw ex;
+         }
+         if (path.equals("/favicon.ico")) {
+           rsp.status(Status.NOT_FOUND).end();
+         } else {
+-          throw new Err(Status.NOT_FOUND, req.path());
++          throw new Err(Status.NOT_FOUND, req.path(true));
+         }
+       }
+     }, method, path, "err", accept));
+     return routes.toArray(new Route[routes.size()]);
+   }
+   private static List<Route> findRoutes(final Set<Route.Definition> routeDefs, final String method,
+       final String path, final MediaType type, final List<MediaType> accept) {
+     List<Route> routes = new ArrayList<>();
+     for (Route.Definition routeDef : routeDefs) {
+       Optional<Route> route = routeDef.matches(method, path, type, accept);
+
+--- a/jooby/src/main/java/org/jooby/internal/RouteImpl.java
++++ b/jooby/src/main/java/org/jooby/internal/RouteImpl.java
+@@ -215,21 +215,21 @@
+   private Definition route;
+   private String path;
+   private Map<Object, String> vars;
+   private Filter filter;
+   private List<MediaType> produces;
+   private String method;
+   private Source source;
+   public static RouteWithFilter notFound(final String method, final String path) {
+     return new FallbackRoute("404", method, path, MediaType.ALL, (req, rsp, chain) -> {
+       if (!rsp.status().isPresent()) {
+-        throw new Err(Status.NOT_FOUND, req.path());
++        throw new Err(Status.NOT_FOUND, req.path(true));
+       }
+     });
+   }
+   public static RouteWithFilter fallback(final Filter filter, final String method,
+     final String path, final String name, final List<MediaType> produces) {
+     return new FallbackRoute(name, method, path, produces, filter);
+   }
+   public RouteImpl(final Filter filter, final Definition route, final String method,
+     final String path, final List<MediaType> produces, final Map<Object, String> vars,
+     final Mapper<?> mapper, final Source source) {
+
+--- a/modules/jooby-jetty/src/main/java/org/jooby/internal/jetty/JettyHandler.java
++++ b/modules/jooby-jetty/src/main/java/org/jooby/internal/jetty/JettyHandler.java
+@@ -238,21 +238,21 @@
+   }
+   @Override
+   public void handle(final String target, final Request baseRequest,
+       final HttpServletRequest request, final HttpServletResponse response) throws IOException,
+       ServletException {
+     try {
+       baseRequest.setHandled(true);
+       String type = baseRequest.getContentType();
+       boolean multipart = false;
+       if (type != null && type.toLowerCase().startsWith(MediaType.multipart.name())) {
+-        baseRequest.setAttribute(Request.MULTIPART_CONFIG_ELEMENT, multiPartConfig);
++        baseRequest.setAttribute(Request.__MULTIPART_CONFIG_ELEMENT, multiPartConfig);
+         multipart = true;
+       }
+       ServletServletRequest nreq = new ServletServletRequest(request, tmpdir, multipart)
+           .with(upgrade(baseRequest, request, response, webSocketServerFactory));
+       dispatcher.handle(nreq, new JettyResponse(nreq, response));
+     } catch (IOException | ServletException | RuntimeException ex) {
+       baseRequest.setHandled(false);
+       log.error("execution of: " + target + " resulted in error", ex);
+       throw ex;
+     } catch (Throwable ex) {

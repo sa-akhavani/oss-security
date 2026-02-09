@@ -1,0 +1,335 @@
+--- a/lib/rubygems.rb
++++ b/lib/rubygems.rb
+@@ -1,14 +1,14 @@
+ require 'rbconfig'
+ require 'thread'
+ module Gem
+-  VERSION = "2.7.6"
++  VERSION = "2.7.5"
+ end
+ require 'rubygems/compatibility'
+ require 'rubygems/defaults'
+ require 'rubygems/deprecate'
+ require 'rubygems/errors'
+ module Gem
+   RUBYGEMS_DIR = File.dirname File.expand_path(__FILE__)
+   WIN_PATTERNS = [
+     /bccwin/i,
+     /cygwin/i,
+
+--- a/lib/rubygems/commands/owner_command.rb
++++ b/lib/rubygems/commands/owner_command.rb
+@@ -42,21 +42,21 @@
+     name = get_one_gem_name
+     add_owners    name, options[:add]
+     remove_owners name, options[:remove]
+     show_owners   name
+   end
+   def show_owners name
+     response = rubygems_api_request :get, "api/v1/gems/#{name}/owners.yaml" do |request|
+       request.add_field "Authorization", api_key
+     end
+     with_response response do |resp|
+-      owners = Gem::SafeYAML.load resp.body
++      owners = YAML.load resp.body
+       say "Owners for gem: #{name}"
+       owners.each do |owner|
+         say "- #{owner['email'] || owner['handle'] || owner['id']}"
+       end
+     end
+   end
+   def add_owners name, owners
+     manage_owners :post, name, owners
+   end
+   def remove_owners name, owners
+
+--- a/lib/rubygems/package.rb
++++ b/lib/rubygems/package.rb
+@@ -190,63 +190,49 @@
+         destination = install_location entry.full_name, destination_dir
+         FileUtils.rm_rf destination
+         mkdir_options = {}
+         mkdir_options[:mode] = entry.header.mode if entry.directory?
+         mkdir =
+           if entry.directory? then
+             destination
+           else
+             File.dirname destination
+           end
+-        mkdir_p_safe mkdir, mkdir_options, destination_dir, entry.full_name
++        FileUtils.mkdir_p mkdir, mkdir_options
+         File.open destination, 'wb' do |out|
+           out.write entry.read
+           FileUtils.chmod entry.header.mode, destination
+         end if entry.file?
+         File.symlink(entry.header.linkname, destination) if entry.symlink?
+         verbose destination
+       end
+     end
+   end
+   def gzip_to io # :yields: gz_io
+     gz_io = Zlib::GzipWriter.new io, Zlib::BEST_COMPRESSION
+     gz_io.mtime = @build_time
+     yield gz_io
+   ensure
+     gz_io.close
+   end
+   def install_location filename, destination_dir # :nodoc:
+     raise Gem::Package::PathError.new(filename, destination_dir) if
+       filename.start_with? '/'
+-    destination_dir = realpath destination_dir
++    destination_dir = File.realpath destination_dir if
++      File.respond_to? :realpath
+     destination_dir = File.expand_path destination_dir
+     destination = File.join destination_dir, filename
+     destination = File.expand_path destination
+     raise Gem::Package::PathError.new(destination, destination_dir) unless
+-      destination.start_with? destination_dir + '/'
++      destination.start_with? destination_dir
+     destination.untaint
+     destination
+-  end
+-  def mkdir_p_safe mkdir, mkdir_options, destination_dir, file_name
+-    destination_dir = realpath File.expand_path(destination_dir)
+-    parts = mkdir.split(File::SEPARATOR)
+-    parts.reduce do |path, basename|
+-      path = realpath path  unless path == ""
+-      path = File.expand_path(path + File::SEPARATOR + basename)
+-      lstat = File.lstat path rescue nil
+-      if !lstat || !lstat.directory?
+-        unless path.start_with? destination_dir and (FileUtils.mkdir path, mkdir_options rescue false)
+-          raise Gem::Package::PathError.new(file_name, destination_dir)
+-        end
+-      end
+-      path
+-    end
+   end
+   def load_spec entry # :nodoc:
+     case entry.full_name
+     when 'metadata' then
+       @spec = Gem::Specification.from_yaml entry.read
+     when 'metadata.gz' then
+       args = [entry]
+       args << { :external_encoding => Encoding::UTF_8 } if
+         Object.const_defined?(:Encoding) &&
+           Zlib::GzipReader.method(:wrap).arity != 1
+@@ -344,39 +330,27 @@
+     gem.each do |entry|
+       verify_entry entry
+     end
+     unless @spec then
+       raise Gem::Package::FormatError.new 'package metadata is missing', @gem
+     end
+     unless @files.include? 'data.tar.gz' then
+       raise Gem::Package::FormatError.new \
+               'package content (data.tar.gz) is missing', @gem
+     end
+-    if duplicates = @files.group_by {|f| f }.select {|k,v| v.size > 1 }.map(&:first) and duplicates.any?
+-      raise Gem::Security::Exception, "duplicate files in the package: (#{duplicates.map(&:inspect).join(', ')})"
+-    end
+   end
+   def verify_gz entry # :nodoc:
+     Zlib::GzipReader.wrap entry do |gzio|
+       gzio.read 16384 until gzio.eof? # gzip checksum verification
+     end
+   rescue Zlib::GzipFile::Error => e
+     raise Gem::Package::FormatError.new(e.message, entry.full_name)
+-  end
+-  if File.respond_to? :realpath
+-    def realpath file
+-      File.realpath file
+-    end
+-  else
+-    def realpath file
+-      file
+-    end
+   end
+ end
+ require 'rubygems/package/digest_io'
+ require 'rubygems/package/source'
+ require 'rubygems/package/file_source'
+ require 'rubygems/package/io_source'
+ require 'rubygems/package/old'
+ require 'rubygems/package/tar_header'
+ require 'rubygems/package/tar_reader'
+ require 'rubygems/package/tar_reader/entry'
+
+--- a/lib/rubygems/package/tar_header.rb
++++ b/lib/rubygems/package/tar_header.rb
+@@ -48,40 +48,36 @@
+                   'A32'  + # gname
+                   'A8'   + # devmajor
+                   'A8'   + # devminor
+                   'A155'   # prefix
+   attr_reader(*FIELDS)
+   def self.from(stream)
+     header = stream.read 512
+     empty = (header == "\0" * 512)
+     fields = header.unpack UNPACK_FORMAT
+     new :name     => fields.shift,
+-        :mode     => strict_oct(fields.shift),
+-        :uid      => strict_oct(fields.shift),
+-        :gid      => strict_oct(fields.shift),
+-        :size     => strict_oct(fields.shift),
+-        :mtime    => strict_oct(fields.shift),
+-        :checksum => strict_oct(fields.shift),
++        :mode     => fields.shift.oct,
++        :uid      => fields.shift.oct,
++        :gid      => fields.shift.oct,
++        :size     => fields.shift.oct,
++        :mtime    => fields.shift.oct,
++        :checksum => fields.shift.oct,
+         :typeflag => fields.shift,
+         :linkname => fields.shift,
+         :magic    => fields.shift,
+-        :version  => strict_oct(fields.shift),
++        :version  => fields.shift.oct,
+         :uname    => fields.shift,
+         :gname    => fields.shift,
+-        :devmajor => strict_oct(fields.shift),
+-        :devminor => strict_oct(fields.shift),
++        :devmajor => fields.shift.oct,
++        :devminor => fields.shift.oct,
+         :prefix   => fields.shift,
+         :empty => empty
+-  end
+-  def self.strict_oct(str)
+-    return str.oct if str =~ /\A[0-7]*\z/
+-    raise ArgumentError, "#{str.inspect} is not an octal string"
+   end
+   def initialize(vals)
+     unless vals[:name] && vals[:size] && vals[:prefix] && vals[:mode] then
+       raise ArgumentError, ":name, :size, :prefix and :mode required"
+     end
+     vals[:uid] ||= 0
+     vals[:gid] ||= 0
+     vals[:mtime] ||= 0
+     vals[:checksum] ||= ""
+     vals[:typeflag] = "0" if vals[:typeflag].nil? || vals[:typeflag].empty?
+
+--- a/lib/rubygems/package/tar_writer.rb
++++ b/lib/rubygems/package/tar_writer.rb
+@@ -90,21 +90,20 @@
+     signature_digest = digests.values.compact.find do |digest|
+       digest_name =
+         if digest.respond_to? :name then
+           digest.name
+         else
+           /::([^:]+)$/ =~ digest.class.name
+           $1
+         end
+       digest_name == signer.digest_name
+     end
+-    raise "no #{signer.digest_name} in #{digests.values.compact}" unless signature_digest
+     if signer.key then
+       signature = signer.sign signature_digest.digest
+       add_file_simple "#{name}.sig", 0444, signature.length do |io|
+         io.write signature
+       end
+     end
+     digests
+   end
+   def add_file_simple(name, mode, size) # :yields: io
+     check_closed
+
+--- a/lib/rubygems/server.rb
++++ b/lib/rubygems/server.rb
+@@ -475,40 +475,30 @@
+           "name"    => dep.name,
+           "type"    => dep.type,
+           "version" => dep.requirement.to_s,
+         }
+       }
+       deps = deps.sort_by { |dep| [dep["name"].downcase, dep["version"]] }
+       deps.last["is_last"] = true unless deps.empty?
+       executables = spec.executables.sort.collect { |exec| {"executable" => exec} }
+       executables = nil if executables.empty?
+       executables.last["is_last"] = true if executables
+-      begin
+-        homepage_uri = URI.parse(spec.homepage)
+-        if [URI::HTTP, URI::HTTPS].member? homepage_uri.class
+-          homepage_uri = spec.homepage
+-        else
+-          homepage_uri = "."
+-        end
+-      rescue URI::InvalidURIError
+-        homepage_uri = "."
+-      end
+       specs << {
+         "authors"             => spec.authors.sort.join(", "),
+         "date"                => spec.date.to_s,
+         "dependencies"        => deps,
+         "doc_path"            => doc_root(spec.full_name),
+         "executables"         => executables,
+         "only_one_executable" => (executables && executables.size == 1),
+         "full_name"           => spec.full_name,
+         "has_deps"            => !deps.empty?,
+-        "homepage"            => homepage_uri,
++        "homepage"            => spec.homepage,
+         "name"                => spec.name,
+         "rdoc_installed"      => Gem::RDoc.new(spec).rdoc_installed?,
+         "ri_installed"        => Gem::RDoc.new(spec).ri_installed?,
+         "summary"             => spec.summary,
+         "version"             => spec.version.to_s,
+       }
+     end
+     specs << {
+       "authors" => "Chad Fowler, Rich Kilmer, Jim Weirich, Eric Hodel and others",
+       "dependencies" => [],
+
+--- a/lib/rubygems/specification.rb
++++ b/lib/rubygems/specification.rb
+@@ -1,19 +1,18 @@
+ require 'rubygems/version'
+ require 'rubygems/requirement'
+ require 'rubygems/platform'
+ require 'rubygems/deprecate'
+ require 'rubygems/basic_specification'
+ require 'rubygems/stub_specification'
+ require 'rubygems/util/list'
+ require 'stringio'
+-require 'uri'
+ class Gem::Specification < Gem::BasicSpecification
+   NONEXISTENT_SPECIFICATION_VERSION = -1
+   CURRENT_SPECIFICATION_VERSION = 4 # :nodoc:
+   SPECIFICATION_VERSION_HISTORY = { # :nodoc:
+     -1 => ['(RubyGems versions up to and including 0.7 did not have versioned specifications)'],
+     1  => [
+       'Deprecated "test_suite_file" in favor of the new, but equivalent, "test_files"',
+       '"test_file=x" is a shortcut for "test_files=[x]"'
+     ],
+     2  => [
+@@ -1459,29 +1458,24 @@
+     end
+     unless Array(email).grep(/FI XME|TO DO/x).empty? then
+       raise Gem::InvalidSpecificationException, "#{lazy} is not an email"
+     end
+     if description =~ /FI XME|TO DO/x then
+       raise Gem::InvalidSpecificationException, "#{lazy} is not a description"
+     end
+     if summary =~ /FI XME|TO DO/x then
+       raise Gem::InvalidSpecificationException, "#{lazy} is not a summary"
+     end
+-    if homepage and not homepage.empty?
+-      begin
+-        homepage_uri = URI.parse(homepage)
+-        unless [URI::HTTP, URI::HTTPS].member? homepage_uri.class
+-          raise Gem::InvalidSpecificationException, "\"#{homepage}\" is not a valid HTTP URI"
+-        end
+-      rescue URI::InvalidURIError
+-        raise Gem::InvalidSpecificationException, "\"#{homepage}\" is not a valid HTTP URI"
+-      end
++    if homepage and not homepage.empty? and
++       homepage !~ /\A[a-z][a-z\d+.-]*:/i then
++      raise Gem::InvalidSpecificationException,
++            "\"#{homepage}\" is not a URI"
+     end
+     %w[author homepage summary files].each do |attribute|
+       value = self.send attribute
+       warning "no #{attribute} specified" if value.nil? or value.empty?
+     end
+     if description == summary then
+       warning 'description and summary are identical'
+     end
+     warning "deprecated autorequire specified" if autorequire
+     executables.each do |executable|

@@ -1,0 +1,165 @@
+--- a/app/models/spree/user.rb
++++ b/app/models/spree/user.rb
+@@ -1,26 +1,19 @@
++require 'paranoia'
+ module Spree
+   class User < Spree::Base
+     include UserMethods
+     devise :database_authenticatable, :registerable, :recoverable,
+            :rememberable, :trackable, :validatable, :encryptable
+     devise :confirmable if Spree::Auth::Config[:confirmable]
+-    if defined?(Spree::SoftDeletable)
+-      include Spree::SoftDeletable
+-    else
+-      acts_as_paranoid
+-      include Spree::ParanoiaDeprecations
+-      include Discard::Model
+-      self.discard_column = :deleted_at
+-    end
++    acts_as_paranoid
+     after_destroy :scramble_email_and_password
+-    after_discard :scramble_email_and_password
+     def password=(new_password)
+       generate_spree_api_key if new_password.present? && spree_api_key.present?
+       super
+     end
+     before_validation :set_login
+     scope :admin, -> { includes(:spree_roles).where("#{Role.table_name}.name" => "admin") }
+     def self.admin_created?
+       User.admin.count > 0
+     end
+     def admin?
+
+--- a/lib/controllers/frontend/spree/users_controller.rb
++++ b/lib/controllers/frontend/spree/users_controller.rb
+@@ -1,33 +1,30 @@
+ class Spree::UsersController < Spree::StoreController
+   skip_before_action :set_current_order, only: :show, raise: false
++  prepend_before_action :load_object, only: [:show, :edit, :update]
+   prepend_before_action :authorize_actions, only: :new
++  include Spree::Core::ControllerHelpers
+   def show
+-    load_object
+     @orders = @user.orders.complete.order('completed_at desc')
+   end
+   def create
+     @user = Spree::User.new(user_params)
+     if @user.save
+       if current_order
+         session[:guest_token] = nil
+       end
+       redirect_back_or_default(root_url)
+     else
+       render :new
+     end
+   end
+-  def edit
+-    load_object
+-  end
+   def update
+-    load_object
+     if @user.update(user_params)
+       spree_current_user.reload
+       redirect_url = spree.account_url
+       if params[:user][:password].present?
+         if Spree::Auth::Config[:signout_after_password_change]
+           redirect_url = spree.login_url
+         else
+           bypass_sign_in(@user)
+         end
+       end
+
+--- a/lib/spree/auth/version.rb
++++ b/lib/spree/auth/version.rb
+@@ -1,5 +1,5 @@
+ module Spree
+   module Auth
+-    VERSION = '2.5.4'
++    VERSION = '2.5.3'
+   end
+ end
+
+--- a/spec/models/user_spec.rb
++++ b/spec/models/user_spec.rb
+@@ -32,45 +32,38 @@
+       expect {
+         user.password = "123456678"
+         user.password_confirmation = "123456678"
+         user.save!
+       }.not_to change(user, :spree_api_key)
+       expect(user.reload.spree_api_key).to be_nil
+     end
+   end
+   describe '#destroy' do
+     let(:user) { create(:user) }
++    it 'acts_as_paranoid' do
++      expect(described_class).to respond_to(:with_deleted)
++      expect(user).to respond_to(:deleted_at)
++    end
+     context 'with same email address as previously deleted account' do
+       it 'will allow users to register later' do
+         user1 = build(:user)
+         user1.save
+         user2 = build(:user)
+         user2.email = user1.email
+         expect(user2.save).to be false
+         expect(user2.errors.messages[:email].first).to eq "has already been taken"
+-        user1.discard
++        user1.destroy
+         expect(user2.save).to be true
+       end
+     end
+   end
+-  describe '#destroy' do
+-    let(:user) { create(:user) }
+-    it 'removes the record from the database' do
+-      user.destroy
+-      if defined?(Spree::ParanoiaDeprecations)
+-        expect(Spree::User.with_discarded.exists?(id: user.id)).to eql true
+-      else
+-        expect(Spree::User.with_discarded.exists?(id: user.id)).to eql false
+-      end
+-    end
+-  end
+-  describe '#really_destroy!', if: defined?(Spree::ParanoiaDeprecations) do
++  describe '#really_destroy!' do
+     let(:user) { create(:user) }
+     it 'removes the record from the database' do
+       user.really_destroy!
+       expect(Spree::User.with_deleted.exists?(id: user.id)).to eql false
+     end
+   end
+   describe "confirmable" do
+     it "loads Devise's :confirmable module when :confirmable is true", confirmable: true do
+       expect(Spree::User.ancestors).to include(Devise::Models::Confirmable)
+     end
+
+--- a/spec/requests/spree/frontend/user_update_spec.rb
++++ b//dev/null
+@@ -1,26 +0,0 @@
+-RSpec.feature 'User update', type: :request do
+-  context 'CSRF protection' do
+-    %i[exception reset_session null_session].each do |strategy|
+-      around do |example|
+-        controller = Spree::UsersController
+-        old_allow_forgery_protection_value = controller.allow_forgery_protection
+-        old_forgery_protection_strategy = controller.forgery_protection_strategy
+-        controller.skip_forgery_protection
+-        controller.allow_forgery_protection = true
+-        controller.protect_from_forgery with: strategy
+-        example.run
+-        controller.allow_forgery_protection = old_allow_forgery_protection_value
+-        controller.forgery_protection_strategy = old_forgery_protection_strategy
+-      end
+-      it "is not possible to take account over with the #{strategy} forgery protection strategy" do
+-        user = create(:user, email: 'legit@mail.com', password: 'password')
+-        post '/login', params: "spree_user[email]=legit@mail.com&spree_user[password]=password"
+-        begin
+-          put '/users/123456', params: 'user[email]=hacked@example.com'
+-        rescue
+-        end
+-        expect(user.reload.email).to eq('legit@mail.com')
+-      end
+-    end
+-  end
+-end

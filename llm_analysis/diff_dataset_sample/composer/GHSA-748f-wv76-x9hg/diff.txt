@@ -1,0 +1,826 @@
+--- a/src/Backend/Core/Engine/Authentication.php
++++ b/src/Backend/Core/Engine/Authentication.php
+@@ -1,15 +1,14 @@
+ <?php
+ namespace Backend\Core\Engine;
+ use Backend\Core\Engine\Model as BackendModel;
+ use Backend\Modules\Users\Engine\Model as BackendUsersModel;
+-use RuntimeException;
+ /**
+  * The class below will handle all authentication stuff. It will handle module-access, action-access, ...
+  */
+ class Authentication
+ {
+     /**
+      * All allowed modules
+      *
+      * @var array
+      */
+@@ -259,57 +258,45 @@
+              FROM users AS u
+              WHERE u.email = ? AND u.active = ? AND u.deleted = ?
+              LIMIT 1',
+             [$login, true, false]
+         );
+         if ($userId === 0) {
+             self::logout();
+             return false;
+         }
+         self::cleanupOldSessions();
+-        $session = BackendModel::getSession();
+-        if (!$session->migrate(true)) {
+-            throw new RuntimeException(
+-                'For safety reasons the session should be regenerated. But apparently it failed.'
+-            );
+-        }
+-        $userSession = [
++        $session = [
+             'user_id' => $userId,
+-            'secret_key' => static::getEncryptedString($session->getId(), $userId),
+-            'session_id' => $session->getId(),
++            'secret_key' => static::getEncryptedString(BackendModel::getSession()->getId(), $userId),
++            'session_id' => BackendModel::getSession()->getId(),
+             'date' => BackendModel::getUTCDate(),
+         ];
+-        $database->insert('users_sessions', $userSession);
+-        $session->set('backend_logged_in', true);
+-        $session->set('backend_secret_key', $userSession['secret_key']);
++        $database->insert('users_sessions', $session);
++        BackendModel::getSession()->set('backend_logged_in', true);
++        BackendModel::getSession()->set('backend_secret_key', $session['secret_key']);
+         BackendModel::getContainer()->set('logged_in', true);
+         self::$user = new User($userId);
+         return true;
+     }
+     /**
+      * Logout the current user
+      */
+     public static function logout(): void
+     {
+         if (self::$alreadyLoggedOut) {
+             return;
+         }
+-        $session = BackendModel::getSession();
+-        BackendModel::get('database')->delete('users_sessions', 'session_id = ?', $session->getId());
+-        $session->set('backend_logged_in', false);
+-        $session->set('backend_secret_key', '');
+-        $session->set('csrf_token', '');
+-        if (!$session->migrate(true)) {
+-            throw new RuntimeException(
+-                'For safety reasons the session should be regenerated. But apparently it failed.'
+-            );
+-        }
++        BackendModel::get('database')->delete('users_sessions', 'session_id = ?', BackendModel::getSession()->getId());
++        BackendModel::getSession()->set('backend_logged_in', false);
++        BackendModel::getSession()->set('backend_secret_key', '');
++        BackendModel::getSession()->set('csrf_token', '');
+         self::$alreadyLoggedOut = true;
+     }
+     /**
+      * Reset our class to make sure no contamination from previous
+      * authentications persists. This signifies a deeper issue with
+      * this class. Solving the issue would be preferable to introducting
+      * another method. This currently only exists to serve the test.
+      */
+     public static function tearDown(): void
+     {
+
+--- a/src/Backend/Core/Engine/Base/Widget.php
++++ b/src/Backend/Core/Engine/Base/Widget.php
+@@ -1,14 +1,13 @@
+ <?php
+ namespace Backend\Core\Engine\Base;
+ use Backend\Core\Engine\Model;
+-use Backend\Core\Engine\Model as BackendModel;
+ use Common\Exception\RedirectException;
+ use ForkCMS\App\KernelLoader;
+ use Symfony\Component\HttpFoundation\RedirectResponse;
+ use Symfony\Component\HttpFoundation\Request;
+ use Symfony\Component\HttpFoundation\Response;
+ use Symfony\Component\HttpKernel\KernelInterface;
+ use Backend\Core\Engine\Authentication as BackendAuthentication;
+ use Backend\Core\Engine\Header;
+ use Backend\Core\Engine\TwigTemplate;
+ /**
+@@ -134,33 +133,11 @@
+     }
+     /**
+      * Get the request from the container.
+      *
+      * @return Request
+      */
+     public function getRequest(): Request
+     {
+         return Model::getRequest();
+     }
+-    /**
+-     * Check if the token is ok
+-     */
+-    public function checkToken(): void
+-    {
+-        $fromSession = BackendModel::getSession()->get('csrf_token', '');
+-        $fromGet = $this->getRequest()->query->get('token');
+-        if ($fromSession !== '' && $fromGet !== '' && $fromSession === $fromGet) {
+-            return;
+-        }
+-        BackendModel::getSession()->set('csrf_token', '');
+-        $this->redirect(
+-            BackendModel::createUrlForAction(
+-                $this->getContainer()->get('url')->getDefaultActionForCurrentModule(),
+-                null,
+-                null,
+-                [
+-                    'error' => 'csrf',
+-                ]
+-            )
+-        );
+-    }
+ }
+
+--- a/src/Backend/Core/Js/backend.js
++++ b/src/Backend/Core/Js/backend.js
+@@ -127,31 +127,31 @@
+       $navbarNav.css('left', '0')
+       $('.js-nav-next').hide()
+     }
+     this.setControls(0)
+   },
+   toggleCollapse: function () {
+     var $wrapper = $('.main-wrapper')
+     var $navCollapse = $('.js-toggle-nav')
+     var collapsed = $wrapper.hasClass('navigation-collapsed')
+     if ($wrapper.hasClass('navigation-collapsed')) {
+-      $('.js-nav-screen-text').text(jsBackend.locale.lbl('OpenNavigation'))
++      $('.js-nav-screen-text').html(jsBackend.locale.lbl('OpenNavigation'))
+     } else {
+-      $('.js-nav-screen-text').text(jsBackend.locale.lbl('CloseNavigation'))
++      $('.js-nav-screen-text').html(jsBackend.locale.lbl('CloseNavigation'))
+     }
+     $navCollapse.on('click', function (e) {
+       e.preventDefault()
+       $wrapper.toggleClass('navigation-collapsed')
+       if ($wrapper.hasClass('navigation-collapsed')) {
+-        $('.js-nav-screen-text').text(jsBackend.locale.lbl('OpenNavigation'))
++        $('.js-nav-screen-text').html(jsBackend.locale.lbl('OpenNavigation'))
+       } else {
+-        $('.js-nav-screen-text').text(jsBackend.locale.lbl('CloseNavigation'))
++        $('.js-nav-screen-text').html(jsBackend.locale.lbl('CloseNavigation'))
+       }
+       collapsed = !collapsed
+       utils.cookies.setCookie('navigation-collapse', collapsed)
+       setTimeout(function () {
+         jsBackend.resizeFunctions.init()
+       }, 250)
+     })
+   },
+   tooltip: function () {
+     var $tooltip = $('[data-toggle="tooltip-nav"]')
+
+--- a/src/Backend/Core/Js/jquery/jquery.backend.js
++++ b/src/Backend/Core/Js/jquery/jquery.backend.js
+@@ -210,21 +210,21 @@
+       extraParams: {},
+       inputClasses: 'inputText',
+       allowEmpty: false,
+       tooltip: 'click to edit',
+       afterSave: null
+     }
+     options = $.extend(defaults, options)
+     var editing = false
+     return this.each(function () {
+       var $this = $(this)
+-      $this.html('<span>' + utils.string.htmlEncode($this.text()) + '</span><span style="display: none;" class="inlineEditTooltip label label-primary">' + options.tooltip + '</span>')
++      $this.html('<span>' + $this.text() + '</span><span style="display: none;" class="inlineEditTooltip label label-primary">' + options.tooltip + '</span>')
+       var $span = $this.find('span')
+       var element = $span.eq(0)
+       var tooltip = $span.eq(1)
+       element.bind('click focus', createElement)
+       tooltip.bind('click', createElement)
+       $this.hover(
+         function () {
+           if (element.hasClass('inlineEditing')) {
+             $this.removeClass('inlineEditHover')
+             tooltip.hide()
+
+--- a/src/Backend/Modules/Extensions/Actions/UploadTheme.php
++++ b/src/Backend/Modules/Extensions/Actions/UploadTheme.php
+@@ -160,23 +160,22 @@
+      *
+      * @return string[]
+      */
+     private function getValidatedFilesList(ZipArchive $zip): array
+     {
+         $this->parentFolderName = $this->extractFolderNameBasedOnInfoFile($this->infoFilePath);
+         $files = [];
+         for ($i = 0; $i < $zip->numFiles; ++$i) {
+             $file = $zip->statIndex($i);
+             $fileName = $file['name'];
+-            if ($this->checkIfPathContainsIgnoredWord($fileName)
+-                || (!empty($this->parentFolderName) && mb_stripos($fileName, $this->parentFolderName) !== 0)
+-                || mb_strpos(basename($fileName), '.') === 0 // ignore hidden files
++            if ($this->checkIfPathContainsIgnoredWord($fileName) ||
++                (!empty($this->parentFolderName) && mb_stripos($fileName, $this->parentFolderName) !== 0)
+             ) {
+                 continue;
+             }
+             $files[] = $fileName;
+         }
+         return $files;
+     }
+     /**
+      * @param string $infoFilePath
+      *
+
+--- a/src/Backend/Modules/Groups/Engine/Model.php
++++ b/src/Backend/Modules/Groups/Engine/Model.php
+@@ -1,27 +1,27 @@
+ <?php
+ namespace Backend\Modules\Groups\Engine;
+ use Backend\Core\Engine\Model as BackendModel;
+ /**
+  * In this file we store all generic functions that we will be using in the groups module.
+  */
+ class Model
+ {
+     const QUERY_BROWSE =
+         'SELECT g.id, g.name, COUNT(u.id) AS num_users
+-         FROM `groups` AS g
++         FROM groups AS g
+          LEFT OUTER JOIN users_groups AS ug ON g.id = ug.group_id
+-         LEFT OUTER JOIN `users` AS u ON u.id = ug.user_id
++         LEFT OUTER JOIN users AS u ON u.id = ug.user_id
+          GROUP BY g.id';
+     const QUERY_ACTIVE_USERS =
+         'SELECT u.id, u.email
+-         FROM `users` AS u
++         FROM users AS u
+          INNER JOIN users_groups AS ug ON u.id = ug.user_id
+          WHERE ug.group_id = ? AND u.deleted = ?';
+     public static function addActionPermissions(array $actionPermissions): void
+     {
+         foreach ((array) $actionPermissions as $permission) {
+             if (!self::existsActionPermission($permission)) {
+                 BackendModel::getContainer()->get('database')->insert('groups_rights_actions', $permission);
+             }
+         }
+     }
+@@ -30,21 +30,21 @@
+         foreach ((array) $modulePermissions as $permission) {
+             if (!self::existsModulePermission($permission)) {
+                 BackendModel::getContainer()->get('database')->insert('groups_rights_modules', $permission);
+             }
+         }
+     }
+     public static function alreadyExists(string $groupName): bool
+     {
+         return (bool) BackendModel::getContainer()->get('database')->getVar(
+             'SELECT i.*
+-             FROM `groups` AS i
++             FROM groups AS i
+              WHERE i.name = ?',
+             [$groupName]
+         );
+     }
+     public static function delete(int $groupId): void
+     {
+         /** @var SpoonDatabase $database */
+         $database = BackendModel::getContainer()->get('database');
+         $database->delete('groups', 'id = ?', [$groupId]);
+         $database->delete('groups_settings', 'group_id = ?', [$groupId]);
+@@ -83,21 +83,21 @@
+      * Check if a group already exists
+      *
+      * @param int $id The id to check upon.
+      *
+      * @return bool
+      */
+     public static function exists(int $id): bool
+     {
+         return (bool) BackendModel::getContainer()->get('database')->getVar(
+             'SELECT i.*
+-             FROM `groups` AS i
++             FROM groups AS i
+              WHERE i.id = ?',
+             [$id]
+         );
+     }
+     public static function existsActionPermission(array $permission): bool
+     {
+         return (bool) BackendModel::getContainer()->get('database')->getVar(
+             'SELECT i.*
+              FROM groups_rights_actions AS i
+              WHERE i.module = ? AND i.group_id = ? AND i.action = ?',
+@@ -110,45 +110,45 @@
+             'SELECT i.*
+              FROM groups_rights_modules AS i
+              WHERE i.module = ? AND i.group_id = ?',
+             [$permission['module'], $permission['group_id']]
+         );
+     }
+     public static function get(int $groupId): array
+     {
+         return (array) BackendModel::getContainer()->get('database')->getRecord(
+             'SELECT i.*
+-             FROM `groups` AS i
++             FROM groups AS i
+              WHERE i.id = ?',
+             [$groupId]
+         );
+     }
+     public static function getActionPermissions(int $groupId): array
+     {
+         return (array) BackendModel::getContainer()->get('database')->getRecords(
+             'SELECT i.module, i.action
+              FROM groups_rights_actions AS i
+              WHERE i.group_id = ?',
+             [$groupId]
+         );
+     }
+     public static function getAll(): array
+     {
+         return (array) BackendModel::getContainer()->get('database')->getRecords(
+-            'SELECT i.id AS value, i.name AS label FROM `groups` AS i'
++            'SELECT i.id AS value, i.name AS label FROM groups AS i'
+         );
+     }
+     public static function getGroupsByUser(int $userId): array
+     {
+         return (array) BackendModel::getContainer()->get('database')->getRecords(
+             'SELECT i.id, i.name
+-             FROM `groups` AS i
++             FROM groups AS i
+              INNER JOIN users_groups AS ug ON i.id = ug.group_id
+              WHERE ug.user_id = ?',
+             [$userId]
+         );
+     }
+     public static function isUserInGroup(int $userId, int $groupId): bool
+     {
+         $groupsByUser = static::getGroupsByUser($userId);
+         foreach ($groupsByUser as $group) {
+             if ((int) $group['id'] === $groupId) {
+@@ -179,21 +179,21 @@
+         }
+         if (isset($setting['value'])) {
+             return unserialize($setting['value'], ['allowed_classes' => false]);
+         }
+         return [];
+     }
+     public static function getUsers(int $groupId): array
+     {
+         return (array) BackendModel::getContainer()->get('database')->getRecords(
+             'SELECT i.*
+-             FROM `users` AS i
++             FROM users AS i
+              INNER JOIN users_groups AS ug ON i.id = ug.user_id
+              WHERE ug.group_id = ? AND i.deleted = ? AND i.active = ?',
+             [$groupId, false, true]
+         );
+     }
+     /**
+      * Insert a group and a setting
+      *
+      * @param array $group The group to insert.
+      * @param array $setting The setting to insert.
+
+--- a/src/Backend/Modules/MediaLibrary/Js/MediaLibrary.js
++++ b/src/Backend/Modules/MediaLibrary/Js/MediaLibrary.js
+@@ -208,21 +208,21 @@
+     }
+     return $(refNode).prop('id').replace('folder-', '')
+   },
+   toggleJsTreeCollapse: function () {
+     $('[data-role="toggle-js-tree-collapse"]').on('click', function () {
+       var $this = $(this)
+       $this.toggleClass('tree-collapsed')
+       var collapsed = $this.hasClass('tree-collapsed')
+       var $buttonText = $('[data-role="toggle-js-tree-collapse-text"]')
+       if (collapsed) {
+-        $buttonText.text(jsBackend.locale.lbl('OpenTreeNavigation'))
++        $buttonText.html(jsBackend.locale.lbl('OpenTreeNavigation'))
+         $.tree.reference('#tree div').close_all()
+         return
+       }
+-      $buttonText.text(jsBackend.locale.lbl('CloseTreeNavigation'))
++      $buttonText.html(jsBackend.locale.lbl('CloseTreeNavigation'))
+       $.tree.reference('#tree div').open_all()
+     })
+   }
+ }
+ /** global jsBackend */
+ $(jsBackend.mediaLibrary.init)
+
+--- a/src/Backend/Modules/Pages/Actions/Add.php
++++ b/src/Backend/Modules/Pages/Actions/Add.php
+@@ -5,24 +5,22 @@
+ use Backend\Core\Engine\Authentication as BackendAuthentication;
+ use Backend\Core\Engine\Form as BackendForm;
+ use Backend\Core\Language\Language as BL;
+ use Backend\Core\Engine\Meta as BackendMeta;
+ use Backend\Core\Engine\Model as BackendModel;
+ use Backend\Modules\Extensions\Engine\Model as BackendExtensionsModel;
+ use Backend\Modules\Pages\Engine\Model as BackendPagesModel;
+ use Backend\Modules\Search\Engine\Model as BackendSearchModel;
+ use Backend\Modules\Tags\Engine\Model as BackendTagsModel;
+ use Backend\Modules\Profiles\Engine\Model as BackendProfilesModel;
+-use Common\Core\Model;
+ use ForkCMS\Utility\Thumbnails;
+ use SpoonFormHidden;
+-use Symfony\Component\DomCrawler\Crawler;
+ use Symfony\Component\Filesystem\Filesystem;
+ use Symfony\Component\HttpFoundation\Response;
+ /**
+  * This is the add-action, it will display a form to create a new item
+  */
+ class Add extends BackendBaseActionAdd
+ {
+     /**
+      * The blocks linked to this page
+      *
+@@ -417,23 +415,24 @@
+                 }
+                 $page = [];
+                 $page['id'] = BackendPagesModel::getMaximumPageId() + 1;
+                 $page['user_id'] = BackendAuthentication::getUser()->getUserId();
+                 $page['parent_id'] = $parentId;
+                 $page['template_id'] = $templateId;
+                 $page['meta_id'] = (int) $this->meta->save();
+                 $page['language'] = BL::getWorkingLanguage();
+                 $page['type'] = $parentPage ? 'page' : 'root';
+                 $page['title'] = $this->form->getField('title')->getValue();
+-                $page['navigation_title'] = ($this->form->getField('navigation_title')->getValue() != '')
+-                    ? $this->form->getField('navigation_title')->getValue()
+-                    : $this->form->getField('title')->getValue();
++                $page['navigation_title'] = ($this->form->getField('navigation_title')->getValue(
++                ) != '') ? $this->form->getField('navigation_title')->getValue() : $this->form->getField(
++                    'title'
++                )->getValue();
+                 $page['navigation_title_overwrite'] = $this->form->getField(
+                     'navigation_title_overwrite'
+                 )->isChecked();
+                 $page['hidden'] = $this->form->getField('hidden')->getValue();
+                 $page['status'] = $status;
+                 $page['publish_on'] = BackendModel::getUTCDate();
+                 $page['created_on'] = BackendModel::getUTCDate();
+                 $page['edited_on'] = BackendModel::getUTCDate();
+                 $page['allow_move'] = true;
+                 $page['allow_children'] = true;
+@@ -551,50 +550,21 @@
+         };
+     }
+     private function getOriginalPage(): ?array
+     {
+         $id = $this->getRequest()->query->getInt('copy');
+         if ($id === 0 || !BackendPagesModel::exists($id)) {
+             return null;
+         }
+         $this->template->assign('showCopyWarning', true);
+         $originalPage = BackendPagesModel::get($id);
+-        $this->blocksContent = array_map(
+-            function (array $block) {
+-                if ($block['extra_type'] !== 'usertemplate') {
+-                    return $block;
+-                }
+-                if (strpos($block['html'], 'data-ft-type="image"') === false) {
+-                    return $block;
+-                }
+-                $blockElements = new Crawler($block['html']);
+-                $images = $blockElements->filter('[data-ft-type="image"]');
+-                $filesystem = new Filesystem();
+-                $path = FRONTEND_FILES_PATH . '/Pages/UserTemplate';
+-                $url = FRONTEND_FILES_URL . '/Pages/UserTemplate';
+-                foreach ($images as $image) {
+-                    $imagePath = $image->getAttribute('src');
+-                    $basename = pathinfo($imagePath, PATHINFO_FILENAME);
+-                    $extension = pathinfo($imagePath, PATHINFO_EXTENSION);
+-                    $originalFilename = $basename . '.' . $extension;
+-                    $filename = $originalFilename;
+-                    while ($filesystem->exists($path . '/' . $filename)) {
+-                        $basename = Model::addNumber($basename);
+-                        $filename = $basename . '.' . $extension;
+-                    }
+-                    $block['html'] = str_replace($imagePath, $url . '/' . $filename, $block['html']);
+-                    $filesystem->copy($path . '/' . $originalFilename, $path . '/' . $filename);
+-                }
+-                return $block;
+-            },
+-            BackendPagesModel::getBlocks($id, $originalPage['revision_id'])
+-        );
++        $this->blocksContent = BackendPagesModel::getBlocks($id, $originalPage['revision_id']);
+         return $originalPage;
+     }
+     private function saveSearchIndex(bool $removeFromSearchIndex, array $page): void
+     {
+         if ($removeFromSearchIndex) {
+             BackendSearchModel::removeIndex(
+                 $this->getModule(),
+                 $page['id']
+             );
+             return;
+
+--- a/src/Backend/Modules/Pages/Actions/Edit.php
++++ b/src/Backend/Modules/Pages/Actions/Edit.php
+@@ -58,24 +58,20 @@
+      *
+      * @var array
+      */
+     private $positions = [];
+     /**
+      * The template data
+      *
+      * @var array
+      */
+     private $templates = [];
+-    /**
+-     * @var string
+-     */
+-    private $oldUrl;
+     public function execute(): void
+     {
+         parent::execute();
+         $this->loadData();
+         $this->header->addJS('jstree/jquery.tree.js', null, false);
+         $this->header->addJS('jstree/lib/jquery.cookie.js', null, false);
+         $this->header->addJS('jstree/plugins/jquery.tree.cookie.js', null, false);
+         $this->header->addJS('/js/vendors/SimpleAjaxUploader.min.js', 'Core', false, true);
+         $this->templates = BackendExtensionsModel::getTemplates();
+         $this->templates[$this->record['template_id']]['checked'] = true;
+@@ -404,21 +400,20 @@
+                 null,
+                 'form-control js-tags-input',
+                 'error js-tags-input'
+             )->setAttribute('aria-describedby', 'tags-info');
+         }
+         $isAction = isset($this->record['data']['is_action']) && $this->record['data']['is_action'];
+         $this->form->addCheckbox('is_action', $isAction);
+         $blockTypes = BackendPagesModel::getTypes();
+         $this->form->addDropdown('extra_type', $blockTypes, key($blockTypes));
+         $this->meta = new BackendMeta($this->form, $this->record['meta_id'], 'title', true);
+-        $this->oldUrl = $this->meta->getUrl();
+         $this->meta->setUrlCallback(
+             'Backend\Modules\Pages\Engine\Model',
+             'getUrl',
+             [$this->record['id'], $this->record['parent_id'], $isAction]
+         );
+     }
+     private function loadRevisions(): void
+     {
+         $this->dgRevisions = new BackendDataGridDatabase(
+             BackendPagesModel::QUERY_BROWSE_REVISIONS,
+@@ -572,21 +567,20 @@
+             $page['navigation_title'] = $page['title'];
+         }
+         $page['revision_id'] = BackendPagesModel::update($page);
+         $this->insertBlocks($page['revision_id']);
+         $this->saveTags($page['id']);
+         $cacheShouldBeUpdated = !(
+             $this->record['title'] === $page['title']
+             && $this->record['navigation_title'] === $page['navigation_title']
+             && $this->record['navigation_title_overwrite'] == $page['navigation_title_overwrite'] // can be 0 or false
+             && $this->record['hidden'] == $page['hidden'] // can be 0 or false
+-            && $this->meta->getUrl() === $this->oldUrl
+         );
+         if ($cacheShouldBeUpdated) {
+             BackendPagesModel::buildCache(BL::getWorkingLanguage());
+         }
+         if ($page['status'] === 'draft') {
+             $this->redirect(
+                 BackendModel::createUrlForAction('Edit') . '&id=' . $page['id']
+                 . '&report=saved-as-draft&var=' . rawurlencode($page['title']) . '&highlight=row-' . $page['id']
+                 . '&draft=' . $page['revision_id']
+             );
+
+--- a/src/Backend/Modules/Pages/Ajax/UploadFile.php
++++ b/src/Backend/Modules/Pages/Ajax/UploadFile.php
+@@ -9,46 +9,28 @@
+ use Symfony\Component\HttpFoundation\Response;
+ /**
+  * This action will enable you to upload files trough ajax.
+  * It accepts both XmlHttp requests or file uploads using a form.
+  *
+  * Note that it only accepts single file uploads.
+  * The type $_GET parameter will be used to determine which folder to upload in.
+  */
+ class UploadFile extends AjaxAction
+ {
+-    private const ALLOWED_EXTENSIONS = [
+-        'apng',
+-        'avif',
+-        'gif',
+-        'jfif',
+-        'jpeg',
+-        'jpg',
+-        'pjp',
+-        'pjpeg',
+-        'png',
+-        'svg',
+-        'webp',
+-    ];
+     public function execute(): void
+     {
+         $request = $this->getRequest();
+-        try {
+-            $fileName = $this->writeFile(
+-                $this->getFileContentFromRequest($request),
+-                $this->getFileNameFromRequest($request),
+-                $request->get('type')
+-            );
+-        } catch (Exception $backendCoreException) {
+-            $this->output(Response::HTTP_BAD_REQUEST, $backendCoreException->getMessage());
+-            return;
+-        }
++        $fileName = $this->writeFile(
++            $this->getFileContentFromRequest($request),
++            $this->getFileNameFromRequest($request),
++            $request->get('type')
++        );
+         $this->output(Response::HTTP_OK, $fileName);
+     }
+     /**
+      * Extracts the uploaded file from a request. It handles both XmlHttpRequest
+      * uploads and form uploads (with files in the $_FILES global)
+      *
+      * @param Request $request
+      *
+      * @throws Exception When no file could be extracted
+      *
+@@ -86,30 +68,27 @@
+      * Writes some content to a file in a given folder
+      *
+      * @param string $content
+      * @param string $fileName
+      * @param string $destinationFolder
+      *
+      * @return string The filename of the written file.
+      */
+     private function writeFile(string $content, string $fileName, string $destinationFolder): string
+     {
+-        $path = FRONTEND_FILES_PATH . '/Pages/' . basename($destinationFolder);
++        $path = FRONTEND_FILES_PATH . '/Pages/' . $destinationFolder;
+         $filesystem = new Filesystem();
+         if (!$filesystem->exists($path)) {
+             $filesystem->mkdir($path);
+         }
+         $baseName = Uri::getUrl(pathinfo($fileName, PATHINFO_FILENAME));
+         $extension = pathinfo($fileName, PATHINFO_EXTENSION);
+-        if (!in_array(strtolower($extension), self::ALLOWED_EXTENSIONS)) {
+-            throw new Exception('This is not an image.');
+-        }
+         $fileName = $baseName . '.' . $extension;
+         while ($filesystem->exists($path . '/' . $fileName)) {
+             $baseName = Model::addNumber($baseName);
+             $fileName = $baseName . '.' . $extension;
+         }
+         $filesystem->dumpFile(
+             $path . '/' . $fileName,
+             $content
+         );
+         return $fileName;
+
+--- a/src/Backend/Modules/Pages/Engine/Model.php
++++ b/src/Backend/Modules/Pages/Engine/Model.php
+@@ -682,21 +682,21 @@
+         $html = '<h4>' . SpoonFilter::ucfirst(BL::lbl('MainNavigation')) . '</h4>' . "\n";
+         $html .= '<div class="clearfix" data-tree="main">' . "\n";
+         $html .= '    <ul>' . "\n";
+         $html .= '        <li id="page-"' . BackendModel::HOME_PAGE_ID . ' rel="home">';
+         $homePage = self::get(BackendModel::HOME_PAGE_ID);
+         $html .= '            <a href="' . BackendModel::createUrlForAction(
+             'Edit',
+             null,
+             null,
+             ['id' => BackendModel::HOME_PAGE_ID]
+-        ) . '"><ins>&#160;</ins>' . htmlentities($homePage['title']) . '</a>' . "\n";
++        ) . '"><ins>&#160;</ins>' . $homePage['title'] . '</a>' . "\n";
+         $html .= self::getSubtree($navigation, BackendModel::HOME_PAGE_ID);
+         $html .= '        </li>' . "\n";
+         $html .= '    </ul>' . "\n";
+         $html .= '</div>' . "\n";
+         if (BackendModel::get('fork.settings')->get('Pages', 'meta_navigation', false)) {
+             $html .= '<h4>' . SpoonFilter::ucfirst(BL::lbl('Meta')) . '</h4>' . "\n";
+             $html .= '<div class="clearfix" data-tree="meta">' . "\n";
+             $html .= '    <ul>' . "\n";
+             if (isset($navigation['meta'][0]) && !empty($navigation['meta'][0])) {
+                 foreach ($navigation['meta'][0] as $page) {
+
+--- a/src/Backend/Modules/Pages/Js/Pages.js
++++ b/src/Backend/Modules/Pages/Js/Pages.js
+@@ -978,24 +978,24 @@
+       }
+     })
+   },
+   toggleJsTreeCollapse: function () {
+     $('[data-role="toggle-js-tree-collapse"]').on('click', function () {
+       var $this = $(this)
+       $this.toggleClass('tree-collapsed')
+       var collapsed = $this.hasClass('tree-collapsed')
+       var $buttonText = $('[data-role="toggle-js-tree-collapse-text"]')
+       if (collapsed) {
+-        $buttonText.text(jsBackend.locale.lbl('OpenTreeNavigation'))
++        $buttonText.html(jsBackend.locale.lbl('OpenTreeNavigation'))
+         $.each($('#tree div'), function (index, element) {
+           $.tree.reference($(element).attr('id')).close_all()
+         })
+         return
+       }
+-      $buttonText.text(jsBackend.locale.lbl('CloseTreeNavigation'))
++      $buttonText.html(jsBackend.locale.lbl('CloseTreeNavigation'))
+       $.each($('#tree div'), function (index, element) {
+         $.tree.reference($(element).attr('id')).open_all()
+       })
+     })
+   }
+ }
+ $(jsBackend.pages.init)
+
+--- a/src/Frontend/Modules/Profiles/Engine/Authentication.php
++++ b/src/Frontend/Modules/Profiles/Engine/Authentication.php
+@@ -1,16 +1,15 @@
+ <?php
+ namespace Frontend\Modules\Profiles\Engine;
+ use Frontend\Core\Engine\Model as FrontendModel;
+ use Frontend\Modules\Profiles\Engine\Model as FrontendProfilesModel;
+ use Frontend\Modules\Profiles\Engine\Profile as FrontendProfilesProfile;
+-use RuntimeException;
+ /**
+  * Profile authentication functions.
+  */
+ class Authentication
+ {
+     /**
+      * The login credentials are correct and the profile is active.
+      *
+      * @var string
+      */
+@@ -140,65 +139,53 @@
+         return false;
+     }
+     /**
+      * @param int $profileId Login the profile with this id in.
+      * @param bool $remember Should we set a cookie for later?
+      */
+     public static function login(int $profileId, bool $remember = false): void
+     {
+         $secretKey = null;
+         self::cleanupOldSessions();
+-        $session = FrontendModel::getSession();
+-        if (!$session->migrate(true)) {
+-            throw new RuntimeException(
+-                'For safety reasons the session should be regenerated. But apparently it failed.'
+-            );
+-        }
+-        $session->set('frontend_profile_logged_in', true);
++        FrontendModel::getSession()->set('frontend_profile_logged_in', true);
+         if ($remember) {
+             $secretKey = FrontendProfilesModel::getEncryptedString(
+-                $session->getId(),
++                FrontendModel::getSession()->getId(),
+                 FrontendProfilesModel::getRandomString()
+             );
+             FrontendModel::getContainer()->get('fork.cookie')->set('frontend_profile_secret_key', $secretKey);
+         }
+         FrontendModel::getContainer()->get('database')->delete(
+             'profiles_sessions',
+             'session_id = ?',
+-            $session->getId()
++            FrontendModel::getSession()->getId()
+         );
+         FrontendModel::getContainer()->get('database')->insert(
+             'profiles_sessions',
+             [
+                 'profile_id' => $profileId,
+-                'session_id' => $session->getId(),
++                'session_id' => FrontendModel::getSession()->getId(),
+                 'secret_key' => $secretKey,
+                 'date' => FrontendModel::getUTCDate(),
+             ]
+         );
+         FrontendProfilesModel::update($profileId, ['last_login' => FrontendModel::getUTCDate()]);
+         self::$profile = new FrontendProfilesProfile($profileId);
+     }
+     public static function logout(): void
+     {
+-        $session = FrontendModel::getSession();
+         FrontendModel::getContainer()->get('database')->delete(
+             'profiles_sessions',
+             'session_id = ?',
+-            [$session->getId()]
++            [FrontendModel::getSession()->getId()]
+         );
+-        $session->set('frontend_profile_logged_in', false);
+-        if (!$session->migrate(true)) {
+-            throw new RuntimeException(
+-                'For safety reasons the session should be regenerated. But apparently it failed.'
+-            );
+-        }
++        FrontendModel::getSession()->set('frontend_profile_logged_in', false);
+         FrontendModel::getContainer()->get('fork.cookie')->delete('frontend_profile_secret_key');
+     }
+     /**
+      * Update profile password and salt.
+      *
+      * @param int $profileId Profile id for which we are changing the password.
+      * @param string $password New password.
+      */
+     public static function updatePassword(int $profileId, string $password): void
+     {

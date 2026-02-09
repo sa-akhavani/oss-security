@@ -1,0 +1,3041 @@
+# ====================================================================
+# FILE: libs/experimental/langchain_experimental/data_anonymizer/base.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-24 ---
+     1| from abc import ABC, abstractmethod
+     2| from typing import Optional
+     3| class AnonymizerBase(ABC):
+     4|     """
+     5|     Base abstract class for anonymizers.
+     6|     It is public and non-virtual because it allows
+     7|         wrapping the behavior for all methods in a base class.
+     8|     """
+     9|     def anonymize(self, text: str, language: Optional[str] = None) -> str:
+    10|         """Anonymize text"""
+    11|         return self._anonymize(text, language)
+    12|     @abstractmethod
+    13|     def _anonymize(self, text: str, language: Optional[str]) -> str:
+    14|         """Abstract method to anonymize text"""
+    15| class ReversibleAnonymizerBase(AnonymizerBase):
+    16|     """
+    17|     Base abstract class for reversible anonymizers.
+    18|     """
+    19|     def deanonymize(self, text: str) -> str:
+    20|         """Deanonymize text"""
+    21|         return self._deanonymize(text)
+    22|     @abstractmethod
+    23|     def _deanonymize(self, text: str) -> str:
+    24|         """Abstract method to deanonymize text"""
+
+
+# ====================================================================
+# FILE: libs/experimental/langchain_experimental/data_anonymizer/deanonymizer_matching_strategies.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-12 ---
+     1| from langchain_experimental.data_anonymizer.presidio import MappingDataType
+     2| def default_matching_strategy(text: str, deanonymizer_mapping: MappingDataType) -> str:
+     3|     """
+     4|     Default matching strategy for deanonymization.
+     5|     It replaces all the anonymized entities with the original ones.
+     6|     Args:
+     7|         text: text to deanonymize
+     8|         deanonymizer_mapping: mapping between anonymized entities and original ones"""
+     9|     for entity_type in deanonymizer_mapping:
+    10|         for anonymized, original in deanonymizer_mapping[entity_type].items():
+    11|             text = text.replace(anonymized, original)
+    12|     return text
+
+
+# ====================================================================
+# FILE: libs/experimental/langchain_experimental/data_anonymizer/faker_presidio_mapping.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 13-33 ---
+    13|         "PERSON": lambda _: fake.name(),
+    14|         "EMAIL_ADDRESS": lambda _: fake.email(),
+    15|         "PHONE_NUMBER": lambda _: fake.phone_number(),
+    16|         "IBAN_CODE": lambda _: fake.iban(),
+    17|         "CREDIT_CARD": lambda _: fake.credit_card_number(),
+    18|         "CRYPTO": lambda _: "bc1"
+    19|         + "".join(
+    20|             fake.random_choices(string.ascii_lowercase + string.digits, length=26)
+    21|         ),
+    22|         "IP_ADDRESS": lambda _: fake.ipv4_public(),
+    23|         "LOCATION": lambda _: fake.city(),
+    24|         "DATE_TIME": lambda _: fake.date(),
+    25|         "NRP": lambda _: str(fake.random_number(digits=8, fix_len=True)),
+    26|         "MEDICAL_LICENSE": lambda _: fake.bothify(text="??######").upper(),
+    27|         "URL": lambda _: fake.url(),
+    28|         "US_BANK_NUMBER": lambda _: fake.bban(),
+    29|         "US_DRIVER_LICENSE": lambda _: str(fake.random_number(digits=9, fix_len=True)),
+    30|         "US_ITIN": lambda _: fake.bothify(text="9##-7#-####"),
+    31|         "US_PASSPORT": lambda _: fake.bothify(text="#####??").upper(),
+    32|         "US_SSN": lambda _: fake.ssn(),
+    33|     }
+
+
+# ====================================================================
+# FILE: libs/experimental/langchain_experimental/data_anonymizer/presidio.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-36 ---
+     1| from __future__ import annotations
+     2| import json
+     3| from pathlib import Path
+     4| from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
+     5| import yaml
+     6| from langchain_experimental.data_anonymizer.base import (
+     7|     AnonymizerBase,
+     8|     ReversibleAnonymizerBase,
+     9| )
+    10| from langchain_experimental.data_anonymizer.deanonymizer_mapping import (
+    11|     DeanonymizerMapping,
+    12|     MappingDataType,
+    13|     create_anonymizer_mapping,
+    14| )
+    15| from langchain_experimental.data_anonymizer.deanonymizer_matching_strategies import (
+    16|     default_matching_strategy,
+    17| )
+    18| from langchain_experimental.data_anonymizer.faker_presidio_mapping import (
+    19|     get_pseudoanonymizer_mapping,
+    20| )
+    21| try:
+    22|     from presidio_analyzer import AnalyzerEngine
+    23|     from presidio_analyzer.nlp_engine import NlpEngineProvider
+    24| except ImportError as e:
+    25|     raise ImportError(
+    26|         "Could not import presidio_analyzer, please install with "
+    27|         "`pip install presidio-analyzer`. You will also need to download a "
+    28|         "spaCy model to use the analyzer, e.g. "
+    29|         "`python -m spacy download en_core_web_lg`."
+    30|     ) from e
+    31| try:
+    32|     from presidio_anonymizer import AnonymizerEngine
+    33|     from presidio_anonymizer.entities import OperatorConfig
+    34| except ImportError as e:
+    35|     raise ImportError(
+    36|         "Could not import presidio_anonymizer, please install with "
+
+# --- HUNK 2: Lines 137-177 ---
+   137|         analyzer_results = self._analyzer.analyze(
+   138|             text,
+   139|             entities=self.analyzed_fields,
+   140|             language=language,
+   141|         )
+   142|         filtered_analyzer_results = (
+   143|             self._anonymizer._remove_conflicts_and_get_text_manipulation_data(
+   144|                 analyzer_results
+   145|             )
+   146|         )
+   147|         anonymizer_results = self._anonymizer.anonymize(
+   148|             text,
+   149|             analyzer_results=analyzer_results,
+   150|             operators=self.operators,
+   151|         )
+   152|         anonymizer_mapping = create_anonymizer_mapping(
+   153|             text,
+   154|             filtered_analyzer_results,
+   155|             anonymizer_results,
+   156|         )
+   157|         return default_matching_strategy(text, anonymizer_mapping)
+   158| class PresidioReversibleAnonymizer(PresidioAnonymizerBase, ReversibleAnonymizerBase):
+   159|     def __init__(
+   160|         self,
+   161|         analyzed_fields: Optional[List[str]] = None,
+   162|         operators: Optional[Dict[str, OperatorConfig]] = None,
+   163|         languages_config: Dict = DEFAULT_LANGUAGES_CONFIG,
+   164|         add_default_faker_operators: bool = True,
+   165|         faker_seed: Optional[int] = None,
+   166|     ):
+   167|         super().__init__(
+   168|             analyzed_fields,
+   169|             operators,
+   170|             languages_config,
+   171|             add_default_faker_operators,
+   172|             faker_seed,
+   173|         )
+   174|         self._deanonymizer_mapping = DeanonymizerMapping()
+   175|     @property
+   176|     def deanonymizer_mapping(self) -> MappingDataType:
+   177|         """Return the deanonymizer mapping"""
+
+# --- HUNK 3: Lines 216-280 ---
+   216|             entities=self.analyzed_fields,
+   217|             language=language,
+   218|         )
+   219|         filtered_analyzer_results = (
+   220|             self._anonymizer._remove_conflicts_and_get_text_manipulation_data(
+   221|                 analyzer_results
+   222|             )
+   223|         )
+   224|         anonymizer_results = self._anonymizer.anonymize(
+   225|             text,
+   226|             analyzer_results=analyzer_results,
+   227|             operators=self.operators,
+   228|         )
+   229|         new_deanonymizer_mapping = create_anonymizer_mapping(
+   230|             text,
+   231|             filtered_analyzer_results,
+   232|             anonymizer_results,
+   233|             is_reversed=True,
+   234|         )
+   235|         self._deanonymizer_mapping.update(new_deanonymizer_mapping)
+   236|         return default_matching_strategy(text, self.anonymizer_mapping)
+   237|     def _deanonymize(
+   238|         self,
+   239|         text_to_deanonymize: str,
+   240|         deanonymizer_matching_strategy: Callable[
+   241|             [str, MappingDataType], str
+   242|         ] = default_matching_strategy,
+   243|     ) -> str:
+   244|         """Deanonymize text.
+   245|         Each anonymized entity is replaced with its original value.
+   246|         This method exploits the mapping created during the anonymization process.
+   247|         Args:
+   248|             text_to_deanonymize: text to deanonymize
+   249|             deanonymizer_matching_strategy: function to use to match
+   250|                 anonymized entities with their original values and replace them.
+   251|         """
+   252|         if not self._deanonymizer_mapping:
+   253|             raise ValueError(
+   254|                 "Deanonymizer mapping is empty.",
+   255|                 "Please call anonymize() and anonymize some text first.",
+   256|             )
+   257|         text_to_deanonymize = deanonymizer_matching_strategy(
+   258|             text_to_deanonymize, self.deanonymizer_mapping
+   259|         )
+   260|         return text_to_deanonymize
+   261|     def save_deanonymizer_mapping(self, file_path: Union[Path, str]) -> None:
+   262|         """Save the deanonymizer mapping to a JSON or YAML file.
+   263|         Args:
+   264|             file_path: Path to file to save the mapping to.
+   265|         Example:
+   266|         .. code-block:: python
+   267|             anonymizer.save_deanonymizer_mapping(file_path="path/mapping.json")
+   268|         """
+   269|         save_path = Path(file_path)
+   270|         if save_path.suffix not in [".json", ".yaml"]:
+   271|             raise ValueError(f"{save_path} must have an extension of .json or .yaml")
+   272|         save_path.parent.mkdir(parents=True, exist_ok=True)
+   273|         if save_path.suffix == ".json":
+   274|             with open(save_path, "w") as f:
+   275|                 json.dump(self.deanonymizer_mapping, f, indent=2)
+   276|         elif save_path.suffix == ".yaml":
+   277|             with open(save_path, "w") as f:
+   278|                 yaml.dump(self.deanonymizer_mapping, f, default_flow_style=False)
+   279|     def load_deanonymizer_mapping(self, file_path: Union[Path, str]) -> None:
+   280|         """Load the deanonymizer mapping from a JSON or YAML file.
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 26-68 ---
+    26|     )
+    27| surface_langchain_deprecation_warnings()
+    28| def __getattr__(name: str) -> Any:
+    29|     if name == "MRKLChain":
+    30|         from langchain.agents import MRKLChain
+    31|         _warn_on_import(name)
+    32|         return MRKLChain
+    33|     elif name == "ReActChain":
+    34|         from langchain.agents import ReActChain
+    35|         _warn_on_import(name)
+    36|         return ReActChain
+    37|     elif name == "SelfAskWithSearchChain":
+    38|         from langchain.agents import SelfAskWithSearchChain
+    39|         _warn_on_import(name)
+    40|         return SelfAskWithSearchChain
+    41|     elif name == "ConversationChain":
+    42|         from langchain.chains import ConversationChain
+    43|         _warn_on_import(name)
+    44|         return ConversationChain
+    45|     elif name == "LLMBashChain":
+    46|         from langchain.chains import LLMBashChain
+    47|         _warn_on_import(name)
+    48|         return LLMBashChain
+    49|     elif name == "LLMChain":
+    50|         from langchain.chains import LLMChain
+    51|         _warn_on_import(name)
+    52|         return LLMChain
+    53|     elif name == "LLMCheckerChain":
+    54|         from langchain.chains import LLMCheckerChain
+    55|         _warn_on_import(name)
+    56|         return LLMCheckerChain
+    57|     elif name == "LLMMathChain":
+    58|         from langchain.chains import LLMMathChain
+    59|         _warn_on_import(name)
+    60|         return LLMMathChain
+    61|     elif name == "QAWithSourcesChain":
+    62|         from langchain.chains import QAWithSourcesChain
+    63|         _warn_on_import(name)
+    64|         return QAWithSourcesChain
+    65|     elif name == "VectorDBQA":
+    66|         from langchain.chains import VectorDBQA
+    67|         _warn_on_import(name)
+    68|         return VectorDBQA
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/agents/agent_toolkits/sql/toolkit.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 23-62 ---
+    23|         """Configuration for this pydantic object."""
+    24|         arbitrary_types_allowed = True
+    25|     def get_tools(self) -> List[BaseTool]:
+    26|         """Get the tools in the toolkit."""
+    27|         list_sql_database_tool = ListSQLDatabaseTool(db=self.db)
+    28|         info_sql_database_tool_description = (
+    29|             "Input to this tool is a comma-separated list of tables, output is the "
+    30|             "schema and sample rows for those tables. "
+    31|             "Be sure that the tables actually exist by calling "
+    32|             f"{list_sql_database_tool.name} first! "
+    33|             "Example Input: 'table1, table2, table3'"
+    34|         )
+    35|         info_sql_database_tool = InfoSQLDatabaseTool(
+    36|             db=self.db, description=info_sql_database_tool_description
+    37|         )
+    38|         query_sql_database_tool_description = (
+    39|             "Input to this tool is a detailed and correct SQL query, output is a "
+    40|             "result from the database. If the query is not correct, an error message "
+    41|             "will be returned. If an error is returned, rewrite the query, check the "
+    42|             "query, and try again. If you encounter an issue with Unknown column "
+    43|             f"'xxxx' in 'field list', using {info_sql_database_tool.name} "
+    44|             "to query the correct table fields."
+    45|         )
+    46|         query_sql_database_tool = QuerySQLDataBaseTool(
+    47|             db=self.db, description=query_sql_database_tool_description
+    48|         )
+    49|         query_sql_checker_tool_description = (
+    50|             "Use this tool to double check if your query is correct before executing "
+    51|             "it. Always use this tool before executing a query with "
+    52|             f"{query_sql_database_tool.name}!"
+    53|         )
+    54|         query_sql_checker_tool = QuerySQLCheckerTool(
+    55|             db=self.db, llm=self.llm, description=query_sql_checker_tool_description
+    56|         )
+    57|         return [
+    58|             query_sql_database_tool,
+    59|             info_sql_database_tool,
+    60|             list_sql_database_tool,
+    61|             query_sql_checker_tool,
+    62|         ]
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/agents/conversational_chat/prompt.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-39 ---
+     1| PREFIX = """Assistant is a large language model trained by OpenAI.
+     2| Assistant is designed to be able to assist with a wide range of tasks, from answering simple questions to providing in-depth explanations and discussions on a wide range of topics. As a language model, Assistant is able to generate human-like text based on the input it receives, allowing it to engage in natural-sounding conversations and provide responses that are coherent and relevant to the topic at hand.
+     3| Assistant is constantly learning and improving, and its capabilities are constantly evolving. It is able to process and understand large amounts of text, and can use this knowledge to provide accurate and informative responses to a wide range of questions. Additionally, Assistant is able to generate its own text based on the input it receives, allowing it to engage in discussions and provide explanations and descriptions on a wide range of topics.
+     4| Overall, Assistant is a powerful system that can help with a wide range of tasks and provide valuable insights and information on a wide range of topics. Whether you need help with a specific question or just want to have a conversation about a particular topic, Assistant is here to assist."""
+     5| FORMAT_INSTRUCTIONS = """RESPONSE FORMAT INSTRUCTIONS
+     6| ----------------------------
+     7| When responding to me, please output a response in one of two formats:
+     8| **Option 1:**
+     9| Use this if you want the human to use a tool.
+    10| Markdown code snippet formatted in the following schema:
+    11| ```json
+    12| {{{{
+    13|     "action": string, \\ The action to take. Must be one of {tool_names}
+    14|     "action_input": string \\ The input to the action
+    15| }}}}
+    16| ```
+    17| **Option #2:**
+    18| Use this if you want to respond directly to the human. Markdown code snippet formatted in the following schema:
+    19| ```json
+    20| {{{{
+    21|     "action": "Final Answer",
+    22|     "action_input": string \\ You should put what you want to return to use here
+    23| }}}}
+    24| ```"""
+    25| SUFFIX = """TOOLS
+    26| ------
+    27| Assistant can ask the user to use tools to look up information that may be helpful in answering the users original question. The tools the human can use are:
+    28| {{tools}}
+    29| {format_instructions}
+    30| USER'S INPUT
+    31| --------------------
+    32| Here is the user's input (remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else):
+    33| {{{{input}}}}"""
+    34| TEMPLATE_TOOL_RESPONSE = """TOOL RESPONSE: 
+    35| ---------------------
+    36| {observation}
+    37| USER'S INPUT
+    38| --------------------
+    39| Okay, so what is the response to my last comment? If using information obtained from the tools you must mention it explicitly without mentioning the tool names - I have forgotten all TOOL RESPONSES! Remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else."""
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/cache.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 521-575 ---
+   521|         except ImportError:
+   522|             raise ImportError(
+   523|                 "Could not import momento python package. "
+   524|                 "Please install it with `pip install momento`."
+   525|             )
+   526|         if not isinstance(cache_client, CacheClient):
+   527|             raise TypeError("cache_client must be a momento.CacheClient object.")
+   528|         _validate_ttl(ttl)
+   529|         if ensure_cache_exists:
+   530|             _ensure_cache_exists(cache_client, cache_name)
+   531|         self.cache_client = cache_client
+   532|         self.cache_name = cache_name
+   533|         self.ttl = ttl
+   534|     @classmethod
+   535|     def from_client_params(
+   536|         cls,
+   537|         cache_name: str,
+   538|         ttl: timedelta,
+   539|         *,
+   540|         configuration: Optional[momento.config.Configuration] = None,
+   541|         auth_token: Optional[str] = None,
+   542|         **kwargs: Any,
+   543|     ) -> MomentoCache:
+   544|         """Construct cache from CacheClient parameters."""
+   545|         try:
+   546|             from momento import CacheClient, Configurations, CredentialProvider
+   547|         except ImportError:
+   548|             raise ImportError(
+   549|                 "Could not import momento python package. "
+   550|                 "Please install it with `pip install momento`."
+   551|             )
+   552|         if configuration is None:
+   553|             configuration = Configurations.Laptop.v1()
+   554|         auth_token = auth_token or get_from_env("auth_token", "MOMENTO_AUTH_TOKEN")
+   555|         credentials = CredentialProvider.from_string(auth_token)
+   556|         cache_client = CacheClient(configuration, credentials, default_ttl=ttl)
+   557|         return cls(cache_client, cache_name, ttl=ttl, **kwargs)
+   558|     def __key(self, prompt: str, llm_string: str) -> str:
+   559|         """Compute cache key from prompt and associated model and settings.
+   560|         Args:
+   561|             prompt (str): The prompt run through the language model.
+   562|             llm_string (str): The language model version and settings.
+   563|         Returns:
+   564|             str: The cache key.
+   565|         """
+   566|         return _hash(prompt + llm_string)
+   567|     def lookup(self, prompt: str, llm_string: str) -> Optional[RETURN_VAL_TYPE]:
+   568|         """Lookup llm generations in cache by prompt and associated model and settings.
+   569|         Args:
+   570|             prompt (str): The prompt run through the language model.
+   571|             llm_string (str): The language model version and settings.
+   572|         Raises:
+   573|             SdkException: Momento service or network error
+   574|         Returns:
+   575|             Optional[RETURN_VAL_TYPE]: A list of language model generations.
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/callbacks/llmonitor_callback.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-20 ---
+     1| import os
+     2| import traceback
+     3| from contextvars import ContextVar
+     4| from datetime import datetime
+     5| from typing import Any, Dict, List, Literal, Union
+     6| from uuid import UUID
+     7| import requests
+     8| from langchain.callbacks.base import BaseCallbackHandler
+     9| from langchain.schema.agent import AgentAction, AgentFinish
+    10| from langchain.schema.messages import BaseMessage
+    11| from langchain.schema.output import LLMResult
+    12| DEFAULT_API_URL = "https://app.llmonitor.com"
+    13| user_ctx = ContextVar[Union[str, None]]("user_ctx", default=None)
+    14| user_props_ctx = ContextVar[Union[str, None]]("user_props_ctx", default=None)
+    15| class UserContextManager:
+    16|     """Context manager for LLMonitor user context."""
+    17|     def __init__(self, user_id: str, user_props: Any = None) -> None:
+    18|         user_ctx.set(user_id)
+    19|         user_props_ctx.set(user_props)
+    20|     def __enter__(self) -> Any:
+
+# --- HUNK 2: Lines 159-441 ---
+   159|                 f"Could not connect to the LLMonitor API at {self.__api_url}"
+   160|             ) from e
+   161|     def __send_event(self, event: Dict[str, Any]) -> None:
+   162|         headers = {"Content-Type": "application/json"}
+   163|         event = {**event, "app": self.__app_id, "timestamp": str(datetime.utcnow())}
+   164|         if self.__verbose:
+   165|             print("llmonitor_callback", event)
+   166|         data = {"events": event}
+   167|         requests.post(headers=headers, url=f"{self.__api_url}/api/report", json=data)
+   168|     def on_llm_start(
+   169|         self,
+   170|         serialized: Dict[str, Any],
+   171|         prompts: List[str],
+   172|         *,
+   173|         run_id: UUID,
+   174|         parent_run_id: Union[UUID, None] = None,
+   175|         tags: Union[List[str], None] = None,
+   176|         metadata: Union[Dict[str, Any], None] = None,
+   177|         **kwargs: Any,
+   178|     ) -> None:
+   179|         user_id = _get_user_id(metadata)
+   180|         user_props = _get_user_props(metadata)
+   181|         event = {
+   182|             "event": "start",
+   183|             "type": "llm",
+   184|             "userId": user_id,
+   185|             "runId": str(run_id),
+   186|             "parentRunId": str(parent_run_id) if parent_run_id else None,
+   187|             "input": _parse_input(prompts),
+   188|             "name": kwargs.get("invocation_params", {}).get("model_name"),
+   189|             "tags": tags,
+   190|             "metadata": metadata,
+   191|         }
+   192|         if user_props:
+   193|             event["userProps"] = user_props
+   194|         self.__send_event(event)
+   195|     def on_chat_model_start(
+   196|         self,
+   197|         serialized: Dict[str, Any],
+   198|         messages: List[List[BaseMessage]],
+   199|         *,
+   200|         run_id: UUID,
+   201|         parent_run_id: Union[UUID, None] = None,
+   202|         tags: Union[List[str], None] = None,
+   203|         metadata: Union[Dict[str, Any], None] = None,
+   204|         **kwargs: Any,
+   205|     ) -> Any:
+   206|         user_id = _get_user_id(metadata)
+   207|         user_props = _get_user_props(metadata)
+   208|         event = {
+   209|             "event": "start",
+   210|             "type": "llm",
+   211|             "userId": user_id,
+   212|             "runId": str(run_id),
+   213|             "parentRunId": str(parent_run_id) if parent_run_id else None,
+   214|             "input": _parse_lc_messages(messages[0]),
+   215|             "name": kwargs.get("invocation_params", {}).get("model_name"),
+   216|             "tags": tags,
+   217|             "metadata": metadata,
+   218|         }
+   219|         if user_props:
+   220|             event["userProps"] = user_props
+   221|         self.__send_event(event)
+   222|     def on_llm_end(
+   223|         self,
+   224|         response: LLMResult,
+   225|         *,
+   226|         run_id: UUID,
+   227|         parent_run_id: Union[UUID, None] = None,
+   228|         **kwargs: Any,
+   229|     ) -> None:
+   230|         token_usage = (response.llm_output or {}).get("token_usage", {})
+   231|         parsed_output = [
+   232|             {
+   233|                 "text": generation.text,
+   234|                 "role": "ai",
+   235|                 **(
+   236|                     {
+   237|                         "functionCall": generation.message.additional_kwargs[
+   238|                             "function_call"
+   239|                         ]
+   240|                     }
+   241|                     if hasattr(generation, "message")
+   242|                     and hasattr(generation.message, "additional_kwargs")
+   243|                     and "function_call" in generation.message.additional_kwargs
+   244|                     else {}
+   245|                 ),
+   246|             }
+   247|             for generation in response.generations[0]
+   248|         ]
+   249|         event = {
+   250|             "event": "end",
+   251|             "type": "llm",
+   252|             "runId": str(run_id),
+   253|             "parent_run_id": str(parent_run_id) if parent_run_id else None,
+   254|             "output": parsed_output,
+   255|             "tokensUsage": {
+   256|                 "prompt": token_usage.get("prompt_tokens"),
+   257|                 "completion": token_usage.get("completion_tokens"),
+   258|             },
+   259|         }
+   260|         self.__send_event(event)
+   261|     def on_tool_start(
+   262|         self,
+   263|         serialized: Dict[str, Any],
+   264|         input_str: str,
+   265|         *,
+   266|         run_id: UUID,
+   267|         parent_run_id: Union[UUID, None] = None,
+   268|         tags: Union[List[str], None] = None,
+   269|         metadata: Union[Dict[str, Any], None] = None,
+   270|         **kwargs: Any,
+   271|     ) -> None:
+   272|         user_id = _get_user_id(metadata)
+   273|         user_props = _get_user_props(metadata)
+   274|         event = {
+   275|             "event": "start",
+   276|             "type": "tool",
+   277|             "userId": user_id,
+   278|             "runId": str(run_id),
+   279|             "parentRunId": str(parent_run_id) if parent_run_id else None,
+   280|             "name": serialized.get("name"),
+   281|             "input": input_str,
+   282|             "tags": tags,
+   283|             "metadata": metadata,
+   284|         }
+   285|         if user_props:
+   286|             event["userProps"] = user_props
+   287|         self.__send_event(event)
+   288|     def on_tool_end(
+   289|         self,
+   290|         output: str,
+   291|         *,
+   292|         run_id: UUID,
+   293|         parent_run_id: Union[UUID, None] = None,
+   294|         tags: Union[List[str], None] = None,
+   295|         **kwargs: Any,
+   296|     ) -> None:
+   297|         event = {
+   298|             "event": "end",
+   299|             "type": "tool",
+   300|             "runId": str(run_id),
+   301|             "parent_run_id": str(parent_run_id) if parent_run_id else None,
+   302|             "output": output,
+   303|         }
+   304|         self.__send_event(event)
+   305|     def on_chain_start(
+   306|         self,
+   307|         serialized: Dict[str, Any],
+   308|         inputs: Dict[str, Any],
+   309|         *,
+   310|         run_id: UUID,
+   311|         parent_run_id: Union[UUID, None] = None,
+   312|         tags: Union[List[str], None] = None,
+   313|         metadata: Union[Dict[str, Any], None] = None,
+   314|         **kwargs: Any,
+   315|     ) -> Any:
+   316|         name = serialized.get("id", [None, None, None, None])[3]
+   317|         type = "chain"
+   318|         metadata = metadata or {}
+   319|         agentName = metadata.get("agent_name")
+   320|         if agentName is None:
+   321|             agentName = metadata.get("agentName")
+   322|         if agentName is not None:
+   323|             type = "agent"
+   324|             name = agentName
+   325|         if name == "AgentExecutor" or name == "PlanAndExecute":
+   326|             type = "agent"
+   327|         if parent_run_id is not None:
+   328|             type = "chain"
+   329|         user_id = _get_user_id(metadata)
+   330|         user_props = _get_user_props(metadata)
+   331|         event = {
+   332|             "event": "start",
+   333|             "type": type,
+   334|             "userId": user_id,
+   335|             "runId": str(run_id),
+   336|             "parentRunId": str(parent_run_id) if parent_run_id else None,
+   337|             "input": _parse_input(inputs),
+   338|             "tags": tags,
+   339|             "metadata": metadata,
+   340|             "name": name,
+   341|         }
+   342|         if user_props:
+   343|             event["userProps"] = user_props
+   344|         self.__send_event(event)
+   345|     def on_chain_end(
+   346|         self,
+   347|         outputs: Dict[str, Any],
+   348|         *,
+   349|         run_id: UUID,
+   350|         parent_run_id: Union[UUID, None] = None,
+   351|         **kwargs: Any,
+   352|     ) -> Any:
+   353|         event = {
+   354|             "event": "end",
+   355|             "type": "chain",
+   356|             "runId": str(run_id),
+   357|             "output": _parse_output(outputs),
+   358|         }
+   359|         self.__send_event(event)
+   360|     def on_agent_action(
+   361|         self,
+   362|         action: AgentAction,
+   363|         *,
+   364|         run_id: UUID,
+   365|         parent_run_id: Union[UUID, None] = None,
+   366|         **kwargs: Any,
+   367|     ) -> Any:
+   368|         event = {
+   369|             "event": "start",
+   370|             "type": "tool",
+   371|             "runId": str(run_id),
+   372|             "parentRunId": str(parent_run_id) if parent_run_id else None,
+   373|             "name": action.tool,
+   374|             "input": _parse_input(action.tool_input),
+   375|         }
+   376|         self.__send_event(event)
+   377|     def on_agent_finish(
+   378|         self,
+   379|         finish: AgentFinish,
+   380|         *,
+   381|         run_id: UUID,
+   382|         parent_run_id: Union[UUID, None] = None,
+   383|         **kwargs: Any,
+   384|     ) -> Any:
+   385|         event = {
+   386|             "event": "end",
+   387|             "type": "agent",
+   388|             "runId": str(run_id),
+   389|             "parentRunId": str(parent_run_id) if parent_run_id else None,
+   390|             "output": _parse_output(finish.return_values),
+   391|         }
+   392|         self.__send_event(event)
+   393|     def on_chain_error(
+   394|         self,
+   395|         error: BaseException,
+   396|         *,
+   397|         run_id: UUID,
+   398|         parent_run_id: Union[UUID, None] = None,
+   399|         **kwargs: Any,
+   400|     ) -> Any:
+   401|         event = {
+   402|             "event": "error",
+   403|             "type": "chain",
+   404|             "runId": str(run_id),
+   405|             "parent_run_id": str(parent_run_id) if parent_run_id else None,
+   406|             "error": {"message": str(error), "stack": traceback.format_exc()},
+   407|         }
+   408|         self.__send_event(event)
+   409|     def on_tool_error(
+   410|         self,
+   411|         error: BaseException,
+   412|         *,
+   413|         run_id: UUID,
+   414|         parent_run_id: Union[UUID, None] = None,
+   415|         **kwargs: Any,
+   416|     ) -> Any:
+   417|         event = {
+   418|             "event": "error",
+   419|             "type": "tool",
+   420|             "runId": str(run_id),
+   421|             "parent_run_id": str(parent_run_id) if parent_run_id else None,
+   422|             "error": {"message": str(error), "stack": traceback.format_exc()},
+   423|         }
+   424|         self.__send_event(event)
+   425|     def on_llm_error(
+   426|         self,
+   427|         error: BaseException,
+   428|         *,
+   429|         run_id: UUID,
+   430|         parent_run_id: Union[UUID, None] = None,
+   431|         **kwargs: Any,
+   432|     ) -> Any:
+   433|         event = {
+   434|             "event": "error",
+   435|             "type": "llm",
+   436|             "runId": str(run_id),
+   437|             "parent_run_id": str(parent_run_id) if parent_run_id else None,
+   438|             "error": {"message": str(error), "stack": traceback.format_exc()},
+   439|         }
+   440|         self.__send_event(event)
+   441| __all__ = ["LLMonitorCallbackHandler", "identify"]
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/callbacks/manager.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1622-1668 ---
+  1622|         inheritable_tags (Optional[List[str]], optional): The inheritable tags.
+  1623|             Defaults to None.
+  1624|         local_tags (Optional[List[str]], optional): The local tags. Defaults to None.
+  1625|         inheritable_metadata (Optional[Dict[str, Any]], optional): The inheritable
+  1626|             metadata. Defaults to None.
+  1627|         local_metadata (Optional[Dict[str, Any]], optional): The local metadata.
+  1628|             Defaults to None.
+  1629|     Returns:
+  1630|         T: The configured callback manager.
+  1631|     """
+  1632|     callback_manager = callback_manager_cls(handlers=[])
+  1633|     if inheritable_callbacks or local_callbacks:
+  1634|         if isinstance(inheritable_callbacks, list) or inheritable_callbacks is None:
+  1635|             inheritable_callbacks_ = inheritable_callbacks or []
+  1636|             callback_manager = callback_manager_cls(
+  1637|                 handlers=inheritable_callbacks_.copy(),
+  1638|                 inheritable_handlers=inheritable_callbacks_.copy(),
+  1639|             )
+  1640|         else:
+  1641|             callback_manager = callback_manager_cls(
+  1642|                 handlers=inheritable_callbacks.handlers,
+  1643|                 inheritable_handlers=inheritable_callbacks.inheritable_handlers,
+  1644|                 parent_run_id=inheritable_callbacks.parent_run_id,
+  1645|                 tags=inheritable_callbacks.tags,
+  1646|                 inheritable_tags=inheritable_callbacks.inheritable_tags,
+  1647|                 metadata=inheritable_callbacks.metadata,
+  1648|                 inheritable_metadata=inheritable_callbacks.inheritable_metadata,
+  1649|             )
+  1650|         local_handlers_ = (
+  1651|             local_callbacks
+  1652|             if isinstance(local_callbacks, list)
+  1653|             else (local_callbacks.handlers if local_callbacks else [])
+  1654|         )
+  1655|         for handler in local_handlers_:
+  1656|             callback_manager.add_handler(handler, False)
+  1657|     if inheritable_tags or local_tags:
+  1658|         callback_manager.add_tags(inheritable_tags or [])
+  1659|         callback_manager.add_tags(local_tags or [], False)
+  1660|     if inheritable_metadata or local_metadata:
+  1661|         callback_manager.add_metadata(inheritable_metadata or {})
+  1662|         callback_manager.add_metadata(local_metadata or {}, False)
+  1663|     tracer = tracing_callback_var.get()
+  1664|     wandb_tracer = wandb_tracing_callback_var.get()
+  1665|     open_ai = openai_callback_var.get()
+  1666|     tracing_enabled_ = (
+  1667|         env_var_is_set("LANGCHAIN_TRACING")
+  1668|         or tracer is not None
+
+# --- HUNK 2: Lines 1720-1749 ---
+  1720|                 handler = WandbTracer()
+  1721|                 callback_manager.add_handler(handler, True)
+  1722|         if tracing_v2_enabled_ and not any(
+  1723|             isinstance(handler, LangChainTracer)
+  1724|             for handler in callback_manager.handlers
+  1725|         ):
+  1726|             if tracer_v2:
+  1727|                 callback_manager.add_handler(tracer_v2, True)
+  1728|             else:
+  1729|                 try:
+  1730|                     handler = LangChainTracer(project_name=tracer_project)
+  1731|                     callback_manager.add_handler(handler, True)
+  1732|                 except Exception as e:
+  1733|                     logger.warning(
+  1734|                         "Unable to load requested LangChainTracer."
+  1735|                         " To disable this warning,"
+  1736|                         " unset the  LANGCHAIN_TRACING_V2 environment variables.",
+  1737|                         e,
+  1738|                     )
+  1739|         if open_ai is not None and not any(
+  1740|             isinstance(handler, OpenAICallbackHandler)
+  1741|             for handler in callback_manager.handlers
+  1742|         ):
+  1743|             callback_manager.add_handler(open_ai, True)
+  1744|     if run_collector_ is not None and not any(
+  1745|         handler is run_collector_  # direct pointer comparison
+  1746|         for handler in callback_manager.handlers
+  1747|     ):
+  1748|         callback_manager.add_handler(run_collector_, False)
+  1749|     return callback_manager
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/chains/__init__.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 20-60 ---
+    20| from langchain.chains.combine_documents.stuff import StuffDocumentsChain
+    21| from langchain.chains.constitutional_ai.base import ConstitutionalChain
+    22| from langchain.chains.conversation.base import ConversationChain
+    23| from langchain.chains.conversational_retrieval.base import (
+    24|     ChatVectorDBChain,
+    25|     ConversationalRetrievalChain,
+    26| )
+    27| from langchain.chains.example_generator import generate_example
+    28| from langchain.chains.flare.base import FlareChain
+    29| from langchain.chains.graph_qa.arangodb import ArangoGraphQAChain
+    30| from langchain.chains.graph_qa.base import GraphQAChain
+    31| from langchain.chains.graph_qa.cypher import GraphCypherQAChain
+    32| from langchain.chains.graph_qa.falkordb import FalkorDBQAChain
+    33| from langchain.chains.graph_qa.hugegraph import HugeGraphQAChain
+    34| from langchain.chains.graph_qa.kuzu import KuzuQAChain
+    35| from langchain.chains.graph_qa.nebulagraph import NebulaGraphQAChain
+    36| from langchain.chains.graph_qa.neptune_cypher import NeptuneOpenCypherQAChain
+    37| from langchain.chains.graph_qa.sparql import GraphSparqlQAChain
+    38| from langchain.chains.hyde.base import HypotheticalDocumentEmbedder
+    39| from langchain.chains.llm import LLMChain
+    40| from langchain.chains.llm_bash.base import LLMBashChain
+    41| from langchain.chains.llm_checker.base import LLMCheckerChain
+    42| from langchain.chains.llm_math.base import LLMMathChain
+    43| from langchain.chains.llm_requests import LLMRequestsChain
+    44| from langchain.chains.llm_summarization_checker.base import LLMSummarizationCheckerChain
+    45| from langchain.chains.loading import load_chain
+    46| from langchain.chains.mapreduce import MapReduceChain
+    47| from langchain.chains.moderation import OpenAIModerationChain
+    48| from langchain.chains.natbot.base import NatBotChain
+    49| from langchain.chains.openai_functions import (
+    50|     create_citation_fuzzy_match_chain,
+    51|     create_extraction_chain,
+    52|     create_extraction_chain_pydantic,
+    53|     create_qa_with_sources_chain,
+    54|     create_qa_with_structure_chain,
+    55|     create_tagging_chain,
+    56|     create_tagging_chain_pydantic,
+    57| )
+    58| from langchain.chains.qa_generation.base import QAGenerationChain
+    59| from langchain.chains.qa_with_sources.base import QAWithSourcesChain
+    60| from langchain.chains.qa_with_sources.retrieval import RetrievalQAWithSourcesChain
+
+# --- HUNK 2: Lines 69-109 ---
+    69| )
+    70| from langchain.chains.sequential import SequentialChain, SimpleSequentialChain
+    71| from langchain.chains.sql_database.query import create_sql_query_chain
+    72| from langchain.chains.transform import TransformChain
+    73| __all__ = [
+    74|     "APIChain",
+    75|     "AnalyzeDocumentChain",
+    76|     "ArangoGraphQAChain",
+    77|     "ChatVectorDBChain",
+    78|     "ConstitutionalChain",
+    79|     "ConversationChain",
+    80|     "ConversationalRetrievalChain",
+    81|     "FalkorDBQAChain",
+    82|     "FlareChain",
+    83|     "GraphCypherQAChain",
+    84|     "GraphQAChain",
+    85|     "GraphSparqlQAChain",
+    86|     "HugeGraphQAChain",
+    87|     "HypotheticalDocumentEmbedder",
+    88|     "KuzuQAChain",
+    89|     "LLMBashChain",
+    90|     "LLMChain",
+    91|     "LLMCheckerChain",
+    92|     "LLMMathChain",
+    93|     "LLMRequestsChain",
+    94|     "LLMRouterChain",
+    95|     "LLMSummarizationCheckerChain",
+    96|     "MapReduceChain",
+    97|     "MapReduceDocumentsChain",
+    98|     "MapRerankDocumentsChain",
+    99|     "MultiPromptChain",
+   100|     "MultiRetrievalQAChain",
+   101|     "MultiRouteChain",
+   102|     "NatBotChain",
+   103|     "NebulaGraphQAChain",
+   104|     "NeptuneOpenCypherQAChain",
+   105|     "OpenAIModerationChain",
+   106|     "OpenAPIEndpointChain",
+   107|     "QAGenerationChain",
+   108|     "QAWithSourcesChain",
+   109|     "ReduceDocumentsChain",
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/chains/llm_bash/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-1 ---
+     1| """Chain that interprets a prompt and executes bash code to perform bash operations."""
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/chains/llm_bash/base.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-115 ---
+     1| """Chain that interprets a prompt and executes bash operations."""
+     2| from __future__ import annotations
+     3| import logging
+     4| import warnings
+     5| from typing import Any, Dict, List, Optional
+     6| from langchain._api import warn_deprecated
+     7| from langchain.callbacks.manager import CallbackManagerForChainRun
+     8| from langchain.chains.base import Chain
+     9| from langchain.chains.llm import LLMChain
+    10| from langchain.chains.llm_bash.prompt import PROMPT
+    11| from langchain.pydantic_v1 import Extra, Field, root_validator
+    12| from langchain.schema import BasePromptTemplate, OutputParserException
+    13| from langchain.schema.language_model import BaseLanguageModel
+    14| from langchain.utilities.bash import BashProcess
+    15| logger = logging.getLogger(__name__)
+    16| class LLMBashChain(Chain):
+    17|     """Chain that interprets a prompt and executes bash operations.
+    18|     Warning:
+    19|         This chain can execute arbitrary code using bash.
+    20|         This can be dangerous if not properly sandboxed.
+    21|     Example:
+    22|         .. code-block:: python
+    23|             from langchain.chains import LLMBashChain
+    24|             from langchain.llms import OpenAI
+    25|             llm_bash = LLMBashChain.from_llm(OpenAI())
+    26|     """
+    27|     llm_chain: LLMChain
+    28|     llm: Optional[BaseLanguageModel] = None
+    29|     """[Deprecated] LLM wrapper to use."""
+    30|     input_key: str = "question"  #: :meta private:
+    31|     output_key: str = "answer"  #: :meta private:
+    32|     prompt: BasePromptTemplate = PROMPT
+    33|     """[Deprecated]"""
+    34|     bash_process: BashProcess = Field(default_factory=BashProcess)  #: :meta private:
+    35|     class Config:
+    36|         """Configuration for this pydantic object."""
+    37|         extra = Extra.forbid
+    38|         arbitrary_types_allowed = True
+    39|     @root_validator(pre=True)
+    40|     def raise_deprecation(cls, values: Dict) -> Dict:
+    41|         if "llm" in values:
+    42|             warnings.warn(
+    43|                 "Directly instantiating an LLMBashChain with an llm is deprecated. "
+    44|                 "Please instantiate with llm_chain or using the from_llm class method."
+    45|             )
+    46|             if "llm_chain" not in values and values["llm"] is not None:
+    47|                 prompt = values.get("prompt", PROMPT)
+    48|                 values["llm_chain"] = LLMChain(llm=values["llm"], prompt=prompt)
+    49|         return values
+    50|     @root_validator
+    51|     def validate_prompt(cls, values: Dict) -> Dict:
+    52|         if values["llm_chain"].prompt.output_parser is None:
+    53|             raise ValueError(
+    54|                 "The prompt used by llm_chain is expected to have an output_parser."
+    55|             )
+    56|         return values
+    57|     @property
+    58|     def input_keys(self) -> List[str]:
+    59|         """Expect input key.
+    60|         :meta private:
+    61|         """
+    62|         return [self.input_key]
+    63|     @property
+    64|     def output_keys(self) -> List[str]:
+    65|         """Expect output key.
+    66|         :meta private:
+    67|         """
+    68|         return [self.output_key]
+    69|     def _call(
+    70|         self,
+    71|         inputs: Dict[str, Any],
+    72|         run_manager: Optional[CallbackManagerForChainRun] = None,
+    73|     ) -> Dict[str, str]:
+    74|         warn_deprecated(
+    75|             since="0.0.308",
+    76|             message=(
+    77|                 "On 2023-10-12 the LLMBashChain "
+    78|                 "will be moved to langchain-experimental"
+    79|             ),
+    80|             pending=True,
+    81|         )
+    82|         _run_manager = run_manager or CallbackManagerForChainRun.get_noop_manager()
+    83|         _run_manager.on_text(inputs[self.input_key], verbose=self.verbose)
+    84|         t = self.llm_chain.predict(
+    85|             question=inputs[self.input_key], callbacks=_run_manager.get_child()
+    86|         )
+    87|         _run_manager.on_text(t, color="green", verbose=self.verbose)
+    88|         t = t.strip()
+    89|         try:
+    90|             parser = self.llm_chain.prompt.output_parser
+    91|             command_list = parser.parse(t)  # type: ignore[union-attr]
+    92|         except OutputParserException as e:
+    93|             _run_manager.on_chain_error(e, verbose=self.verbose)
+    94|             raise e
+    95|         if self.verbose:
+    96|             _run_manager.on_text("\nCode: ", verbose=self.verbose)
+    97|             _run_manager.on_text(
+    98|                 str(command_list), color="yellow", verbose=self.verbose
+    99|             )
+   100|         output = self.bash_process.run(command_list)
+   101|         _run_manager.on_text("\nAnswer: ", verbose=self.verbose)
+   102|         _run_manager.on_text(output, color="yellow", verbose=self.verbose)
+   103|         return {self.output_key: output}
+   104|     @property
+   105|     def _chain_type(self) -> str:
+   106|         return "llm_bash_chain"
+   107|     @classmethod
+   108|     def from_llm(
+   109|         cls,
+   110|         llm: BaseLanguageModel,
+   111|         prompt: BasePromptTemplate = PROMPT,
+   112|         **kwargs: Any,
+   113|     ) -> LLMBashChain:
+   114|         llm_chain = LLMChain(llm=llm, prompt=prompt)
+   115|         return cls(llm_chain=llm_chain, **kwargs)
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/chains/llm_bash/prompt.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-47 ---
+     1| from __future__ import annotations
+     2| import re
+     3| from typing import List
+     4| from langchain.prompts.prompt import PromptTemplate
+     5| from langchain.schema import BaseOutputParser, OutputParserException
+     6| _PROMPT_TEMPLATE = """If someone asks you to perform a task, your job is to come up with a series of bash commands that will perform the task. There is no need to put "#!/bin/bash" in your answer. Make sure to reason step by step, using this format:
+     7| Question: "copy the files in the directory named 'target' into a new directory at the same level as target called 'myNewDirectory'"
+     8| I need to take the following actions:
+     9| - List all files in the directory
+    10| - Create a new directory
+    11| - Copy the files from the first directory into the second directory
+    12| ```bash
+    13| ls
+    14| mkdir myNewDirectory
+    15| cp -r target/* myNewDirectory
+    16| ```
+    17| That is the format. Begin!
+    18| Question: {question}"""
+    19| class BashOutputParser(BaseOutputParser):
+    20|     """Parser for bash output."""
+    21|     def parse(self, text: str) -> List[str]:
+    22|         if "```bash" in text:
+    23|             return self.get_code_blocks(text)
+    24|         else:
+    25|             raise OutputParserException(
+    26|                 f"Failed to parse bash output. Got: {text}",
+    27|             )
+    28|     @staticmethod
+    29|     def get_code_blocks(t: str) -> List[str]:
+    30|         """Get multiple code blocks from the LLM result."""
+    31|         code_blocks: List[str] = []
+    32|         pattern = re.compile(r"```bash(.*?)(?:\n\s*)```", re.DOTALL)
+    33|         for match in pattern.finditer(t):
+    34|             matched = match.group(1).strip()
+    35|             if matched:
+    36|                 code_blocks.extend(
+    37|                     [line for line in matched.split("\n") if line.strip()]
+    38|                 )
+    39|         return code_blocks
+    40|     @property
+    41|     def _type(self) -> str:
+    42|         return "bash"
+    43| PROMPT = PromptTemplate(
+    44|     input_variables=["question"],
+    45|     template=_PROMPT_TEMPLATE,
+    46|     output_parser=BashOutputParser(),
+    47| )
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/chains/llm_symbolic_math/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-12 ---
+     1| """Chain that interprets a prompt and executes python code to do math.
+     2| Heavily borrowed from llm_math, wrapper for SymPy
+     3| """
+     4| from langchain._api import warn_deprecated
+     5| warn_deprecated(
+     6|     since="0.0.304",
+     7|     message=(
+     8|         "On 2023-10-06 this module will be moved to langchain-experimental as "
+     9|         "it relies on sympy https://github.com/sympy/sympy/issues/10805"
+    10|     ),
+    11|     pending=True,
+    12| )
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/chains/llm_symbolic_math/base.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-134 ---
+     1| """Chain that interprets a prompt and executes python code to do symbolic math."""
+     2| from __future__ import annotations
+     3| import re
+     4| from typing import Any, Dict, List, Optional
+     5| from langchain.base_language import BaseLanguageModel
+     6| from langchain.callbacks.manager import (
+     7|     AsyncCallbackManagerForChainRun,
+     8|     CallbackManagerForChainRun,
+     9| )
+    10| from langchain.chains.base import Chain
+    11| from langchain.chains.llm import LLMChain
+    12| from langchain.chains.llm_symbolic_math.prompt import PROMPT
+    13| from langchain.prompts.base import BasePromptTemplate
+    14| from langchain.pydantic_v1 import Extra
+    15| class LLMSymbolicMathChain(Chain):
+    16|     """Chain that interprets a prompt and executes python code to do symbolic math.
+    17|     Example:
+    18|         .. code-block:: python
+    19|             from langchain.chains import LLMSymbolicMathChain
+    20|             from langchain.llms import OpenAI
+    21|             llm_symbolic_math = LLMSymbolicMathChain.from_llm(OpenAI())
+    22|     """
+    23|     llm_chain: LLMChain
+    24|     input_key: str = "question"  #: :meta private:
+    25|     output_key: str = "answer"  #: :meta private:
+    26|     class Config:
+    27|         """Configuration for this pydantic object."""
+    28|         extra = Extra.forbid
+    29|         arbitrary_types_allowed = True
+    30|     @property
+    31|     def input_keys(self) -> List[str]:
+    32|         """Expect input key.
+    33|         :meta private:
+    34|         """
+    35|         return [self.input_key]
+    36|     @property
+    37|     def output_keys(self) -> List[str]:
+    38|         """Expect output key.
+    39|         :meta private:
+    40|         """
+    41|         return [self.output_key]
+    42|     def _evaluate_expression(self, expression: str) -> str:
+    43|         try:
+    44|             import sympy
+    45|         except ImportError as e:
+    46|             raise ImportError(
+    47|                 "Unable to import sympy, please install it with `pip install sympy`."
+    48|             ) from e
+    49|         try:
+    50|             output = str(sympy.sympify(expression, evaluate=True))
+    51|         except Exception as e:
+    52|             raise ValueError(
+    53|                 f'LLMSymbolicMathChain._evaluate("{expression}") raised error: {e}.'
+    54|                 " Please try again with a valid numerical expression"
+    55|             )
+    56|         return re.sub(r"^\[|\]$", "", output)
+    57|     def _process_llm_result(
+    58|         self, llm_output: str, run_manager: CallbackManagerForChainRun
+    59|     ) -> Dict[str, str]:
+    60|         run_manager.on_text(llm_output, color="green", verbose=self.verbose)
+    61|         llm_output = llm_output.strip()
+    62|         text_match = re.search(r"^```text(.*?)```", llm_output, re.DOTALL)
+    63|         if text_match:
+    64|             expression = text_match.group(1)
+    65|             output = self._evaluate_expression(expression)
+    66|             run_manager.on_text("\nAnswer: ", verbose=self.verbose)
+    67|             run_manager.on_text(output, color="yellow", verbose=self.verbose)
+    68|             answer = "Answer: " + output
+    69|         elif llm_output.startswith("Answer:"):
+    70|             answer = llm_output
+    71|         elif "Answer:" in llm_output:
+    72|             answer = "Answer: " + llm_output.split("Answer:")[-1]
+    73|         else:
+    74|             raise ValueError(f"unknown format from LLM: {llm_output}")
+    75|         return {self.output_key: answer}
+    76|     async def _aprocess_llm_result(
+    77|         self,
+    78|         llm_output: str,
+    79|         run_manager: AsyncCallbackManagerForChainRun,
+    80|     ) -> Dict[str, str]:
+    81|         await run_manager.on_text(llm_output, color="green", verbose=self.verbose)
+    82|         llm_output = llm_output.strip()
+    83|         text_match = re.search(r"^```text(.*?)```", llm_output, re.DOTALL)
+    84|         if text_match:
+    85|             expression = text_match.group(1)
+    86|             output = self._evaluate_expression(expression)
+    87|             await run_manager.on_text("\nAnswer: ", verbose=self.verbose)
+    88|             await run_manager.on_text(output, color="yellow", verbose=self.verbose)
+    89|             answer = "Answer: " + output
+    90|         elif llm_output.startswith("Answer:"):
+    91|             answer = llm_output
+    92|         elif "Answer:" in llm_output:
+    93|             answer = "Answer: " + llm_output.split("Answer:")[-1]
+    94|         else:
+    95|             raise ValueError(f"unknown format from LLM: {llm_output}")
+    96|         return {self.output_key: answer}
+    97|     def _call(
+    98|         self,
+    99|         inputs: Dict[str, str],
+   100|         run_manager: Optional[CallbackManagerForChainRun] = None,
+   101|     ) -> Dict[str, str]:
+   102|         _run_manager = run_manager or CallbackManagerForChainRun.get_noop_manager()
+   103|         _run_manager.on_text(inputs[self.input_key])
+   104|         llm_output = self.llm_chain.predict(
+   105|             question=inputs[self.input_key],
+   106|             stop=["```output"],
+   107|             callbacks=_run_manager.get_child(),
+   108|         )
+   109|         return self._process_llm_result(llm_output, _run_manager)
+   110|     async def _acall(
+   111|         self,
+   112|         inputs: Dict[str, str],
+   113|         run_manager: Optional[AsyncCallbackManagerForChainRun] = None,
+   114|     ) -> Dict[str, str]:
+   115|         _run_manager = run_manager or AsyncCallbackManagerForChainRun.get_noop_manager()
+   116|         await _run_manager.on_text(inputs[self.input_key])
+   117|         llm_output = await self.llm_chain.apredict(
+   118|             question=inputs[self.input_key],
+   119|             stop=["```output"],
+   120|             callbacks=_run_manager.get_child(),
+   121|         )
+   122|         return await self._aprocess_llm_result(llm_output, _run_manager)
+   123|     @property
+   124|     def _chain_type(self) -> str:
+   125|         return "llm_symbolic_math_chain"
+   126|     @classmethod
+   127|     def from_llm(
+   128|         cls,
+   129|         llm: BaseLanguageModel,
+   130|         prompt: BasePromptTemplate = PROMPT,
+   131|         **kwargs: Any,
+   132|     ) -> LLMSymbolicMathChain:
+   133|         llm_chain = LLMChain(llm=llm, prompt=prompt)
+   134|         return cls(llm_chain=llm_chain, **kwargs)
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/chains/llm_symbolic_math/prompt.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-43 ---
+     1| from langchain.prompts.prompt import PromptTemplate
+     2| _PROMPT_TEMPLATE = """Translate a math problem into a expression that can be executed using Python's SymPy library. Use the output of running this code to answer the question.
+     3| Question: ${{Question with math problem.}}
+     4| ```text
+     5| ${{single line sympy expression that solves the problem}}
+     6| ```
+     7| ...sympy.sympify(text, evaluate=True)...
+     8| ```output
+     9| ${{Output of running the code}}
+    10| ```
+    11| Answer: ${{Answer}}
+    12| Begin.
+    13| Question: What is the limit of sin(x) / x as x goes to 0
+    14| ```text
+    15| limit(sin(x)/x, x, 0)
+    16| ```
+    17| ...sympy.sympify("limit(sin(x)/x, x, 0)")...
+    18| ```output
+    19| 1
+    20| ```
+    21| Answer: 1
+    22| Question: What is the integral of e^-x from 0 to infinity
+    23| ```text
+    24| integrate(exp(-x), (x, 0, oo))
+    25| ```
+    26| ...sympy.sympify("integrate(exp(-x), (x, 0, oo))")...
+    27| ```output
+    28| 1
+    29| ```
+    30| Question: What are the solutions to this equation x**2 - x?
+    31| ```text
+    32| solveset(x**2 - x, x)
+    33| ```
+    34| ...sympy.sympify("solveset(x**2 - x, x)")...
+    35| ```output
+    36| [0, 1]
+    37| ```
+    38| Question: {question}
+    39| """
+    40| PROMPT = PromptTemplate(
+    41|     input_variables=["question"],
+    42|     template=_PROMPT_TEMPLATE,
+    43| )
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/chains/loading.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-36 ---
+     1| """Functionality for loading chains."""
+     2| import json
+     3| from pathlib import Path
+     4| from typing import Any, Union
+     5| import yaml
+     6| from langchain.chains import ReduceDocumentsChain
+     7| from langchain.chains.api.base import APIChain
+     8| from langchain.chains.base import Chain
+     9| from langchain.chains.combine_documents.map_reduce import MapReduceDocumentsChain
+    10| from langchain.chains.combine_documents.map_rerank import MapRerankDocumentsChain
+    11| from langchain.chains.combine_documents.refine import RefineDocumentsChain
+    12| from langchain.chains.combine_documents.stuff import StuffDocumentsChain
+    13| from langchain.chains.graph_qa.cypher import GraphCypherQAChain
+    14| from langchain.chains.hyde.base import HypotheticalDocumentEmbedder
+    15| from langchain.chains.llm import LLMChain
+    16| from langchain.chains.llm_bash.base import LLMBashChain
+    17| from langchain.chains.llm_checker.base import LLMCheckerChain
+    18| from langchain.chains.llm_math.base import LLMMathChain
+    19| from langchain.chains.llm_requests import LLMRequestsChain
+    20| from langchain.chains.qa_with_sources.base import QAWithSourcesChain
+    21| from langchain.chains.qa_with_sources.retrieval import RetrievalQAWithSourcesChain
+    22| from langchain.chains.qa_with_sources.vector_db import VectorDBQAWithSourcesChain
+    23| from langchain.chains.retrieval_qa.base import RetrievalQA, VectorDBQA
+    24| from langchain.llms.loading import load_llm, load_llm_from_config
+    25| from langchain.prompts.loading import (
+    26|     _load_output_parser,
+    27|     load_prompt,
+    28|     load_prompt_from_config,
+    29| )
+    30| from langchain.utilities.loading import try_load_from_hub
+    31| URL_BASE = "https://raw.githubusercontent.com/hwchase17/langchain-hub/master/chains/"
+    32| def _load_llm_chain(config: dict, **kwargs: Any) -> LLMChain:
+    33|     """Load LLM chain from config dict."""
+    34|     if "llm" in config:
+    35|         llm_config = config.pop("llm")
+    36|         llm = load_llm_from_config(llm_config)
+
+# --- HUNK 2: Lines 140-180 ---
+   140|         collapse_documents_chain = load_chain(
+   141|             config.pop("collapse_documents_chain_path")
+   142|         )
+   143|     elif "collapse_document_chain" in config:
+   144|         collapse_document_chain_config = config.pop("collapse_document_chain")
+   145|         if collapse_document_chain_config is None:
+   146|             collapse_documents_chain = None
+   147|         else:
+   148|             collapse_documents_chain = load_chain_from_config(
+   149|                 collapse_document_chain_config
+   150|             )
+   151|     elif "collapse_document_chain_path" in config:
+   152|         collapse_documents_chain = load_chain(
+   153|             config.pop("collapse_document_chain_path")
+   154|         )
+   155|     return ReduceDocumentsChain(
+   156|         combine_documents_chain=combine_documents_chain,
+   157|         collapse_documents_chain=collapse_documents_chain,
+   158|         **config,
+   159|     )
+   160| def _load_llm_bash_chain(config: dict, **kwargs: Any) -> LLMBashChain:
+   161|     llm_chain = None
+   162|     if "llm_chain" in config:
+   163|         llm_chain_config = config.pop("llm_chain")
+   164|         llm_chain = load_chain_from_config(llm_chain_config)
+   165|     elif "llm_chain_path" in config:
+   166|         llm_chain = load_chain(config.pop("llm_chain_path"))
+   167|     elif "llm" in config:
+   168|         llm_config = config.pop("llm")
+   169|         llm = load_llm_from_config(llm_config)
+   170|     elif "llm_path" in config:
+   171|         llm = load_llm(config.pop("llm_path"))
+   172|     else:
+   173|         raise ValueError("One of `llm_chain` or `llm_chain_path` must be present.")
+   174|     if "prompt" in config:
+   175|         prompt_config = config.pop("prompt")
+   176|         prompt = load_prompt_from_config(prompt_config)
+   177|     elif "prompt_path" in config:
+   178|         prompt = load_prompt(config.pop("prompt_path"))
+   179|     if llm_chain:
+   180|         return LLMBashChain(llm_chain=llm_chain, prompt=prompt, **config)
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/cli/cli.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-34 ---
+     1| """A CLI for creating a new project with LangChain."""
+     2| from pathlib import Path
+     3| from typing import Optional
+     4| from typing_extensions import Annotated
+     5| from langchain.cli.create_repo.base import create, is_poetry_installed
+     6| from langchain.cli.create_repo.pypi_name import is_name_taken, lint_name
+     7| from langchain.cli.create_repo.user_info import get_git_user_email, get_git_user_name
+     8| try:
+     9|     import typer
+    10| except ImportError:
+    11|     raise ImportError(
+    12|         "Typer must be installed to use the CLI. "
+    13|         "You can install it with `pip install typer`."
+    14|     )
+    15| app = typer.Typer(no_args_is_help=False, add_completion=False)
+    16| def _select_project_name(suggested_project_name: str) -> str:
+    17|     """Help the user select a valid project name."""
+    18|     while True:
+    19|         project_name = typer.prompt("Project Name", default=suggested_project_name)
+    20|         project_name_diagnostics = lint_name(project_name)
+    21|         if project_name_diagnostics:
+    22|             typer.echo(
+    23|                 f"{typer.style('Warning:', fg=typer.colors.MAGENTA)}"
+    24|                 f" The project name"
+    25|                 f" {typer.style(project_name, fg=typer.colors.BRIGHT_CYAN)}"
+    26|                 f" is not valid.",
+    27|                 err=True,
+    28|             )
+    29|             for diagnostic in project_name_diagnostics:
+    30|                 typer.echo(f"  - {diagnostic}")
+    31|             if typer.confirm(
+    32|                 "Select another name?",
+    33|                 default=True,
+    34|             ):
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/cli/create_repo/base.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 65-146 ---
+    65|                 raise typer.Exit(code=1)
+    66| def _copy_template_files(
+    67|     template_directories: Sequence[Path],
+    68|     project_directory_path: Path,
+    69|     project_name: str,
+    70|     project_name_identifier: str,
+    71|     author_name: str,
+    72|     author_email: str,
+    73| ) -> None:
+    74|     """Copy template files to project directory and substitute variables.
+    75|     Args:
+    76|         template_directories: The directories containing the templates.
+    77|         project_directory_path: The destination directory.
+    78|         project_name: The name of the project.
+    79|         project_name_identifier: The identifier of the project name.
+    80|         author_name: The name of the author.
+    81|         author_email: The email of the author.
+    82|     """
+    83|     for template_directory_path in template_directories:
+    84|         for template_file_path in template_directory_path.glob("**/*"):
+    85|             relative_template_file_path = UnderscoreTemplate(
+    86|                 str(template_file_path.relative_to(template_directory_path))
+    87|             ).substitute(project_name_identifier=project_name_identifier)
+    88|             project_file_path = project_directory_path / relative_template_file_path
+    89|             if template_file_path.is_dir():
+    90|                 project_file_path.mkdir(parents=True, exist_ok=True)
+    91|             else:
+    92|                 project_file_path.write_text(
+    93|                     UnderscoreTemplate(template_file_path.read_text()).substitute(
+    94|                         project_name=project_name,
+    95|                         project_name_identifier=project_name_identifier,
+    96|                         author_name=author_name,
+    97|                         author_email=author_email,
+    98|                         langchain_version=langchain.__version__,
+    99|                     )
+   100|                 )
+   101| def _poetry_install(project_directory_path: Path) -> None:
+   102|     """Install dependencies with Poetry."""
+   103|     typer.echo(
+   104|         f"\n{typer.style('2.', bold=True, fg=typer.colors.GREEN)}"
+   105|         f" Installing dependencies with Poetry..."
+   106|     )
+   107|     subprocess.run(["pwd"], cwd=project_directory_path)
+   108|     subprocess.run(
+   109|         ["poetry", "install"],
+   110|         cwd=project_directory_path,
+   111|         env={**os.environ.copy(), "VIRTUAL_ENV": ""},
+   112|     )
+   113| def _pip_install(project_directory_path: Path) -> None:
+   114|     """Create virtual environment and install dependencies."""
+   115|     typer.echo(
+   116|         f"\n{typer.style('2.', bold=True, fg=typer.colors.GREEN)}"
+   117|         f" Creating virtual environment..."
+   118|     )
+   119|     subprocess.run(["pwd"], cwd=project_directory_path)
+   120|     subprocess.run(["python", "-m", "venv", ".venv"], cwd=project_directory_path)
+   121| def _init_git(project_directory_path: Path) -> None:
+   122|     """Initialize git repository."""
+   123|     typer.echo(
+   124|         f"\n{typer.style('Initializing git...', bold=True, fg=typer.colors.GREEN)}"
+   125|     )
+   126|     subprocess.run(["git", "init"], cwd=project_directory_path)
+   127|     subprocess.run(["git", "add", "."], cwd=project_directory_path)
+   128|     subprocess.run(
+   129|         ["git", "commit", "-m", "Initial commit"],
+   130|         cwd=project_directory_path,
+   131|     )
+   132| def create(
+   133|     project_directory: pathlib.Path,
+   134|     project_name: str,
+   135|     author_name: str,
+   136|     author_email: str,
+   137|     use_poetry: bool,
+   138| ) -> None:
+   139|     """Create a new LangChain project.
+   140|     Args:
+   141|         project_directory (str): The directory to create the project in.
+   142|         project_name: The name of the project.
+   143|         author_name (str): The name of the author.
+   144|         author_email (str): The email of the author.
+   145|         use_poetry (bool): Whether to use Poetry to manage the project.
+   146|     """
+
+# --- HUNK 2: Lines 163-183 ---
+   163|         raise typer.Exit(code=0)
+   164|     _create_project_dir(
+   165|         project_directory_path,
+   166|         use_poetry,
+   167|         project_name,
+   168|         project_name_identifier,
+   169|         author_name,
+   170|         author_email,
+   171|     )
+   172|     _init_git(project_directory_path)
+   173|     typer.echo(
+   174|         f"\n{typer.style('Done!🙌', bold=True, fg=typer.colors.GREEN)}"
+   175|         f" Your new LangChain project"
+   176|         f" {typer.style(project_name, fg=typer.colors.BRIGHT_CYAN)}"
+   177|         f" has been created in"
+   178|         f" {typer.style(project_directory_path.resolve(), fg=typer.colors.BRIGHT_CYAN)}"
+   179|         f"."
+   180|     )
+   181| def is_poetry_installed() -> bool:
+   182|     """Check if Poetry is installed."""
+   183|     return subprocess.run(["poetry", "--version"], capture_output=True).returncode == 0
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/document_loaders/csv_loader.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-108 ---
+     1| import csv
+     2| from io import TextIOWrapper
+     3| from typing import Any, Dict, List, Optional
+     4| from langchain.docstore.document import Document
+     5| from langchain.document_loaders.base import BaseLoader
+     6| from langchain.document_loaders.helpers import detect_file_encodings
+     7| from langchain.document_loaders.unstructured import (
+     8|     UnstructuredFileLoader,
+     9|     validate_unstructured_version,
+    10| )
+    11| class CSVLoader(BaseLoader):
+    12|     """Load a `CSV` file into a list of Documents.
+    13|     Each document represents one row of the CSV file. Every row is converted into a
+    14|     key/value pair and outputted to a new line in the document's page_content.
+    15|     The source for each document loaded from csv is set to the value of the
+    16|     `file_path` argument for all documents by default.
+    17|     You can override this by setting the `source_column` argument to the
+    18|     name of a column in the CSV file.
+    19|     The source of each document will then be set to the value of the column
+    20|     with the name specified in `source_column`.
+    21|     Output Example:
+    22|         .. code-block:: txt
+    23|             column1: value1
+    24|             column2: value2
+    25|             column3: value3
+    26|     """
+    27|     def __init__(
+    28|         self,
+    29|         file_path: str,
+    30|         source_column: Optional[str] = None,
+    31|         csv_args: Optional[Dict] = None,
+    32|         encoding: Optional[str] = None,
+    33|         autodetect_encoding: bool = False,
+    34|     ):
+    35|         """
+    36|         Args:
+    37|             file_path: The path to the CSV file.
+    38|             source_column: The name of the column in the CSV file to use as the source.
+    39|               Optional. Defaults to None.
+    40|             csv_args: A dictionary of arguments to pass to the csv.DictReader.
+    41|               Optional. Defaults to None.
+    42|             encoding: The encoding of the CSV file. Optional. Defaults to None.
+    43|             autodetect_encoding: Whether to try to autodetect the file encoding.
+    44|         """
+    45|         self.file_path = file_path
+    46|         self.source_column = source_column
+    47|         self.encoding = encoding
+    48|         self.csv_args = csv_args or {}
+    49|         self.autodetect_encoding = autodetect_encoding
+    50|     def load(self) -> List[Document]:
+    51|         """Load data into document objects."""
+    52|         docs = []
+    53|         try:
+    54|             with open(self.file_path, newline="", encoding=self.encoding) as csvfile:
+    55|                 docs = self.__read_file(csvfile)
+    56|         except UnicodeDecodeError as e:
+    57|             if self.autodetect_encoding:
+    58|                 detected_encodings = detect_file_encodings(self.file_path)
+    59|                 for encoding in detected_encodings:
+    60|                     try:
+    61|                         with open(
+    62|                             self.file_path, newline="", encoding=encoding.encoding
+    63|                         ) as csvfile:
+    64|                             docs = self.__read_file(csvfile)
+    65|                             break
+    66|                     except UnicodeDecodeError:
+    67|                         continue
+    68|             else:
+    69|                 raise RuntimeError(f"Error loading {self.file_path}") from e
+    70|         except Exception as e:
+    71|             raise RuntimeError(f"Error loading {self.file_path}") from e
+    72|         return docs
+    73|     def __read_file(self, csvfile: TextIOWrapper) -> List[Document]:
+    74|         docs = []
+    75|         csv_reader = csv.DictReader(csvfile, **self.csv_args)  # type: ignore
+    76|         for i, row in enumerate(csv_reader):
+    77|             content = "\n".join(f"{k.strip()}: {v.strip()}" for k, v in row.items())
+    78|             try:
+    79|                 source = (
+    80|                     row[self.source_column]
+    81|                     if self.source_column is not None
+    82|                     else self.file_path
+    83|                 )
+    84|             except KeyError:
+    85|                 raise ValueError(
+    86|                     f"Source column '{self.source_column}' not found in CSV file."
+    87|                 )
+    88|             metadata = {"source": source, "row": i}
+    89|             doc = Document(page_content=content, metadata=metadata)
+    90|             docs.append(doc)
+    91|         return docs
+    92| class UnstructuredCSVLoader(UnstructuredFileLoader):
+    93|     """Load `CSV` files using `Unstructured`.
+    94|     Like other
+    95|     Unstructured loaders, UnstructuredCSVLoader can be used in both
+    96|     "single" and "elements" mode. If you use the loader in "elements"
+    97|     mode, the CSV file will be a single Unstructured Table element.
+    98|     If you use the loader in "elements" mode, an HTML representation
+    99|     of the table will be available in the "text_as_html" key in the
+   100|     document metadata.
+   101|     Examples
+   102|     --------
+   103|     from langchain.document_loaders.csv_loader import UnstructuredCSVLoader
+   104|     loader = UnstructuredCSVLoader("stanley-cups.csv", mode="elements")
+   105|     docs = loader.load()
+   106|     """
+   107|     def __init__(
+   108|         self, file_path: str, mode: str = "single", **unstructured_kwargs: Any
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/llms/__init__.py
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 11-50 ---
+    11|     CallbackManager, AsyncCallbackManager,
+    12|     AIMessage, BaseMessage
+    13| """  # noqa: E501
+    14| from typing import Any, Callable, Dict, Type
+    15| from langchain.llms.base import BaseLLM
+    16| def _import_ai21() -> Any:
+    17|     from langchain.llms.ai21 import AI21
+    18|     return AI21
+    19| def _import_aleph_alpha() -> Any:
+    20|     from langchain.llms.aleph_alpha import AlephAlpha
+    21|     return AlephAlpha
+    22| def _import_amazon_api_gateway() -> Any:
+    23|     from langchain.llms.amazon_api_gateway import AmazonAPIGateway
+    24|     return AmazonAPIGateway
+    25| def _import_anthropic() -> Any:
+    26|     from langchain.llms.anthropic import Anthropic
+    27|     return Anthropic
+    28| def _import_anyscale() -> Any:
+    29|     from langchain.llms.anyscale import Anyscale
+    30|     return Anyscale
+    31| def _import_aviary() -> Any:
+    32|     from langchain.llms.aviary import Aviary
+    33|     return Aviary
+    34| def _import_azureml_endpoint() -> Any:
+    35|     from langchain.llms.azureml_endpoint import AzureMLOnlineEndpoint
+    36|     return AzureMLOnlineEndpoint
+    37| def _import_baidu_qianfan_endpoint() -> Any:
+    38|     from langchain.llms.baidu_qianfan_endpoint import QianfanLLMEndpoint
+    39|     return QianfanLLMEndpoint
+    40| def _import_bananadev() -> Any:
+    41|     from langchain.llms.bananadev import Banana
+    42|     return Banana
+    43| def _import_baseten() -> Any:
+    44|     from langchain.llms.baseten import Baseten
+    45|     return Baseten
+    46| def _import_beam() -> Any:
+    47|     from langchain.llms.beam import Beam
+    48|     return Beam
+    49| def _import_bedrock() -> Any:
+    50|     from langchain.llms.bedrock import Bedrock
+
+# --- HUNK 2: Lines 231-270 ---
+   231| def _import_vllm_openai() -> Any:
+   232|     from langchain.llms.vllm import VLLMOpenAI
+   233|     return VLLMOpenAI
+   234| def _import_writer() -> Any:
+   235|     from langchain.llms.writer import Writer
+   236|     return Writer
+   237| def _import_xinference() -> Any:
+   238|     from langchain.llms.xinference import Xinference
+   239|     return Xinference
+   240| def __getattr__(name: str) -> Any:
+   241|     if name == "AI21":
+   242|         return _import_ai21()
+   243|     elif name == "AlephAlpha":
+   244|         return _import_aleph_alpha()
+   245|     elif name == "AmazonAPIGateway":
+   246|         return _import_amazon_api_gateway()
+   247|     elif name == "Anthropic":
+   248|         return _import_anthropic()
+   249|     elif name == "Anyscale":
+   250|         return _import_anyscale()
+   251|     elif name == "Aviary":
+   252|         return _import_aviary()
+   253|     elif name == "AzureMLOnlineEndpoint":
+   254|         return _import_azureml_endpoint()
+   255|     elif name == "QianfanLLMEndpoint":
+   256|         return _import_baidu_qianfan_endpoint()
+   257|     elif name == "Banana":
+   258|         return _import_bananadev()
+   259|     elif name == "Baseten":
+   260|         return _import_baseten()
+   261|     elif name == "Beam":
+   262|         return _import_beam()
+   263|     elif name == "Bedrock":
+   264|         return _import_bedrock()
+   265|     elif name == "NIBittensorLLM":
+   266|         return _import_bittensor()
+   267|     elif name == "CerebriumAI":
+   268|         return _import_cerebriumai()
+   269|     elif name == "ChatGLM":
+   270|         return _import_chatglm()
+
+# --- HUNK 3: Lines 382-421 ---
+   382|         return _import_vllm()
+   383|     elif name == "VLLMOpenAI":
+   384|         return _import_vllm_openai()
+   385|     elif name == "Writer":
+   386|         return _import_writer()
+   387|     elif name == "Xinference":
+   388|         return _import_xinference()
+   389|     elif name == "type_to_cls_dict":
+   390|         type_to_cls_dict: Dict[str, Type[BaseLLM]] = {
+   391|             k: v() for k, v in get_type_to_cls_dict().items()
+   392|         }
+   393|         return type_to_cls_dict
+   394|     else:
+   395|         raise AttributeError(f"Could not find: {name}")
+   396| __all__ = [
+   397|     "AI21",
+   398|     "AlephAlpha",
+   399|     "AmazonAPIGateway",
+   400|     "Anthropic",
+   401|     "Anyscale",
+   402|     "Aviary",
+   403|     "AzureMLOnlineEndpoint",
+   404|     "AzureOpenAI",
+   405|     "Banana",
+   406|     "Baseten",
+   407|     "Beam",
+   408|     "Bedrock",
+   409|     "CTransformers",
+   410|     "CTranslate2",
+   411|     "CerebriumAI",
+   412|     "ChatGLM",
+   413|     "Clarifai",
+   414|     "Cohere",
+   415|     "Databricks",
+   416|     "DeepInfra",
+   417|     "DeepSparse",
+   418|     "EdenAI",
+   419|     "FakeListLLM",
+   420|     "Fireworks",
+   421|     "ForefrontAI",
+
+# --- HUNK 4: Lines 460-499 ---
+   460|     "TitanTakeoff",
+   461|     "Tongyi",
+   462|     "VertexAI",
+   463|     "VertexAIModelGarden",
+   464|     "VLLM",
+   465|     "VLLMOpenAI",
+   466|     "Writer",
+   467|     "OctoAIEndpoint",
+   468|     "Xinference",
+   469|     "JavelinAIGateway",
+   470|     "QianfanLLMEndpoint",
+   471| ]
+   472| def get_type_to_cls_dict() -> Dict[str, Callable[[], Type[BaseLLM]]]:
+   473|     return {
+   474|         "ai21": _import_ai21,
+   475|         "aleph_alpha": _import_aleph_alpha,
+   476|         "amazon_api_gateway": _import_amazon_api_gateway,
+   477|         "amazon_bedrock": _import_bedrock,
+   478|         "anthropic": _import_anthropic,
+   479|         "anyscale": _import_anyscale,
+   480|         "aviary": _import_aviary,
+   481|         "azure": _import_azure_openai,
+   482|         "azureml_endpoint": _import_azureml_endpoint,
+   483|         "bananadev": _import_bananadev,
+   484|         "baseten": _import_baseten,
+   485|         "beam": _import_beam,
+   486|         "cerebriumai": _import_cerebriumai,
+   487|         "chat_glm": _import_chatglm,
+   488|         "clarifai": _import_clarifai,
+   489|         "cohere": _import_cohere,
+   490|         "ctransformers": _import_ctransformers,
+   491|         "ctranslate2": _import_ctranslate2,
+   492|         "databricks": _import_databricks,
+   493|         "deepinfra": _import_deepinfra,
+   494|         "deepsparse": _import_deepsparse,
+   495|         "edenai": _import_edenai,
+   496|         "fake-list": _import_fake,
+   497|         "forefrontai": _import_forefrontai,
+   498|         "google_palm": _import_google_palm,
+   499|         "gooseai": _import_gooseai,
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/memory/chat_message_histories/momento.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 65-119 ---
+    65|             )
+    66|         if not isinstance(cache_client, CacheClient):
+    67|             raise TypeError("cache_client must be a momento.CacheClient object.")
+    68|         if ensure_cache_exists:
+    69|             _ensure_cache_exists(cache_client, cache_name)
+    70|         self.key = key_prefix + session_id
+    71|         self.cache_client = cache_client
+    72|         self.cache_name = cache_name
+    73|         if ttl is not None:
+    74|             self.ttl = CollectionTtl.of(ttl)
+    75|         else:
+    76|             self.ttl = CollectionTtl.from_cache_ttl()
+    77|     @classmethod
+    78|     def from_client_params(
+    79|         cls,
+    80|         session_id: str,
+    81|         cache_name: str,
+    82|         ttl: timedelta,
+    83|         *,
+    84|         configuration: Optional[momento.config.Configuration] = None,
+    85|         auth_token: Optional[str] = None,
+    86|         **kwargs: Any,
+    87|     ) -> MomentoChatMessageHistory:
+    88|         """Construct cache from CacheClient parameters."""
+    89|         try:
+    90|             from momento import CacheClient, Configurations, CredentialProvider
+    91|         except ImportError:
+    92|             raise ImportError(
+    93|                 "Could not import momento python package. "
+    94|                 "Please install it with `pip install momento`."
+    95|             )
+    96|         if configuration is None:
+    97|             configuration = Configurations.Laptop.v1()
+    98|         auth_token = auth_token or get_from_env("auth_token", "MOMENTO_AUTH_TOKEN")
+    99|         credentials = CredentialProvider.from_string(auth_token)
+   100|         cache_client = CacheClient(configuration, credentials, default_ttl=ttl)
+   101|         return cls(session_id, cache_client, cache_name, ttl=ttl, **kwargs)
+   102|     @property
+   103|     def messages(self) -> list[BaseMessage]:  # type: ignore[override]
+   104|         """Retrieve the messages from Momento.
+   105|         Raises:
+   106|             SdkException: Momento service or network error
+   107|             Exception: Unexpected response
+   108|         Returns:
+   109|             list[BaseMessage]: List of cached messages
+   110|         """
+   111|         from momento.responses import CacheListFetch
+   112|         fetch_response = self.cache_client.list_fetch(self.cache_name, self.key)
+   113|         if isinstance(fetch_response, CacheListFetch.Hit):
+   114|             items = [json.loads(m) for m in fetch_response.value_list_string]
+   115|             return messages_from_dict(items)
+   116|         elif isinstance(fetch_response, CacheListFetch.Miss):
+   117|             return []
+   118|         elif isinstance(fetch_response, CacheListFetch.Error):
+   119|             raise fetch_response.inner_exception
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/prompts/base.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-31 ---
+     1| """BasePrompt schema definition."""
+     2| from __future__ import annotations
+     3| import warnings
+     4| from abc import ABC
+     5| from typing import Any, Callable, Dict, List, Set
+     6| from langchain.schema.messages import BaseMessage, HumanMessage
+     7| from langchain.schema.prompt import PromptValue
+     8| from langchain.schema.prompt_template import BasePromptTemplate
+     9| from langchain.utils.formatting import formatter
+    10| def jinja2_formatter(template: str, **kwargs: Any) -> str:
+    11|     """Format a template using jinja2."""
+    12|     try:
+    13|         from jinja2 import Template
+    14|     except ImportError:
+    15|         raise ImportError(
+    16|             "jinja2 not installed, which is needed to use the jinja2_formatter. "
+    17|             "Please install it with `pip install jinja2`."
+    18|         )
+    19|     return Template(template).render(**kwargs)
+    20| def validate_jinja2(template: str, input_variables: List[str]) -> None:
+    21|     """
+    22|     Validate that the input variables are valid for the template.
+    23|     Issues a warning if missing or extra variables are found.
+    24|     Args:
+    25|         template: The template string.
+    26|         input_variables: The input variables.
+    27|     """
+    28|     input_variables_set = set(input_variables)
+    29|     valid_variables = _get_jinja2_variables_from_template(template)
+    30|     missing_variables = valid_variables - input_variables_set
+    31|     extra_variables = input_variables_set - valid_variables
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/prompts/loading.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 69-108 ---
+    69| def _load_few_shot_prompt(config: dict) -> FewShotPromptTemplate:
+    70|     """Load the "few shot" prompt from the config."""
+    71|     config = _load_template("suffix", config)
+    72|     config = _load_template("prefix", config)
+    73|     if "example_prompt_path" in config:
+    74|         if "example_prompt" in config:
+    75|             raise ValueError(
+    76|                 "Only one of example_prompt and example_prompt_path should "
+    77|                 "be specified."
+    78|             )
+    79|         config["example_prompt"] = load_prompt(config.pop("example_prompt_path"))
+    80|     else:
+    81|         config["example_prompt"] = load_prompt_from_config(config["example_prompt"])
+    82|     config = _load_examples(config)
+    83|     config = _load_output_parser(config)
+    84|     return FewShotPromptTemplate(**config)
+    85| def _load_prompt(config: dict) -> PromptTemplate:
+    86|     """Load the prompt template from config."""
+    87|     config = _load_template("template", config)
+    88|     config = _load_output_parser(config)
+    89|     return PromptTemplate(**config)
+    90| def load_prompt(path: Union[str, Path]) -> BasePromptTemplate:
+    91|     """Unified method for loading a prompt from LangChainHub or local fs."""
+    92|     if hub_result := try_load_from_hub(
+    93|         path, _load_prompt_from_file, "prompts", {"py", "json", "yaml"}
+    94|     ):
+    95|         return hub_result
+    96|     else:
+    97|         return _load_prompt_from_file(path)
+    98| def _load_prompt_from_file(file: Union[str, Path]) -> BasePromptTemplate:
+    99|     """Load prompt from file."""
+   100|     if isinstance(file, str):
+   101|         file_path = Path(file)
+   102|     else:
+   103|         file_path = file
+   104|     if file_path.suffix == ".json":
+   105|         with open(file_path) as f:
+   106|             config = json.load(f)
+   107|     elif file_path.suffix == ".yaml":
+   108|         with open(file_path, "r") as f:
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/prompts/prompt.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-37 ---
+     1| """Prompt schema definition."""
+     2| from __future__ import annotations
+     3| from pathlib import Path
+     4| from string import Formatter
+     5| from typing import Any, Dict, List, Optional, Union
+     6| from langchain.prompts.base import (
+     7|     DEFAULT_FORMATTER_MAPPING,
+     8|     StringPromptTemplate,
+     9|     _get_jinja2_variables_from_template,
+    10|     check_valid_template,
+    11| )
+    12| from langchain.pydantic_v1 import root_validator
+    13| class PromptTemplate(StringPromptTemplate):
+    14|     """A prompt template for a language model.
+    15|     A prompt template consists of a string template. It accepts a set of parameters
+    16|     from the user that can be used to generate a prompt for a language model.
+    17|     The template can be formatted using either f-strings (default) or jinja2 syntax.
+    18|     Example:
+    19|         .. code-block:: python
+    20|             from langchain.prompts import PromptTemplate
+    21|             prompt = PromptTemplate.from_template("Say {foo}")
+    22|             prompt.format(foo="bar")
+    23|             prompt = PromptTemplate(input_variables=["foo"], template="Say {foo}")
+    24|     """
+    25|     @property
+    26|     def lc_attributes(self) -> Dict[str, Any]:
+    27|         return {
+    28|             "template_format": self.template_format,
+    29|         }
+    30|     input_variables: List[str]
+    31|     """A list of the names of the variables the prompt template expects."""
+    32|     template: str
+    33|     """The prompt template."""
+    34|     template_format: str = "f-string"
+    35|     """The format of the prompt template. Options are: 'f-string', 'jinja2'."""
+    36|     validate_template: bool = True
+    37|     """Whether or not to try validating the template."""
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/retrievers/__init__.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-32 ---
+     1| """**Retriever** class returns Documents given a text **query**.
+     2| It is more general than a vector store. A retriever does not need to be able to
+     3| store documents, only to return (or retrieve) it. Vector stores can be used as
+     4| the backbone of a retriever, but there are other types of retrievers as well.
+     5| **Class hierarchy:**
+     6| .. code-block::
+     7|     BaseRetriever --> <name>Retriever  # Examples: ArxivRetriever, MergerRetriever
+     8| **Main helpers:**
+     9| .. code-block::
+    10|     Document, Serializable, Callbacks,
+    11|     CallbackManagerForRetrieverRun, AsyncCallbackManagerForRetrieverRun
+    12| """
+    13| from langchain.retrievers.arxiv import ArxivRetriever
+    14| from langchain.retrievers.azure_cognitive_search import AzureCognitiveSearchRetriever
+    15| from langchain.retrievers.bm25 import BM25Retriever
+    16| from langchain.retrievers.chaindesk import ChaindeskRetriever
+    17| from langchain.retrievers.chatgpt_plugin_retriever import ChatGPTPluginRetriever
+    18| from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
+    19| from langchain.retrievers.docarray import DocArrayRetriever
+    20| from langchain.retrievers.elastic_search_bm25 import ElasticSearchBM25Retriever
+    21| from langchain.retrievers.ensemble import EnsembleRetriever
+    22| from langchain.retrievers.google_cloud_enterprise_search import (
+    23|     GoogleCloudEnterpriseSearchRetriever,
+    24| )
+    25| from langchain.retrievers.google_vertex_ai_search import (
+    26|     GoogleVertexAISearchRetriever,
+    27| )
+    28| from langchain.retrievers.kay import KayAiRetriever
+    29| from langchain.retrievers.kendra import AmazonKendraRetriever
+    30| from langchain.retrievers.knn import KNNRetriever
+    31| from langchain.retrievers.llama_index import (
+    32|     LlamaIndexGraphRetriever,
+
+# --- HUNK 2: Lines 40-79 ---
+    40| from langchain.retrievers.parent_document_retriever import ParentDocumentRetriever
+    41| from langchain.retrievers.pinecone_hybrid_search import PineconeHybridSearchRetriever
+    42| from langchain.retrievers.pubmed import PubMedRetriever
+    43| from langchain.retrievers.re_phraser import RePhraseQueryRetriever
+    44| from langchain.retrievers.remote_retriever import RemoteLangChainRetriever
+    45| from langchain.retrievers.self_query.base import SelfQueryRetriever
+    46| from langchain.retrievers.svm import SVMRetriever
+    47| from langchain.retrievers.tavily_search_api import TavilySearchAPIRetriever
+    48| from langchain.retrievers.tfidf import TFIDFRetriever
+    49| from langchain.retrievers.time_weighted_retriever import (
+    50|     TimeWeightedVectorStoreRetriever,
+    51| )
+    52| from langchain.retrievers.vespa_retriever import VespaRetriever
+    53| from langchain.retrievers.weaviate_hybrid_search import WeaviateHybridSearchRetriever
+    54| from langchain.retrievers.web_research import WebResearchRetriever
+    55| from langchain.retrievers.wikipedia import WikipediaRetriever
+    56| from langchain.retrievers.zep import ZepRetriever
+    57| from langchain.retrievers.zilliz import ZillizRetriever
+    58| __all__ = [
+    59|     "AmazonKendraRetriever",
+    60|     "ArxivRetriever",
+    61|     "AzureCognitiveSearchRetriever",
+    62|     "ChatGPTPluginRetriever",
+    63|     "ContextualCompressionRetriever",
+    64|     "ChaindeskRetriever",
+    65|     "ElasticSearchBM25Retriever",
+    66|     "GoogleCloudEnterpriseSearchRetriever",
+    67|     "GoogleVertexAISearchRetriever",
+    68|     "KayAiRetriever",
+    69|     "KNNRetriever",
+    70|     "LlamaIndexGraphRetriever",
+    71|     "LlamaIndexRetriever",
+    72|     "MergerRetriever",
+    73|     "MetalRetriever",
+    74|     "MilvusRetriever",
+    75|     "MultiQueryRetriever",
+    76|     "PineconeHybridSearchRetriever",
+    77|     "PubMedRetriever",
+    78|     "RemoteLangChainRetriever",
+    79|     "SVMRetriever",
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/retrievers/document_compressors/cohere_rerank.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 3-42 ---
+     3| from langchain.callbacks.manager import Callbacks
+     4| from langchain.pydantic_v1 import Extra, root_validator
+     5| from langchain.retrievers.document_compressors.base import BaseDocumentCompressor
+     6| from langchain.schema import Document
+     7| from langchain.utils import get_from_dict_or_env
+     8| if TYPE_CHECKING:
+     9|     from cohere import Client
+    10| else:
+    11|     try:
+    12|         from cohere import Client
+    13|     except ImportError:
+    14|         pass
+    15| class CohereRerank(BaseDocumentCompressor):
+    16|     """Document compressor that uses `Cohere Rerank API`."""
+    17|     client: Client
+    18|     """Cohere client to use for compressing documents."""
+    19|     top_n: int = 3
+    20|     """Number of documents to return."""
+    21|     model: str = "rerank-english-v2.0"
+    22|     """Model to use for reranking."""
+    23|     class Config:
+    24|         """Configuration for this pydantic object."""
+    25|         extra = Extra.forbid
+    26|         arbitrary_types_allowed = True
+    27|     @root_validator(pre=True)
+    28|     def validate_environment(cls, values: Dict) -> Dict:
+    29|         """Validate that api key and python package exists in environment."""
+    30|         cohere_api_key = get_from_dict_or_env(
+    31|             values, "cohere_api_key", "COHERE_API_KEY"
+    32|         )
+    33|         try:
+    34|             import cohere
+    35|             values["client"] = cohere.Client(cohere_api_key)
+    36|         except ImportError:
+    37|             raise ImportError(
+    38|                 "Could not import cohere python package. "
+    39|                 "Please install it with `pip install cohere`."
+    40|             )
+    41|         return values
+    42|     def compress_documents(
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/schema/runnable/__init__.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-20 ---
+     1| from langchain.schema.runnable._locals import GetLocalVar, PutLocalVar
+     2| from langchain.schema.runnable.base import (
+     3|     Runnable,
+     4|     RunnableBinding,
+     5|     RunnableGenerator,
+     6|     RunnableLambda,
+     7|     RunnableMap,
+     8|     RunnableParallel,
+     9|     RunnableSequence,
+    10|     RunnableSerializable,
+    11| )
+    12| from langchain.schema.runnable.branch import RunnableBranch
+    13| from langchain.schema.runnable.config import RunnableConfig, patch_config
+    14| from langchain.schema.runnable.fallbacks import RunnableWithFallbacks
+    15| from langchain.schema.runnable.passthrough import RunnablePassthrough
+    16| from langchain.schema.runnable.router import RouterInput, RouterRunnable
+    17| from langchain.schema.runnable.utils import ConfigurableField
+    18| __all__ = [
+    19|     "ConfigurableField",
+    20|     "GetLocalVar",
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/schema/runnable/base.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1643-1756 ---
+  1643|     def astream(
+  1644|         self,
+  1645|         input: Input,
+  1646|         config: Optional[RunnableConfig] = None,
+  1647|         **kwargs: Any,
+  1648|     ) -> AsyncIterator[Output]:
+  1649|         async def input_aiter() -> AsyncIterator[Input]:
+  1650|             yield input
+  1651|         return self.atransform(input_aiter(), config, **kwargs)
+  1652|     async def ainvoke(
+  1653|         self, input: Input, config: Optional[RunnableConfig] = None, **kwargs: Any
+  1654|     ) -> Output:
+  1655|         final = None
+  1656|         async for output in self.astream(input, config, **kwargs):
+  1657|             if final is None:
+  1658|                 final = output
+  1659|             else:
+  1660|                 final = final + output
+  1661|         return cast(Output, final)
+  1662| class RunnableLambda(Runnable[Input, Output]):
+  1663|     """
+  1664|     A runnable that runs a callable.
+  1665|     """
+  1666|     def __init__(
+  1667|         self,
+  1668|         func: Union[Callable[[Input], Output], Callable[[Input], Awaitable[Output]]],
+  1669|         afunc: Optional[Callable[[Input], Awaitable[Output]]] = None,
+  1670|     ) -> None:
+  1671|         if afunc is not None:
+  1672|             self.afunc = afunc
+  1673|         if inspect.iscoroutinefunction(func):
+  1674|             self.afunc = func
+  1675|         elif callable(func):
+  1676|             self.func = cast(Callable[[Input], Output], func)
+  1677|         else:
+  1678|             raise TypeError(
+  1679|                 "Expected a callable type for `func`."
+  1680|                 f"Instead got an unsupported type: {type(func)}"
+  1681|             )
+  1682|     @property
+  1683|     def InputType(self) -> Any:
+  1684|         func = getattr(self, "func", None) or getattr(self, "afunc")
+  1685|         try:
+  1686|             params = inspect.signature(func).parameters
+  1687|             first_param = next(iter(params.values()), None)
+  1688|             if first_param and first_param.annotation != inspect.Parameter.empty:
+  1689|                 return first_param.annotation
+  1690|             else:
+  1691|                 return Any
+  1692|         except ValueError:
+  1693|             return Any
+  1694|     @property
+  1695|     def input_schema(self) -> Type[BaseModel]:
+  1696|         func = getattr(self, "func", None) or getattr(self, "afunc")
+  1697|         if isinstance(func, itemgetter):
+  1698|             items = str(func).replace("operator.itemgetter(", "")[:-1].split(", ")
+  1699|             if all(
+  1700|                 item[0] == "'" and item[-1] == "'" and len(item) > 2 for item in items
+  1701|             ):
+  1702|                 return create_model(
+  1703|                     "RunnableLambdaInput",
+  1704|                     **{item[1:-1]: (Any, None) for item in items},  # type: ignore
+  1705|                 )
+  1706|             else:
+  1707|                 return create_model("RunnableLambdaInput", __root__=(List[Any], None))
+  1708|         if dict_keys := get_function_first_arg_dict_keys(func):
+  1709|             return create_model(
+  1710|                 "RunnableLambdaInput",
+  1711|                 **{key: (Any, None) for key in dict_keys},  # type: ignore
+  1712|             )
+  1713|         return super().input_schema
+  1714|     @property
+  1715|     def OutputType(self) -> Any:
+  1716|         func = getattr(self, "func", None) or getattr(self, "afunc")
+  1717|         try:
+  1718|             sig = inspect.signature(func)
+  1719|             return (
+  1720|                 sig.return_annotation
+  1721|                 if sig.return_annotation != inspect.Signature.empty
+  1722|                 else Any
+  1723|             )
+  1724|         except ValueError:
+  1725|             return Any
+  1726|     def __eq__(self, other: Any) -> bool:
+  1727|         if isinstance(other, RunnableLambda):
+  1728|             if hasattr(self, "func") and hasattr(other, "func"):
+  1729|                 return self.func == other.func
+  1730|             elif hasattr(self, "afunc") and hasattr(other, "afunc"):
+  1731|                 return self.afunc == other.afunc
+  1732|             else:
+  1733|                 return False
+  1734|         else:
+  1735|             return False
+  1736|     def __repr__(self) -> str:
+  1737|         return f"RunnableLambda({get_lambda_source(self.func) or '...'})"
+  1738|     def _invoke(
+  1739|         self,
+  1740|         input: Input,
+  1741|         run_manager: CallbackManagerForChainRun,
+  1742|         config: RunnableConfig,
+  1743|     ) -> Output:
+  1744|         output = call_func_with_variable_args(self.func, input, run_manager, config)
+  1745|         if isinstance(output, Runnable):
+  1746|             recursion_limit = config["recursion_limit"]
+  1747|             if recursion_limit <= 0:
+  1748|                 raise RecursionError(
+  1749|                     f"Recursion limit reached when invoking {self} with input {input}."
+  1750|                 )
+  1751|             output = output.invoke(
+  1752|                 input,
+  1753|                 patch_config(
+  1754|                     config,
+  1755|                     callbacks=run_manager.get_child(),
+  1756|                     recursion_limit=recursion_limit - 1,
+
+# --- HUNK 2: Lines 1782-1838 ---
+  1782|             )
+  1783|         return output
+  1784|     def _config(
+  1785|         self, config: Optional[RunnableConfig], callable: Callable[..., Any]
+  1786|     ) -> RunnableConfig:
+  1787|         config = config or {}
+  1788|         if config.get("run_name") is None:
+  1789|             try:
+  1790|                 run_name = callable.__name__
+  1791|             except AttributeError:
+  1792|                 run_name = None
+  1793|             if run_name is not None:
+  1794|                 return patch_config(config, run_name=run_name)
+  1795|         return config
+  1796|     def invoke(
+  1797|         self,
+  1798|         input: Input,
+  1799|         config: Optional[RunnableConfig] = None,
+  1800|         **kwargs: Optional[Any],
+  1801|     ) -> Output:
+  1802|         if hasattr(self, "func"):
+  1803|             return self._call_with_config(
+  1804|                 self._invoke,
+  1805|                 input,
+  1806|                 self._config(config, self.func),
+  1807|             )
+  1808|         else:
+  1809|             raise TypeError(
+  1810|                 "Cannot invoke a coroutine function synchronously."
+  1811|                 "Use `ainvoke` instead."
+  1812|             )
+  1813|     async def ainvoke(
+  1814|         self,
+  1815|         input: Input,
+  1816|         config: Optional[RunnableConfig] = None,
+  1817|         **kwargs: Optional[Any],
+  1818|     ) -> Output:
+  1819|         if hasattr(self, "afunc"):
+  1820|             return await self._acall_with_config(
+  1821|                 self._ainvoke,
+  1822|                 input,
+  1823|                 self._config(config, self.afunc),
+  1824|             )
+  1825|         else:
+  1826|             return await super().ainvoke(input, config)
+  1827| class RunnableEach(RunnableSerializable[List[Input], List[Output]]):
+  1828|     """
+  1829|     A runnable that delegates calls to another runnable
+  1830|     with each element of the input sequence.
+  1831|     """
+  1832|     bound: Runnable[Input, Output]
+  1833|     class Config:
+  1834|         arbitrary_types_allowed = True
+  1835|     @property
+  1836|     def InputType(self) -> Any:
+  1837|         return List[self.bound.InputType]  # type: ignore[name-defined]
+  1838|     @property
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/schema/runnable/passthrough.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-83 ---
+     1| from __future__ import annotations
+     2| import asyncio
+     3| import threading
+     4| from typing import (
+     5|     Any,
+     6|     AsyncIterator,
+     7|     Callable,
+     8|     Dict,
+     9|     Iterator,
+    10|     List,
+    11|     Mapping,
+    12|     Optional,
+    13|     Sequence,
+    14|     Type,
+    15|     Union,
+    16|     cast,
+    17| )
+    18| from langchain.pydantic_v1 import BaseModel, create_model
+    19| from langchain.schema.runnable.base import (
+    20|     Input,
+    21|     Runnable,
+    22|     RunnableParallel,
+    23|     RunnableSerializable,
+    24| )
+    25| from langchain.schema.runnable.config import RunnableConfig, get_executor_for_config
+    26| from langchain.schema.runnable.utils import AddableDict, ConfigurableFieldSpec
+    27| from langchain.utils.aiter import atee, py_anext
+    28| from langchain.utils.iter import safetee
+    29| def identity(x: Input) -> Input:
+    30|     return x
+    31| async def aidentity(x: Input) -> Input:
+    32|     return x
+    33| class RunnablePassthrough(RunnableSerializable[Input, Input]):
+    34|     """
+    35|     A runnable that passes through the input.
+    36|     """
+    37|     input_type: Optional[Type[Input]] = None
+    38|     @classmethod
+    39|     def is_lc_serializable(cls) -> bool:
+    40|         return True
+    41|     @classmethod
+    42|     def get_lc_namespace(cls) -> List[str]:
+    43|         return cls.__module__.split(".")[:-1]
+    44|     @property
+    45|     def InputType(self) -> Any:
+    46|         return self.input_type or Any
+    47|     @property
+    48|     def OutputType(self) -> Any:
+    49|         return self.input_type or Any
+    50|     @classmethod
+    51|     def assign(
+    52|         cls,
+    53|         **kwargs: Union[
+    54|             Runnable[Dict[str, Any], Any],
+    55|             Callable[[Dict[str, Any]], Any],
+    56|             Mapping[
+    57|                 str,
+    58|                 Union[Runnable[Dict[str, Any], Any], Callable[[Dict[str, Any]], Any]],
+    59|             ],
+    60|         ],
+    61|     ) -> RunnableAssign:
+    62|         """
+    63|         Merge the Dict input with the output produced by the mapping argument.
+    64|         Args:
+    65|             mapping: A mapping from keys to runnables or callables.
+    66|         Returns:
+    67|             A runnable that merges the Dict input with the output produced by the
+    68|             mapping argument.
+    69|         """
+    70|         return RunnableAssign(RunnableParallel(kwargs))
+    71|     def invoke(self, input: Input, config: Optional[RunnableConfig] = None) -> Input:
+    72|         return self._call_with_config(identity, input, config)
+    73|     async def ainvoke(
+    74|         self,
+    75|         input: Input,
+    76|         config: Optional[RunnableConfig] = None,
+    77|         **kwargs: Optional[Any],
+    78|     ) -> Input:
+    79|         return await self._acall_with_config(aidentity, input, config)
+    80|     def transform(
+    81|         self,
+    82|         input: Iterator[Input],
+    83|         config: Optional[RunnableConfig] = None,
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/tools/shell/tool.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-60 ---
+     1| import asyncio
+     2| import platform
+     3| import warnings
+     4| from typing import List, Optional, Type, Union
+     5| from langchain.callbacks.manager import (
+     6|     AsyncCallbackManagerForToolRun,
+     7|     CallbackManagerForToolRun,
+     8| )
+     9| from langchain.pydantic_v1 import BaseModel, Field, root_validator
+    10| from langchain.tools.base import BaseTool
+    11| from langchain.utilities.bash import BashProcess
+    12| class ShellInput(BaseModel):
+    13|     """Commands for the Bash Shell tool."""
+    14|     commands: Union[str, List[str]] = Field(
+    15|         ...,
+    16|         description="List of shell commands to run. Deserialized using json.loads",
+    17|     )
+    18|     """List of shell commands to run."""
+    19|     @root_validator
+    20|     def _validate_commands(cls, values: dict) -> dict:
+    21|         """Validate commands."""
+    22|         commands = values.get("commands")
+    23|         if not isinstance(commands, list):
+    24|             values["commands"] = [commands]
+    25|         warnings.warn(
+    26|             "The shell tool has no safeguards by default. Use at your own risk."
+    27|         )
+    28|         return values
+    29| def _get_default_bash_processs() -> BashProcess:
+    30|     """Get file path from string."""
+    31|     return BashProcess(return_err_output=True)
+    32| def _get_platform() -> str:
+    33|     """Get platform."""
+    34|     system = platform.system()
+    35|     if system == "Darwin":
+    36|         return "MacOS"
+    37|     return system
+    38| class ShellTool(BaseTool):
+    39|     """Tool to run shell commands."""
+    40|     process: BashProcess = Field(default_factory=_get_default_bash_processs)
+    41|     """Bash process to run commands."""
+    42|     name: str = "terminal"
+    43|     """Name of tool."""
+    44|     description: str = f"Run shell commands on this {_get_platform()} machine."
+    45|     """Description of tool."""
+    46|     args_schema: Type[BaseModel] = ShellInput
+    47|     """Schema for input arguments."""
+    48|     def _run(
+    49|         self,
+    50|         commands: Union[str, List[str]],
+    51|         run_manager: Optional[CallbackManagerForToolRun] = None,
+    52|     ) -> str:
+    53|         """Run commands and return final output."""
+    54|         return self.process.run(commands)
+    55|     async def _arun(
+    56|         self,
+    57|         commands: Union[str, List[str]],
+    58|         run_manager: Optional[AsyncCallbackManagerForToolRun] = None,
+    59|     ) -> str:
+    60|         """Run commands asynchronously and return final output."""
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/utilities/__init__.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-63 ---
+     1| """**Utilities** are the integrations with third-part systems and packages.
+     2| Other LangChain classes use **Utilities** to interact with third-part systems
+     3| and packages.
+     4| """
+     5| from langchain.utilities.alpha_vantage import AlphaVantageAPIWrapper
+     6| from langchain.utilities.apify import ApifyWrapper
+     7| from langchain.utilities.arxiv import ArxivAPIWrapper
+     8| from langchain.utilities.awslambda import LambdaWrapper
+     9| from langchain.utilities.bash import BashProcess
+    10| from langchain.utilities.bibtex import BibtexparserWrapper
+    11| from langchain.utilities.bing_search import BingSearchAPIWrapper
+    12| from langchain.utilities.brave_search import BraveSearchWrapper
+    13| from langchain.utilities.duckduckgo_search import DuckDuckGoSearchAPIWrapper
+    14| from langchain.utilities.golden_query import GoldenQueryAPIWrapper
+    15| from langchain.utilities.google_places_api import GooglePlacesAPIWrapper
+    16| from langchain.utilities.google_search import GoogleSearchAPIWrapper
+    17| from langchain.utilities.google_serper import GoogleSerperAPIWrapper
+    18| from langchain.utilities.graphql import GraphQLAPIWrapper
+    19| from langchain.utilities.jira import JiraAPIWrapper
+    20| from langchain.utilities.max_compute import MaxComputeAPIWrapper
+    21| from langchain.utilities.metaphor_search import MetaphorSearchAPIWrapper
+    22| from langchain.utilities.openweathermap import OpenWeatherMapAPIWrapper
+    23| from langchain.utilities.portkey import Portkey
+    24| from langchain.utilities.powerbi import PowerBIDataset
+    25| from langchain.utilities.pubmed import PubMedAPIWrapper
+    26| from langchain.utilities.python import PythonREPL
+    27| from langchain.utilities.requests import Requests, RequestsWrapper, TextRequestsWrapper
+    28| from langchain.utilities.scenexplain import SceneXplainAPIWrapper
+    29| from langchain.utilities.searchapi import SearchApiAPIWrapper
+    30| from langchain.utilities.searx_search import SearxSearchWrapper
+    31| from langchain.utilities.serpapi import SerpAPIWrapper
+    32| from langchain.utilities.spark_sql import SparkSQL
+    33| from langchain.utilities.sql_database import SQLDatabase
+    34| from langchain.utilities.tensorflow_datasets import TensorflowDatasets
+    35| from langchain.utilities.twilio import TwilioAPIWrapper
+    36| from langchain.utilities.wikipedia import WikipediaAPIWrapper
+    37| from langchain.utilities.wolfram_alpha import WolframAlphaAPIWrapper
+    38| from langchain.utilities.zapier import ZapierNLAWrapper
+    39| __all__ = [
+    40|     "AlphaVantageAPIWrapper",
+    41|     "ApifyWrapper",
+    42|     "ArxivAPIWrapper",
+    43|     "BashProcess",
+    44|     "BibtexparserWrapper",
+    45|     "BingSearchAPIWrapper",
+    46|     "BraveSearchWrapper",
+    47|     "DuckDuckGoSearchAPIWrapper",
+    48|     "GoldenQueryAPIWrapper",
+    49|     "GooglePlacesAPIWrapper",
+    50|     "GoogleSearchAPIWrapper",
+    51|     "GoogleSerperAPIWrapper",
+    52|     "GraphQLAPIWrapper",
+    53|     "JiraAPIWrapper",
+    54|     "LambdaWrapper",
+    55|     "MaxComputeAPIWrapper",
+    56|     "MetaphorSearchAPIWrapper",
+    57|     "OpenWeatherMapAPIWrapper",
+    58|     "Portkey",
+    59|     "PowerBIDataset",
+    60|     "PubMedAPIWrapper",
+    61|     "PythonREPL",
+    62|     "Requests",
+    63|     "RequestsWrapper",
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/utilities/bash.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-155 ---
+     1| """Wrapper around subprocess to run commands."""
+     2| from __future__ import annotations
+     3| import platform
+     4| import re
+     5| import subprocess
+     6| from typing import TYPE_CHECKING, List, Union
+     7| from uuid import uuid4
+     8| if TYPE_CHECKING:
+     9|     import pexpect
+    10| class BashProcess:
+    11|     """
+    12|     Wrapper class for starting subprocesses.
+    13|     Uses the python built-in subprocesses.run()
+    14|     Persistent processes are **not** available
+    15|     on Windows systems, as pexpect makes use of
+    16|     Unix pseudoterminals (ptys). MacOS and Linux
+    17|     are okay.
+    18|     Example:
+    19|         .. code-block:: python
+    20|         from langchain.utilities.bash import BashProcess
+    21|             bash = BashProcess(
+    22|                 strip_newlines = False,
+    23|                 return_err_output = False,
+    24|                 persistent = False
+    25|             )
+    26|             bash.run('echo \'hello world\'')
+    27|     """
+    28|     strip_newlines: bool = False
+    29|     """Whether or not to run .strip() on the output"""
+    30|     return_err_output: bool = False
+    31|     """Whether or not to return the output of a failed
+    32|     command, or just the error message and stacktrace"""
+    33|     persistent: bool = False
+    34|     """Whether or not to spawn a persistent session
+    35|     NOTE: Unavailable for Windows environments"""
+    36|     def __init__(
+    37|         self,
+    38|         strip_newlines: bool = False,
+    39|         return_err_output: bool = False,
+    40|         persistent: bool = False,
+    41|     ):
+    42|         """
+    43|         Initializes with default settings
+    44|         """
+    45|         self.strip_newlines = strip_newlines
+    46|         self.return_err_output = return_err_output
+    47|         self.prompt = ""
+    48|         self.process = None
+    49|         if persistent:
+    50|             self.prompt = str(uuid4())
+    51|             self.process = self._initialize_persistent_process(self, self.prompt)
+    52|     @staticmethod
+    53|     def _lazy_import_pexpect() -> pexpect:
+    54|         """Import pexpect only when needed."""
+    55|         if platform.system() == "Windows":
+    56|             raise ValueError(
+    57|                 "Persistent bash processes are not yet supported on Windows."
+    58|             )
+    59|         try:
+    60|             import pexpect
+    61|         except ImportError:
+    62|             raise ImportError(
+    63|                 "pexpect required for persistent bash processes."
+    64|                 " To install, run `pip install pexpect`."
+    65|             )
+    66|         return pexpect
+    67|     @staticmethod
+    68|     def _initialize_persistent_process(self: BashProcess, prompt: str) -> pexpect.spawn:
+    69|         """
+    70|         Initializes a persistent bash setting in a
+    71|         clean environment.
+    72|         NOTE: Unavailable on Windows
+    73|         Args:
+    74|             Prompt(str): the bash command to execute
+    75|         """  # noqa: E501
+    76|         pexpect = self._lazy_import_pexpect()
+    77|         process = pexpect.spawn(
+    78|             "env", ["-i", "bash", "--norc", "--noprofile"], encoding="utf-8"
+    79|         )
+    80|         process.sendline("PS1=" + prompt)
+    81|         process.expect_exact(prompt, timeout=10)
+    82|         return process
+    83|     def run(self, commands: Union[str, List[str]]) -> str:
+    84|         """
+    85|         Run commands in either an existing persistent
+    86|         subprocess or on in a new subprocess environment.
+    87|         Args:
+    88|             commands(List[str]): a list of commands to
+    89|                 execute in the session
+    90|         """  # noqa: E501
+    91|         if isinstance(commands, str):
+    92|             commands = [commands]
+    93|         commands = ";".join(commands)
+    94|         if self.process is not None:
+    95|             return self._run_persistent(
+    96|                 commands,
+    97|             )
+    98|         else:
+    99|             return self._run(commands)
+   100|     def _run(self, command: str) -> str:
+   101|         """
+   102|         Runs a command in a subprocess and returns
+   103|         the output.
+   104|         Args:
+   105|             command: The command to run
+   106|         """  # noqa: E501
+   107|         try:
+   108|             output = subprocess.run(
+   109|                 command,
+   110|                 shell=True,
+   111|                 check=True,
+   112|                 stdout=subprocess.PIPE,
+   113|                 stderr=subprocess.STDOUT,
+   114|             ).stdout.decode()
+   115|         except subprocess.CalledProcessError as error:
+   116|             if self.return_err_output:
+   117|                 return error.stdout.decode()
+   118|             return str(error)
+   119|         if self.strip_newlines:
+   120|             output = output.strip()
+   121|         return output
+   122|     def process_output(self, output: str, command: str) -> str:
+   123|         """
+   124|         Uses regex to remove the command from the output
+   125|         Args:
+   126|             output: a process' output string
+   127|             command: the executed command
+   128|         """  # noqa: E501
+   129|         pattern = re.escape(command) + r"\s*\n"
+   130|         output = re.sub(pattern, "", output, count=1)
+   131|         return output.strip()
+   132|     def _run_persistent(self, command: str) -> str:
+   133|         """
+   134|         Runs commands in a persistent environment
+   135|         and returns the output.
+   136|         Args:
+   137|             command: the command to execute
+   138|         """  # noqa: E501
+   139|         pexpect = self._lazy_import_pexpect()
+   140|         if self.process is None:
+   141|             raise ValueError("Process not initialized")
+   142|         self.process.sendline(command)
+   143|         self.process.expect(self.prompt, timeout=10)
+   144|         self.process.sendline("")
+   145|         try:
+   146|             self.process.expect([self.prompt, pexpect.EOF], timeout=10)
+   147|         except pexpect.TIMEOUT:
+   148|             return f"Timeout error while executing command {command}"
+   149|         if self.process.after == pexpect.EOF:
+   150|             return f"Exited with error status: {self.process.exitstatus}"
+   151|         output = self.process.before
+   152|         output = self.process_output(output, command)
+   153|         if self.strip_newlines:
+   154|             return output.strip()
+   155|         return output
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/utils/math.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-41 ---
+     1| """Math utils."""
+     2| from typing import List, Optional, Tuple, Union
+     3| import numpy as np
+     4| Matrix = Union[List[List[float]], List[np.ndarray], np.ndarray]
+     5| def cosine_similarity(X: Matrix, Y: Matrix) -> np.ndarray:
+     6|     """Row-wise cosine similarity between two equal-width matrices."""
+     7|     if len(X) == 0 or len(Y) == 0:
+     8|         return np.array([])
+     9|     X = np.array(X)
+    10|     Y = np.array(Y)
+    11|     if X.shape[1] != Y.shape[1]:
+    12|         raise ValueError(
+    13|             f"Number of columns in X and Y must be the same. X has shape {X.shape} "
+    14|             f"and Y has shape {Y.shape}."
+    15|         )
+    16|     X_norm = np.linalg.norm(X, axis=1)
+    17|     Y_norm = np.linalg.norm(Y, axis=1)
+    18|     with np.errstate(divide="ignore", invalid="ignore"):
+    19|         similarity = np.dot(X, Y.T) / np.outer(X_norm, Y_norm)
+    20|     similarity[np.isnan(similarity) | np.isinf(similarity)] = 0.0
+    21|     return similarity
+    22| def cosine_similarity_top_k(
+    23|     X: Matrix,
+    24|     Y: Matrix,
+    25|     top_k: Optional[int] = 5,
+    26|     score_threshold: Optional[float] = None,
+    27| ) -> Tuple[List[Tuple[int, int]], List[float]]:
+    28|     """Row-wise cosine similarity with optional top-k and score threshold filtering.
+    29|     Args:
+    30|         X: Matrix.
+    31|         Y: Matrix, same width as X.
+    32|         top_k: Max number of results to return.
+    33|         score_threshold: Minimum cosine similarity of results.
+    34|     Returns:
+    35|         Tuple of two lists. First contains two-tuples of indices (X_idx, Y_idx),
+    36|             second contains corresponding cosine similarities.
+    37|     """
+    38|     if len(X) == 0 or len(Y) == 0:
+    39|         return [], []
+    40|     score_array = cosine_similarity(X, Y)
+    41|     score_threshold = score_threshold or -1.0
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/vectorstores/__init__.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 87-126 ---
+    87|     from langchain.vectorstores.hologres import Hologres
+    88|     return Hologres
+    89| def _import_lancedb() -> Any:
+    90|     from langchain.vectorstores.lancedb import LanceDB
+    91|     return LanceDB
+    92| def _import_llm_rails() -> Any:
+    93|     from langchain.vectorstores.llm_rails import LLMRails
+    94|     return LLMRails
+    95| def _import_marqo() -> Any:
+    96|     from langchain.vectorstores.marqo import Marqo
+    97|     return Marqo
+    98| def _import_matching_engine() -> Any:
+    99|     from langchain.vectorstores.matching_engine import MatchingEngine
+   100|     return MatchingEngine
+   101| def _import_meilisearch() -> Any:
+   102|     from langchain.vectorstores.meilisearch import Meilisearch
+   103|     return Meilisearch
+   104| def _import_milvus() -> Any:
+   105|     from langchain.vectorstores.milvus import Milvus
+   106|     return Milvus
+   107| def _import_mongodb_atlas() -> Any:
+   108|     from langchain.vectorstores.mongodb_atlas import MongoDBAtlasVectorSearch
+   109|     return MongoDBAtlasVectorSearch
+   110| def _import_myscale() -> Any:
+   111|     from langchain.vectorstores.myscale import MyScale
+   112|     return MyScale
+   113| def _import_myscale_settings() -> Any:
+   114|     from langchain.vectorstores.myscale import MyScaleSettings
+   115|     return MyScaleSettings
+   116| def _import_neo4j_vector() -> Any:
+   117|     from langchain.vectorstores.neo4j_vector import Neo4jVector
+   118|     return Neo4jVector
+   119| def _import_opensearch_vector_search() -> Any:
+   120|     from langchain.vectorstores.opensearch_vector_search import OpenSearchVectorSearch
+   121|     return OpenSearchVectorSearch
+   122| def _import_pgembedding() -> Any:
+   123|     from langchain.vectorstores.pgembedding import PGEmbedding
+   124|     return PGEmbedding
+   125| def _import_pgvector() -> Any:
+   126|     from langchain.vectorstores.pgvector import PGVector
+
+# --- HUNK 2: Lines 238-277 ---
+   238|     elif name == "ElasticsearchStore":
+   239|         return _import_elasticsearch()
+   240|     elif name == "Epsilla":
+   241|         return _import_epsilla()
+   242|     elif name == "FAISS":
+   243|         return _import_faiss()
+   244|     elif name == "Hologres":
+   245|         return _import_hologres()
+   246|     elif name == "LanceDB":
+   247|         return _import_lancedb()
+   248|     elif name == "LLMRails":
+   249|         return _import_llm_rails()
+   250|     elif name == "Marqo":
+   251|         return _import_marqo()
+   252|     elif name == "MatchingEngine":
+   253|         return _import_matching_engine()
+   254|     elif name == "Meilisearch":
+   255|         return _import_meilisearch()
+   256|     elif name == "Milvus":
+   257|         return _import_milvus()
+   258|     elif name == "MongoDBAtlasVectorSearch":
+   259|         return _import_mongodb_atlas()
+   260|     elif name == "MyScaleSettings":
+   261|         return _import_myscale_settings()
+   262|     elif name == "MyScale":
+   263|         return _import_myscale()
+   264|     elif name == "Neo4jVector":
+   265|         return _import_neo4j_vector()
+   266|     elif name == "OpenSearchVectorSearch":
+   267|         return _import_opensearch_vector_search()
+   268|     elif name == "PGEmbedding":
+   269|         return _import_pgembedding()
+   270|     elif name == "PGVector":
+   271|         return _import_pgvector()
+   272|     elif name == "Pinecone":
+   273|         return _import_pinecone()
+   274|     elif name == "Qdrant":
+   275|         return _import_qdrant()
+   276|     elif name == "Redis":
+   277|         return _import_redis()
+
+# --- HUNK 3: Lines 335-374 ---
+   335|     "Clickhouse",
+   336|     "ClickhouseSettings",
+   337|     "DashVector",
+   338|     "DeepLake",
+   339|     "DeepLake",
+   340|     "Dingo",
+   341|     "DocArrayHnswSearch",
+   342|     "DocArrayInMemorySearch",
+   343|     "ElasticKnnSearch",
+   344|     "ElasticVectorSearch",
+   345|     "ElasticsearchStore",
+   346|     "Epsilla",
+   347|     "FAISS",
+   348|     "Hologres",
+   349|     "LanceDB",
+   350|     "LLMRails",
+   351|     "Marqo",
+   352|     "MatchingEngine",
+   353|     "Meilisearch",
+   354|     "Milvus",
+   355|     "MongoDBAtlasVectorSearch",
+   356|     "MyScale",
+   357|     "MyScaleSettings",
+   358|     "Neo4jVector",
+   359|     "OpenSearchVectorSearch",
+   360|     "OpenSearchVectorSearch",
+   361|     "PGEmbedding",
+   362|     "PGVector",
+   363|     "Pinecone",
+   364|     "Qdrant",
+   365|     "Redis",
+   366|     "Rockset",
+   367|     "SKLearnVectorStore",
+   368|     "ScaNN",
+   369|     "SingleStoreDB",
+   370|     "SingleStoreDB",
+   371|     "SQLiteVSS",
+   372|     "StarRocks",
+   373|     "SupabaseVectorStore",
+   374|     "Tair",
+
+
+# ====================================================================
+# FILE: libs/langchain/langchain/vectorstores/llm_rails.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-95 ---
+     1| """Wrapper around LLMRails vector database."""
+     2| from __future__ import annotations
+     3| import json
+     4| import logging
+     5| import os
+     6| import uuid
+     7| from enum import Enum
+     8| from typing import Any, Iterable, List, Optional, Tuple
+     9| import requests
+    10| from langchain.pydantic_v1 import Field
+    11| from langchain.schema import Document
+    12| from langchain.schema.embeddings import Embeddings
+    13| from langchain.schema.vectorstore import VectorStore, VectorStoreRetriever
+    14| class ModelChoices(str, Enum):
+    15|     embedding_english_v1 = "embedding-english-v1"
+    16|     embedding_multi_v1 = "embedding-multi-v1"
+    17| class LLMRails(VectorStore):
+    18|     """Implementation of Vector Store using LLMRails (https://llmrails.com/).
+    19|     Example:
+    20|         .. code-block:: python
+    21|             from langchain.vectorstores import LLMRails
+    22|             vectorstore = LLMRails(
+    23|                 api_key=llm_rails_api_key,
+    24|                 datastore_id=datastore_id
+    25|             )
+    26|     """
+    27|     def __init__(
+    28|         self,
+    29|         datastore_id: Optional[str] = None,
+    30|         api_key: Optional[str] = None,
+    31|     ):
+    32|         """Initialize with LLMRails API."""
+    33|         self._datastore_id = datastore_id or os.environ.get("LLM_RAILS_DATASTORE_ID")
+    34|         self._api_key = api_key or os.environ.get("LLM_RAILS_API_KEY")
+    35|         if self._api_key is None:
+    36|             logging.warning("Can't find Rails credentials in environment.")
+    37|         self._session = requests.Session()  # to reuse connections
+    38|         self.datastore_id = datastore_id
+    39|         self.base_url = "https://api.llmrails.com/v1"
+    40|     def _get_post_headers(self) -> dict:
+    41|         """Returns headers that should be attached to each post request."""
+    42|         return {
+    43|             "X-API-KEY": self._api_key,
+    44|             "Content-Type": "application/json",
+    45|         }
+    46|     def add_texts(
+    47|         self,
+    48|         texts: Iterable[str],
+    49|         metadatas: Optional[List[dict]] = None,
+    50|         **kwargs: Any,
+    51|     ) -> List[str]:
+    52|         """Run more texts through the embeddings and add to the vectorstore.
+    53|         Args:
+    54|             texts: Iterable of strings to add to the vectorstore.
+    55|         Returns:
+    56|             List of ids from adding the texts into the vectorstore.
+    57|         """
+    58|         names: List[str] = []
+    59|         for text in texts:
+    60|             doc_name = str(uuid.uuid4())
+    61|             response = self._session.post(
+    62|                 f"{self.base_url}/datastores/{self._datastore_id}/text",
+    63|                 json={"name": doc_name, "text": text},
+    64|                 verify=True,
+    65|                 headers=self._get_post_headers(),
+    66|             )
+    67|             if response.status_code != 200:
+    68|                 logging.error(
+    69|                     f"Create request failed for doc_name = {doc_name} with status code "
+    70|                     f"{response.status_code}, reason {response.reason}, text "
+    71|                     f"{response.text}"
+    72|                 )
+    73|                 return names
+    74|             names.append(doc_name)
+    75|         return names
+    76|     def similarity_search_with_score(
+    77|         self, query: str, k: int = 5
+    78|     ) -> List[Tuple[Document, float]]:
+    79|         """Return LLMRails documents most similar to query, along with scores.
+    80|         Args:
+    81|             query: Text to look up documents similar to.
+    82|             k: Number of Documents to return. Defaults to 5 Max 10.
+    83|             alpha: parameter for hybrid search .
+    84|         Returns:
+    85|             List of Documents most similar to the query and score for each.
+    86|         """
+    87|         response = self._session.post(
+    88|             headers=self._get_post_headers(),
+    89|             url=f"{self.base_url}/datastores/{self._datastore_id}/search",
+    90|             data=json.dumps({"k": k, "text": query}),
+    91|             timeout=10,
+    92|         )
+    93|         if response.status_code != 200:
+    94|             logging.error(
+    95|                 "Query failed %s",
+

@@ -1,0 +1,1455 @@
+# ====================================================================
+# FILE: lib/Drupal.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-688 ---
+     1| <?php
+     2| use Drupal\Core\DependencyInjection\ContainerNotInitializedException;
+     3| use Symfony\Component\DependencyInjection\ContainerInterface;
+     4| /**
+     5|  * Static Service Container wrapper.
+     6|  *
+     7|  * Generally, code in Drupal should accept its dependencies via either
+     8|  * constructor injection or setter method injection. However, there are cases,
+     9|  * particularly in legacy procedural code, where that is infeasible. This
+    10|  * class acts as a unified global accessor to arbitrary services within the
+    11|  * system in order to ease the transition from procedural code to injected OO
+    12|  * code.
+    13|  *
+    14|  * The container is built by the kernel and passed in to this class which stores
+    15|  * it statically. The container always contains the services from
+    16|  * \Drupal\Core\CoreServiceProvider, the service providers of enabled modules and any other
+    17|  * service providers defined in $GLOBALS['conf']['container_service_providers'].
+    18|  *
+    19|  * This class exists only to support legacy code that cannot be dependency
+    20|  * injected. If your code needs it, consider refactoring it to be object
+    21|  * oriented, if possible. When this is not possible, for instance in the case of
+    22|  * hook implementations, and your code is more than a few non-reusable lines, it
+    23|  * is recommended to instantiate an object implementing the actual logic.
+    24|  *
+    25|  * @code
+    26|  *   // Legacy procedural code.
+    27|  *   function hook_do_stuff() {
+    28|  *     $lock = lock()->acquire('stuff_lock');
+    29|  *     // ...
+    30|  *   }
+    31|  *
+    32|  *   // Correct procedural code.
+    33|  *   function hook_do_stuff() {
+    34|  *     $lock = \Drupal::lock()->acquire('stuff_lock');
+    35|  *     // ...
+    36|  *   }
+    37|  *
+    38|  *   // The preferred way: dependency injected code.
+    39|  *   function hook_do_stuff() {
+    40|  *     // Move the actual implementation to a class and instantiate it.
+    41|  *     $instance = new StuffDoingClass(\Drupal::lock());
+    42|  *     $instance->doStuff();
+    43|  *
+    44|  *     // Or, even better, rely on the service container to avoid hard coding a
+    45|  *     // specific interface implementation, so that the actual logic can be
+    46|  *     // swapped. This might not always make sense, but in general it is a good
+    47|  *     // practice.
+    48|  *     \Drupal::service('stuff.doing')->doStuff();
+    49|  *   }
+    50|  *
+    51|  *   interface StuffDoingInterface {
+    52|  *     public function doStuff();
+    53|  *   }
+    54|  *
+    55|  *   class StuffDoingClass implements StuffDoingInterface {
+    56|  *     protected $lockBackend;
+    57|  *
+    58|  *     public function __construct(LockBackendInterface $lock_backend) {
+    59|  *       $this->lockBackend = $lock_backend;
+    60|  *     }
+    61|  *
+    62|  *     public function doStuff() {
+    63|  *       $lock = $this->lockBackend->acquire('stuff_lock');
+    64|  *       // ...
+    65|  *     }
+    66|  *   }
+    67|  * @endcode
+    68|  *
+    69|  * @see \Drupal\Core\DrupalKernel
+    70|  */
+    71| class Drupal {
+    72|   /**
+    73|    * The current system version.
+    74|    */
+    75|   const VERSION = '11.1.5';
+    76|   /**
+    77|    * Core API compatibility.
+    78|    *
+    79|    * This constant is set to '8.x' to provide legacy compatibility with
+    80|    * extensions that use the '8.x-' prefix to denote Drupal core major version
+    81|    * compatibility, for example '8.x-1.0'. These extensions can specify
+    82|    * compatibility with multiple major versions of Drupal core by setting the
+    83|    * version constraint in 'core_version_requirement'. Drupal does not support
+    84|    * using this core major version number prefix with versions greater than 8.
+    85|    * For example '9.x-' prefixed extensions are not supported.
+    86|    *
+    87|    * @todo Remove or rename this constant in https://www.drupal.org/i/3085662
+    88|    */
+    89|   const CORE_COMPATIBILITY = '8.x';
+    90|   /**
+    91|    * Core minimum schema version.
+    92|    */
+    93|   const CORE_MINIMUM_SCHEMA_VERSION = 8000;
+    94|   /**
+    95|    * Minimum allowed version of PHP for Drupal to be bootstrapped.
+    96|    *
+    97|    * Below this version:
+    98|    * - The installer cannot be run.
+    99|    * - Updates cannot be run.
+   100|    * - Modules and themes cannot be enabled.
+   101|    * - If a site managed to bypass all of the above, then an error is shown in
+   102|    *   the status report and various fatal errors occur on various pages.
+   103|    *
+   104|    * Note: To prevent the installer from having fatal errors on older versions
+   105|    * of PHP, the value of this constant is hardcoded twice in core/install.php:
+   106|    * - Once as a parameter of version_compare()
+   107|    * - Once in the error message printed to the user immediately after.
+   108|    * Remember to update both whenever this constant is updated.
+   109|    */
+   110|   const MINIMUM_PHP = '8.3.0';
+   111|   /**
+   112|    * Minimum recommended value of PHP memory_limit.
+   113|    *
+   114|    * 64M was chosen as a minimum requirement in order to allow for additional
+   115|    * contributed modules to be installed prior to hitting the limit. However,
+   116|    * 40M is the target for the Standard installation profile.
+   117|    */
+   118|   const MINIMUM_PHP_MEMORY_LIMIT = '64M';
+   119|   /**
+   120|    * Minimum recommended version of PHP.
+   121|    *
+   122|    * Sites installing Drupal on PHP versions lower than this will see a warning
+   123|    * message, but Drupal can still be installed. Used for (e.g.) PHP versions
+   124|    * that have reached their EOL or will in the near future.
+   125|    */
+   126|   const RECOMMENDED_PHP = '8.3.0';
+   127|   /**
+   128|    * The currently active container object, or NULL if not initialized yet.
+   129|    *
+   130|    * @var \Drupal\Component\DependencyInjection\ContainerInterface|null
+   131|    */
+   132|   protected static $container;
+   133|   /**
+   134|    * Sets a new global container.
+   135|    *
+   136|    * @param \Symfony\Component\DependencyInjection\ContainerInterface $container
+   137|    *   A new container instance to replace the current.
+   138|    */
+   139|   public static function setContainer(ContainerInterface $container) {
+   140|     static::$container = $container;
+   141|   }
+   142|   /**
+   143|    * Unsets the global container.
+   144|    */
+   145|   public static function unsetContainer() {
+   146|     static::$container = NULL;
+   147|   }
+   148|   /**
+   149|    * Returns the currently active global container.
+   150|    *
+   151|    * @return \Drupal\Component\DependencyInjection\ContainerInterface
+   152|    *
+   153|    * @throws \Drupal\Core\DependencyInjection\ContainerNotInitializedException
+   154|    */
+   155|   public static function getContainer() {
+   156|     if (static::$container === NULL) {
+   157|       throw new ContainerNotInitializedException('\Drupal::$container is not initialized yet. \Drupal::setContainer() must be called with a real container.');
+   158|     }
+   159|     return static::$container;
+   160|   }
+   161|   /**
+   162|    * Returns TRUE if the container has been initialized, FALSE otherwise.
+   163|    *
+   164|    * @return bool
+   165|    */
+   166|   public static function hasContainer() {
+   167|     return static::$container !== NULL;
+   168|   }
+   169|   /**
+   170|    * Retrieves a service from the container.
+   171|    *
+   172|    * Use this method if the desired service is not one of those with a dedicated
+   173|    * accessor method below. If it is listed below, those methods are preferred
+   174|    * as they can return useful type hints.
+   175|    *
+   176|    * @param string $id
+   177|    *   The ID of the service to retrieve.
+   178|    *
+   179|    * @return mixed
+   180|    *   The specified service.
+   181|    */
+   182|   public static function service($id) {
+   183|     return static::getContainer()->get($id);
+   184|   }
+   185|   /**
+   186|    * Indicates if a service is defined in the container.
+   187|    *
+   188|    * @param string $id
+   189|    *   The ID of the service to check.
+   190|    *
+   191|    * @return bool
+   192|    *   TRUE if the specified service exists, FALSE otherwise.
+   193|    */
+   194|   public static function hasService($id) {
+   195|     return static::hasContainer() && static::getContainer()->has($id);
+   196|   }
+   197|   /**
+   198|    * Gets the app root.
+   199|    *
+   200|    * @return string
+   201|    */
+   202|   public static function root() {
+   203|     return static::getContainer()->getParameter('app.root');
+   204|   }
+   205|   /**
+   206|    * Gets the active install profile.
+   207|    *
+   208|    * @return string|false|null
+   209|    *   The name of the active install profile. FALSE indicates that the site is
+   210|    *   not using an install profile. NULL indicates that the site has not yet
+   211|    *   been installed.
+   212|    */
+   213|   public static function installProfile() {
+   214|     return static::getContainer()->getParameter('install_profile');
+   215|   }
+   216|   /**
+   217|    * Indicates if there is a currently active request object.
+   218|    *
+   219|    * @return bool
+   220|    *   TRUE if there is a currently active request object, FALSE otherwise.
+   221|    */
+   222|   public static function hasRequest() {
+   223|     return static::hasContainer() && static::getContainer()->has('request_stack') && static::getContainer()->get('request_stack')->getCurrentRequest() !== NULL;
+   224|   }
+   225|   /**
+   226|    * Retrieves the currently active request object.
+   227|    *
+   228|    * Note: The use of this wrapper in particular is especially discouraged. Most
+   229|    * code should not need to access the request directly.  Doing so means it
+   230|    * will only function when handling an HTTP request, and will require special
+   231|    * modification or wrapping when run from a command line tool, from certain
+   232|    * queue processors, or from automated tests.
+   233|    *
+   234|    * If code must access the request, it is considerably better to register
+   235|    * an object with the Service Container and give it a setRequest() method
+   236|    * that is configured to run when the service is created.  That way, the
+   237|    * correct request object can always be provided by the container and the
+   238|    * service can still be unit tested.
+   239|    *
+   240|    * If this method must be used, never save the request object that is
+   241|    * returned.  Doing so may lead to inconsistencies as the request object is
+   242|    * volatile and may change at various times, such as during a subrequest.
+   243|    *
+   244|    * @return \Symfony\Component\HttpFoundation\Request
+   245|    *   The currently active request object.
+   246|    */
+   247|   public static function request() {
+   248|     return static::getContainer()->get('request_stack')->getCurrentRequest();
+   249|   }
+   250|   /**
+   251|    * Retrieves the request stack.
+   252|    *
+   253|    * @return \Symfony\Component\HttpFoundation\RequestStack
+   254|    *   The request stack
+   255|    */
+   256|   public static function requestStack() {
+   257|     return static::getContainer()->get('request_stack');
+   258|   }
+   259|   /**
+   260|    * Retrieves the currently active route match object.
+   261|    *
+   262|    * @return \Drupal\Core\Routing\RouteMatchInterface
+   263|    *   The currently active route match object.
+   264|    */
+   265|   public static function routeMatch() {
+   266|     return static::getContainer()->get('current_route_match');
+   267|   }
+   268|   /**
+   269|    * Gets the current active user.
+   270|    *
+   271|    * This method will return the \Drupal\Core\Session\AccountProxy object of the
+   272|    * current user. You can use the \Drupal\user\Entity\User::load() method to
+   273|    * load the full user entity object. For example:
+   274|    * @code
+   275|    *   $user = \Drupal\user\Entity\User::load(\Drupal::currentUser()->id());
+   276|    * @endcode
+   277|    *
+   278|    * @return \Drupal\Core\Session\AccountProxyInterface
+   279|    */
+   280|   public static function currentUser() {
+   281|     return static::getContainer()->get('current_user');
+   282|   }
+   283|   /**
+   284|    * Retrieves the entity type manager.
+   285|    *
+   286|    * @return \Drupal\Core\Entity\EntityTypeManagerInterface
+   287|    *   The entity type manager.
+   288|    */
+   289|   public static function entityTypeManager() {
+   290|     return static::getContainer()->get('entity_type.manager');
+   291|   }
+   292|   /**
+   293|    * Returns the current primary database.
+   294|    *
+   295|    * @return \Drupal\Core\Database\Connection
+   296|    *   The current active database's master connection.
+   297|    */
+   298|   public static function database() {
+   299|     return static::getContainer()->get('database');
+   300|   }
+   301|   /**
+   302|    * Returns the requested cache bin.
+   303|    *
+   304|    * @param string $bin
+   305|    *   (optional) The cache bin for which the cache object should be returned,
+   306|    *   defaults to 'default'.
+   307|    *
+   308|    * @return \Drupal\Core\Cache\CacheBackendInterface
+   309|    *   The cache object associated with the specified bin.
+   310|    *
+   311|    * @ingroup cache
+   312|    */
+   313|   public static function cache($bin = 'default') {
+   314|     return static::getContainer()->get('cache.' . $bin);
+   315|   }
+   316|   /**
+   317|    * Retrieves the class resolver.
+   318|    *
+   319|    * This is to be used in procedural code such as module files to instantiate
+   320|    * an object of a class that implements
+   321|    * \Drupal\Core\DependencyInjection\ContainerInjectionInterface.
+   322|    *
+   323|    * One common use case is to provide a class which contains the actual code
+   324|    * of a hook implementation, without having to create a service.
+   325|    *
+   326|    * @param string $class
+   327|    *   (optional) A class name to instantiate.
+   328|    *
+   329|    * @return \Drupal\Core\DependencyInjection\ClassResolverInterface|object
+   330|    *   The class resolver or if $class is provided, a class instance with a
+   331|    *   given class definition.
+   332|    *
+   333|    * @throws \InvalidArgumentException
+   334|    *   If $class does not exist.
+   335|    */
+   336|   public static function classResolver($class = NULL) {
+   337|     if ($class) {
+   338|       return static::getContainer()->get('class_resolver')->getInstanceFromDefinition($class);
+   339|     }
+   340|     return static::getContainer()->get('class_resolver');
+   341|   }
+   342|   /**
+   343|    * Returns an expirable key value store collection.
+   344|    *
+   345|    * @param string $collection
+   346|    *   The name of the collection holding key and value pairs.
+   347|    *
+   348|    * @return \Drupal\Core\KeyValueStore\KeyValueStoreExpirableInterface
+   349|    *   An expirable key value store collection.
+   350|    */
+   351|   public static function keyValueExpirable($collection) {
+   352|     return static::getContainer()->get('keyvalue.expirable')->get($collection);
+   353|   }
+   354|   /**
+   355|    * Returns the locking layer instance.
+   356|    *
+   357|    * @return \Drupal\Core\Lock\LockBackendInterface
+   358|    *
+   359|    * @ingroup lock
+   360|    */
+   361|   public static function lock() {
+   362|     return static::getContainer()->get('lock');
+   363|   }
+   364|   /**
+   365|    * Retrieves a configuration object.
+   366|    *
+   367|    * This is the main entry point to the configuration API. Calling
+   368|    * @code \Drupal::config('my_module.admin') @endcode will return a
+   369|    * configuration object the my_module module can use to read its
+   370|    * administrative settings.
+   371|    *
+   372|    * @param string $name
+   373|    *   The name of the configuration object to retrieve, which typically
+   374|    *   corresponds to a configuration file. For
+   375|    *   @code \Drupal::config('my_module.admin') @endcode, the configuration
+   376|    *   object returned will contain the content of the my_module.admin
+   377|    *   configuration file.
+   378|    *
+   379|    * @return \Drupal\Core\Config\ImmutableConfig
+   380|    *   An immutable configuration object.
+   381|    */
+   382|   public static function config($name) {
+   383|     return static::getContainer()->get('config.factory')->get($name);
+   384|   }
+   385|   /**
+   386|    * Retrieves the configuration factory.
+   387|    *
+   388|    * This is mostly used to change the override settings on the configuration
+   389|    * factory. For example, changing the language, or turning all overrides on
+   390|    * or off.
+   391|    *
+   392|    * @return \Drupal\Core\Config\ConfigFactoryInterface
+   393|    *   The configuration factory service.
+   394|    */
+   395|   public static function configFactory() {
+   396|     return static::getContainer()->get('config.factory');
+   397|   }
+   398|   /**
+   399|    * Returns a queue for the given queue name.
+   400|    *
+   401|    * The following values can be set in your settings.php file's $settings
+   402|    * array to define which services are used for queues:
+   403|    * - queue_reliable_service_$name: The container service to use for the
+   404|    *   reliable queue $name.
+   405|    * - queue_service_$name: The container service to use for the
+   406|    *   queue $name.
+   407|    * - queue_default: The container service to use by default for queues
+   408|    *   without overrides. This defaults to 'queue.database'.
+   409|    *
+   410|    * @param string $name
+   411|    *   The name of the queue to work with.
+   412|    * @param bool $reliable
+   413|    *   (optional) TRUE if the ordering of items and guaranteeing every item
+   414|    *   executes at least once is important, FALSE if scalability is the main
+   415|    *   concern. Defaults to FALSE.
+   416|    *
+   417|    * @return \Drupal\Core\Queue\QueueInterface
+   418|    *   The queue object for a given name.
+   419|    */
+   420|   public static function queue($name, $reliable = FALSE) {
+   421|     return static::getContainer()->get('queue')->get($name, $reliable);
+   422|   }
+   423|   /**
+   424|    * Returns a key/value storage collection.
+   425|    *
+   426|    * @param string $collection
+   427|    *   Name of the key/value collection to return.
+   428|    *
+   429|    * @return \Drupal\Core\KeyValueStore\KeyValueStoreInterface
+   430|    */
+   431|   public static function keyValue($collection) {
+   432|     return static::getContainer()->get('keyvalue')->get($collection);
+   433|   }
+   434|   /**
+   435|    * Returns the state storage service.
+   436|    *
+   437|    * Use this to store machine-generated data, local to a specific environment
+   438|    * that does not need deploying and does not need human editing; for example,
+   439|    * the last time cron was run. Data which needs to be edited by humans and
+   440|    * needs to be the same across development, production, etc. environments
+   441|    * (for example, the system maintenance message) should use \Drupal::config() instead.
+   442|    *
+   443|    * @return \Drupal\Core\State\StateInterface
+   444|    */
+   445|   public static function state() {
+   446|     return static::getContainer()->get('state');
+   447|   }
+   448|   /**
+   449|    * Returns the default http client.
+   450|    *
+   451|    * @return \GuzzleHttp\Client
+   452|    *   A guzzle http client instance.
+   453|    */
+   454|   public static function httpClient() {
+   455|     return static::getContainer()->get('http_client');
+   456|   }
+   457|   /**
+   458|    * Returns the entity query object for this entity type.
+   459|    *
+   460|    * @param string $entity_type
+   461|    *   The entity type (for example, node) for which the query object should be
+   462|    *   returned.
+   463|    * @param string $conjunction
+   464|    *   (optional) Either 'AND' if all conditions in the query need to apply, or
+   465|    *   'OR' if any of them is sufficient. Defaults to 'AND'.
+   466|    *
+   467|    * @return \Drupal\Core\Entity\Query\QueryInterface
+   468|    *   The query object that can query the given entity type.
+   469|    */
+   470|   public static function entityQuery($entity_type, $conjunction = 'AND') {
+   471|     return static::entityTypeManager()->getStorage($entity_type)->getQuery($conjunction);
+   472|   }
+   473|   /**
+   474|    * Returns the entity query aggregate object for this entity type.
+   475|    *
+   476|    * @param string $entity_type
+   477|    *   The entity type (for example, node) for which the query object should be
+   478|    *   returned.
+   479|    * @param string $conjunction
+   480|    *   (optional) Either 'AND' if all conditions in the query need to apply, or
+   481|    *   'OR' if any of them is sufficient. Defaults to 'AND'.
+   482|    *
+   483|    * @return \Drupal\Core\Entity\Query\QueryAggregateInterface
+   484|    *   The query object that can query the given entity type.
+   485|    */
+   486|   public static function entityQueryAggregate($entity_type, $conjunction = 'AND') {
+   487|     return static::entityTypeManager()->getStorage($entity_type)->getAggregateQuery($conjunction);
+   488|   }
+   489|   /**
+   490|    * Returns the flood instance.
+   491|    *
+   492|    * @return \Drupal\Core\Flood\FloodInterface
+   493|    */
+   494|   public static function flood() {
+   495|     return static::getContainer()->get('flood');
+   496|   }
+   497|   /**
+   498|    * Returns the module handler.
+   499|    *
+   500|    * @return \Drupal\Core\Extension\ModuleHandlerInterface
+   501|    */
+   502|   public static function moduleHandler() {
+   503|     return static::getContainer()->get('module_handler');
+   504|   }
+   505|   /**
+   506|    * Returns the typed data manager service.
+   507|    *
+   508|    * Use the typed data manager service for creating typed data objects.
+   509|    *
+   510|    * @return \Drupal\Core\TypedData\TypedDataManagerInterface
+   511|    *   The typed data manager.
+   512|    *
+   513|    * @see \Drupal\Core\TypedData\TypedDataManager::create()
+   514|    */
+   515|   public static function typedDataManager() {
+   516|     return static::getContainer()->get('typed_data_manager');
+   517|   }
+   518|   /**
+   519|    * Returns the token service.
+   520|    *
+   521|    * @return \Drupal\Core\Utility\Token
+   522|    *   The token service.
+   523|    */
+   524|   public static function token() {
+   525|     return static::getContainer()->get('token');
+   526|   }
+   527|   /**
+   528|    * Returns the URL generator service.
+   529|    *
+   530|    * @return \Drupal\Core\Routing\UrlGeneratorInterface
+   531|    *   The URL generator service.
+   532|    */
+   533|   public static function urlGenerator() {
+   534|     return static::getContainer()->get('url_generator');
+   535|   }
+   536|   /**
+   537|    * Returns the link generator service.
+   538|    *
+   539|    * @return \Drupal\Core\Utility\LinkGeneratorInterface
+   540|    */
+   541|   public static function linkGenerator() {
+   542|     return static::getContainer()->get('link_generator');
+   543|   }
+   544|   /**
+   545|    * Returns the string translation service.
+   546|    *
+   547|    * @return \Drupal\Core\StringTranslation\TranslationManager
+   548|    *   The string translation manager.
+   549|    */
+   550|   public static function translation() {
+   551|     return static::getContainer()->get('string_translation');
+   552|   }
+   553|   /**
+   554|    * Returns the language manager service.
+   555|    *
+   556|    * @return \Drupal\Core\Language\LanguageManagerInterface
+   557|    *   The language manager.
+   558|    */
+   559|   public static function languageManager() {
+   560|     return static::getContainer()->get('language_manager');
+   561|   }
+   562|   /**
+   563|    * Returns the CSRF token manager service.
+   564|    *
+   565|    * The generated token is based on the session ID of the current user. Normally,
+   566|    * anonymous users do not have a session, so the generated token will be
+   567|    * different on every page request. To generate a token for users without a
+   568|    * session, manually start a session prior to calling this function.
+   569|    *
+   570|    * @return \Drupal\Core\Access\CsrfTokenGenerator
+   571|    *   The CSRF token manager.
+   572|    *
+   573|    * @see \Drupal\Core\Session\SessionManager::start()
+   574|    */
+   575|   public static function csrfToken() {
+   576|     return static::getContainer()->get('csrf_token');
+   577|   }
+   578|   /**
+   579|    * Returns the transliteration service.
+   580|    *
+   581|    * @return \Drupal\Core\Transliteration\PhpTransliteration
+   582|    *   The transliteration manager.
+   583|    */
+   584|   public static function transliteration() {
+   585|     return static::getContainer()->get('transliteration');
+   586|   }
+   587|   /**
+   588|    * Returns the form builder service.
+   589|    *
+   590|    * @return \Drupal\Core\Form\FormBuilderInterface
+   591|    *   The form builder.
+   592|    */
+   593|   public static function formBuilder() {
+   594|     return static::getContainer()->get('form_builder');
+   595|   }
+   596|   /**
+   597|    * Gets the theme service.
+   598|    *
+   599|    * @return \Drupal\Core\Theme\ThemeManagerInterface
+   600|    */
+   601|   public static function theme() {
+   602|     return static::getContainer()->get('theme.manager');
+   603|   }
+   604|   /**
+   605|    * Gets the syncing state.
+   606|    *
+   607|    * @return bool
+   608|    *   Returns TRUE is syncing flag set.
+   609|    */
+   610|   public static function isConfigSyncing() {
+   611|     return static::getContainer()->get('config.installer')->isSyncing();
+   612|   }
+   613|   /**
+   614|    * Returns a channel logger object.
+   615|    *
+   616|    * @param string $channel
+   617|    *   The name of the channel. Can be any string, but the general practice is
+   618|    *   to use the name of the subsystem calling this.
+   619|    *
+   620|    * @return \Psr\Log\LoggerInterface
+   621|    *   The logger for this channel.
+   622|    */
+   623|   public static function logger($channel) {
+   624|     return static::getContainer()->get('logger.factory')->get($channel);
+   625|   }
+   626|   /**
+   627|    * Returns the menu tree.
+   628|    *
+   629|    * @return \Drupal\Core\Menu\MenuLinkTreeInterface
+   630|    *   The menu tree.
+   631|    */
+   632|   public static function menuTree() {
+   633|     return static::getContainer()->get('menu.link_tree');
+   634|   }
+   635|   /**
+   636|    * Returns the path validator.
+   637|    *
+   638|    * @return \Drupal\Core\Path\PathValidatorInterface
+   639|    */
+   640|   public static function pathValidator() {
+   641|     return static::getContainer()->get('path.validator');
+   642|   }
+   643|   /**
+   644|    * Returns the access manager service.
+   645|    *
+   646|    * @return \Drupal\Core\Access\AccessManagerInterface
+   647|    *   The access manager service.
+   648|    */
+   649|   public static function accessManager() {
+   650|     return static::getContainer()->get('access_manager');
+   651|   }
+   652|   /**
+   653|    * Returns the redirect destination helper.
+   654|    *
+   655|    * @return \Drupal\Core\Routing\RedirectDestinationInterface
+   656|    *   The redirect destination helper.
+   657|    */
+   658|   public static function destination() {
+   659|     return static::getContainer()->get('redirect.destination');
+   660|   }
+   661|   /**
+   662|    * Returns the entity definition update manager.
+   663|    *
+   664|    * @return \Drupal\Core\Entity\EntityDefinitionUpdateManagerInterface
+   665|    *   The entity definition update manager.
+   666|    */
+   667|   public static function entityDefinitionUpdateManager() {
+   668|     return static::getContainer()->get('entity.definition_update_manager');
+   669|   }
+   670|   /**
+   671|    * Returns the time service.
+   672|    *
+   673|    * @return \Drupal\Component\Datetime\TimeInterface
+   674|    *   The time service.
+   675|    */
+   676|   public static function time() {
+   677|     return static::getContainer()->get('datetime.time');
+   678|   }
+   679|   /**
+   680|    * Returns the messenger.
+   681|    *
+   682|    * @return \Drupal\Core\Messenger\MessengerInterface
+   683|    *   The messenger.
+   684|    */
+   685|   public static function messenger() {
+   686|     return static::getContainer()->get('messenger');
+   687|   }
+   688| }
+
+
+# ====================================================================
+# FILE: modules/link/src/AttributeXss.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-147 ---
+     1| <?php
+     2| declare(strict_types=1);
+     3| namespace Drupal\link;
+     4| use Drupal\Component\Utility\Html;
+     5| use Drupal\Component\Utility\UrlHelper;
+     6| use Drupal\Core\Template\Attribute;
+     7| /**
+     8|  * Defines a class for attribute XSS filtering.
+     9|  *
+    10|  * @internal This class was added for a security fix and will be folded into
+    11|  *   the \Drupal\Component\Utility\Xss class in a public issue.
+    12|  */
+    13| final class AttributeXss {
+    14|   /**
+    15|    * Filters attributes.
+    16|    *
+    17|    * @param string $attributes
+    18|    *   Rendered attribute string, e.g. 'class="foo bar"'.
+    19|    */
+    20|   private static function attributes(string $attributes): array {
+    21|     $attributes_array = [];
+    22|     $mode = 0;
+    23|     $attribute_name = '';
+    24|     $skip = FALSE;
+    25|     $skip_protocol_filtering = FALSE;
+    26|     while (strlen($attributes) != 0) {
+    27|       $working = 0;
+    28|       switch ($mode) {
+    29|         case 0:
+    30|           if (preg_match('/^([-a-zA-Z][-a-zA-Z0-9]*)/', $attributes, $match)) {
+    31|             $attribute_name = strtolower($match[1]);
+    32|             $skip = (
+    33|               $attribute_name == 'style' ||
+    34|               str_starts_with($attribute_name, 'on') ||
+    35|               str_starts_with($attribute_name, '-') ||
+    36|               strlen($attribute_name) > 96
+    37|             );
+    38|             $skip_protocol_filtering = str_starts_with($attribute_name, 'data-') || in_array($attribute_name, [
+    39|               'title',
+    40|               'alt',
+    41|               'rel',
+    42|               'property',
+    43|               'class',
+    44|               'datetime',
+    45|             ]);
+    46|             $working = $mode = 1;
+    47|             $attributes = preg_replace('/^[-a-zA-Z][-a-zA-Z0-9]*/', '', $attributes);
+    48|           }
+    49|           break;
+    50|         case 1:
+    51|           if (preg_match('/^\s*=\s*/', $attributes)) {
+    52|             $working = 1;
+    53|             $mode = 2;
+    54|             $attributes = preg_replace('/^\s*=\s*/', '', $attributes);
+    55|             break;
+    56|           }
+    57|           if (preg_match('/^\s+/', $attributes)) {
+    58|             $working = 1;
+    59|             $mode = 0;
+    60|             if (!$skip) {
+    61|               $attributes_array[$attribute_name] = $attribute_name;
+    62|             }
+    63|             $attributes = preg_replace('/^\s+/', '', $attributes);
+    64|           }
+    65|           break;
+    66|         case 2:
+    67|           $mode = 0;
+    68|           $working = 1;
+    69|           if (preg_match('/^"([^"]*)"(\s+|$)/', $attributes, $match)) {
+    70|             $value = $skip_protocol_filtering ? $match[1] : UrlHelper::filterBadProtocol($match[1]);
+    71|             if (!$skip) {
+    72|               $attributes_array[$attribute_name] = $value;
+    73|             }
+    74|             $attributes = preg_replace('/^"[^"]*"(\s+|$)/', '', $attributes);
+    75|             break;
+    76|           }
+    77|           if (preg_match("/^'([^']*)'(\s+|$)/", $attributes, $match)) {
+    78|             $value = $skip_protocol_filtering ? $match[1] : UrlHelper::filterBadProtocol($match[1]);
+    79|             if (!$skip) {
+    80|               $attributes_array[$attribute_name] = $value;
+    81|             }
+    82|             $attributes = preg_replace("/^'[^']*'(\s+|$)/", '', $attributes);
+    83|             break;
+    84|           }
+    85|           if (preg_match("%^([^\s\"']+)(\s+|$)%", $attributes, $match)) {
+    86|             $value = $skip_protocol_filtering ? $match[1] : UrlHelper::filterBadProtocol($match[1]);
+    87|             if (!$skip) {
+    88|               $attributes_array[$attribute_name] = $value;
+    89|             }
+    90|             $attributes = preg_replace("%^[^\s\"']+(\s+|$)%", '', $attributes);
+    91|           }
+    92|           break;
+    93|       }
+    94|       if ($working == 0) {
+    95|         $attributes = preg_replace('/
+    96|           ^
+    97|           (
+    98|           "[^"]*("|$)     # - a string that starts with a double quote, up until the next double quote or the end of the string
+    99|           |               # or
+   100|           \'[^\']*(\'|$)| # - a string that starts with a quote, up until the next quote or the end of the string
+   101|           |               # or
+   102|           \S              # - a non-whitespace character
+   103|           )*              # any number of the above three
+   104|           \s*             # any number of whitespaces
+   105|           /x', '', $attributes);
+   106|         $mode = 0;
+   107|       }
+   108|     }
+   109|     if ($mode == 1 && !$skip) {
+   110|       $attributes_array[$attribute_name] = $attribute_name;
+   111|     }
+   112|     return $attributes_array;
+   113|   }
+   114|   /**
+   115|    * Sanitizes attributes.
+   116|    *
+   117|    * @param array $attributes
+   118|    *   Attribute values as key => value format. Value may be a string or in the
+   119|    *   case of the 'class' attribute, an array.
+   120|    *
+   121|    * @return array
+   122|    *   Sanitized attributes.
+   123|    */
+   124|   public static function sanitizeAttributes(array $attributes): array {
+   125|     $new_attributes = [];
+   126|     foreach ($attributes as $name => $value) {
+   127|       $names = \array_filter(\explode(' ', $name));
+   128|       if (\count($names) === 0) {
+   129|         continue;
+   130|       }
+   131|       $with_values = \array_combine($names, $names);
+   132|       $last_name = \end($names);
+   133|       $with_values[$last_name] = $value;
+   134|       $attribute_object = new Attribute($with_values);
+   135|       $safe = AttributeXss::attributes((string) $attribute_object);
+   136|       $safe = \array_map([Html::class, 'decodeEntities'], $safe);
+   137|       if (\array_key_exists('class', $safe)) {
+   138|         $safe['class'] = \explode(' ', $safe['class']);
+   139|       }
+   140|       if (\array_key_exists($last_name, $safe) && \is_bool($value)) {
+   141|         $safe[$last_name] = $value;
+   142|       }
+   143|       $new_attributes += \array_intersect_key($safe, $with_values);
+   144|     }
+   145|     return $new_attributes;
+   146|   }
+   147| }
+
+
+# ====================================================================
+# FILE: modules/link/src/Plugin/Field/FieldFormatter/LinkFormatter.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-224 ---
+     1| <?php
+     2| namespace Drupal\link\Plugin\Field\FieldFormatter;
+     3| use Drupal\Component\Utility\Unicode;
+     4| use Drupal\Core\Field\Attribute\FieldFormatter;
+     5| use Drupal\Core\Field\FieldDefinitionInterface;
+     6| use Drupal\Core\Field\FieldItemListInterface;
+     7| use Drupal\Core\Field\FormatterBase;
+     8| use Drupal\Core\Form\FormStateInterface;
+     9| use Drupal\Core\Path\PathValidatorInterface;
+    10| use Drupal\Core\StringTranslation\TranslatableMarkup;
+    11| use Drupal\Core\Url;
+    12| use Drupal\link\AttributeXss;
+    13| use Drupal\link\LinkItemInterface;
+    14| use Symfony\Component\DependencyInjection\ContainerInterface;
+    15| /**
+    16|  * Plugin implementation of the 'link' formatter.
+    17|  */
+    18|   id: 'link',
+    19|   label: new TranslatableMarkup('Link'),
+    20|   field_types: [
+    21|     'link',
+    22|   ],
+    23| )]
+    24| class LinkFormatter extends FormatterBase {
+    25|   /**
+    26|    * The path validator service.
+    27|    *
+    28|    * @var \Drupal\Core\Path\PathValidatorInterface
+    29|    */
+    30|   protected $pathValidator;
+    31|   /**
+    32|    * {@inheritdoc}
+    33|    */
+    34|   public static function create(ContainerInterface $container, array $configuration, $plugin_id, $plugin_definition) {
+    35|     return new static(
+    36|       $plugin_id,
+    37|       $plugin_definition,
+    38|       $configuration['field_definition'],
+    39|       $configuration['settings'],
+    40|       $configuration['label'],
+    41|       $configuration['view_mode'],
+    42|       $configuration['third_party_settings'],
+    43|       $container->get('path.validator')
+    44|     );
+    45|   }
+    46|   /**
+    47|    * Constructs a new LinkFormatter.
+    48|    *
+    49|    * @param string $plugin_id
+    50|    *   The plugin ID for the formatter.
+    51|    * @param mixed $plugin_definition
+    52|    *   The plugin implementation definition.
+    53|    * @param \Drupal\Core\Field\FieldDefinitionInterface $field_definition
+    54|    *   The definition of the field to which the formatter is associated.
+    55|    * @param array $settings
+    56|    *   The formatter settings.
+    57|    * @param string $label
+    58|    *   The formatter label display setting.
+    59|    * @param string $view_mode
+    60|    *   The view mode.
+    61|    * @param array $third_party_settings
+    62|    *   Third party settings.
+    63|    * @param \Drupal\Core\Path\PathValidatorInterface $path_validator
+    64|    *   The path validator service.
+    65|    */
+    66|   public function __construct($plugin_id, $plugin_definition, FieldDefinitionInterface $field_definition, array $settings, $label, $view_mode, array $third_party_settings, PathValidatorInterface $path_validator) {
+    67|     parent::__construct($plugin_id, $plugin_definition, $field_definition, $settings, $label, $view_mode, $third_party_settings);
+    68|     $this->pathValidator = $path_validator;
+    69|   }
+    70|   /**
+    71|    * {@inheritdoc}
+    72|    */
+    73|   public static function defaultSettings() {
+    74|     return [
+    75|       'trim_length' => '80',
+    76|       'url_only' => '',
+    77|       'url_plain' => '',
+    78|       'rel' => '',
+    79|       'target' => '',
+    80|     ] + parent::defaultSettings();
+    81|   }
+    82|   /**
+    83|    * {@inheritdoc}
+    84|    */
+    85|   public function settingsForm(array $form, FormStateInterface $form_state) {
+    86|     $elements = parent::settingsForm($form, $form_state);
+    87|     $elements['trim_length'] = [
+    88|       '#type' => 'number',
+    89|       '#title' => $this->t('Trim link text length'),
+    90|       '#field_suffix' => $this->t('characters'),
+    91|       '#default_value' => $this->getSetting('trim_length'),
+    92|       '#min' => 1,
+    93|       '#description' => $this->t('Leave blank to allow unlimited link text lengths.'),
+    94|     ];
+    95|     $elements['url_only'] = [
+    96|       '#type' => 'checkbox',
+    97|       '#title' => $this->t('URL only'),
+    98|       '#default_value' => $this->getSetting('url_only'),
+    99|       '#access' => $this->getPluginId() == 'link',
+   100|     ];
+   101|     $elements['url_plain'] = [
+   102|       '#type' => 'checkbox',
+   103|       '#title' => $this->t('Show URL as plain text'),
+   104|       '#default_value' => $this->getSetting('url_plain'),
+   105|       '#access' => $this->getPluginId() == 'link',
+   106|       '#states' => [
+   107|         'visible' => [
+   108|           ':input[name*="url_only"]' => ['checked' => TRUE],
+   109|         ],
+   110|       ],
+   111|     ];
+   112|     $elements['rel'] = [
+   113|       '#type' => 'checkbox',
+   114|       '#title' => $this->t('Add rel="nofollow" to links'),
+   115|       '#return_value' => 'nofollow',
+   116|       '#default_value' => $this->getSetting('rel'),
+   117|     ];
+   118|     $elements['target'] = [
+   119|       '#type' => 'checkbox',
+   120|       '#title' => $this->t('Open link in new window'),
+   121|       '#return_value' => '_blank',
+   122|       '#default_value' => $this->getSetting('target'),
+   123|     ];
+   124|     return $elements;
+   125|   }
+   126|   /**
+   127|    * {@inheritdoc}
+   128|    */
+   129|   public function settingsSummary() {
+   130|     $summary = [];
+   131|     $settings = $this->getSettings();
+   132|     if (!empty($settings['trim_length'])) {
+   133|       $summary[] = $this->t('Link text trimmed to @limit characters', ['@limit' => $settings['trim_length']]);
+   134|     }
+   135|     else {
+   136|       $summary[] = $this->t('Link text not trimmed');
+   137|     }
+   138|     if ($this->getPluginId() == 'link' && !empty($settings['url_only'])) {
+   139|       if (!empty($settings['url_plain'])) {
+   140|         $summary[] = $this->t('Show URL only as plain-text');
+   141|       }
+   142|       else {
+   143|         $summary[] = $this->t('Show URL only');
+   144|       }
+   145|     }
+   146|     if (!empty($settings['rel'])) {
+   147|       $summary[] = $this->t('Add rel="@rel"', ['@rel' => $settings['rel']]);
+   148|     }
+   149|     if (!empty($settings['target'])) {
+   150|       $summary[] = $this->t('Open link in new window');
+   151|     }
+   152|     return $summary;
+   153|   }
+   154|   /**
+   155|    * {@inheritdoc}
+   156|    */
+   157|   public function viewElements(FieldItemListInterface $items, $langcode) {
+   158|     $element = [];
+   159|     $entity = $items->getEntity();
+   160|     $settings = $this->getSettings();
+   161|     foreach ($items as $delta => $item) {
+   162|       $url = $this->buildUrl($item);
+   163|       $link_title = $url->toString();
+   164|       if (empty($settings['url_only']) && !empty($item->title)) {
+   165|         $link_title = \Drupal::token()->replace($item->title, [$entity->getEntityTypeId() => $entity], ['clear' => TRUE]);
+   166|       }
+   167|       if (!empty($settings['trim_length'])) {
+   168|         $link_title = Unicode::truncate($link_title, $settings['trim_length'], FALSE, TRUE);
+   169|       }
+   170|       if (!empty($settings['url_only']) && !empty($settings['url_plain'])) {
+   171|         $element[$delta] = [
+   172|           '#plain_text' => $link_title,
+   173|         ];
+   174|         if (!empty($item->_attributes)) {
+   175|           $content = str_replace('internal:/', '', $item->uri);
+   176|           $item->_attributes += ['content' => $content];
+   177|         }
+   178|       }
+   179|       else {
+   180|         $element[$delta] = [
+   181|           '#type' => 'link',
+   182|           '#title' => $link_title,
+   183|           '#url' => $url,
+   184|         ];
+   185|         if (!empty($item->_attributes)) {
+   186|           $element[$delta]['#attributes'] = $item->_attributes;
+   187|           unset($item->_attributes);
+   188|         }
+   189|       }
+   190|     }
+   191|     return $element;
+   192|   }
+   193|   /**
+   194|    * Builds the \Drupal\Core\Url object for a link field item.
+   195|    *
+   196|    * @param \Drupal\link\LinkItemInterface $item
+   197|    *   The link field item being rendered.
+   198|    *
+   199|    * @return \Drupal\Core\Url
+   200|    *   A Url object.
+   201|    */
+   202|   protected function buildUrl(LinkItemInterface $item) {
+   203|     try {
+   204|       $url = $item->getUrl();
+   205|     }
+   206|     catch (\InvalidArgumentException) {
+   207|       $url = Url::fromRoute('<none>');
+   208|     }
+   209|     $settings = $this->getSettings();
+   210|     $options = $item->options;
+   211|     $options += $url->getOptions();
+   212|     if (!empty($settings['rel'])) {
+   213|       $options['attributes']['rel'] = $settings['rel'];
+   214|     }
+   215|     if (!empty($settings['target'])) {
+   216|       $options['attributes']['target'] = $settings['target'];
+   217|     }
+   218|     if (!empty($options['attributes'])) {
+   219|       $options['attributes'] = AttributeXss::sanitizeAttributes($options['attributes']);
+   220|     }
+   221|     $url->setOptions($options);
+   222|     return $url;
+   223|   }
+   224| }
+
+
+# ====================================================================
+# FILE: modules/menu_link_content/src/Entity/MenuLinkContent.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-369 ---
+     1| <?php
+     2| namespace Drupal\menu_link_content\Entity;
+     3| use Drupal\Core\Entity\Attribute\ContentEntityType;
+     4| use Drupal\Core\StringTranslation\TranslatableMarkup;
+     5| use Drupal\Core\Entity\EditorialContentEntityBase;
+     6| use Drupal\Core\Entity\EntityStorageInterface;
+     7| use Drupal\Core\Entity\EntityTypeInterface;
+     8| use Drupal\Core\Field\BaseFieldDefinition;
+     9| use Drupal\Core\Url;
+    10| use Drupal\link\AttributeXss;
+    11| use Drupal\link\LinkItemInterface;
+    12| use Drupal\menu_link_content\Form\MenuLinkContentDeleteForm;
+    13| use Drupal\menu_link_content\Form\MenuLinkContentForm;
+    14| use Drupal\menu_link_content\MenuLinkContentAccessControlHandler;
+    15| use Drupal\menu_link_content\MenuLinkContentInterface;
+    16| use Drupal\menu_link_content\MenuLinkContentStorage;
+    17| use Drupal\menu_link_content\MenuLinkContentStorageSchema;
+    18| use Drupal\menu_link_content\MenuLinkListBuilder;
+    19| /**
+    20|  * Defines the menu link content entity class.
+    21|  *
+    22|  * @property \Drupal\Core\Field\FieldItemList $link
+    23|  * @property \Drupal\Core\Field\FieldItemList $rediscover
+    24|  */
+    25|   id: 'menu_link_content',
+    26|   label: new TranslatableMarkup('Custom menu link'),
+    27|   label_collection: new TranslatableMarkup('Custom menu links'),
+    28|   label_singular: new TranslatableMarkup('custom menu link'),
+    29|   label_plural: new TranslatableMarkup('custom menu links'),
+    30|   entity_keys: [
+    31|     'id' => 'id',
+    32|     'revision' => 'revision_id',
+    33|     'label' => 'title',
+    34|     'langcode' => 'langcode',
+    35|     'uuid' => 'uuid',
+    36|     'bundle' => 'bundle',
+    37|     'published' => 'enabled',
+    38|   ],
+    39|   handlers: [
+    40|     'storage' => MenuLinkContentStorage::class,
+    41|     'storage_schema' => MenuLinkContentStorageSchema::class,
+    42|     'access' => MenuLinkContentAccessControlHandler::class,
+    43|     'form' => [
+    44|       'default' => MenuLinkContentForm::class,
+    45|       'delete' => MenuLinkContentDeleteForm::class,
+    46|     ],
+    47|     'list_builder' => MenuLinkListBuilder::class,
+    48|   ],
+    49|   links: [
+    50|     'canonical' => '/admin/structure/menu/item/{menu_link_content}/edit',
+    51|     'edit-form' => '/admin/structure/menu/item/{menu_link_content}/edit',
+    52|     'delete-form' => '/admin/structure/menu/item/{menu_link_content}/delete',
+    53|   ],
+    54|   admin_permission: 'administer menu',
+    55|   base_table: 'menu_link_content',
+    56|   data_table: 'menu_link_content_data',
+    57|   revision_table: 'menu_link_content_revision',
+    58|   revision_data_table: 'menu_link_content_field_revision',
+    59|   translatable: TRUE,
+    60|   label_count: [
+    61|     'singular' => '@count custom menu link',
+    62|     'plural' => '@count custom menu links',
+    63|   ],
+    64|   constraints: [
+    65|     'MenuTreeHierarchy' => [],
+    66|   ],
+    67|   revision_metadata_keys: [
+    68|     'revision_user' => 'revision_user',
+    69|     'revision_created' => 'revision_created',
+    70|     'revision_log_message' => 'revision_log_message',
+    71|   ],
+    72|   )]
+    73| class MenuLinkContent extends EditorialContentEntityBase implements MenuLinkContentInterface {
+    74|   /**
+    75|    * A flag for whether this entity is wrapped in a plugin instance.
+    76|    *
+    77|    * @var bool
+    78|    */
+    79|   protected $insidePlugin = FALSE;
+    80|   /**
+    81|    * {@inheritdoc}
+    82|    */
+    83|   public function setInsidePlugin() {
+    84|     $this->insidePlugin = TRUE;
+    85|   }
+    86|   /**
+    87|    * {@inheritdoc}
+    88|    */
+    89|   public function getTitle() {
+    90|     return $this->get('title')->value;
+    91|   }
+    92|   /**
+    93|    * {@inheritdoc}
+    94|    */
+    95|   public function getUrlObject() {
+    96|     $url = $this->link->first()->getUrl();
+    97|     assert($url instanceof Url);
+    98|     if ($attributes = $url->getOption('attributes')) {
+    99|       $url->setOption('attributes', AttributeXss::sanitizeAttributes($attributes));
+   100|     }
+   101|     return $url;
+   102|   }
+   103|   /**
+   104|    * {@inheritdoc}
+   105|    */
+   106|   public function getMenuName() {
+   107|     return $this->get('menu_name')->value;
+   108|   }
+   109|   /**
+   110|    * {@inheritdoc}
+   111|    */
+   112|   public function getDescription() {
+   113|     return $this->get('description')->value;
+   114|   }
+   115|   /**
+   116|    * {@inheritdoc}
+   117|    */
+   118|   public function getPluginId() {
+   119|     return 'menu_link_content:' . $this->uuid();
+   120|   }
+   121|   /**
+   122|    * {@inheritdoc}
+   123|    */
+   124|   public function isEnabled() {
+   125|     return (bool) $this->get('enabled')->value;
+   126|   }
+   127|   /**
+   128|    * {@inheritdoc}
+   129|    */
+   130|   public function isExpanded() {
+   131|     return (bool) $this->get('expanded')->value;
+   132|   }
+   133|   /**
+   134|    * {@inheritdoc}
+   135|    */
+   136|   public function getParentId() {
+   137|     return (string) $this->get('parent')->value;
+   138|   }
+   139|   /**
+   140|    * {@inheritdoc}
+   141|    */
+   142|   public function getWeight() {
+   143|     return (int) $this->get('weight')->value;
+   144|   }
+   145|   /**
+   146|    * {@inheritdoc}
+   147|    */
+   148|   public function getPluginDefinition() {
+   149|     $definition = [];
+   150|     $definition['class'] = 'Drupal\menu_link_content\Plugin\Menu\MenuLinkContent';
+   151|     $definition['menu_name'] = $this->getMenuName();
+   152|     if ($url_object = $this->getUrlObject()) {
+   153|       $definition['url'] = NULL;
+   154|       $definition['route_name'] = NULL;
+   155|       $definition['route_parameters'] = [];
+   156|       if (!$url_object->isRouted()) {
+   157|         $definition['url'] = $url_object->getUri();
+   158|       }
+   159|       else {
+   160|         $definition['route_name'] = $url_object->getRouteName();
+   161|         $definition['route_parameters'] = $url_object->getRouteParameters();
+   162|       }
+   163|       $definition['options'] = $url_object->getOptions();
+   164|     }
+   165|     $definition['title'] = $this->getTitle();
+   166|     $definition['description'] = $this->getDescription();
+   167|     $definition['weight'] = $this->getWeight();
+   168|     $definition['id'] = $this->getPluginId();
+   169|     $definition['metadata'] = ['entity_id' => $this->id()];
+   170|     $definition['form_class'] = '\Drupal\menu_link_content\Form\MenuLinkContentForm';
+   171|     $definition['enabled'] = $this->isEnabled() ? 1 : 0;
+   172|     $definition['expanded'] = $this->isExpanded() ? 1 : 0;
+   173|     $definition['provider'] = 'menu_link_content';
+   174|     $definition['discovered'] = 0;
+   175|     $definition['parent'] = $this->getParentId();
+   176|     return $definition;
+   177|   }
+   178|   /**
+   179|    * {@inheritdoc}
+   180|    */
+   181|   public static function preCreate(EntityStorageInterface $storage, array &$values) {
+   182|     $values += ['bundle' => 'menu_link_content'];
+   183|   }
+   184|   /**
+   185|    * {@inheritdoc}
+   186|    */
+   187|   public function preSave(EntityStorageInterface $storage) {
+   188|     parent::preSave($storage);
+   189|     if (parse_url($this->link->uri, PHP_URL_SCHEME) === 'internal') {
+   190|       $this->setRequiresRediscovery(TRUE);
+   191|     }
+   192|     else {
+   193|       $this->setRequiresRediscovery(FALSE);
+   194|     }
+   195|   }
+   196|   /**
+   197|    * {@inheritdoc}
+   198|    */
+   199|   public function postSave(EntityStorageInterface $storage, $update = TRUE) {
+   200|     parent::postSave($storage, $update);
+   201|     if (!$this->isDefaultRevision()) {
+   202|       return;
+   203|     }
+   204|     /** @var \Drupal\Core\Menu\MenuLinkManagerInterface $menu_link_manager */
+   205|     $menu_link_manager = \Drupal::service('plugin.manager.menu.link');
+   206|     $definition = $this->getPluginDefinition();
+   207|     if ($menu_link_manager->getDefinition($this->getPluginId(), FALSE)) {
+   208|       if (!$this->insidePlugin) {
+   209|         $menu_link_manager->updateDefinition($this->getPluginId(), $definition, FALSE);
+   210|       }
+   211|     }
+   212|     else {
+   213|       $menu_link_manager->addDefinition($this->getPluginId(), $definition);
+   214|     }
+   215|   }
+   216|   /**
+   217|    * {@inheritdoc}
+   218|    */
+   219|   public static function preDelete(EntityStorageInterface $storage, array $entities) {
+   220|     parent::preDelete($storage, $entities);
+   221|     /** @var \Drupal\Core\Menu\MenuLinkManagerInterface $menu_link_manager */
+   222|     $menu_link_manager = \Drupal::service('plugin.manager.menu.link');
+   223|     foreach ($entities as $menu_link) {
+   224|       /** @var \Drupal\menu_link_content\Entity\MenuLinkContent $menu_link */
+   225|       $menu_link_manager->removeDefinition($menu_link->getPluginId(), FALSE);
+   226|       $parent_plugin_id = $menu_link->getParentId();
+   227|       $children = $storage->loadByProperties(['parent' => $menu_link->getPluginId()]);
+   228|       foreach ($children as $child) {
+   229|         /** @var \Drupal\menu_link_content\Entity\MenuLinkContent $child */
+   230|         $child->set('parent', $parent_plugin_id)->save();
+   231|       }
+   232|     }
+   233|   }
+   234|   /**
+   235|    * {@inheritdoc}
+   236|    */
+   237|   public static function baseFieldDefinitions(EntityTypeInterface $entity_type) {
+   238|     /** @var \Drupal\Core\Field\BaseFieldDefinition[] $fields */
+   239|     $fields = parent::baseFieldDefinitions($entity_type);
+   240|     $fields += static::publishedBaseFieldDefinitions($entity_type);
+   241|     $fields['id']->setLabel(t('Entity ID'))
+   242|       ->setDescription(t('The entity ID for this menu link content entity.'));
+   243|     $fields['uuid']->setDescription(t('The content menu link UUID.'));
+   244|     $fields['langcode']->setDescription(t('The menu link language code.'));
+   245|     $fields['bundle']
+   246|       ->setDescription(t('The content menu link bundle.'))
+   247|       ->setSetting('max_length', EntityTypeInterface::BUNDLE_MAX_LENGTH)
+   248|       ->setSetting('is_ascii', TRUE);
+   249|     $fields['title'] = BaseFieldDefinition::create('string')
+   250|       ->setLabel(t('Menu link title'))
+   251|       ->setRequired(TRUE)
+   252|       ->setTranslatable(TRUE)
+   253|       ->setRevisionable(TRUE)
+   254|       ->setSetting('max_length', 255)
+   255|       ->setDisplayOptions('view', [
+   256|         'label' => 'hidden',
+   257|         'type' => 'string',
+   258|         'weight' => -5,
+   259|       ])
+   260|       ->setDisplayOptions('form', [
+   261|         'type' => 'string_textfield',
+   262|         'weight' => -5,
+   263|       ])
+   264|       ->setDisplayConfigurable('form', TRUE);
+   265|     $fields['description'] = BaseFieldDefinition::create('string')
+   266|       ->setLabel(t('Description'))
+   267|       ->setDescription(t('Shown when hovering over the menu link.'))
+   268|       ->setTranslatable(TRUE)
+   269|       ->setRevisionable(TRUE)
+   270|       ->setSetting('max_length', 255)
+   271|       ->setDisplayOptions('view', [
+   272|         'label' => 'hidden',
+   273|         'type' => 'string',
+   274|         'weight' => 0,
+   275|       ])
+   276|       ->setDisplayOptions('form', [
+   277|         'type' => 'string_textfield',
+   278|         'weight' => 0,
+   279|       ]);
+   280|     $fields['menu_name'] = BaseFieldDefinition::create('string')
+   281|       ->setLabel(t('Menu name'))
+   282|       ->setDescription(t('The menu name. All links with the same menu name (such as "tools") are part of the same menu.'))
+   283|       ->setDefaultValue('tools')
+   284|       ->setSetting('is_ascii', TRUE);
+   285|     $fields['link'] = BaseFieldDefinition::create('link')
+   286|       ->setLabel(t('Link'))
+   287|       ->setRevisionable(TRUE)
+   288|       ->setRequired(TRUE)
+   289|       ->setSettings([
+   290|         'link_type' => LinkItemInterface::LINK_GENERIC,
+   291|         'title' => DRUPAL_DISABLED,
+   292|       ])
+   293|       ->setDisplayOptions('form', [
+   294|         'type' => 'link_default',
+   295|         'weight' => -2,
+   296|       ]);
+   297|     $fields['external'] = BaseFieldDefinition::create('boolean')
+   298|       ->setLabel(t('External'))
+   299|       ->setDescription(t('A flag to indicate if the link points to a full URL starting with a protocol, like http:// (1 = external, 0 = internal).'))
+   300|       ->setDefaultValue(FALSE)
+   301|       ->setRevisionable(TRUE);
+   302|     $fields['rediscover'] = BaseFieldDefinition::create('boolean')
+   303|       ->setLabel(t('Indicates whether the menu link should be rediscovered'))
+   304|       ->setDefaultValue(FALSE);
+   305|     $fields['weight'] = BaseFieldDefinition::create('integer')
+   306|       ->setLabel(t('Weight'))
+   307|       ->setDescription(t('Link weight among links in the same menu at the same depth. In the menu, the links with high weight will sink and links with a low weight will be positioned nearer the top.'))
+   308|       ->setDefaultValue(0)
+   309|       ->setDisplayOptions('view', [
+   310|         'label' => 'hidden',
+   311|         'type' => 'number_integer',
+   312|         'weight' => 0,
+   313|       ])
+   314|       ->setDisplayOptions('form', [
+   315|         'type' => 'number',
+   316|         'weight' => 20,
+   317|       ]);
+   318|     $fields['expanded'] = BaseFieldDefinition::create('boolean')
+   319|       ->setLabel(t('Show as expanded'))
+   320|       ->setDescription(t('If selected and this menu link has children, the menu will always appear expanded. This option may be overridden for the entire menu tree when placing a menu block.'))
+   321|       ->setDefaultValue(FALSE)
+   322|       ->setDisplayOptions('view', [
+   323|         'label' => 'hidden',
+   324|         'type' => 'boolean',
+   325|         'weight' => 0,
+   326|       ])
+   327|       ->setDisplayOptions('form', [
+   328|         'settings' => ['display_label' => TRUE],
+   329|         'weight' => 0,
+   330|       ]);
+   331|     $fields['enabled']->setLabel(t('Enabled'));
+   332|     $fields['enabled']->setDescription(t('A flag for whether the link should be enabled in menus or hidden.'));
+   333|     $fields['enabled']->setTranslatable(FALSE);
+   334|     $fields['enabled']->setDisplayOptions('view', [
+   335|       'label' => 'hidden',
+   336|       'type' => 'boolean',
+   337|       'weight' => 0,
+   338|     ]);
+   339|     $fields['enabled']->setDisplayOptions('form', [
+   340|       'settings' => ['display_label' => TRUE],
+   341|       'weight' => -1,
+   342|     ]);
+   343|     $fields['parent'] = BaseFieldDefinition::create('string')
+   344|       ->setLabel(t('Parent plugin ID'))
+   345|       ->setDescription(t('The ID of the parent menu link plugin, or empty string when at the top level of the hierarchy.'));
+   346|     $fields['changed'] = BaseFieldDefinition::create('changed')
+   347|       ->setLabel(t('Changed'))
+   348|       ->setDescription(t('The time that the menu link was last edited.'))
+   349|       ->setTranslatable(TRUE)
+   350|       ->setRevisionable(TRUE);
+   351|     $fields['revision_log_message']->setDisplayOptions('form', [
+   352|       'region' => 'hidden',
+   353|     ]);
+   354|     return $fields;
+   355|   }
+   356|   /**
+   357|    * {@inheritdoc}
+   358|    */
+   359|   public function requiresRediscovery() {
+   360|     return $this->get('rediscover')->value;
+   361|   }
+   362|   /**
+   363|    * {@inheritdoc}
+   364|    */
+   365|   public function setRequiresRediscovery($rediscovery) {
+   366|     $this->set('rediscover', $rediscovery);
+   367|     return $this;
+   368|   }
+   369| }
+

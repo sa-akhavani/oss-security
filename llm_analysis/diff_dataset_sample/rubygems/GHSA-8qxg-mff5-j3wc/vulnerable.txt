@@ -1,0 +1,442 @@
+# ====================================================================
+# FILE: lib/rubygems.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-24 ---
+     1| require 'rbconfig'
+     2| require 'thread'
+     3| module Gem
+     4|   VERSION = "2.7.5"
+     5| end
+     6| require 'rubygems/compatibility'
+     7| require 'rubygems/defaults'
+     8| require 'rubygems/deprecate'
+     9| require 'rubygems/errors'
+    10| module Gem
+    11|   RUBYGEMS_DIR = File.dirname File.expand_path(__FILE__)
+    12|   WIN_PATTERNS = [
+    13|     /bccwin/i,
+    14|     /cygwin/i,
+    15|     /djgpp/i,
+    16|     /mingw/i,
+    17|     /mswin/i,
+    18|     /wince/i,
+    19|   ]
+    20|   GEM_DEP_FILES = %w[
+    21|     gem.deps.rb
+    22|     gems.rb
+    23|     Gemfile
+    24|     Isolate
+
+
+# ====================================================================
+# FILE: lib/rubygems/commands/owner_command.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 32-72 ---
+    32|     end
+    33|     add_option '-h', '--host HOST',
+    34|                'Use another gemcutter-compatible host',
+    35|                '  (e.g. https://rubygems.org)' do |value, options|
+    36|       options[:host] = value
+    37|     end
+    38|   end
+    39|   def execute
+    40|     @host = options[:host]
+    41|     sign_in
+    42|     name = get_one_gem_name
+    43|     add_owners    name, options[:add]
+    44|     remove_owners name, options[:remove]
+    45|     show_owners   name
+    46|   end
+    47|   def show_owners name
+    48|     response = rubygems_api_request :get, "api/v1/gems/#{name}/owners.yaml" do |request|
+    49|       request.add_field "Authorization", api_key
+    50|     end
+    51|     with_response response do |resp|
+    52|       owners = YAML.load resp.body
+    53|       say "Owners for gem: #{name}"
+    54|       owners.each do |owner|
+    55|         say "- #{owner['email'] || owner['handle'] || owner['id']}"
+    56|       end
+    57|     end
+    58|   end
+    59|   def add_owners name, owners
+    60|     manage_owners :post, name, owners
+    61|   end
+    62|   def remove_owners name, owners
+    63|     manage_owners :delete, name, owners
+    64|   end
+    65|   def manage_owners method, name, owners
+    66|     owners.each do |owner|
+    67|       begin
+    68|         response = rubygems_api_request method, "api/v1/gems/#{name}/owners" do |request|
+    69|           request.set_form_data 'email' => owner
+    70|           request.add_field "Authorization", api_key
+    71|         end
+    72|         action = method == :delete ? "Removing" : "Adding"
+
+
+# ====================================================================
+# FILE: lib/rubygems/package.rb
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 180-248 ---
+   180|         next unless entry.full_name == 'data.tar.gz'
+   181|         extract_tar_gz entry, destination_dir, pattern
+   182|         return # ignore further entries
+   183|       end
+   184|     end
+   185|   end
+   186|   def extract_tar_gz io, destination_dir, pattern = "*" # :nodoc:
+   187|     open_tar_gz io do |tar|
+   188|       tar.each do |entry|
+   189|         next unless File.fnmatch pattern, entry.full_name, File::FNM_DOTMATCH
+   190|         destination = install_location entry.full_name, destination_dir
+   191|         FileUtils.rm_rf destination
+   192|         mkdir_options = {}
+   193|         mkdir_options[:mode] = entry.header.mode if entry.directory?
+   194|         mkdir =
+   195|           if entry.directory? then
+   196|             destination
+   197|           else
+   198|             File.dirname destination
+   199|           end
+   200|         FileUtils.mkdir_p mkdir, mkdir_options
+   201|         File.open destination, 'wb' do |out|
+   202|           out.write entry.read
+   203|           FileUtils.chmod entry.header.mode, destination
+   204|         end if entry.file?
+   205|         File.symlink(entry.header.linkname, destination) if entry.symlink?
+   206|         verbose destination
+   207|       end
+   208|     end
+   209|   end
+   210|   def gzip_to io # :yields: gz_io
+   211|     gz_io = Zlib::GzipWriter.new io, Zlib::BEST_COMPRESSION
+   212|     gz_io.mtime = @build_time
+   213|     yield gz_io
+   214|   ensure
+   215|     gz_io.close
+   216|   end
+   217|   def install_location filename, destination_dir # :nodoc:
+   218|     raise Gem::Package::PathError.new(filename, destination_dir) if
+   219|       filename.start_with? '/'
+   220|     destination_dir = File.realpath destination_dir if
+   221|       File.respond_to? :realpath
+   222|     destination_dir = File.expand_path destination_dir
+   223|     destination = File.join destination_dir, filename
+   224|     destination = File.expand_path destination
+   225|     raise Gem::Package::PathError.new(destination, destination_dir) unless
+   226|       destination.start_with? destination_dir
+   227|     destination.untaint
+   228|     destination
+   229|   end
+   230|   def load_spec entry # :nodoc:
+   231|     case entry.full_name
+   232|     when 'metadata' then
+   233|       @spec = Gem::Specification.from_yaml entry.read
+   234|     when 'metadata.gz' then
+   235|       args = [entry]
+   236|       args << { :external_encoding => Encoding::UTF_8 } if
+   237|         Object.const_defined?(:Encoding) &&
+   238|           Zlib::GzipReader.method(:wrap).arity != 1
+   239|       Zlib::GzipReader.wrap(*args) do |gzio|
+   240|         @spec = Gem::Specification.from_yaml gzio.read
+   241|       end
+   242|     end
+   243|   end
+   244|   def open_tar_gz io # :nodoc:
+   245|     Zlib::GzipReader.wrap io do |gzio|
+   246|       tar = Gem::Package::TarReader.new gzio
+   247|       yield tar
+   248|     end
+
+# --- HUNK 2: Lines 320-357 ---
+   320|       load_spec entry
+   321|     when 'data.tar.gz' then
+   322|       verify_gz entry
+   323|     end
+   324|   rescue => e
+   325|     message = "package is corrupt, exception while verifying: " +
+   326|               "#{e.message} (#{e.class})"
+   327|     raise Gem::Package::FormatError.new message, @gem
+   328|   end
+   329|   def verify_files gem
+   330|     gem.each do |entry|
+   331|       verify_entry entry
+   332|     end
+   333|     unless @spec then
+   334|       raise Gem::Package::FormatError.new 'package metadata is missing', @gem
+   335|     end
+   336|     unless @files.include? 'data.tar.gz' then
+   337|       raise Gem::Package::FormatError.new \
+   338|               'package content (data.tar.gz) is missing', @gem
+   339|     end
+   340|   end
+   341|   def verify_gz entry # :nodoc:
+   342|     Zlib::GzipReader.wrap entry do |gzio|
+   343|       gzio.read 16384 until gzio.eof? # gzip checksum verification
+   344|     end
+   345|   rescue Zlib::GzipFile::Error => e
+   346|     raise Gem::Package::FormatError.new(e.message, entry.full_name)
+   347|   end
+   348| end
+   349| require 'rubygems/package/digest_io'
+   350| require 'rubygems/package/source'
+   351| require 'rubygems/package/file_source'
+   352| require 'rubygems/package/io_source'
+   353| require 'rubygems/package/old'
+   354| require 'rubygems/package/tar_header'
+   355| require 'rubygems/package/tar_reader'
+   356| require 'rubygems/package/tar_reader/entry'
+   357| require 'rubygems/package/tar_writer'
+
+
+# ====================================================================
+# FILE: lib/rubygems/package/tar_header.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 38-93 ---
+    38|                   'A8'   + # uid
+    39|                   'A8'   + # gid
+    40|                   'A12'  + # size
+    41|                   'A12'  + # mtime
+    42|                   'A8'   + # checksum
+    43|                   'A'    + # typeflag
+    44|                   'A100' + # linkname
+    45|                   'A6'   + # magic
+    46|                   'A2'   + # version
+    47|                   'A32'  + # uname
+    48|                   'A32'  + # gname
+    49|                   'A8'   + # devmajor
+    50|                   'A8'   + # devminor
+    51|                   'A155'   # prefix
+    52|   attr_reader(*FIELDS)
+    53|   def self.from(stream)
+    54|     header = stream.read 512
+    55|     empty = (header == "\0" * 512)
+    56|     fields = header.unpack UNPACK_FORMAT
+    57|     new :name     => fields.shift,
+    58|         :mode     => fields.shift.oct,
+    59|         :uid      => fields.shift.oct,
+    60|         :gid      => fields.shift.oct,
+    61|         :size     => fields.shift.oct,
+    62|         :mtime    => fields.shift.oct,
+    63|         :checksum => fields.shift.oct,
+    64|         :typeflag => fields.shift,
+    65|         :linkname => fields.shift,
+    66|         :magic    => fields.shift,
+    67|         :version  => fields.shift.oct,
+    68|         :uname    => fields.shift,
+    69|         :gname    => fields.shift,
+    70|         :devmajor => fields.shift.oct,
+    71|         :devminor => fields.shift.oct,
+    72|         :prefix   => fields.shift,
+    73|         :empty => empty
+    74|   end
+    75|   def initialize(vals)
+    76|     unless vals[:name] && vals[:size] && vals[:prefix] && vals[:mode] then
+    77|       raise ArgumentError, ":name, :size, :prefix and :mode required"
+    78|     end
+    79|     vals[:uid] ||= 0
+    80|     vals[:gid] ||= 0
+    81|     vals[:mtime] ||= 0
+    82|     vals[:checksum] ||= ""
+    83|     vals[:typeflag] = "0" if vals[:typeflag].nil? || vals[:typeflag].empty?
+    84|     vals[:magic] ||= "ustar"
+    85|     vals[:version] ||= "00"
+    86|     vals[:uname] ||= "wheel"
+    87|     vals[:gname] ||= "wheel"
+    88|     vals[:devmajor] ||= 0
+    89|     vals[:devminor] ||= 0
+    90|     FIELDS.each do |name|
+    91|       instance_variable_set "@#{name}", vals[name]
+    92|     end
+    93|     @empty = vals[:empty]
+
+
+# ====================================================================
+# FILE: lib/rubygems/package/tar_writer.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 80-119 ---
+    80|     digests
+    81|   end
+    82|   def add_file_signed name, mode, signer
+    83|     digest_algorithms = [
+    84|       signer.digest_algorithm,
+    85|       Digest::SHA512,
+    86|     ].compact.uniq
+    87|     digests = add_file_digest name, mode, digest_algorithms do |io|
+    88|       yield io
+    89|     end
+    90|     signature_digest = digests.values.compact.find do |digest|
+    91|       digest_name =
+    92|         if digest.respond_to? :name then
+    93|           digest.name
+    94|         else
+    95|           /::([^:]+)$/ =~ digest.class.name
+    96|           $1
+    97|         end
+    98|       digest_name == signer.digest_name
+    99|     end
+   100|     if signer.key then
+   101|       signature = signer.sign signature_digest.digest
+   102|       add_file_simple "#{name}.sig", 0444, signature.length do |io|
+   103|         io.write signature
+   104|       end
+   105|     end
+   106|     digests
+   107|   end
+   108|   def add_file_simple(name, mode, size) # :yields: io
+   109|     check_closed
+   110|     name, prefix = split_name name
+   111|     header = Gem::Package::TarHeader.new(:name => name, :mode => mode,
+   112|                                          :size => size, :prefix => prefix,
+   113|                                          :mtime => Time.now).to_s
+   114|     @io.write header
+   115|     os = BoundedStream.new @io, size
+   116|     yield os if block_given?
+   117|     min_padding = size - os.written
+   118|     @io.write("\0" * min_padding)
+   119|     remainder = (512 - (size % 512)) % 512
+
+
+# ====================================================================
+# FILE: lib/rubygems/server.rb
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 465-514 ---
+   465|     reset_gems
+   466|     add_date res
+   467|     raise WEBrick::HTTPStatus::NotFound, "`#{req.path}' not found." unless
+   468|       req.path == '/'
+   469|     specs = []
+   470|     total_file_count = 0
+   471|     Gem::Specification.each do |spec|
+   472|       total_file_count += spec.files.size
+   473|       deps = spec.dependencies.map { |dep|
+   474|         {
+   475|           "name"    => dep.name,
+   476|           "type"    => dep.type,
+   477|           "version" => dep.requirement.to_s,
+   478|         }
+   479|       }
+   480|       deps = deps.sort_by { |dep| [dep["name"].downcase, dep["version"]] }
+   481|       deps.last["is_last"] = true unless deps.empty?
+   482|       executables = spec.executables.sort.collect { |exec| {"executable" => exec} }
+   483|       executables = nil if executables.empty?
+   484|       executables.last["is_last"] = true if executables
+   485|       specs << {
+   486|         "authors"             => spec.authors.sort.join(", "),
+   487|         "date"                => spec.date.to_s,
+   488|         "dependencies"        => deps,
+   489|         "doc_path"            => doc_root(spec.full_name),
+   490|         "executables"         => executables,
+   491|         "only_one_executable" => (executables && executables.size == 1),
+   492|         "full_name"           => spec.full_name,
+   493|         "has_deps"            => !deps.empty?,
+   494|         "homepage"            => spec.homepage,
+   495|         "name"                => spec.name,
+   496|         "rdoc_installed"      => Gem::RDoc.new(spec).rdoc_installed?,
+   497|         "ri_installed"        => Gem::RDoc.new(spec).ri_installed?,
+   498|         "summary"             => spec.summary,
+   499|         "version"             => spec.version.to_s,
+   500|       }
+   501|     end
+   502|     specs << {
+   503|       "authors" => "Chad Fowler, Rich Kilmer, Jim Weirich, Eric Hodel and others",
+   504|       "dependencies" => [],
+   505|       "doc_path" => doc_root("rubygems-#{Gem::VERSION}"),
+   506|       "executables" => [{"executable" => 'gem', "is_last" => true}],
+   507|       "only_one_executable" => true,
+   508|       "full_name" => "rubygems-#{Gem::VERSION}",
+   509|       "has_deps" => false,
+   510|       "homepage" => "http://guides.rubygems.org/",
+   511|       "name" => 'rubygems',
+   512|       "ri_installed" => true,
+   513|       "summary" => "RubyGems itself",
+   514|       "version" => Gem::VERSION,
+
+
+# ====================================================================
+# FILE: lib/rubygems/specification.rb
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-28 ---
+     1| require 'rubygems/version'
+     2| require 'rubygems/requirement'
+     3| require 'rubygems/platform'
+     4| require 'rubygems/deprecate'
+     5| require 'rubygems/basic_specification'
+     6| require 'rubygems/stub_specification'
+     7| require 'rubygems/util/list'
+     8| require 'stringio'
+     9| class Gem::Specification < Gem::BasicSpecification
+    10|   NONEXISTENT_SPECIFICATION_VERSION = -1
+    11|   CURRENT_SPECIFICATION_VERSION = 4 # :nodoc:
+    12|   SPECIFICATION_VERSION_HISTORY = { # :nodoc:
+    13|     -1 => ['(RubyGems versions up to and including 0.7 did not have versioned specifications)'],
+    14|     1  => [
+    15|       'Deprecated "test_suite_file" in favor of the new, but equivalent, "test_files"',
+    16|       '"test_file=x" is a shortcut for "test_files=[x]"'
+    17|     ],
+    18|     2  => [
+    19|       'Added "required_rubygems_version"',
+    20|       'Now forward-compatible with future versions',
+    21|     ],
+    22|     3 => [
+    23|        'Added Fixnum validation to the specification_version'
+    24|     ],
+    25|     4 => [
+    26|       'Added sandboxed freeform metadata to the specification version.'
+    27|     ]
+    28|   }
+
+# --- HUNK 2: Lines 1448-1491 ---
+  1448|       end
+  1449|     }
+  1450|     warning <<-warning if licenses.empty?
+  1451| licenses is empty, but is recommended.  Use a license identifier from
+  1452| http://spdx.org/licenses or '#{Gem::Licenses::NONSTANDARD}' for a nonstandard license.
+  1453|     warning
+  1454|     validate_permissions
+  1455|     lazy = '"FIxxxXME" or "TOxxxDO"'.gsub(/xxx/, '')
+  1456|     unless authors.grep(/FI XME|TO DO/x).empty? then
+  1457|       raise Gem::InvalidSpecificationException, "#{lazy} is not an author"
+  1458|     end
+  1459|     unless Array(email).grep(/FI XME|TO DO/x).empty? then
+  1460|       raise Gem::InvalidSpecificationException, "#{lazy} is not an email"
+  1461|     end
+  1462|     if description =~ /FI XME|TO DO/x then
+  1463|       raise Gem::InvalidSpecificationException, "#{lazy} is not a description"
+  1464|     end
+  1465|     if summary =~ /FI XME|TO DO/x then
+  1466|       raise Gem::InvalidSpecificationException, "#{lazy} is not a summary"
+  1467|     end
+  1468|     if homepage and not homepage.empty? and
+  1469|        homepage !~ /\A[a-z][a-z\d+.-]*:/i then
+  1470|       raise Gem::InvalidSpecificationException,
+  1471|             "\"#{homepage}\" is not a URI"
+  1472|     end
+  1473|     %w[author homepage summary files].each do |attribute|
+  1474|       value = self.send attribute
+  1475|       warning "no #{attribute} specified" if value.nil? or value.empty?
+  1476|     end
+  1477|     if description == summary then
+  1478|       warning 'description and summary are identical'
+  1479|     end
+  1480|     warning "deprecated autorequire specified" if autorequire
+  1481|     executables.each do |executable|
+  1482|       executable_path = File.join(bindir, executable)
+  1483|       shebang = File.read(executable_path, 2) == '#!'
+  1484|       warning "#{executable_path} is missing #! line" unless shebang
+  1485|     end
+  1486|     files.each do |file|
+  1487|       next unless File.symlink?(file)
+  1488|       warning "#{file} is a symlink, which is not supported on all platforms"
+  1489|     end
+  1490|     validate_dependencies
+  1491|     true
+

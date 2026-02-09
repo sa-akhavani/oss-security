@@ -1,0 +1,780 @@
+--- a/src/Constants.php
++++ b/src/Constants.php
+@@ -7,25 +7,25 @@
+  */
+ namespace App;
+ /**
+  * Some "very" global constants for Kimai.
+  */
+ class Constants
+ {
+     /**
+      * The current release version
+      */
+-    public const VERSION = '1.16.2';
++    public const VERSION = '1.16.0';
+     /**
+      * The current release: major * 10000 + minor * 100 + patch
+      */
+-    public const VERSION_ID = 11602;
++    public const VERSION_ID = 11600;
+     /**
+      * The current release status, either "stable" or "dev"
+      */
+     public const STATUS = 'prod';
+     /**
+      * The software name
+      */
+     public const SOFTWARE = 'Kimai';
+     /**
+      * The release name, will only change for new major version
+
+--- a/src/Controller/ProjectController.php
++++ b/src/Controller/ProjectController.php
+@@ -349,32 +349,26 @@
+             } catch (\Exception $ex) {
+                 $this->flashUpdateException($ex);
+             }
+         }
+         return $this->render('project/edit.html.twig', [
+             'project' => $project,
+             'form' => $editForm->createView()
+         ]);
+     }
+     /**
+-     * @Route(path="/{id}/duplicate/{token}", name="admin_project_duplicate", methods={"GET", "POST"})
++     * @Route(path="/{id}/duplicate", name="admin_project_duplicate", methods={"GET", "POST"})
+      * @Security("is_granted('edit', project)")
+      */
+-    public function duplicateAction(Project $project, string $token, ProjectDuplicationService $projectDuplicationService, CsrfTokenManagerInterface $csrfTokenManager)
+-    {
+-        if (!$csrfTokenManager->isTokenValid(new CsrfToken('project.duplicate', $token))) {
+-            $this->flashError('action.csrf.error');
+-            return $this->redirectToRoute('project_details', ['id' => $project->getId()]);
+-        }
+-        $csrfTokenManager->refreshToken($token);
++    public function duplicateAction(Project $project, Request $request, ProjectDuplicationService $projectDuplicationService)
++    {
+         $newProject = $projectDuplicationService->duplicate($project, $project->getName() . ' [COPY]');
+-        $this->flashSuccess('action.update.success');
+         return $this->redirectToRoute('project_details', ['id' => $newProject->getId()]);
+     }
+     /**
+      * @Route(path="/{id}/delete", name="admin_project_delete", methods={"GET", "POST"})
+      * @Security("is_granted('delete', project)")
+      */
+     public function deleteAction(Project $project, Request $request, ProjectStatisticService $statisticService)
+     {
+         $stats = $statisticService->getProjectStatistics($project);
+         $deleteForm = $this->createFormBuilder(null, [
+
+--- a/src/Controller/TeamController.php
++++ b/src/Controller/TeamController.php
+@@ -12,22 +12,20 @@
+ use App\Form\TeamProjectForm;
+ use App\Form\Toolbar\TeamToolbarForm;
+ use App\Repository\Query\TeamQuery;
+ use App\Repository\TeamRepository;
+ use Sensio\Bundle\FrameworkExtraBundle\Configuration\Security;
+ use Symfony\Component\Form\FormInterface;
+ use Symfony\Component\HttpFoundation\RedirectResponse;
+ use Symfony\Component\HttpFoundation\Request;
+ use Symfony\Component\HttpFoundation\Response;
+ use Symfony\Component\Routing\Annotation\Route;
+-use Symfony\Component\Security\Csrf\CsrfToken;
+-use Symfony\Component\Security\Csrf\CsrfTokenManagerInterface;
+ /**
+  * @Route(path="/admin/teams")
+  * @Security("is_granted('view_team')")
+  */
+ final class TeamController extends AbstractController
+ {
+     /**
+      * @var TeamRepository
+      */
+     private $repository;
+@@ -65,30 +63,25 @@
+      * @Security("is_granted('create_team')")
+      *
+      * @param Request $request
+      * @return RedirectResponse|Response
+      */
+     public function createTeam(Request $request)
+     {
+         return $this->renderEditScreen(new Team(), $request);
+     }
+     /**
+-     * @Route(path="/{id}/duplicate/{token}", name="team_duplicate", methods={"GET", "POST"})
++     * @Route(path="/{id}/duplicate", name="team_duplicate", methods={"GET", "POST"})
+      * @Security("is_granted('edit', team) and is_granted('create_team')")
+      */
+-    public function duplicateTeam(Team $team, string $token, CsrfTokenManagerInterface $csrfTokenManager)
++    public function duplicateTeam(Team $team, Request $request)
+     {
+-        if (!$csrfTokenManager->isTokenValid(new CsrfToken('team.duplicate', $token))) {
+-            $this->flashError('action.csrf.error');
+-            return $this->redirectToRoute('admin_team_edit', ['id' => $team->getId()]);
+-        }
+-        $csrfTokenManager->refreshToken($token);
+         $newTeam = clone $team;
+         $newTeam->setName($team->getName() . ' [COPY]');
+         try {
+             $this->repository->saveTeam($newTeam);
+             $this->flashSuccess('action.update.success');
+             return $this->redirectToRoute('admin_team_edit', ['id' => $newTeam->getId()]);
+         } catch (\Exception $ex) {
+             $this->flashUpdateException($ex);
+         }
+         return $this->redirectToRoute('admin_team');
+
+--- a/src/Controller/TimesheetAbstractController.php
++++ b/src/Controller/TimesheetAbstractController.php
+@@ -174,26 +174,26 @@
+                 return $this->redirectToRoute($this->getTimesheetRoute());
+             } catch (\Exception $ex) {
+                 $this->flashUpdateException($ex);
+             }
+         }
+         return $this->render($renderTemplate, [
+             'timesheet' => $entry,
+             'form' => $createForm->createView(),
+         ]);
+     }
+-    protected function duplicate(Timesheet $timesheet, Request $request, string $renderTemplate, string $token): Response
++    protected function duplicate(Timesheet $timesheet, Request $request, string $renderTemplate): Response
+     {
+         $copyTimesheet = clone $timesheet;
+         $event = new TimesheetMetaDefinitionEvent($copyTimesheet);
+         $this->dispatcher->dispatch($event);
+-        $form = $this->getDuplicateForm($copyTimesheet, $timesheet, $token);
++        $form = $this->getDuplicateForm($copyTimesheet, $timesheet);
+         $form->handleRequest($request);
+         if ($form->isSubmitted() && $form->isValid()) {
+             try {
+                 $this->dispatcher->dispatch(new TimesheetDuplicatePreEvent($copyTimesheet, $timesheet));
+                 $this->service->saveNewTimesheet($copyTimesheet);
+                 $this->dispatcher->dispatch(new TimesheetDuplicatePostEvent($copyTimesheet, $timesheet));
+                 $this->flashSuccess('action.update.success');
+                 return $this->redirectToRoute($this->getTimesheetRoute());
+             } catch (\Exception $ex) {
+                 $this->flashUpdateException($ex);
+@@ -510,13 +510,13 @@
+     protected function getQueryNamePrefix(): string
+     {
+         return 'MyTimes';
+     }
+     protected function createDefaultQuery(string $suffix = 'Listing'): TimesheetQuery
+     {
+         $query = new TimesheetQuery();
+         $query->setName($this->getQueryNamePrefix() . $suffix);
+         return $query;
+     }
+-    abstract protected function getDuplicateForm(Timesheet $entry, Timesheet $original, string $token): FormInterface;
++    abstract protected function getDuplicateForm(Timesheet $entry, Timesheet $original): FormInterface;
+     abstract protected function getCreateForm(Timesheet $entry): FormInterface;
+ }
+
+--- a/src/Controller/TimesheetController.php
++++ b/src/Controller/TimesheetController.php
+@@ -11,22 +11,20 @@
+ use App\Export\ServiceExport;
+ use App\Form\TimesheetEditForm;
+ use App\Repository\ActivityRepository;
+ use App\Repository\ProjectRepository;
+ use App\Repository\TagRepository;
+ use Sensio\Bundle\FrameworkExtraBundle\Configuration\Security;
+ use Symfony\Component\Form\FormInterface;
+ use Symfony\Component\HttpFoundation\Request;
+ use Symfony\Component\HttpFoundation\Response;
+ use Symfony\Component\Routing\Annotation\Route;
+-use Symfony\Component\Security\Csrf\CsrfToken;
+-use Symfony\Component\Security\Csrf\CsrfTokenManagerInterface;
+ /**
+  * @Route(path="/timesheet")
+  * @Security("is_granted('view_own_timesheet')")
+  */
+ class TimesheetController extends TimesheetAbstractController
+ {
+     /**
+      * @Route(path="/", defaults={"page": 1}, name="timesheet", methods={"GET"})
+      * @Route(path="/page/{page}", requirements={"page": "[1-9]\d*"}, name="timesheet_paginated", methods={"GET"})
+      * @Security("is_granted('view_own_timesheet')")
+@@ -47,31 +45,26 @@
+     }
+     /**
+      * @Route(path="/{id}/edit", name="timesheet_edit", methods={"GET", "POST"})
+      * @Security("is_granted('edit', entry)")
+      */
+     public function editAction(Timesheet $entry, Request $request): Response
+     {
+         return $this->edit($entry, $request, 'timesheet/edit.html.twig');
+     }
+     /**
+-     * @Route(path="/{id}/duplicate/{token}", name="timesheet_duplicate", methods={"GET", "POST"})
++     * @Route(path="/{id}/duplicate", name="timesheet_duplicate", methods={"GET", "POST"})
+      * @Security("is_granted('duplicate', entry)")
+      */
+-    public function duplicateAction(Timesheet $entry, Request $request, string $token, CsrfTokenManagerInterface $csrfTokenManager): Response
++    public function duplicateAction(Timesheet $entry, Request $request): Response
+     {
+-        if (!$csrfTokenManager->isTokenValid(new CsrfToken('timesheet.duplicate', $token))) {
+-            $this->flashError('action.csrf.error');
+-            return $this->redirectToRoute('timesheet');
+-        }
+-        $csrfTokenManager->refreshToken($token);
+-        return $this->duplicate($entry, $request, 'timesheet/edit.html.twig', $token);
++        return $this->duplicate($entry, $request, 'timesheet/edit.html.twig');
+     }
+     /**
+      * @Route(path="/multi-update", name="timesheet_multi_update", methods={"POST"})
+      * @Security("is_granted('edit_own_timesheet')")
+      */
+     public function multiUpdateAction(Request $request): Response
+     {
+         return $this->multiUpdate($request, 'timesheet/multi-update.html.twig');
+     }
+     /**
+@@ -87,15 +80,15 @@
+      * @Security("is_granted('create_own_timesheet')")
+      */
+     public function createAction(Request $request, ProjectRepository $projectRepository, ActivityRepository $activityRepository, TagRepository $tagRepository): Response
+     {
+         return $this->create($request, 'timesheet/edit.html.twig', $projectRepository, $activityRepository, $tagRepository);
+     }
+     protected function getCreateForm(Timesheet $entry): FormInterface
+     {
+         return $this->generateCreateForm($entry, TimesheetEditForm::class, $this->generateUrl('timesheet_create'));
+     }
+-    protected function getDuplicateForm(Timesheet $entry, Timesheet $original, string $token): FormInterface
++    protected function getDuplicateForm(Timesheet $entry, Timesheet $original): FormInterface
+     {
+-        return $this->generateCreateForm($entry, TimesheetEditForm::class, $this->generateUrl('timesheet_duplicate', ['id' => $original->getId(), 'token' => $token]));
++        return $this->generateCreateForm($entry, TimesheetEditForm::class, $this->generateUrl('timesheet_duplicate', ['id' => $original->getId()]));
+     }
+ }
+
+--- a/src/Controller/TimesheetTeamController.php
++++ b/src/Controller/TimesheetTeamController.php
+@@ -18,22 +18,20 @@
+ use App\Repository\ActivityRepository;
+ use App\Repository\ProjectRepository;
+ use App\Repository\Query\TimesheetQuery;
+ use App\Repository\TagRepository;
+ use Doctrine\Common\Collections\ArrayCollection;
+ use Sensio\Bundle\FrameworkExtraBundle\Configuration\Security;
+ use Symfony\Component\Form\FormInterface;
+ use Symfony\Component\HttpFoundation\Request;
+ use Symfony\Component\HttpFoundation\Response;
+ use Symfony\Component\Routing\Annotation\Route;
+-use Symfony\Component\Security\Csrf\CsrfToken;
+-use Symfony\Component\Security\Csrf\CsrfTokenManagerInterface;
+ /**
+  * @Route(path="/team/timesheet")
+  * @Security("is_granted('view_other_timesheet')")
+  */
+ class TimesheetTeamController extends TimesheetAbstractController
+ {
+     /**
+      * @Route(path="/", defaults={"page": 1}, name="admin_timesheet", methods={"GET"})
+      * @Route(path="/page/{page}", requirements={"page": "[1-9]\d*"}, name="admin_timesheet_paginated", methods={"GET"})
+      * @Security("is_granted('view_other_timesheet')")
+@@ -58,31 +56,26 @@
+     }
+     /**
+      * @Route(path="/{id}/edit", name="admin_timesheet_edit", methods={"GET", "POST"})
+      * @Security("is_granted('edit', entry)")
+      */
+     public function editAction(Timesheet $entry, Request $request): Response
+     {
+         return $this->edit($entry, $request, 'timesheet-team/edit.html.twig');
+     }
+     /**
+-     * @Route(path="/{id}/duplicate/{token}", name="admin_timesheet_duplicate", methods={"GET", "POST"})
++     * @Route(path="/{id}/duplicate", name="admin_timesheet_duplicate", methods={"GET", "POST"})
+      * @Security("is_granted('duplicate', entry)")
+      */
+-    public function duplicateAction(Timesheet $entry, Request $request, string $token, CsrfTokenManagerInterface $csrfTokenManager): Response
+-    {
+-        if (!$csrfTokenManager->isTokenValid(new CsrfToken('admin_timesheet.duplicate', $token))) {
+-            $this->flashError('action.csrf.error');
+-            return $this->redirectToRoute('admin_timesheet');
+-        }
+-        $csrfTokenManager->refreshToken($token);
+-        return $this->duplicate($entry, $request, 'timesheet-team/edit.html.twig', $token);
++    public function duplicateAction(Timesheet $entry, Request $request): Response
++    {
++        return $this->duplicate($entry, $request, 'timesheet-team/edit.html.twig');
+     }
+     /**
+      * @Route(path="/create", name="admin_timesheet_create", methods={"GET", "POST"})
+      * @Security("is_granted('create_other_timesheet')")
+      */
+     public function createAction(Request $request, ProjectRepository $projectRepository, ActivityRepository $activityRepository, TagRepository $tagRepository): Response
+     {
+         return $this->create($request, 'timesheet-team/edit.html.twig', $projectRepository, $activityRepository, $tagRepository);
+     }
+     /**
+@@ -170,23 +163,23 @@
+         return $this->multiDelete($request);
+     }
+     protected function prepareQuery(TimesheetQuery $query)
+     {
+         $query->setCurrentUser($this->getUser());
+     }
+     protected function getCreateForm(Timesheet $entry): FormInterface
+     {
+         return $this->generateCreateForm($entry, TimesheetAdminEditForm::class, $this->generateUrl('admin_timesheet_create'));
+     }
+-    protected function getDuplicateForm(Timesheet $entry, Timesheet $original, string $token): FormInterface
+-    {
+-        return $this->generateCreateForm($entry, TimesheetAdminEditForm::class, $this->generateUrl('admin_timesheet_duplicate', ['id' => $original->getId(), 'token' => $token]));
++    protected function getDuplicateForm(Timesheet $entry, Timesheet $original): FormInterface
++    {
++        return $this->generateCreateForm($entry, TimesheetAdminEditForm::class, $this->generateUrl('admin_timesheet_duplicate', ['id' => $original->getId()]));
+     }
+     protected function getPermissionEditExport(): string
+     {
+         return 'edit_export_other_timesheet';
+     }
+     protected function getPermissionEditRate(): string
+     {
+         return 'edit_rate_other_timesheet';
+     }
+     protected function getEditFormClassName(): string
+
+--- a/src/EventSubscriber/Actions/AbstractTimesheetSubscriber.php
++++ b/src/EventSubscriber/Actions/AbstractTimesheetSubscriber.php
+@@ -24,21 +24,21 @@
+             }
+             if (!$timesheet->isRunning() && $this->isGranted('start', $timesheet)) {
+                 $event->addAction('repeat', ['url' => $this->path('restart_timesheet', ['id' => $timesheet->getId()]), 'class' => 'api-link', 'attr' => ['data-payload' => '{"copy": "all"}', 'data-event' => 'kimai.timesheetStart kimai.timesheetUpdate', 'data-method' => 'PATCH', 'data-msg-error' => 'timesheet.start.error', 'data-msg-success' => 'timesheet.start.success']]);
+             }
+             if ($this->isGranted('edit', $timesheet)) {
+                 $class = $event->isView('edit') ? '' : 'modal-ajax-form';
+                 $event->addAction('edit', ['url' => $this->path($routeEdit, ['id' => $timesheet->getId()]), 'class' => $class]);
+             }
+             if ($this->isGranted('duplicate', $timesheet)) {
+                 $class = $event->isView('edit') ? '' : 'modal-ajax-form';
+-                $event->addAction('copy', ['url' => $this->path($routeDuplicate, ['id' => $timesheet->getId(), 'token' => $payload['token']]), 'class' => $class]);
++                $event->addAction('copy', ['url' => $this->path($routeDuplicate, ['id' => $timesheet->getId()]), 'class' => $class]);
+             }
+             if ($event->countActions() > 0) {
+                 $event->addDivider();
+             }
+             if ($event->isIndexView() && $this->isGranted('delete', $timesheet)) {
+                 $event->addAction('trash', [
+                     'url' => $this->path('delete_timesheet', ['id' => $timesheet->getId()]),
+                     'class' => 'api-link',
+                     'attr' => [
+                         'data-event' => 'kimai.timesheetDelete',
+
+--- a/src/EventSubscriber/Actions/ProjectSubscriber.php
++++ b/src/EventSubscriber/Actions/ProjectSubscriber.php
+@@ -50,21 +50,21 @@
+                 $event->addAction('create-activity', [
+                     'icon' => 'create',
+                     'url' => $this->path('admin_activity_create_with_project', ['project' => $project->getId()]),
+                     'class' => 'modal-ajax-form'
+                 ]);
+             }
+         }
+         if ($this->isGranted('edit', $project) && $this->isGranted('create_project')) {
+             $event->addAction(
+                 'copy',
+-                ['url' => $this->path('admin_project_duplicate', ['id' => $project->getId(), 'token' => $payload['token']])]
++                ['url' => $this->path('admin_project_duplicate', ['id' => $project->getId()])]
+             );
+         }
+         if (($event->isIndexView() || $event->isView('customer_details')) && $this->isGranted('delete', $project)) {
+             $event->addDelete($this->path('admin_project_delete', ['id' => $project->getId()]));
+         }
+         if ($project->isVisible() && $this->isGranted('view_reporting') && $this->isGranted('details', $project)) {
+             $event->addAction('report_project_details', ['url' => $this->path('report_project_details', ['project' => $project->getId()]), 'icon' => 'reporting', 'translation_domain' => 'reporting']);
+         }
+     }
+ }
+
+--- a/src/EventSubscriber/Actions/TeamSubscriber.php
++++ b/src/EventSubscriber/Actions/TeamSubscriber.php
+@@ -18,21 +18,21 @@
+     {
+         $payload = $event->getPayload();
+         /** @var Team $team */
+         $team = $payload['team'];
+         if ($team->getId() === null) {
+             return;
+         }
+         if ($this->isGranted('edit', $team)) {
+             $event->addAction('edit', ['url' => $this->path('admin_team_edit', ['id' => $team->getId()])]);
+             if ($this->isGranted('create_team')) {
+-                $event->addAction('copy', ['url' => $this->path('team_duplicate', ['id' => $team->getId(), 'token' => $payload['token']])]);
++                $event->addAction('copy', ['url' => $this->path('team_duplicate', ['id' => $team->getId()])]);
+             }
+         }
+         if ($event->isIndexView() && $this->isGranted('delete', $team)) {
+             $event->addAction('trash', [
+                 'url' => $this->path('delete_team', ['id' => $team->getId()]),
+                 'class' => 'api-link',
+                 'attr' => [
+                     'data-event' => 'kimai.teamDelete kimai.teamUpdate',
+                     'data-method' => 'DELETE',
+                     'data-question' => 'confirm.delete',
+
+--- a/src/Migrations/Version20180701120000.php
++++ b/src/Migrations/Version20180701120000.php
+@@ -10,32 +10,39 @@
+ use App\Doctrine\AbstractMigration;
+ use Doctrine\DBAL\Schema\Schema;
+ /**
+  * Initial database structure of Kimai 2.
+  * This file is mainly required for testing the migrations.
+  */
+ final class Version20180701120000 extends AbstractMigration
+ {
+     public function up(Schema $schema): void
+     {
+-        $this->addSql('CREATE TABLE kimai2_users (id INT AUTO_INCREMENT NOT NULL, name VARCHAR(60) NOT NULL, mail VARCHAR(160) NOT NULL, password VARCHAR(254) DEFAULT NULL, alias VARCHAR(60) DEFAULT NULL, active TINYINT(1) NOT NULL, registration_date DATETIME DEFAULT NULL, title VARCHAR(50) DEFAULT NULL, avatar VARCHAR(255) DEFAULT NULL, roles LONGTEXT NOT NULL COMMENT \'(DC2Type:array)\', UNIQUE INDEX UNIQ_B9AC5BCE5E237E06 (name), UNIQUE INDEX UNIQ_B9AC5BCE5126AC48 (mail), PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
+-        $this->addSql('CREATE TABLE kimai2_user_preferences (id INT AUTO_INCREMENT NOT NULL, user_id INT DEFAULT NULL, name VARCHAR(50) NOT NULL, value VARCHAR(255) DEFAULT NULL, INDEX IDX_8D08F631A76ED395 (user_id), UNIQUE INDEX UNIQ_8D08F631A76ED3955E237E06 (user_id, name), PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
+-        $this->addSql('CREATE TABLE kimai2_customers (id INT AUTO_INCREMENT NOT NULL, name VARCHAR(150) NOT NULL, number VARCHAR(50) DEFAULT NULL, comment TEXT DEFAULT NULL, visible TINYINT(1) NOT NULL, company VARCHAR(255) DEFAULT NULL, contact VARCHAR(255) DEFAULT NULL, address TEXT DEFAULT NULL, country VARCHAR(2) NOT NULL, currency VARCHAR(3) NOT NULL, phone VARCHAR(255) DEFAULT NULL, fax VARCHAR(255) DEFAULT NULL, mobile VARCHAR(255) DEFAULT NULL, mail VARCHAR(255) DEFAULT NULL, homepage VARCHAR(255) DEFAULT NULL, timezone VARCHAR(255) NOT NULL, PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
+-        $this->addSql('CREATE TABLE kimai2_projects (id INT AUTO_INCREMENT NOT NULL, customer_id INT DEFAULT NULL, name VARCHAR(150) NOT NULL, order_number TINYTEXT DEFAULT NULL, comment TEXT DEFAULT NULL, visible TINYINT(1) NOT NULL, budget NUMERIC(10, 2) NOT NULL, INDEX IDX_407F12069395C3F3 (customer_id), PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
+-        $this->addSql('CREATE TABLE kimai2_activities (id INT AUTO_INCREMENT NOT NULL, project_id INT DEFAULT NULL, name VARCHAR(150) NOT NULL, comment TEXT DEFAULT NULL, visible TINYINT(1) NOT NULL, INDEX IDX_8811FE1C166D1F9C (project_id), PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
+-        $this->addSql('CREATE TABLE kimai2_timesheet (id INT AUTO_INCREMENT NOT NULL, user INT DEFAULT NULL, activity_id INT DEFAULT NULL, start_time DATETIME NOT NULL, end_time DATETIME DEFAULT NULL, duration INT DEFAULT NULL, description TEXT DEFAULT NULL, rate NUMERIC(10, 2) NOT NULL, INDEX IDX_4F60C6B18D93D649 (user), INDEX IDX_4F60C6B181C06096 (activity_id), PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
+-        $this->addSql('CREATE TABLE kimai2_invoice_templates (id INT AUTO_INCREMENT NOT NULL, name VARCHAR(60) NOT NULL, title VARCHAR(255) NOT NULL, company VARCHAR(255) NOT NULL, address TEXT DEFAULT NULL, due_days INT NOT NULL, vat INT DEFAULT NULL, calculator VARCHAR(20) NOT NULL, number_generator VARCHAR(20) NOT NULL, renderer VARCHAR(20) NOT NULL, payment_terms TEXT DEFAULT NULL, UNIQUE INDEX UNIQ_1626CFE95E237E06 (name), PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
+-        $this->addSql('ALTER TABLE kimai2_user_preferences ADD CONSTRAINT FK_8D08F631A76ED395 FOREIGN KEY (user_id) REFERENCES kimai2_users (id) ON DELETE CASCADE');
+-        $this->addSql('ALTER TABLE kimai2_projects ADD CONSTRAINT FK_407F12069395C3F3 FOREIGN KEY (customer_id) REFERENCES kimai2_customers (id) ON DELETE CASCADE');
+-        $this->addSql('ALTER TABLE kimai2_activities ADD CONSTRAINT FK_8811FE1C166D1F9C FOREIGN KEY (project_id) REFERENCES kimai2_projects (id) ON DELETE CASCADE');
+-        $this->addSql('ALTER TABLE kimai2_timesheet ADD CONSTRAINT FK_4F60C6B18D93D649 FOREIGN KEY (user) REFERENCES kimai2_users (id)');
+-        $this->addSql('ALTER TABLE kimai2_timesheet ADD CONSTRAINT FK_4F60C6B181C06096 FOREIGN KEY (activity_id) REFERENCES kimai2_activities (id) ON DELETE CASCADE');
++        $users = 'kimai2_users';
++        $userPreferences = 'kimai2_user_preferences';
++        $customers = 'kimai2_customers';
++        $projects = 'kimai2_projects';
++        $activities = 'kimai2_activities';
++        $timesheets = 'kimai2_timesheet';
++        $invoiceTemplates = 'kimai2_invoice_templates';
++        $this->addSql('CREATE TABLE ' . $users . ' (id INT AUTO_INCREMENT NOT NULL, name VARCHAR(60) NOT NULL, mail VARCHAR(160) NOT NULL, password VARCHAR(254) DEFAULT NULL, alias VARCHAR(60) DEFAULT NULL, active TINYINT(1) NOT NULL, registration_date DATETIME DEFAULT NULL, title VARCHAR(50) DEFAULT NULL, avatar VARCHAR(255) DEFAULT NULL, roles LONGTEXT NOT NULL COMMENT \'(DC2Type:array)\', UNIQUE INDEX UNIQ_B9AC5BCE5E237E06 (name), UNIQUE INDEX UNIQ_B9AC5BCE5126AC48 (mail), PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
++        $this->addSql('CREATE TABLE ' . $userPreferences . ' (id INT AUTO_INCREMENT NOT NULL, user_id INT DEFAULT NULL, name VARCHAR(50) NOT NULL, value VARCHAR(255) DEFAULT NULL, INDEX IDX_8D08F631A76ED395 (user_id), UNIQUE INDEX UNIQ_8D08F631A76ED3955E237E06 (user_id, name), PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
++        $this->addSql('CREATE TABLE ' . $customers . ' (id INT AUTO_INCREMENT NOT NULL, name VARCHAR(150) NOT NULL, number VARCHAR(50) DEFAULT NULL, comment TEXT DEFAULT NULL, visible TINYINT(1) NOT NULL, company VARCHAR(255) DEFAULT NULL, contact VARCHAR(255) DEFAULT NULL, address TEXT DEFAULT NULL, country VARCHAR(2) NOT NULL, currency VARCHAR(3) NOT NULL, phone VARCHAR(255) DEFAULT NULL, fax VARCHAR(255) DEFAULT NULL, mobile VARCHAR(255) DEFAULT NULL, mail VARCHAR(255) DEFAULT NULL, homepage VARCHAR(255) DEFAULT NULL, timezone VARCHAR(255) NOT NULL, PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
++        $this->addSql('CREATE TABLE ' . $projects . ' (id INT AUTO_INCREMENT NOT NULL, customer_id INT DEFAULT NULL, name VARCHAR(150) NOT NULL, order_number TINYTEXT DEFAULT NULL, comment TEXT DEFAULT NULL, visible TINYINT(1) NOT NULL, budget NUMERIC(10, 2) NOT NULL, INDEX IDX_407F12069395C3F3 (customer_id), PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
++        $this->addSql('CREATE TABLE ' . $activities . ' (id INT AUTO_INCREMENT NOT NULL, project_id INT DEFAULT NULL, name VARCHAR(150) NOT NULL, comment TEXT DEFAULT NULL, visible TINYINT(1) NOT NULL, INDEX IDX_8811FE1C166D1F9C (project_id), PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
++        $this->addSql('CREATE TABLE ' . $timesheets . ' (id INT AUTO_INCREMENT NOT NULL, user INT DEFAULT NULL, activity_id INT DEFAULT NULL, start_time DATETIME NOT NULL, end_time DATETIME DEFAULT NULL, duration INT DEFAULT NULL, description TEXT DEFAULT NULL, rate NUMERIC(10, 2) NOT NULL, INDEX IDX_4F60C6B18D93D649 (user), INDEX IDX_4F60C6B181C06096 (activity_id), PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
++        $this->addSql('CREATE TABLE ' . $invoiceTemplates . ' (id INT AUTO_INCREMENT NOT NULL, name VARCHAR(60) NOT NULL, title VARCHAR(255) NOT NULL, company VARCHAR(255) NOT NULL, address TEXT DEFAULT NULL, due_days INT NOT NULL, vat INT DEFAULT NULL, calculator VARCHAR(20) NOT NULL, number_generator VARCHAR(20) NOT NULL, renderer VARCHAR(20) NOT NULL, payment_terms TEXT DEFAULT NULL, UNIQUE INDEX UNIQ_1626CFE95E237E06 (name), PRIMARY KEY(id)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE = InnoDB');
++        $this->addSql('ALTER TABLE ' . $userPreferences . ' ADD CONSTRAINT FK_8D08F631A76ED395 FOREIGN KEY (user_id) REFERENCES ' . $users . ' (id) ON DELETE CASCADE');
++        $this->addSql('ALTER TABLE ' . $projects . ' ADD CONSTRAINT FK_407F12069395C3F3 FOREIGN KEY (customer_id) REFERENCES ' . $customers . ' (id) ON DELETE CASCADE');
++        $this->addSql('ALTER TABLE ' . $activities . ' ADD CONSTRAINT FK_8811FE1C166D1F9C FOREIGN KEY (project_id) REFERENCES ' . $projects . ' (id) ON DELETE CASCADE');
++        $this->addSql('ALTER TABLE ' . $timesheets . ' ADD CONSTRAINT FK_4F60C6B18D93D649 FOREIGN KEY (user) REFERENCES ' . $users . ' (id)');
++        $this->addSql('ALTER TABLE ' . $timesheets . ' ADD CONSTRAINT FK_4F60C6B181C06096 FOREIGN KEY (activity_id) REFERENCES ' . $activities . ' (id) ON DELETE CASCADE');
+     }
+     public function down(Schema $schema): void
+     {
+         $schema->dropTable('kimai2_invoice_templates');
+         $schema->dropTable('kimai2_timesheet');
+         $schema->dropTable('kimai2_user_preferences');
+         $schema->dropTable('kimai2_users');
+         $schema->dropTable('kimai2_activities');
+         $schema->dropTable('kimai2_projects');
+         $schema->dropTable('kimai2_customers');
+
+--- a/src/Migrations/Version20180715160326.php
++++ b/src/Migrations/Version20180715160326.php
+@@ -24,56 +24,58 @@
+      * @var Index[]
+      */
+     protected $indexesOld = [];
+     /**
+      * @param Schema $schema
+      * @throws \Doctrine\DBAL\DBALException
+      * @throws \Doctrine\DBAL\Schema\SchemaException
+      */
+     public function up(Schema $schema): void
+     {
+-        $indexesOld = $schema->getTable('kimai2_users')->getIndexes();
++        $users = 'kimai2_users';
++        $indexesOld = $schema->getTable($users)->getIndexes();
+         foreach ($indexesOld as $index) {
+             if (\in_array('name', $index->getColumns()) || \in_array('mail', $index->getColumns())) {
+                 $this->indexesOld[] = $index;
+-                $this->addSql('DROP INDEX ' . $index->getName() . ' ON kimai2_users');
++                $this->addSql('DROP INDEX ' . $index->getName() . ' ON ' . $users);
+             }
+         }
+-        $this->addSql('ALTER TABLE kimai2_users CHANGE name username VARCHAR(180) NOT NULL, ADD username_canonical VARCHAR(180) NOT NULL, CHANGE mail email VARCHAR(180) NOT NULL, ADD email_canonical VARCHAR(180) NOT NULL, ADD salt VARCHAR(255) DEFAULT NULL, ADD last_login DATETIME DEFAULT NULL, ADD confirmation_token VARCHAR(180) DEFAULT NULL, ADD password_requested_at DATETIME DEFAULT NULL, CHANGE password password VARCHAR(255) NOT NULL, CHANGE alias alias VARCHAR(60) DEFAULT NULL, CHANGE registration_date registration_date DATETIME DEFAULT NULL, CHANGE title title VARCHAR(50) DEFAULT NULL, CHANGE avatar avatar VARCHAR(255) DEFAULT NULL, CHANGE roles roles LONGTEXT NOT NULL COMMENT \'(DC2Type:array)\', CHANGE active enabled TINYINT(1) NOT NULL');
+-        $this->addSql('UPDATE kimai2_users set username_canonical = username');
+-        $this->addSql('UPDATE kimai2_users set email_canonical = email');
+-        $this->addSql('UPDATE kimai2_users SET roles = \'a:1:{i:0;s:16:"ROLE_SUPER_ADMIN";}\' WHERE roles LIKE \'%ROLE_SUPER_ADMIN%\'');
+-        $this->addSql('UPDATE kimai2_users SET roles = \'a:1:{i:0;s:10:"ROLE_ADMIN";}\' WHERE roles LIKE \'%ROLE_ADMIN%\'');
+-        $this->addSql('UPDATE kimai2_users SET roles = \'a:1:{i:0;s:13:"ROLE_TEAMLEAD";}\' WHERE roles LIKE \'%ROLE_TEAMLEAD%\'');
+-        $this->addSql('UPDATE kimai2_users SET roles = \'a:0:{}\' WHERE roles LIKE \'%ROLE_USER%\'');
+-        $this->addSql('UPDATE kimai2_users SET roles = \'a:1:{i:0;s:13:"ROLE_CUSTOMER";}\' WHERE roles LIKE \'%ROLE_CUSTOMER%\'');
+-        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCE92FC23A8 ON kimai2_users (username_canonical)');
+-        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCEA0D96FBF ON kimai2_users (email_canonical)');
+-        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCEC05FB297 ON kimai2_users (confirmation_token)');
+-        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCEF85E0677 ON kimai2_users (username)');
+-        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCEE7927C74 ON kimai2_users (email)');
++        $this->addSql('ALTER TABLE ' . $users . ' CHANGE name username VARCHAR(180) NOT NULL, ADD username_canonical VARCHAR(180) NOT NULL, CHANGE mail email VARCHAR(180) NOT NULL, ADD email_canonical VARCHAR(180) NOT NULL, ADD salt VARCHAR(255) DEFAULT NULL, ADD last_login DATETIME DEFAULT NULL, ADD confirmation_token VARCHAR(180) DEFAULT NULL, ADD password_requested_at DATETIME DEFAULT NULL, CHANGE password password VARCHAR(255) NOT NULL, CHANGE alias alias VARCHAR(60) DEFAULT NULL, CHANGE registration_date registration_date DATETIME DEFAULT NULL, CHANGE title title VARCHAR(50) DEFAULT NULL, CHANGE avatar avatar VARCHAR(255) DEFAULT NULL, CHANGE roles roles LONGTEXT NOT NULL COMMENT \'(DC2Type:array)\', CHANGE active enabled TINYINT(1) NOT NULL');
++        $this->addSql('UPDATE ' . $users . ' set username_canonical = username');
++        $this->addSql('UPDATE ' . $users . ' set email_canonical = email');
++        $this->addSql('UPDATE ' . $users . ' SET roles = \'a:1:{i:0;s:16:"ROLE_SUPER_ADMIN";}\' WHERE roles LIKE \'%ROLE_SUPER_ADMIN%\'');
++        $this->addSql('UPDATE ' . $users . ' SET roles = \'a:1:{i:0;s:10:"ROLE_ADMIN";}\' WHERE roles LIKE \'%ROLE_ADMIN%\'');
++        $this->addSql('UPDATE ' . $users . ' SET roles = \'a:1:{i:0;s:13:"ROLE_TEAMLEAD";}\' WHERE roles LIKE \'%ROLE_TEAMLEAD%\'');
++        $this->addSql('UPDATE ' . $users . ' SET roles = \'a:0:{}\' WHERE roles LIKE \'%ROLE_USER%\'');
++        $this->addSql('UPDATE ' . $users . ' SET roles = \'a:1:{i:0;s:13:"ROLE_CUSTOMER";}\' WHERE roles LIKE \'%ROLE_CUSTOMER%\'');
++        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCE92FC23A8 ON ' . $users . ' (username_canonical)');
++        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCEA0D96FBF ON ' . $users . ' (email_canonical)');
++        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCEC05FB297 ON ' . $users . ' (confirmation_token)');
++        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCEF85E0677 ON ' . $users . ' (username)');
++        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCEE7927C74 ON ' . $users . ' (email)');
+     }
+     /**
+      * @param Schema $schema
+      * @throws \Doctrine\DBAL\DBALException
+      * @throws \Doctrine\DBAL\Schema\SchemaException
+      */
+     public function down(Schema $schema): void
+     {
++        $users = 'kimai2_users';
+         $indexToDelete = ['UNIQ_B9AC5BCE92FC23A8', 'UNIQ_B9AC5BCEA0D96FBF', 'UNIQ_B9AC5BCEC05FB297', 'UNIQ_B9AC5BCEF85E0677', 'UNIQ_B9AC5BCEE7927C74'];
+         foreach ($indexToDelete as $indexName) {
+-            $this->addSql('DROP INDEX ' . $indexName . ' ON kimai2_users');
++            $this->addSql('DROP INDEX ' . $indexName . ' ON ' . $users);
+         }
+-        $this->addSql('ALTER TABLE kimai2_users CHANGE username name VARCHAR(60) NOT NULL COLLATE utf8mb4_unicode_ci, CHANGE email mail VARCHAR(160) NOT NULL COLLATE utf8mb4_unicode_ci, DROP username_canonical, DROP email_canonical, DROP salt, DROP last_login, DROP confirmation_token, DROP password_requested_at, CHANGE password password VARCHAR(254) DEFAULT NULL COLLATE utf8mb4_unicode_ci, CHANGE roles roles LONGTEXT NOT NULL COMMENT \'(DC2Type:array)\', CHANGE alias alias VARCHAR(60) DEFAULT NULL COLLATE utf8mb4_unicode_ci, CHANGE registration_date registration_date DATETIME DEFAULT NULL, CHANGE title title VARCHAR(50) DEFAULT NULL COLLATE utf8mb4_unicode_ci, CHANGE avatar avatar VARCHAR(255) DEFAULT NULL COLLATE utf8mb4_unicode_ci, CHANGE enabled active TINYINT(1) NOT NULL');
+-        $this->addSql('UPDATE kimai2_users SET roles = \'["ROLE_SUPER_ADMIN"]\' WHERE roles LIKE \'%ROLE_SUPER_ADMIN%\'');
+-        $this->addSql('UPDATE kimai2_users SET roles = \'["ROLE_ADMIN"]\' WHERE roles LIKE \'%ROLE_ADMIN%\'');
+-        $this->addSql('UPDATE kimai2_users SET roles = \'["ROLE_TEAMLEAD"]\' WHERE roles LIKE \'%ROLE_TEAMLEAD%\'');
+-        $this->addSql('UPDATE kimai2_users SET roles = \'["ROLE_USER"]\' WHERE roles LIKE \'%ROLE_USER%\'');
+-        $this->addSql('UPDATE kimai2_users SET roles = \'["ROLE_CUSTOMER"]\' WHERE roles LIKE \'%ROLE_CUSTOMER%\'');
+-        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCE5E237E06 ON kimai2_users (name)');
+-        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCE5126AC48 ON kimai2_users (mail)');
+-        $usersTable = $schema->getTable('kimai2_users');
++        $this->addSql('ALTER TABLE ' . $users . ' CHANGE username name VARCHAR(60) NOT NULL COLLATE utf8mb4_unicode_ci, CHANGE email mail VARCHAR(160) NOT NULL COLLATE utf8mb4_unicode_ci, DROP username_canonical, DROP email_canonical, DROP salt, DROP last_login, DROP confirmation_token, DROP password_requested_at, CHANGE password password VARCHAR(254) DEFAULT NULL COLLATE utf8mb4_unicode_ci, CHANGE roles roles LONGTEXT NOT NULL COMMENT \'(DC2Type:array)\', CHANGE alias alias VARCHAR(60) DEFAULT NULL COLLATE utf8mb4_unicode_ci, CHANGE registration_date registration_date DATETIME DEFAULT NULL, CHANGE title title VARCHAR(50) DEFAULT NULL COLLATE utf8mb4_unicode_ci, CHANGE avatar avatar VARCHAR(255) DEFAULT NULL COLLATE utf8mb4_unicode_ci, CHANGE enabled active TINYINT(1) NOT NULL');
++        $this->addSql('UPDATE ' . $users . ' SET roles = \'["ROLE_SUPER_ADMIN"]\' WHERE roles LIKE \'%ROLE_SUPER_ADMIN%\'');
++        $this->addSql('UPDATE ' . $users . ' SET roles = \'["ROLE_ADMIN"]\' WHERE roles LIKE \'%ROLE_ADMIN%\'');
++        $this->addSql('UPDATE ' . $users . ' SET roles = \'["ROLE_TEAMLEAD"]\' WHERE roles LIKE \'%ROLE_TEAMLEAD%\'');
++        $this->addSql('UPDATE ' . $users . ' SET roles = \'["ROLE_USER"]\' WHERE roles LIKE \'%ROLE_USER%\'');
++        $this->addSql('UPDATE ' . $users . ' SET roles = \'["ROLE_CUSTOMER"]\' WHERE roles LIKE \'%ROLE_CUSTOMER%\'');
++        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCE5E237E06 ON ' . $users . ' (name)');
++        $this->addSql('CREATE UNIQUE INDEX UNIQ_B9AC5BCE5126AC48 ON ' . $users . ' (mail)');
++        $usersTable = $schema->getTable($users);
+         foreach ($this->indexesOld as $index) {
+             $usersTable->addIndex($index->getColumns(), $index->getName(), $index->getFlags(), $index->getOptions());
+         }
+     }
+ }
+
+--- a/src/Migrations/Version20180730044139.php
++++ b/src/Migrations/Version20180730044139.php
+@@ -20,23 +20,28 @@
+     /**
+      * @var Index[]
+      */
+     protected $indexesOld = [];
+     /**
+      * @param Schema $schema
+      * @throws \Doctrine\DBAL\DBALException
+      */
+     public function up(Schema $schema): void
+     {
+-        $this->addSql('ALTER TABLE kimai2_timesheet DROP FOREIGN KEY FK_4F60C6B18D93D649');
+-        $this->addSql('ALTER TABLE kimai2_timesheet ADD CONSTRAINT FK_4F60C6B18D93D649 FOREIGN KEY (user) REFERENCES kimai2_users (id) ON DELETE CASCADE');
++        $timesheet = 'kimai2_timesheet';
++        $user = 'kimai2_users';
++        $activity = 'kimai2_activities';
++        $this->addSql('ALTER TABLE ' . $timesheet . ' DROP FOREIGN KEY FK_4F60C6B18D93D649');
++        $this->addSql('ALTER TABLE ' . $timesheet . ' ADD CONSTRAINT FK_4F60C6B18D93D649 FOREIGN KEY (user) REFERENCES ' . $user . ' (id) ON DELETE CASCADE');
+     }
+     /**
+      * @param Schema $schema
+      * @throws \Doctrine\DBAL\DBALException
+      */
+     public function down(Schema $schema): void
+     {
+-        $this->addSql('ALTER TABLE kimai2_timesheet DROP FOREIGN KEY FK_4F60C6B18D93D649');
+-        $this->addSql('ALTER TABLE kimai2_timesheet ADD CONSTRAINT FK_4F60C6B18D93D649 FOREIGN KEY (user) REFERENCES kimai2_users (id)');
++        $timesheet = 'kimai2_timesheet';
++        $user = 'kimai2_users';
++        $this->addSql('ALTER TABLE ' . $timesheet . ' DROP FOREIGN KEY FK_4F60C6B18D93D649');
++        $this->addSql('ALTER TABLE ' . $timesheet . ' ADD CONSTRAINT FK_4F60C6B18D93D649 FOREIGN KEY (user) REFERENCES ' . $user . ' (id)');
+     }
+ }
+
+--- a/src/Migrations/Version20180924111853.php
++++ b/src/Migrations/Version20180924111853.php
+@@ -11,18 +11,20 @@
+ use Doctrine\DBAL\Schema\Schema;
+ /**
+  * Changes the invoice templates table for:
+  * - shorter template name and proper index name
+  * - VAT supporting percentages
+  */
+ final class Version20180924111853 extends AbstractMigration
+ {
+     public function up(Schema $schema): void
+     {
+-        $this->addSql('UPDATE kimai2_invoice_templates SET name=SUBSTRING(name, 1, 60)');
+-        $this->addSql('ALTER TABLE kimai2_invoice_templates CHANGE name name VARCHAR(60) NOT NULL, CHANGE vat vat DOUBLE PRECISION DEFAULT 0');
++        $invoiceTemplates = 'kimai2_invoice_templates';
++        $this->addSql('UPDATE ' . $invoiceTemplates . ' SET name=SUBSTRING(name, 1, 60)');
++        $this->addSql('ALTER TABLE ' . $invoiceTemplates . ' CHANGE name name VARCHAR(60) NOT NULL, CHANGE vat vat DOUBLE PRECISION DEFAULT 0');
+     }
+     public function down(Schema $schema): void
+     {
+-        $this->addSql('ALTER TABLE kimai2_invoice_templates CHANGE name name VARCHAR(255) NOT NULL COLLATE utf8mb4_unicode_ci, CHANGE vat vat INT DEFAULT NULL');
++        $invoiceTemplates = 'kimai2_invoice_templates';
++        $this->addSql('ALTER TABLE ' . $invoiceTemplates . ' CHANGE name name VARCHAR(255) NOT NULL COLLATE utf8mb4_unicode_ci, CHANGE vat vat INT DEFAULT NULL');
+     }
+ }
+
+--- a/src/Migrations/Version20181031220003.php
++++ b/src/Migrations/Version20181031220003.php
+@@ -10,33 +10,41 @@
+ use App\Doctrine\AbstractMigration;
+ use Doctrine\DBAL\Schema\Schema;
+ /**
+  * Migration that adds the project column to timesheets table, to allow global activities.
+  * It also fixes foreign-key columns on timesheet and projects table, which are not allowed.
+  */
+ final class Version20181031220003 extends AbstractMigration
+ {
+     public function up(Schema $schema): void
+     {
+-        $this->addSql('ALTER TABLE kimai2_projects DROP FOREIGN KEY FK_407F12069395C3F3');
+-        $this->addSql('ALTER TABLE kimai2_projects CHANGE customer_id customer_id INT NOT NULL');
+-        $this->addSql('ALTER TABLE kimai2_projects ADD CONSTRAINT FK_407F12069395C3F3 FOREIGN KEY (customer_id) REFERENCES kimai2_customers (id) ON DELETE CASCADE');
+-        $this->addSql('ALTER TABLE kimai2_timesheet ADD project_id INT DEFAULT NULL AFTER activity_id');
+-        $this->addSql('CREATE INDEX IDX_4F60C6B1166D1F9C ON kimai2_timesheet (project_id)');
+-        $this->addSql('UPDATE kimai2_timesheet SET project_id = (SELECT project_id FROM kimai2_activities WHERE id = activity_id)');
+-        $this->addSql('ALTER TABLE kimai2_timesheet DROP FOREIGN KEY FK_4F60C6B18D93D649');
+-        $this->addSql('ALTER TABLE kimai2_timesheet DROP FOREIGN KEY FK_4F60C6B181C06096');
+-        $this->addSql('ALTER TABLE kimai2_timesheet CHANGE project_id project_id INT NOT NULL, CHANGE user user INT NOT NULL, CHANGE activity_id activity_id INT NOT NULL');
+-        $this->addSql('ALTER TABLE kimai2_timesheet ADD CONSTRAINT FK_4F60C6B1166D1F9C FOREIGN KEY (project_id) REFERENCES kimai2_projects (id) ON DELETE CASCADE');
+-        $this->addSql('ALTER TABLE kimai2_timesheet ADD CONSTRAINT FK_4F60C6B18D93D649 FOREIGN KEY (user) REFERENCES kimai2_users (id) ON DELETE CASCADE');
+-        $this->addSql('ALTER TABLE kimai2_timesheet ADD CONSTRAINT FK_4F60C6B181C06096 FOREIGN KEY (activity_id) REFERENCES kimai2_activities (id) ON DELETE CASCADE');
++        $timesheet = 'kimai2_timesheet';
++        $projects = 'kimai2_projects';
++        $activities = 'kimai2_activities';
++        $users = 'kimai2_users';
++        $customers = 'kimai2_customers';
++        $this->addSql('ALTER TABLE ' . $projects . ' DROP FOREIGN KEY FK_407F12069395C3F3');
++        $this->addSql('ALTER TABLE ' . $projects . ' CHANGE customer_id customer_id INT NOT NULL');
++        $this->addSql('ALTER TABLE ' . $projects . ' ADD CONSTRAINT FK_407F12069395C3F3 FOREIGN KEY (customer_id) REFERENCES ' . $customers . ' (id) ON DELETE CASCADE');
++        $this->addSql('ALTER TABLE ' . $timesheet . ' ADD project_id INT DEFAULT NULL AFTER activity_id');
++        $this->addSql('CREATE INDEX IDX_4F60C6B1166D1F9C ON ' . $timesheet . ' (project_id)');
++        $this->addSql('UPDATE ' . $timesheet . ' SET project_id = (SELECT project_id FROM ' . $activities . ' WHERE id = activity_id)');
++        $this->addSql('ALTER TABLE ' . $timesheet . ' DROP FOREIGN KEY FK_4F60C6B18D93D649');
++        $this->addSql('ALTER TABLE ' . $timesheet . ' DROP FOREIGN KEY FK_4F60C6B181C06096');
++        $this->addSql('ALTER TABLE ' . $timesheet . ' CHANGE project_id project_id INT NOT NULL, CHANGE user user INT NOT NULL, CHANGE activity_id activity_id INT NOT NULL');
++        $this->addSql('ALTER TABLE ' . $timesheet . ' ADD CONSTRAINT FK_4F60C6B1166D1F9C FOREIGN KEY (project_id) REFERENCES ' . $projects . ' (id) ON DELETE CASCADE');
++        $this->addSql('ALTER TABLE ' . $timesheet . ' ADD CONSTRAINT FK_4F60C6B18D93D649 FOREIGN KEY (user) REFERENCES ' . $users . ' (id) ON DELETE CASCADE');
++        $this->addSql('ALTER TABLE ' . $timesheet . ' ADD CONSTRAINT FK_4F60C6B181C06096 FOREIGN KEY (activity_id) REFERENCES ' . $activities . ' (id) ON DELETE CASCADE');
+     }
+     public function down(Schema $schema): void
+     {
+-        $this->addSql('ALTER TABLE kimai2_projects DROP FOREIGN KEY FK_407F12069395C3F3');
+-        $this->addSql('ALTER TABLE kimai2_projects CHANGE customer_id customer_id INT DEFAULT NULL');
+-        $this->addSql('ALTER TABLE kimai2_projects ADD CONSTRAINT FK_407F12069395C3F3 FOREIGN KEY (customer_id) REFERENCES kimai2_customers (id) ON DELETE CASCADE');
+-        $this->addSql('ALTER TABLE kimai2_timesheet DROP FOREIGN KEY FK_4F60C6B1166D1F9C');
+-        $this->addSql('DROP INDEX IDX_4F60C6B1166D1F9C ON kimai2_timesheet');
+-        $this->addSql('ALTER TABLE kimai2_timesheet DROP project_id, CHANGE user user INT DEFAULT NULL, CHANGE activity_id activity_id INT DEFAULT NULL');
++        $timesheet = 'kimai2_timesheet';
++        $projects = 'kimai2_projects';
++        $customers = 'kimai2_customers';
++        $this->addSql('ALTER TABLE ' . $projects . ' DROP FOREIGN KEY FK_407F12069395C3F3');
++        $this->addSql('ALTER TABLE ' . $projects . ' CHANGE customer_id customer_id INT DEFAULT NULL');
++        $this->addSql('ALTER TABLE ' . $projects . ' ADD CONSTRAINT FK_407F12069395C3F3 FOREIGN KEY (customer_id) REFERENCES ' . $customers . ' (id) ON DELETE CASCADE');
++        $this->addSql('ALTER TABLE ' . $timesheet . ' DROP FOREIGN KEY FK_4F60C6B1166D1F9C');
++        $this->addSql('DROP INDEX IDX_4F60C6B1166D1F9C ON ' . $timesheet);
++        $this->addSql('ALTER TABLE ' . $timesheet . ' DROP project_id, CHANGE user user INT DEFAULT NULL, CHANGE activity_id activity_id INT DEFAULT NULL');
+     }
+ }
+
+--- a/src/Migrations/Version20190305152308.php
++++ b/src/Migrations/Version20190305152308.php
+@@ -13,23 +13,32 @@
+  * - rename mail to email in customer table
+  * - converts all decimal to float values, as decimals are treated as string in PHP:
+  *   https://www.doctrine-project.org/projects/doctrine-dbal/en/latest/reference/types.html#decimal
+  *
+  * @version 0.9
+  */
+ final class Version20190305152308 extends AbstractMigration
+ {
+     public function up(Schema $schema): void
+     {
+-        $this->addSql('ALTER TABLE kimai2_activities CHANGE fixed_rate fixed_rate DOUBLE PRECISION DEFAULT NULL, CHANGE hourly_rate hourly_rate DOUBLE PRECISION DEFAULT NULL');
+-        $this->addSql('ALTER TABLE kimai2_customers CHANGE mail email VARCHAR(255) DEFAULT NULL, CHANGE fixed_rate fixed_rate DOUBLE PRECISION DEFAULT NULL, CHANGE hourly_rate hourly_rate DOUBLE PRECISION DEFAULT NULL');
+-        $this->addSql('ALTER TABLE kimai2_projects CHANGE budget budget DOUBLE PRECISION NOT NULL, CHANGE fixed_rate fixed_rate DOUBLE PRECISION DEFAULT NULL, CHANGE hourly_rate hourly_rate DOUBLE PRECISION DEFAULT NULL');
+-        $this->addSql('ALTER TABLE kimai2_timesheet CHANGE rate rate DOUBLE PRECISION NOT NULL, CHANGE fixed_rate fixed_rate DOUBLE PRECISION DEFAULT NULL, CHANGE hourly_rate hourly_rate DOUBLE PRECISION DEFAULT NULL');
++        $customers = 'kimai2_customers';
++        $projects = 'kimai2_projects';
++        $activities = 'kimai2_activities';
++        $timesheet = 'kimai2_timesheet';
++        $users = 'kimai2_users';
++        $this->addSql('ALTER TABLE ' . $activities . ' CHANGE fixed_rate fixed_rate DOUBLE PRECISION DEFAULT NULL, CHANGE hourly_rate hourly_rate DOUBLE PRECISION DEFAULT NULL');
++        $this->addSql('ALTER TABLE ' . $customers . ' CHANGE mail email VARCHAR(255) DEFAULT NULL, CHANGE fixed_rate fixed_rate DOUBLE PRECISION DEFAULT NULL, CHANGE hourly_rate hourly_rate DOUBLE PRECISION DEFAULT NULL');
++        $this->addSql('ALTER TABLE ' . $projects . ' CHANGE budget budget DOUBLE PRECISION NOT NULL, CHANGE fixed_rate fixed_rate DOUBLE PRECISION DEFAULT NULL, CHANGE hourly_rate hourly_rate DOUBLE PRECISION DEFAULT NULL');
++        $this->addSql('ALTER TABLE ' . $timesheet . ' CHANGE rate rate DOUBLE PRECISION NOT NULL, CHANGE fixed_rate fixed_rate DOUBLE PRECISION DEFAULT NULL, CHANGE hourly_rate hourly_rate DOUBLE PRECISION DEFAULT NULL');
+     }
+     public function down(Schema $schema): void
+     {
+-        $this->addSql('ALTER TABLE kimai2_activities CHANGE fixed_rate fixed_rate NUMERIC(10, 2) DEFAULT NULL, CHANGE hourly_rate hourly_rate NUMERIC(10, 2) DEFAULT NULL');
+-        $this->addSql('ALTER TABLE kimai2_customers CHANGE email mail VARCHAR(255) DEFAULT NULL, CHANGE fixed_rate fixed_rate NUMERIC(10, 2) DEFAULT NULL, CHANGE hourly_rate hourly_rate NUMERIC(10, 2) DEFAULT NULL');
+-        $this->addSql('ALTER TABLE kimai2_projects CHANGE budget budget NUMERIC(10, 2) NOT NULL, CHANGE fixed_rate fixed_rate NUMERIC(10, 2) DEFAULT NULL, CHANGE hourly_rate hourly_rate NUMERIC(10, 2) DEFAULT NULL');
+-        $this->addSql('ALTER TABLE kimai2_timesheet CHANGE rate rate NUMERIC(10, 2) NOT NULL, CHANGE fixed_rate fixed_rate NUMERIC(10, 2) DEFAULT NULL, CHANGE hourly_rate hourly_rate NUMERIC(10, 2) DEFAULT NULL');
++        $customers = 'kimai2_customers';
++        $projects = 'kimai2_projects';
++        $activities = 'kimai2_activities';
++        $timesheet = 'kimai2_timesheet';
++        $this->addSql('ALTER TABLE ' . $activities . ' CHANGE fixed_rate fixed_rate NUMERIC(10, 2) DEFAULT NULL, CHANGE hourly_rate hourly_rate NUMERIC(10, 2) DEFAULT NULL');
++        $this->addSql('ALTER TABLE ' . $customers . ' CHANGE email mail VARCHAR(255) DEFAULT NULL, CHANGE fixed_rate fixed_rate NUMERIC(10, 2) DEFAULT NULL, CHANGE hourly_rate hourly_rate NUMERIC(10, 2) DEFAULT NULL');
++        $this->addSql('ALTER TABLE ' . $projects . ' CHANGE budget budget NUMERIC(10, 2) NOT NULL, CHANGE fixed_rate fixed_rate NUMERIC(10, 2) DEFAULT NULL, CHANGE hourly_rate hourly_rate NUMERIC(10, 2) DEFAULT NULL');
++        $this->addSql('ALTER TABLE ' . $timesheet . ' CHANGE rate rate NUMERIC(10, 2) NOT NULL, CHANGE fixed_rate fixed_rate NUMERIC(10, 2) DEFAULT NULL, CHANGE hourly_rate hourly_rate NUMERIC(10, 2) DEFAULT NULL');
+     }
+ }
+
+--- a/src/Migrations/Version20210802152814.php
++++ b/src/Migrations/Version20210802152814.php
+@@ -27,19 +27,19 @@
+         }
+         foreach ($fetch->executeQuery()->iterateAssociative() as $row) {
+             if (!isset($timezones[$row['timezone']])) {
+                 $timezones[$row['timezone']] = new \DateTimeZone($row['timezone']);
+             }
+             $date = new \DateTime($row['start_time'], $timezones['UTC']);
+             $date->setTimezone($timezones[$row['timezone']]);
+             $this->addSql('UPDATE kimai2_timesheet SET date_tz = ? WHERE id = ?', [$date->format('Y-m-d'), $row['id']]);
+         }
+         $fetch->free();
+-        $this->addSql('ALTER TABLE kimai2_timesheet ALTER date_tz DROP DEFAULT');
++        $this->preventEmptyMigrationWarning();
+     }
+     public function down(Schema $schema): void
+     {
+         $timesheet = $schema->getTable('kimai2_timesheet');
+         $timesheet->changeColumn('date_tz', ['notnull' => false]);
+         $this->preventEmptyMigrationWarning();
+     }
+ }
+
+--- a/src/Migrations/Version20211008092010.php
++++ b/src/Migrations/Version20211008092010.php
+@@ -16,19 +16,18 @@
+ {
+     public function getDescription(): string
+     {
+         return 'Extend field orderNumber from 20 to 50 characters.';
+     }
+     public function up(Schema $schema): void
+     {
+         $projects = $schema->getTable('kimai2_projects');
+         $column = $projects->getColumn('order_number');
+         $column->setOptions(['length' => 50]);
+-        $this->preventEmptyMigrationWarning();
+     }
+     public function down(Schema $schema): void
+     {
+         $projects = $schema->getTable('kimai2_projects');
+         $column = $projects->getColumn('order_number');
+         $column->setOptions(['length' => 20]);
+     }
+ }

@@ -1,0 +1,1196 @@
+# ====================================================================
+# FILE: src/Backend/Core/Engine/Authentication.php
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-25 ---
+     1| <?php
+     2| namespace Backend\Core\Engine;
+     3| use Backend\Core\Engine\Model as BackendModel;
+     4| use Backend\Modules\Users\Engine\Model as BackendUsersModel;
+     5| use RuntimeException;
+     6| /**
+     7|  * The class below will handle all authentication stuff. It will handle module-access, action-access, ...
+     8|  */
+     9| class Authentication
+    10| {
+    11|     /**
+    12|      * All allowed modules
+    13|      *
+    14|      * @var array
+    15|      */
+    16|     private static $allowedActions = [];
+    17|     /**
+    18|      * All allowed modules
+    19|      *
+    20|      * @var array
+    21|      */
+    22|     private static $allowedModules = [];
+    23|     /**
+    24|      * A user object for the current authenticated user
+    25|      *
+
+# --- HUNK 2: Lines 249-320 ---
+   249|      */
+   250|     public static function loginUser(string $login, string $password): bool
+   251|     {
+   252|         self::$alreadyLoggedOut = false;
+   253|         $database = BackendModel::get('database');
+   254|         if (!static::verifyPassword($login, $password)) {
+   255|             return false;
+   256|         }
+   257|         $userId = (int) $database->getVar(
+   258|             'SELECT u.id
+   259|              FROM users AS u
+   260|              WHERE u.email = ? AND u.active = ? AND u.deleted = ?
+   261|              LIMIT 1',
+   262|             [$login, true, false]
+   263|         );
+   264|         if ($userId === 0) {
+   265|             self::logout();
+   266|             return false;
+   267|         }
+   268|         self::cleanupOldSessions();
+   269|         $session = BackendModel::getSession();
+   270|         if (!$session->migrate(true)) {
+   271|             throw new RuntimeException(
+   272|                 'For safety reasons the session should be regenerated. But apparently it failed.'
+   273|             );
+   274|         }
+   275|         $userSession = [
+   276|             'user_id' => $userId,
+   277|             'secret_key' => static::getEncryptedString($session->getId(), $userId),
+   278|             'session_id' => $session->getId(),
+   279|             'date' => BackendModel::getUTCDate(),
+   280|         ];
+   281|         $database->insert('users_sessions', $userSession);
+   282|         $session->set('backend_logged_in', true);
+   283|         $session->set('backend_secret_key', $userSession['secret_key']);
+   284|         BackendModel::getContainer()->set('logged_in', true);
+   285|         self::$user = new User($userId);
+   286|         return true;
+   287|     }
+   288|     /**
+   289|      * Logout the current user
+   290|      */
+   291|     public static function logout(): void
+   292|     {
+   293|         if (self::$alreadyLoggedOut) {
+   294|             return;
+   295|         }
+   296|         $session = BackendModel::getSession();
+   297|         BackendModel::get('database')->delete('users_sessions', 'session_id = ?', $session->getId());
+   298|         $session->set('backend_logged_in', false);
+   299|         $session->set('backend_secret_key', '');
+   300|         $session->set('csrf_token', '');
+   301|         if (!$session->migrate(true)) {
+   302|             throw new RuntimeException(
+   303|                 'For safety reasons the session should be regenerated. But apparently it failed.'
+   304|             );
+   305|         }
+   306|         self::$alreadyLoggedOut = true;
+   307|     }
+   308|     /**
+   309|      * Reset our class to make sure no contamination from previous
+   310|      * authentications persists. This signifies a deeper issue with
+   311|      * this class. Solving the issue would be preferable to introducting
+   312|      * another method. This currently only exists to serve the test.
+   313|      */
+   314|     public static function tearDown(): void
+   315|     {
+   316|         self::$allowedActions = [];
+   317|         self::$allowedModules = [];
+   318|         self::$user = null;
+   319|     }
+   320| }
+
+
+# ====================================================================
+# FILE: src/Backend/Core/Engine/Base/Widget.php
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-24 ---
+     1| <?php
+     2| namespace Backend\Core\Engine\Base;
+     3| use Backend\Core\Engine\Model;
+     4| use Backend\Core\Engine\Model as BackendModel;
+     5| use Common\Exception\RedirectException;
+     6| use ForkCMS\App\KernelLoader;
+     7| use Symfony\Component\HttpFoundation\RedirectResponse;
+     8| use Symfony\Component\HttpFoundation\Request;
+     9| use Symfony\Component\HttpFoundation\Response;
+    10| use Symfony\Component\HttpKernel\KernelInterface;
+    11| use Backend\Core\Engine\Authentication as BackendAuthentication;
+    12| use Backend\Core\Engine\Header;
+    13| use Backend\Core\Engine\TwigTemplate;
+    14| /**
+    15|  * This is the base-object for widgets
+    16|  */
+    17| class Widget extends KernelLoader
+    18| {
+    19|     /**
+    20|      * The column wherein the widget should be shown
+    21|      *
+    22|      * @var string
+    23|      */
+    24|     private $column = 'left';
+
+# --- HUNK 2: Lines 124-166 ---
+   124|      * @param int $code The redirect code, default is 302 which means this is a temporary redirect.
+   125|      *
+   126|      * @throws RedirectException
+   127|      */
+   128|     public function redirect(string $url, int $code = Response::HTTP_FOUND): void
+   129|     {
+   130|         throw new RedirectException('Redirect', new RedirectResponse($url, $code));
+   131|     }
+   132|     public function execute(): void
+   133|     {
+   134|     }
+   135|     /**
+   136|      * Get the request from the container.
+   137|      *
+   138|      * @return Request
+   139|      */
+   140|     public function getRequest(): Request
+   141|     {
+   142|         return Model::getRequest();
+   143|     }
+   144|     /**
+   145|      * Check if the token is ok
+   146|      */
+   147|     public function checkToken(): void
+   148|     {
+   149|         $fromSession = BackendModel::getSession()->get('csrf_token', '');
+   150|         $fromGet = $this->getRequest()->query->get('token');
+   151|         if ($fromSession !== '' && $fromGet !== '' && $fromSession === $fromGet) {
+   152|             return;
+   153|         }
+   154|         BackendModel::getSession()->set('csrf_token', '');
+   155|         $this->redirect(
+   156|             BackendModel::createUrlForAction(
+   157|                 $this->getContainer()->get('url')->getDefaultActionForCurrentModule(),
+   158|                 null,
+   159|                 null,
+   160|                 [
+   161|                     'error' => 'csrf',
+   162|                 ]
+   163|             )
+   164|         );
+   165|     }
+   166| }
+
+
+# ====================================================================
+# FILE: src/Backend/Core/Js/backend.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 117-167 ---
+   117|       e.preventDefault()
+   118|       $navbarNav.animate({'left': '-=85px'})
+   119|       this.setControls(-85)
+   120|     }.bind(this))
+   121|   },
+   122|   resize: function () {
+   123|     var $navbarNav = $('.navbar-default .navbar-nav')
+   124|     var navbarWidth = this.calculateNavbarWidth()
+   125|     var windowWidth = this.calculateWindowWidth()
+   126|     if (navbarWidth < windowWidth) {
+   127|       $navbarNav.css('left', '0')
+   128|       $('.js-nav-next').hide()
+   129|     }
+   130|     this.setControls(0)
+   131|   },
+   132|   toggleCollapse: function () {
+   133|     var $wrapper = $('.main-wrapper')
+   134|     var $navCollapse = $('.js-toggle-nav')
+   135|     var collapsed = $wrapper.hasClass('navigation-collapsed')
+   136|     if ($wrapper.hasClass('navigation-collapsed')) {
+   137|       $('.js-nav-screen-text').text(jsBackend.locale.lbl('OpenNavigation'))
+   138|     } else {
+   139|       $('.js-nav-screen-text').text(jsBackend.locale.lbl('CloseNavigation'))
+   140|     }
+   141|     $navCollapse.on('click', function (e) {
+   142|       e.preventDefault()
+   143|       $wrapper.toggleClass('navigation-collapsed')
+   144|       if ($wrapper.hasClass('navigation-collapsed')) {
+   145|         $('.js-nav-screen-text').text(jsBackend.locale.lbl('OpenNavigation'))
+   146|       } else {
+   147|         $('.js-nav-screen-text').text(jsBackend.locale.lbl('CloseNavigation'))
+   148|       }
+   149|       collapsed = !collapsed
+   150|       utils.cookies.setCookie('navigation-collapse', collapsed)
+   151|       setTimeout(function () {
+   152|         jsBackend.resizeFunctions.init()
+   153|       }, 250)
+   154|     })
+   155|   },
+   156|   tooltip: function () {
+   157|     var $tooltip = $('[data-toggle="tooltip-nav"]')
+   158|     var $wrapper = $('.main-wrapper')
+   159|     if ($tooltip.length > 0) {
+   160|       $tooltip.tooltip({
+   161|         trigger: 'manual'
+   162|       })
+   163|       $tooltip.on('mouseover', function (e) {
+   164|         if ($wrapper.hasClass('navigation-collapsed') && $(window).width() > 787) {
+   165|           var $target = $(e.target)
+   166|           $target.tooltip('show')
+   167|         }
+
+
+# ====================================================================
+# FILE: src/Backend/Core/Js/jquery/jquery.backend.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 200-240 ---
+   200|   }
+   201| })(jQuery);
+   202| /**
+   203|  * Inline editing
+   204|  */
+   205| (function ($) {
+   206|   $.fn.inlineTextEdit = function (options) {
+   207|     var defaults = {
+   208|       params: {},
+   209|       current: {},
+   210|       extraParams: {},
+   211|       inputClasses: 'inputText',
+   212|       allowEmpty: false,
+   213|       tooltip: 'click to edit',
+   214|       afterSave: null
+   215|     }
+   216|     options = $.extend(defaults, options)
+   217|     var editing = false
+   218|     return this.each(function () {
+   219|       var $this = $(this)
+   220|       $this.html('<span>' + utils.string.htmlEncode($this.text()) + '</span><span style="display: none;" class="inlineEditTooltip label label-primary">' + options.tooltip + '</span>')
+   221|       var $span = $this.find('span')
+   222|       var element = $span.eq(0)
+   223|       var tooltip = $span.eq(1)
+   224|       element.bind('click focus', createElement)
+   225|       tooltip.bind('click', createElement)
+   226|       $this.hover(
+   227|         function () {
+   228|           if (element.hasClass('inlineEditing')) {
+   229|             $this.removeClass('inlineEditHover')
+   230|             tooltip.hide()
+   231|           } else {
+   232|             $this.addClass('inlineEditHover')
+   233|             tooltip.show()
+   234|           }
+   235|         },
+   236|         function () {
+   237|           $this.removeClass('inlineEditHover')
+   238|           tooltip.hide()
+   239|         }
+   240|       )
+
+
+# ====================================================================
+# FILE: src/Backend/Modules/Extensions/Actions/UploadTheme.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 150-192 ---
+   150|         }
+   151|         return $this->info;
+   152|     }
+   153|     /**
+   154|      * Create a list of files. These are the files that will actuall be unpacked to the Themes folder.
+   155|      * Either we have a zip that contains 1 parent directory with files inside (directory not necessarily named like
+   156|      * the theme) and we extract those files. Or we have a zip that directly contains the theme files and we should
+   157|      * prepend them with the theme folder.
+   158|      *
+   159|      * @param ZipArchive $zip
+   160|      *
+   161|      * @return string[]
+   162|      */
+   163|     private function getValidatedFilesList(ZipArchive $zip): array
+   164|     {
+   165|         $this->parentFolderName = $this->extractFolderNameBasedOnInfoFile($this->infoFilePath);
+   166|         $files = [];
+   167|         for ($i = 0; $i < $zip->numFiles; ++$i) {
+   168|             $file = $zip->statIndex($i);
+   169|             $fileName = $file['name'];
+   170|             if ($this->checkIfPathContainsIgnoredWord($fileName)
+   171|                 || (!empty($this->parentFolderName) && mb_stripos($fileName, $this->parentFolderName) !== 0)
+   172|                 || mb_strpos(basename($fileName), '.') === 0 // ignore hidden files
+   173|             ) {
+   174|                 continue;
+   175|             }
+   176|             $files[] = $fileName;
+   177|         }
+   178|         return $files;
+   179|     }
+   180|     /**
+   181|      * @param string $infoFilePath
+   182|      *
+   183|      * @return string|null
+   184|      */
+   185|     private function extractFolderNameBasedOnInfoFile(string $infoFilePath): ?string
+   186|     {
+   187|         $pathParts = explode('/', $infoFilePath);
+   188|         if (count($pathParts) > 1) {
+   189|             return $pathParts[0];
+   190|         }
+   191|         return null;
+   192|     }
+
+
+# ====================================================================
+# FILE: src/Backend/Modules/Groups/Engine/Model.php
+# Total hunks: 5
+# ====================================================================
+# --- HUNK 1: Lines 1-60 ---
+     1| <?php
+     2| namespace Backend\Modules\Groups\Engine;
+     3| use Backend\Core\Engine\Model as BackendModel;
+     4| /**
+     5|  * In this file we store all generic functions that we will be using in the groups module.
+     6|  */
+     7| class Model
+     8| {
+     9|     const QUERY_BROWSE =
+    10|         'SELECT g.id, g.name, COUNT(u.id) AS num_users
+    11|          FROM `groups` AS g
+    12|          LEFT OUTER JOIN users_groups AS ug ON g.id = ug.group_id
+    13|          LEFT OUTER JOIN `users` AS u ON u.id = ug.user_id
+    14|          GROUP BY g.id';
+    15|     const QUERY_ACTIVE_USERS =
+    16|         'SELECT u.id, u.email
+    17|          FROM `users` AS u
+    18|          INNER JOIN users_groups AS ug ON u.id = ug.user_id
+    19|          WHERE ug.group_id = ? AND u.deleted = ?';
+    20|     public static function addActionPermissions(array $actionPermissions): void
+    21|     {
+    22|         foreach ((array) $actionPermissions as $permission) {
+    23|             if (!self::existsActionPermission($permission)) {
+    24|                 BackendModel::getContainer()->get('database')->insert('groups_rights_actions', $permission);
+    25|             }
+    26|         }
+    27|     }
+    28|     public static function addModulePermissions(array $modulePermissions): void
+    29|     {
+    30|         foreach ((array) $modulePermissions as $permission) {
+    31|             if (!self::existsModulePermission($permission)) {
+    32|                 BackendModel::getContainer()->get('database')->insert('groups_rights_modules', $permission);
+    33|             }
+    34|         }
+    35|     }
+    36|     public static function alreadyExists(string $groupName): bool
+    37|     {
+    38|         return (bool) BackendModel::getContainer()->get('database')->getVar(
+    39|             'SELECT i.*
+    40|              FROM `groups` AS i
+    41|              WHERE i.name = ?',
+    42|             [$groupName]
+    43|         );
+    44|     }
+    45|     public static function delete(int $groupId): void
+    46|     {
+    47|         /** @var SpoonDatabase $database */
+    48|         $database = BackendModel::getContainer()->get('database');
+    49|         $database->delete('groups', 'id = ?', [$groupId]);
+    50|         $database->delete('groups_settings', 'group_id = ?', [$groupId]);
+    51|         $database->delete('groups_rights_actions', 'group_id = ?', [$groupId]);
+    52|         $database->delete('groups_rights_modules', 'group_id = ?', [$groupId]);
+    53|     }
+    54|     public static function deleteActionPermissions(array $actionPermissions): void
+    55|     {
+    56|         foreach ((array) $actionPermissions as $permission) {
+    57|             if (self::existsActionPermission($permission)) {
+    58|                 BackendModel::getContainer()->get('database')->delete(
+    59|                     'groups_rights_actions',
+    60|                     'group_id = ? AND module = ? AND action = ?',
+
+# --- HUNK 2: Lines 73-164 ---
+    73|                     [$permission['group_id'], $permission['module']]
+    74|                 );
+    75|             }
+    76|         }
+    77|     }
+    78|     public static function deleteMultipleGroups(int $userId): void
+    79|     {
+    80|         BackendModel::getContainer()->get('database')->delete('users_groups', 'user_id = ?', [$userId]);
+    81|     }
+    82|     /**
+    83|      * Check if a group already exists
+    84|      *
+    85|      * @param int $id The id to check upon.
+    86|      *
+    87|      * @return bool
+    88|      */
+    89|     public static function exists(int $id): bool
+    90|     {
+    91|         return (bool) BackendModel::getContainer()->get('database')->getVar(
+    92|             'SELECT i.*
+    93|              FROM `groups` AS i
+    94|              WHERE i.id = ?',
+    95|             [$id]
+    96|         );
+    97|     }
+    98|     public static function existsActionPermission(array $permission): bool
+    99|     {
+   100|         return (bool) BackendModel::getContainer()->get('database')->getVar(
+   101|             'SELECT i.*
+   102|              FROM groups_rights_actions AS i
+   103|              WHERE i.module = ? AND i.group_id = ? AND i.action = ?',
+   104|             [$permission['module'], $permission['group_id'], $permission['action']]
+   105|         );
+   106|     }
+   107|     public static function existsModulePermission(array $permission): bool
+   108|     {
+   109|         return (bool) BackendModel::getContainer()->get('database')->getVar(
+   110|             'SELECT i.*
+   111|              FROM groups_rights_modules AS i
+   112|              WHERE i.module = ? AND i.group_id = ?',
+   113|             [$permission['module'], $permission['group_id']]
+   114|         );
+   115|     }
+   116|     public static function get(int $groupId): array
+   117|     {
+   118|         return (array) BackendModel::getContainer()->get('database')->getRecord(
+   119|             'SELECT i.*
+   120|              FROM `groups` AS i
+   121|              WHERE i.id = ?',
+   122|             [$groupId]
+   123|         );
+   124|     }
+   125|     public static function getActionPermissions(int $groupId): array
+   126|     {
+   127|         return (array) BackendModel::getContainer()->get('database')->getRecords(
+   128|             'SELECT i.module, i.action
+   129|              FROM groups_rights_actions AS i
+   130|              WHERE i.group_id = ?',
+   131|             [$groupId]
+   132|         );
+   133|     }
+   134|     public static function getAll(): array
+   135|     {
+   136|         return (array) BackendModel::getContainer()->get('database')->getRecords(
+   137|             'SELECT i.id AS value, i.name AS label FROM `groups` AS i'
+   138|         );
+   139|     }
+   140|     public static function getGroupsByUser(int $userId): array
+   141|     {
+   142|         return (array) BackendModel::getContainer()->get('database')->getRecords(
+   143|             'SELECT i.id, i.name
+   144|              FROM `groups` AS i
+   145|              INNER JOIN users_groups AS ug ON i.id = ug.group_id
+   146|              WHERE ug.user_id = ?',
+   147|             [$userId]
+   148|         );
+   149|     }
+   150|     public static function isUserInGroup(int $userId, int $groupId): bool
+   151|     {
+   152|         $groupsByUser = static::getGroupsByUser($userId);
+   153|         foreach ($groupsByUser as $group) {
+   154|             if ((int) $group['id'] === $groupId) {
+   155|                 return true;
+   156|             }
+   157|         }
+   158|         return false;
+   159|     }
+   160|     public static function getModulePermissions(int $groupId): array
+   161|     {
+   162|         return (array) BackendModel::getContainer()->get('database')->getRecords(
+   163|             'SELECT i.*
+   164|              FROM groups_rights_modules AS i
+
+# --- HUNK 3: Lines 169-209 ---
+   169|     public static function getSetting(int $groupId, string $settingName): array
+   170|     {
+   171|         $setting = (array) BackendModel::getContainer()->get('database')->getRecord(
+   172|             'SELECT i.value
+   173|              FROM groups_settings AS i
+   174|              WHERE i.group_id = ? AND i.name = ?',
+   175|             [$groupId, $settingName]
+   176|         );
+   177|         if (empty($setting)) {
+   178|             return [];
+   179|         }
+   180|         if (isset($setting['value'])) {
+   181|             return unserialize($setting['value'], ['allowed_classes' => false]);
+   182|         }
+   183|         return [];
+   184|     }
+   185|     public static function getUsers(int $groupId): array
+   186|     {
+   187|         return (array) BackendModel::getContainer()->get('database')->getRecords(
+   188|             'SELECT i.*
+   189|              FROM `users` AS i
+   190|              INNER JOIN users_groups AS ug ON i.id = ug.user_id
+   191|              WHERE ug.group_id = ? AND i.deleted = ? AND i.active = ?',
+   192|             [$groupId, false, true]
+   193|         );
+   194|     }
+   195|     /**
+   196|      * Insert a group and a setting
+   197|      *
+   198|      * @param array $group The group to insert.
+   199|      * @param array $setting The setting to insert.
+   200|      *
+   201|      * @return int
+   202|      */
+   203|     public static function insert(array $group, array $setting): int
+   204|     {
+   205|         $groupId = BackendModel::getContainer()->get('database')->insert('groups', $group);
+   206|         $setting['group_id'] = $groupId;
+   207|         self::insertSetting($setting);
+   208|         return $groupId;
+   209|     }
+
+
+# ====================================================================
+# FILE: src/Backend/Modules/MediaLibrary/Js/MediaLibrary.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 198-228 ---
+   198|           window.alert(textStatus)
+   199|         }
+   200|         jsBackend.messages.add('danger', jsBackend.locale.err('CantBeMoved'))
+   201|         $.tree.rollback(rollback)
+   202|       }
+   203|     })
+   204|   },
+   205|   getDroppedOnPageID: function (refNode) {
+   206|     if (typeof refNode === 'undefined') {
+   207|       return 0
+   208|     }
+   209|     return $(refNode).prop('id').replace('folder-', '')
+   210|   },
+   211|   toggleJsTreeCollapse: function () {
+   212|     $('[data-role="toggle-js-tree-collapse"]').on('click', function () {
+   213|       var $this = $(this)
+   214|       $this.toggleClass('tree-collapsed')
+   215|       var collapsed = $this.hasClass('tree-collapsed')
+   216|       var $buttonText = $('[data-role="toggle-js-tree-collapse-text"]')
+   217|       if (collapsed) {
+   218|         $buttonText.text(jsBackend.locale.lbl('OpenTreeNavigation'))
+   219|         $.tree.reference('#tree div').close_all()
+   220|         return
+   221|       }
+   222|       $buttonText.text(jsBackend.locale.lbl('CloseTreeNavigation'))
+   223|       $.tree.reference('#tree div').open_all()
+   224|     })
+   225|   }
+   226| }
+   227| /** global jsBackend */
+   228| $(jsBackend.mediaLibrary.init)
+
+
+# ====================================================================
+# FILE: src/Backend/Modules/Pages/Actions/Add.php
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-38 ---
+     1| <?php
+     2| namespace Backend\Modules\Pages\Actions;
+     3| use Backend\Core\Engine\Authentication;
+     4| use Backend\Core\Engine\Base\ActionAdd as BackendBaseActionAdd;
+     5| use Backend\Core\Engine\Authentication as BackendAuthentication;
+     6| use Backend\Core\Engine\Form as BackendForm;
+     7| use Backend\Core\Language\Language as BL;
+     8| use Backend\Core\Engine\Meta as BackendMeta;
+     9| use Backend\Core\Engine\Model as BackendModel;
+    10| use Backend\Modules\Extensions\Engine\Model as BackendExtensionsModel;
+    11| use Backend\Modules\Pages\Engine\Model as BackendPagesModel;
+    12| use Backend\Modules\Search\Engine\Model as BackendSearchModel;
+    13| use Backend\Modules\Tags\Engine\Model as BackendTagsModel;
+    14| use Backend\Modules\Profiles\Engine\Model as BackendProfilesModel;
+    15| use Common\Core\Model;
+    16| use ForkCMS\Utility\Thumbnails;
+    17| use SpoonFormHidden;
+    18| use Symfony\Component\DomCrawler\Crawler;
+    19| use Symfony\Component\Filesystem\Filesystem;
+    20| use Symfony\Component\HttpFoundation\Response;
+    21| /**
+    22|  * This is the add-action, it will display a form to create a new item
+    23|  */
+    24| class Add extends BackendBaseActionAdd
+    25| {
+    26|     /**
+    27|      * The blocks linked to this page
+    28|      *
+    29|      * @var array
+    30|      */
+    31|     private $blocksContent = [];
+    32|     /**
+    33|      * Is the current user a god user?
+    34|      *
+    35|      * @var bool
+    36|      */
+    37|     private $isGod = false;
+    38|     /**
+
+# --- HUNK 2: Lines 407-449 ---
+   407|                     && $this->form->getField('remove_from_search_index')->isChecked()
+   408|                     && $this->form->getField('auth_required')->isChecked()) {
+   409|                     $data['remove_from_search_index'] = true;
+   410|                 }
+   411|                 if ($this->getContainer()->getParameter('site.multilanguage')) {
+   412|                     foreach (BL::getActiveLanguages() as $language) {
+   413|                         if ($language !== BL::getWorkingLanguage() && $this->form->getfield('hreflang_' . $language)->isFilled()) {
+   414|                             $data['hreflang_' . $language] = $this->form->getfield('hreflang_' . $language)->getValue();
+   415|                         }
+   416|                     }
+   417|                 }
+   418|                 $page = [];
+   419|                 $page['id'] = BackendPagesModel::getMaximumPageId() + 1;
+   420|                 $page['user_id'] = BackendAuthentication::getUser()->getUserId();
+   421|                 $page['parent_id'] = $parentId;
+   422|                 $page['template_id'] = $templateId;
+   423|                 $page['meta_id'] = (int) $this->meta->save();
+   424|                 $page['language'] = BL::getWorkingLanguage();
+   425|                 $page['type'] = $parentPage ? 'page' : 'root';
+   426|                 $page['title'] = $this->form->getField('title')->getValue();
+   427|                 $page['navigation_title'] = ($this->form->getField('navigation_title')->getValue() != '')
+   428|                     ? $this->form->getField('navigation_title')->getValue()
+   429|                     : $this->form->getField('title')->getValue();
+   430|                 $page['navigation_title_overwrite'] = $this->form->getField(
+   431|                     'navigation_title_overwrite'
+   432|                 )->isChecked();
+   433|                 $page['hidden'] = $this->form->getField('hidden')->getValue();
+   434|                 $page['status'] = $status;
+   435|                 $page['publish_on'] = BackendModel::getUTCDate();
+   436|                 $page['created_on'] = BackendModel::getUTCDate();
+   437|                 $page['edited_on'] = BackendModel::getUTCDate();
+   438|                 $page['allow_move'] = true;
+   439|                 $page['allow_children'] = true;
+   440|                 $page['allow_edit'] = true;
+   441|                 $page['allow_delete'] = true;
+   442|                 $page['sequence'] = BackendPagesModel::getMaximumSequence($parentId) + 1;
+   443|                 $page['data'] = ($data !== null) ? serialize($data) : null;
+   444|                 if ($this->isGod) {
+   445|                     $page['allow_move'] = in_array(
+   446|                         'move',
+   447|                         (array) $this->form->getField('allow')->getValue(),
+   448|                         true
+   449|                     );
+
+# --- HUNK 3: Lines 541-610 ---
+   541|     {
+   542|         return Authentication::isAllowedAction('Edit', 'Tags') && Authentication::isAllowedAction('GetAllTags', 'Tags');
+   543|     }
+   544|     private function getHiddenJsonField(string $name, ?string $json): SpoonFormHidden
+   545|     {
+   546|         return new class($name, htmlspecialchars($json)) extends SpoonFormHidden {
+   547|             public function getValue($allowHTML = null)
+   548|             {
+   549|                 return parent::getValue(true);
+   550|             }
+   551|         };
+   552|     }
+   553|     private function getOriginalPage(): ?array
+   554|     {
+   555|         $id = $this->getRequest()->query->getInt('copy');
+   556|         if ($id === 0 || !BackendPagesModel::exists($id)) {
+   557|             return null;
+   558|         }
+   559|         $this->template->assign('showCopyWarning', true);
+   560|         $originalPage = BackendPagesModel::get($id);
+   561|         $this->blocksContent = array_map(
+   562|             function (array $block) {
+   563|                 if ($block['extra_type'] !== 'usertemplate') {
+   564|                     return $block;
+   565|                 }
+   566|                 if (strpos($block['html'], 'data-ft-type="image"') === false) {
+   567|                     return $block;
+   568|                 }
+   569|                 $blockElements = new Crawler($block['html']);
+   570|                 $images = $blockElements->filter('[data-ft-type="image"]');
+   571|                 $filesystem = new Filesystem();
+   572|                 $path = FRONTEND_FILES_PATH . '/Pages/UserTemplate';
+   573|                 $url = FRONTEND_FILES_URL . '/Pages/UserTemplate';
+   574|                 foreach ($images as $image) {
+   575|                     $imagePath = $image->getAttribute('src');
+   576|                     $basename = pathinfo($imagePath, PATHINFO_FILENAME);
+   577|                     $extension = pathinfo($imagePath, PATHINFO_EXTENSION);
+   578|                     $originalFilename = $basename . '.' . $extension;
+   579|                     $filename = $originalFilename;
+   580|                     while ($filesystem->exists($path . '/' . $filename)) {
+   581|                         $basename = Model::addNumber($basename);
+   582|                         $filename = $basename . '.' . $extension;
+   583|                     }
+   584|                     $block['html'] = str_replace($imagePath, $url . '/' . $filename, $block['html']);
+   585|                     $filesystem->copy($path . '/' . $originalFilename, $path . '/' . $filename);
+   586|                 }
+   587|                 return $block;
+   588|             },
+   589|             BackendPagesModel::getBlocks($id, $originalPage['revision_id'])
+   590|         );
+   591|         return $originalPage;
+   592|     }
+   593|     private function saveSearchIndex(bool $removeFromSearchIndex, array $page): void
+   594|     {
+   595|         if ($removeFromSearchIndex) {
+   596|             BackendSearchModel::removeIndex(
+   597|                 $this->getModule(),
+   598|                 $page['id']
+   599|             );
+   600|             return;
+   601|         }
+   602|         $searchText = '';
+   603|         foreach ($this->blocksContent as $block) {
+   604|             $searchText .= ' ' . $block['html'];
+   605|         }
+   606|         BackendSearchModel::saveIndex(
+   607|             $this->getModule(),
+   608|             $page['id'],
+   609|             ['title' => $page['title'], 'text' => $searchText]
+   610|         );
+
+
+# ====================================================================
+# FILE: src/Backend/Modules/Pages/Actions/Edit.php
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 48-91 ---
+    48|      */
+    49|     private $hreflangFields = [];
+    50|     /**
+    51|      * Is the current user a god user?
+    52|      *
+    53|      * @var bool
+    54|      */
+    55|     private $isGod = false;
+    56|     /**
+    57|      * The positions
+    58|      *
+    59|      * @var array
+    60|      */
+    61|     private $positions = [];
+    62|     /**
+    63|      * The template data
+    64|      *
+    65|      * @var array
+    66|      */
+    67|     private $templates = [];
+    68|     /**
+    69|      * @var string
+    70|      */
+    71|     private $oldUrl;
+    72|     public function execute(): void
+    73|     {
+    74|         parent::execute();
+    75|         $this->loadData();
+    76|         $this->header->addJS('jstree/jquery.tree.js', null, false);
+    77|         $this->header->addJS('jstree/lib/jquery.cookie.js', null, false);
+    78|         $this->header->addJS('jstree/plugins/jquery.tree.cookie.js', null, false);
+    79|         $this->header->addJS('/js/vendors/SimpleAjaxUploader.min.js', 'Core', false, true);
+    80|         $this->templates = BackendExtensionsModel::getTemplates();
+    81|         $this->templates[$this->record['template_id']]['checked'] = true;
+    82|         if ($this->id == BackendModel::HOME_PAGE_ID) {
+    83|             foreach ($this->templates as &$row) {
+    84|                 $row['disabled'] = ($row['has_block']);
+    85|             }
+    86|         }
+    87|         $this->extras = BackendExtensionsModel::getExtras();
+    88|         $this->loadForm();
+    89|         $this->loadDrafts();
+    90|         $this->loadRevisions();
+    91|         $this->validateForm();
+
+# --- HUNK 2: Lines 394-434 ---
+   394|             null,
+   395|             null,
+   396|             true
+   397|         );
+   398|         $this->form->addCheckbox('navigation_title_overwrite', $this->record['navigation_title_overwrite']);
+   399|         $this->form->addText('navigation_title', $this->record['navigation_title']);
+   400|         if ($this->userCanSeeAndEditTags()) {
+   401|             $this->form->addText(
+   402|                 'tags',
+   403|                 BackendTagsModel::getTags($this->url->getModule(), $this->id),
+   404|                 null,
+   405|                 'form-control js-tags-input',
+   406|                 'error js-tags-input'
+   407|             )->setAttribute('aria-describedby', 'tags-info');
+   408|         }
+   409|         $isAction = isset($this->record['data']['is_action']) && $this->record['data']['is_action'];
+   410|         $this->form->addCheckbox('is_action', $isAction);
+   411|         $blockTypes = BackendPagesModel::getTypes();
+   412|         $this->form->addDropdown('extra_type', $blockTypes, key($blockTypes));
+   413|         $this->meta = new BackendMeta($this->form, $this->record['meta_id'], 'title', true);
+   414|         $this->oldUrl = $this->meta->getUrl();
+   415|         $this->meta->setUrlCallback(
+   416|             'Backend\Modules\Pages\Engine\Model',
+   417|             'getUrl',
+   418|             [$this->record['id'], $this->record['parent_id'], $isAction]
+   419|         );
+   420|     }
+   421|     private function loadRevisions(): void
+   422|     {
+   423|         $this->dgRevisions = new BackendDataGridDatabase(
+   424|             BackendPagesModel::QUERY_BROWSE_REVISIONS,
+   425|             [
+   426|                  $this->id,
+   427|                  'archive',
+   428|                  BL::getWorkingLanguage(
+   429|                  ),
+   430|             ]
+   431|         );
+   432|         $this->dgRevisions->setColumnsHidden(['id', 'revision_id']);
+   433|         $this->dgRevisions->setPaging(false);
+   434|         $this->dgRevisions->setHeaderLabels(
+
+# --- HUNK 3: Lines 562-602 ---
+   562|             'edited_on' => BackendModel::getUTCDate(),
+   563|             'allow_move' => $this->record['allow_move'],
+   564|             'allow_children' => $this->record['allow_children'],
+   565|             'allow_edit' => $this->record['allow_edit'],
+   566|             'allow_delete' => $this->record['allow_delete'],
+   567|             'sequence' => $this->record['sequence'],
+   568|             'data' => serialize($data),
+   569|         ];
+   570|         $page = $this->changePagePermissions($page);
+   571|         if (empty($page['navigation_title'])) {
+   572|             $page['navigation_title'] = $page['title'];
+   573|         }
+   574|         $page['revision_id'] = BackendPagesModel::update($page);
+   575|         $this->insertBlocks($page['revision_id']);
+   576|         $this->saveTags($page['id']);
+   577|         $cacheShouldBeUpdated = !(
+   578|             $this->record['title'] === $page['title']
+   579|             && $this->record['navigation_title'] === $page['navigation_title']
+   580|             && $this->record['navigation_title_overwrite'] == $page['navigation_title_overwrite'] // can be 0 or false
+   581|             && $this->record['hidden'] == $page['hidden'] // can be 0 or false
+   582|             && $this->meta->getUrl() === $this->oldUrl
+   583|         );
+   584|         if ($cacheShouldBeUpdated) {
+   585|             BackendPagesModel::buildCache(BL::getWorkingLanguage());
+   586|         }
+   587|         if ($page['status'] === 'draft') {
+   588|             $this->redirect(
+   589|                 BackendModel::createUrlForAction('Edit') . '&id=' . $page['id']
+   590|                 . '&report=saved-as-draft&var=' . rawurlencode($page['title']) . '&highlight=row-' . $page['id']
+   591|                 . '&draft=' . $page['revision_id']
+   592|             );
+   593|             return;
+   594|         }
+   595|         $this->movePage($page);
+   596|         $this->saveSearchIndex($data['remove_from_search_index'] || $redirectValue !== 'none', $page);
+   597|         $this->redirect(
+   598|             BackendModel::createUrlForAction('Edit') . '&id=' . $page['id'] . '&report=edited&var='
+   599|             . rawurlencode($page['title']) . '&highlight=row-' . $page['id']
+   600|         );
+   601|     }
+   602|     private function changePagePermissions(array $page): array
+
+
+# ====================================================================
+# FILE: src/Backend/Modules/Pages/Ajax/UploadFile.php
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-64 ---
+     1| <?php
+     2| namespace Backend\Modules\Pages\Ajax;
+     3| use Symfony\Component\HttpFoundation\Request;
+     4| use Symfony\Component\Filesystem\Filesystem;
+     5| use Common\Core\Model;
+     6| use Common\Uri;
+     7| use Backend\Core\Engine\Base\AjaxAction;
+     8| use Backend\Core\Engine\Exception;
+     9| use Symfony\Component\HttpFoundation\Response;
+    10| /**
+    11|  * This action will enable you to upload files trough ajax.
+    12|  * It accepts both XmlHttp requests or file uploads using a form.
+    13|  *
+    14|  * Note that it only accepts single file uploads.
+    15|  * The type $_GET parameter will be used to determine which folder to upload in.
+    16|  */
+    17| class UploadFile extends AjaxAction
+    18| {
+    19|     private const ALLOWED_EXTENSIONS = [
+    20|         'apng',
+    21|         'avif',
+    22|         'gif',
+    23|         'jfif',
+    24|         'jpeg',
+    25|         'jpg',
+    26|         'pjp',
+    27|         'pjpeg',
+    28|         'png',
+    29|         'svg',
+    30|         'webp',
+    31|     ];
+    32|     public function execute(): void
+    33|     {
+    34|         $request = $this->getRequest();
+    35|         try {
+    36|             $fileName = $this->writeFile(
+    37|                 $this->getFileContentFromRequest($request),
+    38|                 $this->getFileNameFromRequest($request),
+    39|                 $request->get('type')
+    40|             );
+    41|         } catch (Exception $backendCoreException) {
+    42|             $this->output(Response::HTTP_BAD_REQUEST, $backendCoreException->getMessage());
+    43|             return;
+    44|         }
+    45|         $this->output(Response::HTTP_OK, $fileName);
+    46|     }
+    47|     /**
+    48|      * Extracts the uploaded file from a request. It handles both XmlHttpRequest
+    49|      * uploads and form uploads (with files in the $_FILES global)
+    50|      *
+    51|      * @param Request $request
+    52|      *
+    53|      * @throws Exception When no file could be extracted
+    54|      *
+    55|      * @return string The content of the uploaded file
+    56|      */
+    57|     private function getFileContentFromRequest(Request $request): string
+    58|     {
+    59|         $uploadedFiles = $request->files->all();
+    60|         if (count($uploadedFiles) === 1) {
+    61|             $file = array_values($uploadedFiles)[0];
+    62|             return file_get_contents($file->getPathname());
+    63|         }
+    64|         throw new Exception('The request doesn\'t contain one file.');
+
+# --- HUNK 2: Lines 76-117 ---
+    76|     private function getFileNameFromRequest(Request $request): string
+    77|     {
+    78|         $uploadedFiles = $request->files->all();
+    79|         if (count($uploadedFiles) === 1) {
+    80|             $file = array_values($uploadedFiles)[0];
+    81|             return $file->getClientOriginalName();
+    82|         }
+    83|         throw new Exception('The request doesn\'t contain one file.');
+    84|     }
+    85|     /**
+    86|      * Writes some content to a file in a given folder
+    87|      *
+    88|      * @param string $content
+    89|      * @param string $fileName
+    90|      * @param string $destinationFolder
+    91|      *
+    92|      * @return string The filename of the written file.
+    93|      */
+    94|     private function writeFile(string $content, string $fileName, string $destinationFolder): string
+    95|     {
+    96|         $path = FRONTEND_FILES_PATH . '/Pages/' . basename($destinationFolder);
+    97|         $filesystem = new Filesystem();
+    98|         if (!$filesystem->exists($path)) {
+    99|             $filesystem->mkdir($path);
+   100|         }
+   101|         $baseName = Uri::getUrl(pathinfo($fileName, PATHINFO_FILENAME));
+   102|         $extension = pathinfo($fileName, PATHINFO_EXTENSION);
+   103|         if (!in_array(strtolower($extension), self::ALLOWED_EXTENSIONS)) {
+   104|             throw new Exception('This is not an image.');
+   105|         }
+   106|         $fileName = $baseName . '.' . $extension;
+   107|         while ($filesystem->exists($path . '/' . $fileName)) {
+   108|             $baseName = Model::addNumber($baseName);
+   109|             $fileName = $baseName . '.' . $extension;
+   110|         }
+   111|         $filesystem->dumpFile(
+   112|             $path . '/' . $fileName,
+   113|             $content
+   114|         );
+   115|         return $fileName;
+   116|     }
+   117| }
+
+
+# ====================================================================
+# FILE: src/Backend/Modules/Pages/Engine/Model.php
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 672-712 ---
+   672|                 $data[$level]
+   673|             );
+   674|             return self::getTree($childIds, $data, ++$level, $language);
+   675|         }
+   676|         unset($data[$level]);
+   677|         return $data;
+   678|     }
+   679|     public static function getTreeHTML(): string
+   680|     {
+   681|         $navigation = static::getCacheBuilder()->getNavigation(BL::getWorkingLanguage());
+   682|         $html = '<h4>' . SpoonFilter::ucfirst(BL::lbl('MainNavigation')) . '</h4>' . "\n";
+   683|         $html .= '<div class="clearfix" data-tree="main">' . "\n";
+   684|         $html .= '    <ul>' . "\n";
+   685|         $html .= '        <li id="page-"' . BackendModel::HOME_PAGE_ID . ' rel="home">';
+   686|         $homePage = self::get(BackendModel::HOME_PAGE_ID);
+   687|         $html .= '            <a href="' . BackendModel::createUrlForAction(
+   688|             'Edit',
+   689|             null,
+   690|             null,
+   691|             ['id' => BackendModel::HOME_PAGE_ID]
+   692|         ) . '"><ins>&#160;</ins>' . htmlentities($homePage['title']) . '</a>' . "\n";
+   693|         $html .= self::getSubtree($navigation, BackendModel::HOME_PAGE_ID);
+   694|         $html .= '        </li>' . "\n";
+   695|         $html .= '    </ul>' . "\n";
+   696|         $html .= '</div>' . "\n";
+   697|         if (BackendModel::get('fork.settings')->get('Pages', 'meta_navigation', false)) {
+   698|             $html .= '<h4>' . SpoonFilter::ucfirst(BL::lbl('Meta')) . '</h4>' . "\n";
+   699|             $html .= '<div class="clearfix" data-tree="meta">' . "\n";
+   700|             $html .= '    <ul>' . "\n";
+   701|             if (isset($navigation['meta'][0]) && !empty($navigation['meta'][0])) {
+   702|                 foreach ($navigation['meta'][0] as $page) {
+   703|                     $html .= '        <li id="page-' . $page['page_id'] . '" rel="' . $page['tree_type'] . '">' . "\n";
+   704|                     $html .= '            <a href="' . BackendModel::createUrlForAction(
+   705|                         'Edit',
+   706|                         null,
+   707|                         null,
+   708|                         ['id' => $page['page_id']]
+   709|                     ) . '"><ins>&#160;</ins>' . htmlspecialchars($page['navigation_title']) . '</a>' . "\n";
+   710|                     $html .= self::getSubtree($navigation, $page['page_id']);
+   711|                     $html .= '        </li>' . "\n";
+   712|                 }
+
+
+# ====================================================================
+# FILE: src/Backend/Modules/Pages/Js/Pages.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 968-1001 ---
+   968|         tree: tree
+   969|       },
+   970|       success: function (json, textStatus) {
+   971|         if (json.code !== 200) {
+   972|           if (jsBackend.debug) window.alert(textStatus)
+   973|           jsBackend.messages.add('danger', jsBackend.locale.err('CantBeMoved'))
+   974|           $.tree.rollback(rollback)
+   975|         } else {
+   976|           jsBackend.messages.add('success', jsBackend.locale.msg('PageIsMoved').replace('%1$s', json.data.title))
+   977|         }
+   978|       }
+   979|     })
+   980|   },
+   981|   toggleJsTreeCollapse: function () {
+   982|     $('[data-role="toggle-js-tree-collapse"]').on('click', function () {
+   983|       var $this = $(this)
+   984|       $this.toggleClass('tree-collapsed')
+   985|       var collapsed = $this.hasClass('tree-collapsed')
+   986|       var $buttonText = $('[data-role="toggle-js-tree-collapse-text"]')
+   987|       if (collapsed) {
+   988|         $buttonText.text(jsBackend.locale.lbl('OpenTreeNavigation'))
+   989|         $.each($('#tree div'), function (index, element) {
+   990|           $.tree.reference($(element).attr('id')).close_all()
+   991|         })
+   992|         return
+   993|       }
+   994|       $buttonText.text(jsBackend.locale.lbl('CloseTreeNavigation'))
+   995|       $.each($('#tree div'), function (index, element) {
+   996|         $.tree.reference($(element).attr('id')).open_all()
+   997|       })
+   998|     })
+   999|   }
+  1000| }
+  1001| $(jsBackend.pages.init)
+
+
+# ====================================================================
+# FILE: src/Frontend/Modules/Profiles/Engine/Authentication.php
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-26 ---
+     1| <?php
+     2| namespace Frontend\Modules\Profiles\Engine;
+     3| use Frontend\Core\Engine\Model as FrontendModel;
+     4| use Frontend\Modules\Profiles\Engine\Model as FrontendProfilesModel;
+     5| use Frontend\Modules\Profiles\Engine\Profile as FrontendProfilesProfile;
+     6| use RuntimeException;
+     7| /**
+     8|  * Profile authentication functions.
+     9|  */
+    10| class Authentication
+    11| {
+    12|     /**
+    13|      * The login credentials are correct and the profile is active.
+    14|      *
+    15|      * @var string
+    16|      */
+    17|     const LOGIN_ACTIVE = 'active';
+    18|     /**
+    19|      * The login credentials are correct, but the profile is inactive.
+    20|      *
+    21|      * @var string
+    22|      */
+    23|     const LOGIN_INACTIVE = 'inactive';
+    24|     /**
+    25|      * The login credentials are correct, but the profile has been deleted.
+    26|      *
+
+# --- HUNK 2: Lines 130-208 ---
+   130|                     $secret
+   131|                 );
+   132|                 FrontendModel::getContainer()->get('fork.cookie')->set('frontend_profile_secret_key', $profileSecret);
+   133|                 FrontendModel::getSession()->set('frontend_profile_logged_in', true);
+   134|                 FrontendProfilesModel::update($profileId, ['last_login' => FrontendModel::getUTCDate()]);
+   135|                 self::$profile = new FrontendProfilesProfile($profileId);
+   136|                 return true;
+   137|             }
+   138|             FrontendModel::getContainer()->get('fork.cookie')->delete('frontend_profile_secret_key');
+   139|         }
+   140|         return false;
+   141|     }
+   142|     /**
+   143|      * @param int $profileId Login the profile with this id in.
+   144|      * @param bool $remember Should we set a cookie for later?
+   145|      */
+   146|     public static function login(int $profileId, bool $remember = false): void
+   147|     {
+   148|         $secretKey = null;
+   149|         self::cleanupOldSessions();
+   150|         $session = FrontendModel::getSession();
+   151|         if (!$session->migrate(true)) {
+   152|             throw new RuntimeException(
+   153|                 'For safety reasons the session should be regenerated. But apparently it failed.'
+   154|             );
+   155|         }
+   156|         $session->set('frontend_profile_logged_in', true);
+   157|         if ($remember) {
+   158|             $secretKey = FrontendProfilesModel::getEncryptedString(
+   159|                 $session->getId(),
+   160|                 FrontendProfilesModel::getRandomString()
+   161|             );
+   162|             FrontendModel::getContainer()->get('fork.cookie')->set('frontend_profile_secret_key', $secretKey);
+   163|         }
+   164|         FrontendModel::getContainer()->get('database')->delete(
+   165|             'profiles_sessions',
+   166|             'session_id = ?',
+   167|             $session->getId()
+   168|         );
+   169|         FrontendModel::getContainer()->get('database')->insert(
+   170|             'profiles_sessions',
+   171|             [
+   172|                 'profile_id' => $profileId,
+   173|                 'session_id' => $session->getId(),
+   174|                 'secret_key' => $secretKey,
+   175|                 'date' => FrontendModel::getUTCDate(),
+   176|             ]
+   177|         );
+   178|         FrontendProfilesModel::update($profileId, ['last_login' => FrontendModel::getUTCDate()]);
+   179|         self::$profile = new FrontendProfilesProfile($profileId);
+   180|     }
+   181|     public static function logout(): void
+   182|     {
+   183|         $session = FrontendModel::getSession();
+   184|         FrontendModel::getContainer()->get('database')->delete(
+   185|             'profiles_sessions',
+   186|             'session_id = ?',
+   187|             [$session->getId()]
+   188|         );
+   189|         $session->set('frontend_profile_logged_in', false);
+   190|         if (!$session->migrate(true)) {
+   191|             throw new RuntimeException(
+   192|                 'For safety reasons the session should be regenerated. But apparently it failed.'
+   193|             );
+   194|         }
+   195|         FrontendModel::getContainer()->get('fork.cookie')->delete('frontend_profile_secret_key');
+   196|     }
+   197|     /**
+   198|      * Update profile password and salt.
+   199|      *
+   200|      * @param int $profileId Profile id for which we are changing the password.
+   201|      * @param string $password New password.
+   202|      */
+   203|     public static function updatePassword(int $profileId, string $password): void
+   204|     {
+   205|         $encryptedPassword = FrontendProfilesModel::encryptPassword($password);
+   206|         FrontendProfilesModel::update($profileId, ['password' => $encryptedPassword]);
+   207|     }
+   208| }
+

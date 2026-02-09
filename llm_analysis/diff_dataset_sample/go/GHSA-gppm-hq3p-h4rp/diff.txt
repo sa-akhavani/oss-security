@@ -1,0 +1,3183 @@
+--- a/cmd/server.go
++++ b/cmd/server.go
+@@ -10,24 +10,20 @@
+ 	"github.com/pkg/errors"
+ 	"github.com/spf13/cobra"
+ 	"github.com/spf13/viper"
+ 	"github.com/runatlantis/atlantis/server"
+ 	"github.com/runatlantis/atlantis/server/events/vcs/bitbucketcloud"
+ 	"github.com/runatlantis/atlantis/server/logging"
+ )
+ const (
+ 	CheckoutStrategyBranch = "branch"
+ 	CheckoutStrategyMerge  = "merge"
+-)
+-const (
+-	TFDistributionTerraform = "terraform"
+-	TFDistributionOpenTofu  = "opentofu"
+ )
+ const (
+ 	ADWebhookPasswordFlag            = "azuredevops-webhook-password" // nolint: gosec
+ 	ADWebhookUserFlag                = "azuredevops-webhook-user"
+ 	ADTokenFlag                      = "azuredevops-token" // nolint: gosec
+ 	ADUserFlag                       = "azuredevops-user"
+ 	ADHostnameFlag                   = "azuredevops-hostname"
+ 	AllowCommandsFlag                = "allow-commands"
+ 	AllowForkPRsFlag                 = "allow-fork-prs"
+ 	AtlantisURLFlag                  = "atlantis-url"
+@@ -107,21 +103,20 @@
+ 	SilenceNoProjectsFlag            = "silence-no-projects"
+ 	SilenceForkPRErrorsFlag          = "silence-fork-pr-errors"
+ 	SilenceVCSStatusNoPlans          = "silence-vcs-status-no-plans"
+ 	SilenceVCSStatusNoProjectsFlag   = "silence-vcs-status-no-projects"
+ 	SilenceAllowlistErrorsFlag       = "silence-allowlist-errors"
+ 	SkipCloneNoChanges               = "skip-clone-no-changes"
+ 	SlackTokenFlag                   = "slack-token"
+ 	SSLCertFileFlag                  = "ssl-cert-file"
+ 	SSLKeyFileFlag                   = "ssl-key-file"
+ 	RestrictFileList                 = "restrict-file-list"
+-	TFDistributionFlag               = "tf-distribution"
+ 	TFDownloadFlag                   = "tf-download"
+ 	TFDownloadURLFlag                = "tf-download-url"
+ 	UseTFPluginCache                 = "use-tf-plugin-cache"
+ 	VarFileAllowlistFlag             = "var-file-allowlist"
+ 	VCSStatusName                    = "vcs-status-name"
+ 	TFEHostnameFlag                  = "tfe-hostname"
+ 	TFELocalExecutionModeFlag        = "tfe-local-execution-mode"
+ 	TFETokenFlag                     = "tfe-token"
+ 	WriteGitCredsFlag                = "write-git-creds" // nolint: gosec
+ 	WebBasicAuthFlag                 = "web-basic-auth"
+@@ -148,21 +143,20 @@
+ 	DefaultLockingDBType                = "boltdb"
+ 	DefaultLogLevel                     = "info"
+ 	DefaultMaxCommentsPerCommand        = 100
+ 	DefaultParallelPoolSize             = 15
+ 	DefaultStatsNamespace               = "atlantis"
+ 	DefaultPort                         = 4141
+ 	DefaultRedisDB                      = 0
+ 	DefaultRedisPort                    = 6379
+ 	DefaultRedisTLSEnabled              = false
+ 	DefaultRedisInsecureSkipVerify      = false
+-	DefaultTFDistribution               = TFDistributionTerraform
+ 	DefaultTFDownloadURL                = "https://releases.hashicorp.com"
+ 	DefaultTFDownload                   = true
+ 	DefaultTFEHostname                  = "app.terraform.io"
+ 	DefaultVCSStatusName                = "atlantis"
+ 	DefaultWebBasicAuth                 = false
+ 	DefaultWebUsername                  = "atlantis"
+ 	DefaultWebPassword                  = "atlantis"
+ )
+ var stringFlags = map[string]stringFlag{
+ 	ADTokenFlag: {
+@@ -377,24 +371,20 @@
+ 			" For Bitbucket Server, {owner} is the name of the project (not the key).",
+ 	},
+ 	SlackTokenFlag: {
+ 		description: "API token for Slack notifications.",
+ 	},
+ 	SSLCertFileFlag: {
+ 		description: "File containing x509 Certificate used for serving HTTPS. If the cert is signed by a CA, the file should be the concatenation of the server's certificate, any intermediates, and the CA's certificate.",
+ 	},
+ 	SSLKeyFileFlag: {
+ 		description: fmt.Sprintf("File containing x509 private key matching --%s.", SSLCertFileFlag),
+-	},
+-	TFDistributionFlag: {
+-		description:  fmt.Sprintf("Which TF distribution to use. Can be set to %s or %s.", TFDistributionTerraform, TFDistributionOpenTofu),
+-		defaultValue: DefaultTFDistribution,
+ 	},
+ 	TFDownloadURLFlag: {
+ 		description:  "Base URL to download Terraform versions from.",
+ 		defaultValue: DefaultTFDownloadURL,
+ 	},
+ 	TFEHostnameFlag: {
+ 		description:  "Hostname of your Terraform Enterprise installation. If using Terraform Cloud no need to set.",
+ 		defaultValue: DefaultTFEHostname,
+ 	},
+ 	TFETokenFlag: {
+@@ -825,23 +815,20 @@
+ 	}
+ 	if c.Port == 0 {
+ 		c.Port = DefaultPort
+ 	}
+ 	if c.RedisDB == 0 {
+ 		c.RedisDB = DefaultRedisDB
+ 	}
+ 	if c.RedisPort == 0 {
+ 		c.RedisPort = DefaultRedisPort
+ 	}
+-	if c.TFDistribution == "" {
+-		c.TFDistribution = DefaultTFDistribution
+-	}
+ 	if c.TFDownloadURL == "" {
+ 		c.TFDownloadURL = DefaultTFDownloadURL
+ 	}
+ 	if c.VCSStatusName == "" {
+ 		c.VCSStatusName = DefaultVCSStatusName
+ 	}
+ 	if c.TFEHostname == "" {
+ 		c.TFEHostname = DefaultTFEHostname
+ 	}
+ 	if c.WebUsername == "" {
+@@ -851,24 +838,20 @@
+ 		c.WebPassword = DefaultWebPassword
+ 	}
+ 	if c.AutoDiscoverModeFlag == "" {
+ 		c.AutoDiscoverModeFlag = DefaultAutoDiscoverMode
+ 	}
+ }
+ func (s *ServerCmd) validate(userConfig server.UserConfig) error {
+ 	userConfig.LogLevel = strings.ToLower(userConfig.LogLevel)
+ 	if !isValidLogLevel(userConfig.LogLevel) {
+ 		return fmt.Errorf("invalid log level: must be one of %v", ValidLogLevels)
+-	}
+-	if userConfig.TFDistribution != TFDistributionTerraform && userConfig.TFDistribution != TFDistributionOpenTofu {
+-		return fmt.Errorf("invalid tf distribution: expected one of %s or %s",
+-			TFDistributionTerraform, TFDistributionOpenTofu)
+ 	}
+ 	checkoutStrategy := userConfig.CheckoutStrategy
+ 	if checkoutStrategy != CheckoutStrategyBranch && checkoutStrategy != CheckoutStrategyMerge {
+ 		return fmt.Errorf("invalid checkout strategy: not one of %s or %s",
+ 			CheckoutStrategyBranch, CheckoutStrategyMerge)
+ 	}
+ 	if (userConfig.SSLKeyFile == "") != (userConfig.SSLCertFile == "") {
+ 		return fmt.Errorf("--%s and --%s are both required for ssl", SSLKeyFileFlag, SSLCertFileFlag)
+ 	}
+ 	vcsErr := fmt.Errorf("--%s/--%s or --%s/--%s or --%s/--%s or --%s/--%s or --%s/--%s or --%s/--%s or --%s/--%s must be set", GHUserFlag, GHTokenFlag, GHAppIDFlag, GHAppKeyFileFlag, GHAppIDFlag, GHAppKeyFlag, GiteaUserFlag, GiteaTokenFlag, GitlabUserFlag, GitlabTokenFlag, BitbucketUserFlag, BitbucketTokenFlag, ADUserFlag, ADTokenFlag)
+
+--- a/e2e/github.go
++++ b/e2e/github.go
+@@ -1,19 +1,19 @@
+ package main
+ import (
+ 	"context"
+ 	"fmt"
+ 	"log"
+ 	"os"
+ 	"os/exec"
+ 	"strings"
+-	"github.com/google/go-github/v63/github"
++	"github.com/google/go-github/v59/github"
+ )
+ type GithubClient struct {
+ 	client    *github.Client
+ 	username  string
+ 	ownerName string
+ 	repoName  string
+ 	token     string
+ }
+ func NewGithubClient() *GithubClient {
+ 	githubUsername := os.Getenv("ATLANTIS_GH_USER")
+@@ -48,28 +48,26 @@
+ func (g GithubClient) Clone(cloneDir string) error {
+ 	repoURL := fmt.Sprintf("https://%s:%s@github.com/%s/%s.git", g.username, g.token, g.ownerName, g.repoName)
+ 	cloneCmd := exec.Command("git", "clone", repoURL, cloneDir)
+ 	log.Printf("git cloning into %q", cloneDir)
+ 	if output, err := cloneCmd.CombinedOutput(); err != nil {
+ 		return fmt.Errorf("failed to clone repository: %v: %s", err, string(output))
+ 	}
+ 	return nil
+ }
+ func (g GithubClient) CreateAtlantisWebhook(ctx context.Context, hookURL string) (int64, error) {
+-	contentType := "json"
+-	hookConfig := &github.HookConfig{
+-		ContentType: &contentType,
+-		URL:         &hookURL,
+-	}
+ 	atlantisHook := &github.Hook{
+ 		Events: []string{"issue_comment", "pull_request", "push"},
+-		Config: hookConfig,
++		Config: map[string]interface{}{
++			"url":          hookURL,
++			"content_type": "json",
++		},
+ 		Active: github.Bool(true),
+ 	}
+ 	hook, _, err := g.client.Repositories.CreateHook(ctx, g.ownerName, g.repoName, atlantisHook)
+ 	if err != nil {
+ 		return 0, err
+ 	}
+ 	log.Println(hook.GetURL())
+ 	return hook.GetID(), nil
+ }
+ func (g GithubClient) DeleteAtlantisHook(ctx context.Context, hookID int64) error {
+
+--- a/runatlantis.io/.vitepress/sidebars.ts
++++ b/runatlantis.io/.vitepress/sidebars.ts
+@@ -30,21 +30,20 @@
+         text: "Configuring Atlantis",
+         collapsed: true,
+         items: [
+           { text: "Overview", link: "/docs/configuring-atlantis" },
+           { text: "Server Configuration", link: "/docs/server-configuration" },
+           { text: "Server Side Repo Config", link: "/docs/server-side-repo-config" },
+           { text: "Pre Workflow Hooks", link: "/docs/pre-workflow-hooks" },
+           { text: "Post Workflow Hooks", link: "/docs/post-workflow-hooks" },
+           { text: "Conftest Policy Checking", link: "/docs/policy-checking" },
+           { text: "Custom Workflows", link: "/docs/custom-workflows" },
+-          { text: "Repo and Project Permissions", link: "/docs/repo-and-project-permissions" },
+           { text: "Repo Level atlantis.yaml", link: "/docs/repo-level-atlantis-yaml" },
+           { text: "Upgrading atlantis.yaml", link: "/docs/upgrading-atlantis-yaml" },
+           { text: "Command Requirements", link: "/docs/command-requirements" },
+           { text: "Checkout Strategy", link: "/docs/checkout-strategy" },
+           { text: "Terraform Versions", link: "/docs/terraform-versions" },
+           { text: "Terraform Cloud", link: "/docs/terraform-cloud" },
+           { text: "Using Slack Hooks", link: "/docs/using-slack-hooks" },
+           { text: "Stats", link: "/docs/stats" },
+           { text: "FAQ", link: "/docs/faq" },
+         ]
+
+--- a/scripts/pin_ci_terraform_providers.sh
++++ b/scripts/pin_ci_terraform_providers.sh
+@@ -1,12 +1,12 @@
+ RANDOM_PROVIDER_VERSION="3.6.1"
+-NULL_PROVIDER_VERSION="3.2.3"
++NULL_PROVIDER_VERSION="3.2.2"
+ TEST_REPOS_DIR="server/controllers/events/testdata/test-repos"
+ for file in $(find $TEST_REPOS_DIR -name '*.tf')
+ do
+     basename=$(basename $file)
+     if [[ "$basename" == "versions.tf" ]]
+     then
+         continue
+     fi
+     if [[ "$basename" != "main.tf" ]]
+     then
+
+--- a/server/controllers/events/events_controller.go
++++ b/server/controllers/events/events_controller.go
+@@ -1,18 +1,18 @@
+ package events
+ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+ 	"strings"
+-	"github.com/google/go-github/v63/github"
++	"github.com/google/go-github/v59/github"
+ 	"github.com/mcdafydd/go-azuredevops/azuredevops"
+ 	"github.com/microcosm-cc/bluemonday"
+ 	"github.com/pkg/errors"
+ 	"github.com/runatlantis/atlantis/server/events"
+ 	"github.com/runatlantis/atlantis/server/events/models"
+ 	"github.com/runatlantis/atlantis/server/events/vcs"
+ 	"github.com/runatlantis/atlantis/server/events/vcs/bitbucketcloud"
+ 	"github.com/runatlantis/atlantis/server/events/vcs/bitbucketserver"
+ 	"github.com/runatlantis/atlantis/server/events/vcs/gitea"
+ 	"github.com/runatlantis/atlantis/server/logging"
+
+--- a/server/controllers/events/github_request_validator.go
++++ b/server/controllers/events/github_request_validator.go
+@@ -1,17 +1,17 @@
+ package events
+ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+-	"github.com/google/go-github/v63/github"
++	"github.com/google/go-github/v59/github"
+ )
+ type GithubRequestValidator interface {
+ 	Validate(r *http.Request, secret []byte) ([]byte, error)
+ }
+ type DefaultGithubRequestValidator struct{}
+ func (d *DefaultGithubRequestValidator) Validate(r *http.Request, secret []byte) ([]byte, error) {
+ 	if len(secret) != 0 {
+ 		return d.validateAgainstSecret(r, secret)
+ 	}
+ 	return d.validateWithoutSecret(r)
+
+--- a/server/controllers/github_app_controller.go
++++ b/server/controllers/github_app_controller.go
+@@ -93,21 +93,20 @@
+ 		},
+ 		Permissions: map[string]string{
+ 			"checks":           "write",
+ 			"contents":         "write",
+ 			"issues":           "write",
+ 			"pull_requests":    "write",
+ 			"repository_hooks": "write",
+ 			"statuses":         "write",
+ 			"administration":   "read",
+ 			"members":          "read",
+-			"actions":          "read",
+ 		},
+ 	}
+ 	url := &url.URL{
+ 		Scheme: "https",
+ 		Host:   g.GithubHostname,
+ 		Path:   "/settings/apps/new",
+ 	}
+ 	if g.GithubOrg != "" {
+ 		url.Path = fmt.Sprintf("organizations/%s%s", g.GithubOrg, url.Path)
+ 	}
+
+--- a/server/core/config/raw/global_cfg.go
++++ b/server/core/config/raw/global_cfg.go
+@@ -6,21 +6,20 @@
+ 	validation "github.com/go-ozzo/ozzo-validation"
+ 	"github.com/pkg/errors"
+ 	"github.com/runatlantis/atlantis/server/core/config/valid"
+ 	"github.com/runatlantis/atlantis/server/utils"
+ )
+ type GlobalCfg struct {
+ 	Repos      []Repo              `yaml:"repos" json:"repos"`
+ 	Workflows  map[string]Workflow `yaml:"workflows" json:"workflows"`
+ 	PolicySets PolicySets          `yaml:"policies" json:"policies"`
+ 	Metrics    Metrics             `yaml:"metrics" json:"metrics"`
+-	TeamAuthz  TeamAuthz           `yaml:"team_authz" json:"team_authz"`
+ }
+ type Repo struct {
+ 	ID                        string         `yaml:"id" json:"id"`
+ 	Branch                    string         `yaml:"branch" json:"branch"`
+ 	RepoConfigFile            string         `yaml:"repo_config_file" json:"repo_config_file"`
+ 	PlanRequirements          []string       `yaml:"plan_requirements" json:"plan_requirements"`
+ 	ApplyRequirements         []string       `yaml:"apply_requirements" json:"apply_requirements"`
+ 	ImportRequirements        []string       `yaml:"import_requirements" json:"import_requirements"`
+ 	PreWorkflowHooks          []WorkflowHook `yaml:"pre_workflow_hooks" json:"pre_workflow_hooks"`
+ 	Workflow                  *string        `yaml:"workflow,omitempty" json:"workflow,omitempty"`
+@@ -129,21 +128,20 @@
+ 	var repos []valid.Repo
+ 	for _, r := range g.Repos {
+ 		repos = append(repos, r.ToValid(workflows, globalPlanReqs, globalApplyReqs, globalImportReqs))
+ 	}
+ 	repos = append(defaultCfg.Repos, repos...)
+ 	return valid.GlobalCfg{
+ 		Repos:      repos,
+ 		Workflows:  workflows,
+ 		PolicySets: g.PolicySets.ToValid(),
+ 		Metrics:    g.Metrics.ToValid(),
+-		TeamAuthz:  g.TeamAuthz.ToValid(),
+ 	}
+ }
+ func (r Repo) HasRegexID() bool {
+ 	return strings.HasPrefix(r.ID, "/") && strings.HasSuffix(r.ID, "/")
+ }
+ func (r Repo) HasRegexBranch() bool {
+ 	return strings.HasPrefix(r.Branch, "/") && strings.HasSuffix(r.Branch, "/")
+ }
+ func (r Repo) Validate() error {
+ 	idValid := func(value interface{}) error {
+
+--- a/server/core/config/raw/policies.go
++++ b/server/core/config/raw/policies.go
+@@ -49,21 +49,21 @@
+ 		policyOwners.Teams = o.Teams
+ 	}
+ 	return policyOwners
+ }
+ type PolicySet struct {
+ 	Path               string       `yaml:"path" json:"path"`
+ 	Source             string       `yaml:"source" json:"source"`
+ 	Name               string       `yaml:"name" json:"name"`
+ 	Owners             PolicyOwners `yaml:"owners,omitempty" json:"owners,omitempty"`
+ 	ApproveCount       int          `yaml:"approve_count,omitempty" json:"approve_count,omitempty"`
+-	PreventSelfApprove bool         `yaml:"prevent_self_approve,omitempty" json:"prevent_self_approve,omitempty"`
++	PreventSelfApprove bool         `yaml:"self_approve,omitempty" json:"prevent_self_approve,omitempty"`
+ }
+ func (p PolicySet) Validate() error {
+ 	return validation.ValidateStruct(&p,
+ 		validation.Field(&p.Name, validation.Required.Error("is required")),
+ 		validation.Field(&p.Owners),
+ 		validation.Field(&p.ApproveCount),
+ 		validation.Field(&p.Path, validation.Required.Error("is required")),
+ 		validation.Field(&p.Source, validation.In(valid.LocalPolicySet, valid.GithubPolicySet).Error("only 'local' and 'github' source types are supported")),
+ 	)
+ }
+
+--- a/server/core/config/raw/team_authz.go
++++ b//dev/null
+@@ -1,15 +0,0 @@
+-package raw
+-import "github.com/runatlantis/atlantis/server/core/config/valid"
+-type TeamAuthz struct {
+-	Command string   `yaml:"command" json:"command"`
+-	Args    []string `yaml:"args" json:"args"`
+-}
+-func (t *TeamAuthz) ToValid() valid.TeamAuthz {
+-	var v valid.TeamAuthz
+-	v.Command = t.Command
+-	v.Args = make([]string, 0)
+-	if t.Args != nil {
+-		v.Args = append(v.Args, t.Args...)
+-	}
+-	return v
+-}
+
+--- a/server/core/config/valid/global_cfg.go
++++ b/server/core/config/valid/global_cfg.go
+@@ -26,21 +26,20 @@
+ const AutoDiscoverKey = "autodiscover"
+ const SilencePRCommentsKey = "silence_pr_comments"
+ var AllowedSilencePRComments = []string{"plan", "apply"}
+ const DefaultAtlantisFile = "atlantis.yaml"
+ var NonOverrideableApplyReqs = []string{PoliciesPassedCommandReq}
+ type GlobalCfg struct {
+ 	Repos      []Repo
+ 	Workflows  map[string]Workflow
+ 	PolicySets PolicySets
+ 	Metrics    Metrics
+-	TeamAuthz  TeamAuthz
+ }
+ type Metrics struct {
+ 	Statsd     *Statsd
+ 	Prometheus *Prometheus
+ }
+ type Statsd struct {
+ 	Port string
+ 	Host string
+ }
+ type Prometheus struct {
+@@ -197,23 +196,20 @@
+ 				DeleteSourceBranchOnMerge: &deleteSourceBranchOnMerge,
+ 				RepoLocks:                 &repoLocks,
+ 				PolicyCheck:               &policyCheck,
+ 				CustomPolicyCheck:         &customPolicyCheck,
+ 				AutoDiscover:              &autoDiscover,
+ 				SilencePRComments:         silencePRComments,
+ 			},
+ 		},
+ 		Workflows: map[string]Workflow{
+ 			DefaultWorkflowName: defaultWorkflow,
+-		},
+-		TeamAuthz: TeamAuthz{
+-			Args: make([]string, 0),
+ 		},
+ 	}
+ }
+ func (r Repo) IDMatches(otherID string) bool {
+ 	if r.ID != "" {
+ 		return r.ID == otherID
+ 	}
+ 	return r.IDRegex.MatchString(otherID)
+ }
+ func (r Repo) BranchMatches(other string) bool {
+
+--- a/server/core/config/valid/team_authz.go
++++ b//dev/null
+@@ -1,5 +0,0 @@
+-package valid
+-type TeamAuthz struct {
+-	Command string   `yaml:"command" json:"command"`
+-	Args    []string `yaml:"args" json:"args"`
+-}
+
+--- a/server/core/runtime/external_team_allowlist_runner.go
++++ b//dev/null
+@@ -1,48 +0,0 @@
+-package runtime
+-import (
+-	"context"
+-	"fmt"
+-	"os"
+-	"os/exec"
+-	"strings"
+-	"github.com/runatlantis/atlantis/server/events/models"
+-)
+-type ExternalTeamAllowlistRunner interface {
+-	Run(ctx models.TeamAllowlistCheckerContext, shell, shellArgs, command string) (string, error)
+-}
+-type DefaultExternalTeamAllowlistRunner struct{}
+-func (r DefaultExternalTeamAllowlistRunner) Run(ctx models.TeamAllowlistCheckerContext, shell, shellArgs, command string) (string, error) {
+-	shellArgsSlice := append(strings.Split(shellArgs, " "), command)
+-	cmd := exec.CommandContext(context.TODO(), shell, shellArgsSlice...) // #nosec
+-	baseEnvVars := os.Environ()
+-	customEnvVars := map[string]string{
+-		"BASE_BRANCH_NAME": ctx.Pull.BaseBranch,
+-		"BASE_REPO_NAME":   ctx.BaseRepo.Name,
+-		"BASE_REPO_OWNER":  ctx.BaseRepo.Owner,
+-		"COMMENT_ARGS":     strings.Join(ctx.EscapedCommentArgs, ","),
+-		"HEAD_BRANCH_NAME": ctx.Pull.HeadBranch,
+-		"HEAD_COMMIT":      ctx.Pull.HeadCommit,
+-		"HEAD_REPO_NAME":   ctx.HeadRepo.Name,
+-		"HEAD_REPO_OWNER":  ctx.HeadRepo.Owner,
+-		"PULL_AUTHOR":      ctx.Pull.Author,
+-		"PULL_NUM":         fmt.Sprintf("%d", ctx.Pull.Num),
+-		"PULL_URL":         ctx.Pull.URL,
+-		"USER_NAME":        ctx.User.Username,
+-		"COMMAND_NAME":     ctx.CommandName,
+-		"PROJECT_NAME":     ctx.ProjectName,
+-		"REPO_ROOT":        ctx.RepoDir,
+-		"REPO_REL_PATH":    ctx.RepoRelDir,
+-	}
+-	finalEnvVars := baseEnvVars
+-	for key, val := range customEnvVars {
+-		finalEnvVars = append(finalEnvVars, fmt.Sprintf("%s=%s", key, val))
+-	}
+-	cmd.Env = finalEnvVars
+-	out, err := cmd.CombinedOutput()
+-	if err != nil {
+-		err = fmt.Errorf("%s: running %q: \n%s", err, shell+" "+shellArgs+" "+command, out)
+-		ctx.Log.Debug("error: %s", err)
+-		return string(out), err
+-	}
+-	return strings.TrimSpace(string(out)), nil
+-}
+
+--- a/server/core/runtime/mocks/mock_external_team_allowlist_runner.go
++++ b//dev/null
+@@ -1,112 +0,0 @@
+-package mocks
+-import (
+-	pegomock "github.com/petergtz/pegomock/v4"
+-	models "github.com/runatlantis/atlantis/server/events/models"
+-	"reflect"
+-	"time"
+-)
+-type MockExternalTeamAllowlistRunner struct {
+-	fail func(message string, callerSkip ...int)
+-}
+-func NewMockExternalTeamAllowlistRunner(options ...pegomock.Option) *MockExternalTeamAllowlistRunner {
+-	mock := &MockExternalTeamAllowlistRunner{}
+-	for _, option := range options {
+-		option.Apply(mock)
+-	}
+-	return mock
+-}
+-func (mock *MockExternalTeamAllowlistRunner) SetFailHandler(fh pegomock.FailHandler) { mock.fail = fh }
+-func (mock *MockExternalTeamAllowlistRunner) FailHandler() pegomock.FailHandler      { return mock.fail }
+-func (mock *MockExternalTeamAllowlistRunner) Run(ctx models.TeamAllowlistCheckerContext, shell string, shellArgs string, command string) (string, error) {
+-	if mock == nil {
+-		panic("mock must not be nil. Use myMock := NewMockExternalTeamAllowlistRunner().")
+-	}
+-	_params := []pegomock.Param{ctx, shell, shellArgs, command}
+-	_result := pegomock.GetGenericMockFrom(mock).Invoke("Run", _params, []reflect.Type{reflect.TypeOf((*string)(nil)).Elem(), reflect.TypeOf((*error)(nil)).Elem()})
+-	var _ret0 string
+-	var _ret1 error
+-	if len(_result) != 0 {
+-		if _result[0] != nil {
+-			_ret0 = _result[0].(string)
+-		}
+-		if _result[1] != nil {
+-			_ret1 = _result[1].(error)
+-		}
+-	}
+-	return _ret0, _ret1
+-}
+-func (mock *MockExternalTeamAllowlistRunner) VerifyWasCalledOnce() *VerifierMockExternalTeamAllowlistRunner {
+-	return &VerifierMockExternalTeamAllowlistRunner{
+-		mock:                   mock,
+-		invocationCountMatcher: pegomock.Times(1),
+-	}
+-}
+-func (mock *MockExternalTeamAllowlistRunner) VerifyWasCalled(invocationCountMatcher pegomock.InvocationCountMatcher) *VerifierMockExternalTeamAllowlistRunner {
+-	return &VerifierMockExternalTeamAllowlistRunner{
+-		mock:                   mock,
+-		invocationCountMatcher: invocationCountMatcher,
+-	}
+-}
+-func (mock *MockExternalTeamAllowlistRunner) VerifyWasCalledInOrder(invocationCountMatcher pegomock.InvocationCountMatcher, inOrderContext *pegomock.InOrderContext) *VerifierMockExternalTeamAllowlistRunner {
+-	return &VerifierMockExternalTeamAllowlistRunner{
+-		mock:                   mock,
+-		invocationCountMatcher: invocationCountMatcher,
+-		inOrderContext:         inOrderContext,
+-	}
+-}
+-func (mock *MockExternalTeamAllowlistRunner) VerifyWasCalledEventually(invocationCountMatcher pegomock.InvocationCountMatcher, timeout time.Duration) *VerifierMockExternalTeamAllowlistRunner {
+-	return &VerifierMockExternalTeamAllowlistRunner{
+-		mock:                   mock,
+-		invocationCountMatcher: invocationCountMatcher,
+-		timeout:                timeout,
+-	}
+-}
+-type VerifierMockExternalTeamAllowlistRunner struct {
+-	mock                   *MockExternalTeamAllowlistRunner
+-	invocationCountMatcher pegomock.InvocationCountMatcher
+-	inOrderContext         *pegomock.InOrderContext
+-	timeout                time.Duration
+-}
+-func (verifier *VerifierMockExternalTeamAllowlistRunner) Run(ctx models.TeamAllowlistCheckerContext, shell string, shellArgs string, command string) *MockExternalTeamAllowlistRunner_Run_OngoingVerification {
+-	_params := []pegomock.Param{ctx, shell, shellArgs, command}
+-	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "Run", _params, verifier.timeout)
+-	return &MockExternalTeamAllowlistRunner_Run_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
+-}
+-type MockExternalTeamAllowlistRunner_Run_OngoingVerification struct {
+-	mock              *MockExternalTeamAllowlistRunner
+-	methodInvocations []pegomock.MethodInvocation
+-}
+-func (c *MockExternalTeamAllowlistRunner_Run_OngoingVerification) GetCapturedArguments() (models.TeamAllowlistCheckerContext, string, string, string) {
+-	ctx, shell, shellArgs, command := c.GetAllCapturedArguments()
+-	return ctx[len(ctx)-1], shell[len(shell)-1], shellArgs[len(shellArgs)-1], command[len(command)-1]
+-}
+-func (c *MockExternalTeamAllowlistRunner_Run_OngoingVerification) GetAllCapturedArguments() (_param0 []models.TeamAllowlistCheckerContext, _param1 []string, _param2 []string, _param3 []string) {
+-	_params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
+-	if len(_params) > 0 {
+-		if len(_params) > 0 {
+-			_param0 = make([]models.TeamAllowlistCheckerContext, len(c.methodInvocations))
+-			for u, param := range _params[0] {
+-				_param0[u] = param.(models.TeamAllowlistCheckerContext)
+-			}
+-		}
+-		if len(_params) > 1 {
+-			_param1 = make([]string, len(c.methodInvocations))
+-			for u, param := range _params[1] {
+-				_param1[u] = param.(string)
+-			}
+-		}
+-		if len(_params) > 2 {
+-			_param2 = make([]string, len(c.methodInvocations))
+-			for u, param := range _params[2] {
+-				_param2[u] = param.(string)
+-			}
+-		}
+-		if len(_params) > 3 {
+-			_param3 = make([]string, len(c.methodInvocations))
+-			for u, param := range _params[3] {
+-				_param3[u] = param.(string)
+-			}
+-		}
+-	}
+-	return
+-}
+
+--- a/server/core/runtime/policy/mocks/mock_downloader.go
++++ b//dev/null
+@@ -1,95 +0,0 @@
+-package mocks
+-import (
+-	pegomock "github.com/petergtz/pegomock/v4"
+-	"reflect"
+-	"time"
+-)
+-type MockDownloader struct {
+-	fail func(message string, callerSkip ...int)
+-}
+-func NewMockDownloader(options ...pegomock.Option) *MockDownloader {
+-	mock := &MockDownloader{}
+-	for _, option := range options {
+-		option.Apply(mock)
+-	}
+-	return mock
+-}
+-func (mock *MockDownloader) SetFailHandler(fh pegomock.FailHandler) { mock.fail = fh }
+-func (mock *MockDownloader) FailHandler() pegomock.FailHandler      { return mock.fail }
+-func (mock *MockDownloader) GetAny(dst string, src string) error {
+-	if mock == nil {
+-		panic("mock must not be nil. Use myMock := NewMockDownloader().")
+-	}
+-	_params := []pegomock.Param{dst, src}
+-	_result := pegomock.GetGenericMockFrom(mock).Invoke("GetAny", _params, []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()})
+-	var _ret0 error
+-	if len(_result) != 0 {
+-		if _result[0] != nil {
+-			_ret0 = _result[0].(error)
+-		}
+-	}
+-	return _ret0
+-}
+-func (mock *MockDownloader) VerifyWasCalledOnce() *VerifierMockDownloader {
+-	return &VerifierMockDownloader{
+-		mock:                   mock,
+-		invocationCountMatcher: pegomock.Times(1),
+-	}
+-}
+-func (mock *MockDownloader) VerifyWasCalled(invocationCountMatcher pegomock.InvocationCountMatcher) *VerifierMockDownloader {
+-	return &VerifierMockDownloader{
+-		mock:                   mock,
+-		invocationCountMatcher: invocationCountMatcher,
+-	}
+-}
+-func (mock *MockDownloader) VerifyWasCalledInOrder(invocationCountMatcher pegomock.InvocationCountMatcher, inOrderContext *pegomock.InOrderContext) *VerifierMockDownloader {
+-	return &VerifierMockDownloader{
+-		mock:                   mock,
+-		invocationCountMatcher: invocationCountMatcher,
+-		inOrderContext:         inOrderContext,
+-	}
+-}
+-func (mock *MockDownloader) VerifyWasCalledEventually(invocationCountMatcher pegomock.InvocationCountMatcher, timeout time.Duration) *VerifierMockDownloader {
+-	return &VerifierMockDownloader{
+-		mock:                   mock,
+-		invocationCountMatcher: invocationCountMatcher,
+-		timeout:                timeout,
+-	}
+-}
+-type VerifierMockDownloader struct {
+-	mock                   *MockDownloader
+-	invocationCountMatcher pegomock.InvocationCountMatcher
+-	inOrderContext         *pegomock.InOrderContext
+-	timeout                time.Duration
+-}
+-func (verifier *VerifierMockDownloader) GetAny(dst string, src string) *MockDownloader_GetAny_OngoingVerification {
+-	_params := []pegomock.Param{dst, src}
+-	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "GetAny", _params, verifier.timeout)
+-	return &MockDownloader_GetAny_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
+-}
+-type MockDownloader_GetAny_OngoingVerification struct {
+-	mock              *MockDownloader
+-	methodInvocations []pegomock.MethodInvocation
+-}
+-func (c *MockDownloader_GetAny_OngoingVerification) GetCapturedArguments() (string, string) {
+-	dst, src := c.GetAllCapturedArguments()
+-	return dst[len(dst)-1], src[len(src)-1]
+-}
+-func (c *MockDownloader_GetAny_OngoingVerification) GetAllCapturedArguments() (_param0 []string, _param1 []string) {
+-	_params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
+-	if len(_params) > 0 {
+-		if len(_params) > 0 {
+-			_param0 = make([]string, len(c.methodInvocations))
+-			for u, param := range _params[0] {
+-				_param0[u] = param.(string)
+-			}
+-		}
+-		if len(_params) > 1 {
+-			_param1 = make([]string, len(c.methodInvocations))
+-			for u, param := range _params[1] {
+-				_param1[u] = param.(string)
+-			}
+-		}
+-	}
+-	return
+-}
+
+--- a/server/core/terraform/distribution.go
++++ b//dev/null
+@@ -1,102 +0,0 @@
+-package terraform
+-import (
+-	"context"
+-	"fmt"
+-	"sort"
+-	"github.com/hashicorp/go-version"
+-	"github.com/hashicorp/hc-install/product"
+-	"github.com/hashicorp/hc-install/releases"
+-	"github.com/opentofu/tofudl"
+-)
+-type Distribution interface {
+-	BinName() string
+-	Downloader() Downloader
+-	ResolveConstraint(context.Context, string) (*version.Version, error)
+-}
+-type DistributionOpenTofu struct {
+-	downloader Downloader
+-}
+-func NewDistributionOpenTofu() Distribution {
+-	return &DistributionOpenTofu{
+-		downloader: &TofuDownloader{},
+-	}
+-}
+-func NewDistributionOpenTofuWithDownloader(downloader Downloader) Distribution {
+-	return &DistributionOpenTofu{
+-		downloader: downloader,
+-	}
+-}
+-func (*DistributionOpenTofu) BinName() string {
+-	return "tofu"
+-}
+-func (d *DistributionOpenTofu) Downloader() Downloader {
+-	return d.downloader
+-}
+-func (*DistributionOpenTofu) ResolveConstraint(ctx context.Context, constraintStr string) (*version.Version, error) {
+-	dl, err := tofudl.New()
+-	if err != nil {
+-		return nil, err
+-	}
+-	vc, err := version.NewConstraint(constraintStr)
+-	if err != nil {
+-		return nil, fmt.Errorf("error parsing constraint string: %s", err)
+-	}
+-	allVersions, err := dl.ListVersions(ctx)
+-	if err != nil {
+-		return nil, fmt.Errorf("error listing OpenTofu versions: %s", err)
+-	}
+-	var versions []*version.Version
+-	for _, ver := range allVersions {
+-		v, err := version.NewVersion(string(ver.ID))
+-		if err != nil {
+-			return nil, err
+-		}
+-		if vc.Check(v) {
+-			versions = append(versions, v)
+-		}
+-	}
+-	sort.Sort(version.Collection(versions))
+-	if len(versions) == 0 {
+-		return nil, fmt.Errorf("no OpenTofu versions found for constraints %s", constraintStr)
+-	}
+-	version := versions[len(versions)-1]
+-	return version, nil
+-}
+-type DistributionTerraform struct {
+-	downloader Downloader
+-}
+-func NewDistributionTerraform() Distribution {
+-	return &DistributionTerraform{
+-		downloader: &TerraformDownloader{},
+-	}
+-}
+-func NewDistributionTerraformWithDownloader(downloader Downloader) Distribution {
+-	return &DistributionTerraform{
+-		downloader: downloader,
+-	}
+-}
+-func (*DistributionTerraform) BinName() string {
+-	return "terraform"
+-}
+-func (d *DistributionTerraform) Downloader() Downloader {
+-	return d.downloader
+-}
+-func (*DistributionTerraform) ResolveConstraint(ctx context.Context, constraintStr string) (*version.Version, error) {
+-	vc, err := version.NewConstraint(constraintStr)
+-	if err != nil {
+-		return nil, fmt.Errorf("error parsing constraint string: %s", err)
+-	}
+-	constrainedVersions := &releases.Versions{
+-		Product:     product.Terraform,
+-		Constraints: vc,
+-	}
+-	installCandidates, err := constrainedVersions.List(ctx)
+-	if err != nil {
+-		return nil, fmt.Errorf("error listing available versions: %s", err)
+-	}
+-	if len(installCandidates) == 0 {
+-		return nil, fmt.Errorf("no Terraform versions found for constraints %s", constraintStr)
+-	}
+-	versionDownloader := installCandidates[len(installCandidates)-1]
+-	return versionDownloader.(*releases.ExactVersion).Version, nil
+-}
+
+--- a/server/core/terraform/downloader.go
++++ b//dev/null
+@@ -1,51 +0,0 @@
+-package terraform
+-import (
+-	"context"
+-	"os"
+-	"path/filepath"
+-	"github.com/hashicorp/go-version"
+-	install "github.com/hashicorp/hc-install"
+-	"github.com/hashicorp/hc-install/product"
+-	"github.com/hashicorp/hc-install/releases"
+-	"github.com/hashicorp/hc-install/src"
+-	"github.com/opentofu/tofudl"
+-)
+-type Downloader interface {
+-	Install(ctx context.Context, dir string, downloadURL string, v *version.Version) (string, error)
+-}
+-type TofuDownloader struct{}
+-func (d *TofuDownloader) Install(ctx context.Context, dir string, _downloadURL string, v *version.Version) (string, error) {
+-	dl, err := tofudl.New()
+-	if err != nil {
+-		return "", err
+-	}
+-	binary, err := dl.Download(ctx, tofudl.DownloadOptVersion(tofudl.Version(v.String())))
+-	if err != nil {
+-		return "", err
+-	}
+-	file := filepath.Join(dir, "tofu"+v.String())
+-	if err := os.WriteFile(file, binary, 0755); /* #nosec G306 */ err != nil {
+-		return "", err
+-	}
+-	return file, nil
+-}
+-type TerraformDownloader struct{}
+-func (d *TerraformDownloader) Install(ctx context.Context, dir string, downloadURL string, v *version.Version) (string, error) {
+-	installer := install.NewInstaller()
+-	execPath, err := installer.Install(ctx, []src.Installable{
+-		&releases.ExactVersion{
+-			Product:    product.Terraform,
+-			Version:    v,
+-			InstallDir: dir,
+-			ApiBaseURL: downloadURL,
+-		},
+-	})
+-	if err != nil {
+-		return "", err
+-	}
+-	newPath := filepath.Join(dir, "terraform"+v.String())
+-	if err := os.Rename(execPath, newPath); err != nil {
+-		return "", err
+-	}
+-	return newPath, nil
+-}
+
+--- a/server/core/terraform/mocks/mock_downloader.go
++++ b/server/core/terraform/mocks/mock_downloader.go
+@@ -1,47 +1,60 @@
+ package mocks
+ import (
+-	context "context"
+ 	go_version "github.com/hashicorp/go-version"
+ 	pegomock "github.com/petergtz/pegomock/v4"
+ 	"reflect"
+ 	"time"
+ )
+ type MockDownloader struct {
+ 	fail func(message string, callerSkip ...int)
+ }
+ func NewMockDownloader(options ...pegomock.Option) *MockDownloader {
+ 	mock := &MockDownloader{}
+ 	for _, option := range options {
+ 		option.Apply(mock)
+ 	}
+ 	return mock
+ }
+ func (mock *MockDownloader) SetFailHandler(fh pegomock.FailHandler) { mock.fail = fh }
+ func (mock *MockDownloader) FailHandler() pegomock.FailHandler      { return mock.fail }
+-func (mock *MockDownloader) Install(ctx context.Context, dir string, downloadURL string, v *go_version.Version) (string, error) {
++func (mock *MockDownloader) GetAny(dst string, src string) error {
+ 	if mock == nil {
+ 		panic("mock must not be nil. Use myMock := NewMockDownloader().")
+ 	}
+-	_params := []pegomock.Param{ctx, dir, downloadURL, v}
+-	_result := pegomock.GetGenericMockFrom(mock).Invoke("Install", _params, []reflect.Type{reflect.TypeOf((*string)(nil)).Elem(), reflect.TypeOf((*error)(nil)).Elem()})
+-	var _ret0 string
+-	var _ret1 error
+-	if len(_result) != 0 {
+-		if _result[0] != nil {
+-			_ret0 = _result[0].(string)
+-		}
+-		if _result[1] != nil {
+-			_ret1 = _result[1].(error)
++	params := []pegomock.Param{dst, src}
++	result := pegomock.GetGenericMockFrom(mock).Invoke("GetAny", params, []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()})
++	var ret0 error
++	if len(result) != 0 {
++		if result[0] != nil {
++			ret0 = result[0].(error)
+ 		}
+ 	}
+-	return _ret0, _ret1
++	return ret0
++}
++func (mock *MockDownloader) Install(dir string, downloadURL string, v *go_version.Version) (string, error) {
++	if mock == nil {
++		panic("mock must not be nil. Use myMock := NewMockDownloader().")
++	}
++	params := []pegomock.Param{dir, downloadURL, v}
++	result := pegomock.GetGenericMockFrom(mock).Invoke("Install", params, []reflect.Type{reflect.TypeOf((*string)(nil)).Elem(), reflect.TypeOf((*error)(nil)).Elem()})
++	var ret0 string
++	var ret1 error
++	if len(result) != 0 {
++		if result[0] != nil {
++			ret0 = result[0].(string)
++		}
++		if result[1] != nil {
++			ret1 = result[1].(error)
++		}
++	}
++	return ret0, ret1
+ }
+ func (mock *MockDownloader) VerifyWasCalledOnce() *VerifierMockDownloader {
+ 	return &VerifierMockDownloader{
+ 		mock:                   mock,
+ 		invocationCountMatcher: pegomock.Times(1),
+ 	}
+ }
+ func (mock *MockDownloader) VerifyWasCalled(invocationCountMatcher pegomock.InvocationCountMatcher) *VerifierMockDownloader {
+ 	return &VerifierMockDownloader{
+ 		mock:                   mock,
+@@ -61,53 +74,68 @@
+ 		invocationCountMatcher: invocationCountMatcher,
+ 		timeout:                timeout,
+ 	}
+ }
+ type VerifierMockDownloader struct {
+ 	mock                   *MockDownloader
+ 	invocationCountMatcher pegomock.InvocationCountMatcher
+ 	inOrderContext         *pegomock.InOrderContext
+ 	timeout                time.Duration
+ }
+-func (verifier *VerifierMockDownloader) Install(ctx context.Context, dir string, downloadURL string, v *go_version.Version) *MockDownloader_Install_OngoingVerification {
+-	_params := []pegomock.Param{ctx, dir, downloadURL, v}
+-	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "Install", _params, verifier.timeout)
++func (verifier *VerifierMockDownloader) GetAny(dst string, src string) *MockDownloader_GetAny_OngoingVerification {
++	params := []pegomock.Param{dst, src}
++	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "GetAny", params, verifier.timeout)
++	return &MockDownloader_GetAny_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
++}
++type MockDownloader_GetAny_OngoingVerification struct {
++	mock              *MockDownloader
++	methodInvocations []pegomock.MethodInvocation
++}
++func (c *MockDownloader_GetAny_OngoingVerification) GetCapturedArguments() (string, string) {
++	dst, src := c.GetAllCapturedArguments()
++	return dst[len(dst)-1], src[len(src)-1]
++}
++func (c *MockDownloader_GetAny_OngoingVerification) GetAllCapturedArguments() (_param0 []string, _param1 []string) {
++	params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
++	if len(params) > 0 {
++		_param0 = make([]string, len(c.methodInvocations))
++		for u, param := range params[0] {
++			_param0[u] = param.(string)
++		}
++		_param1 = make([]string, len(c.methodInvocations))
++		for u, param := range params[1] {
++			_param1[u] = param.(string)
++		}
++	}
++	return
++}
++func (verifier *VerifierMockDownloader) Install(dir string, downloadURL string, v *go_version.Version) *MockDownloader_Install_OngoingVerification {
++	params := []pegomock.Param{dir, downloadURL, v}
++	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "Install", params, verifier.timeout)
+ 	return &MockDownloader_Install_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
+ }
+ type MockDownloader_Install_OngoingVerification struct {
+ 	mock              *MockDownloader
+ 	methodInvocations []pegomock.MethodInvocation
+ }
+-func (c *MockDownloader_Install_OngoingVerification) GetCapturedArguments() (context.Context, string, string, *go_version.Version) {
+-	ctx, dir, downloadURL, v := c.GetAllCapturedArguments()
+-	return ctx[len(ctx)-1], dir[len(dir)-1], downloadURL[len(downloadURL)-1], v[len(v)-1]
++func (c *MockDownloader_Install_OngoingVerification) GetCapturedArguments() (string, string, *go_version.Version) {
++	dir, downloadURL, v := c.GetAllCapturedArguments()
++	return dir[len(dir)-1], downloadURL[len(downloadURL)-1], v[len(v)-1]
+ }
+-func (c *MockDownloader_Install_OngoingVerification) GetAllCapturedArguments() (_param0 []context.Context, _param1 []string, _param2 []string, _param3 []*go_version.Version) {
+-	_params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
+-	if len(_params) > 0 {
+-		if len(_params) > 0 {
+-			_param0 = make([]context.Context, len(c.methodInvocations))
+-			for u, param := range _params[0] {
+-				_param0[u] = param.(context.Context)
+-			}
++func (c *MockDownloader_Install_OngoingVerification) GetAllCapturedArguments() (_param0 []string, _param1 []string, _param2 []*go_version.Version) {
++	params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
++	if len(params) > 0 {
++		_param0 = make([]string, len(c.methodInvocations))
++		for u, param := range params[0] {
++			_param0[u] = param.(string)
+ 		}
+-		if len(_params) > 1 {
+-			_param1 = make([]string, len(c.methodInvocations))
+-			for u, param := range _params[1] {
+-				_param1[u] = param.(string)
+-			}
++		_param1 = make([]string, len(c.methodInvocations))
++		for u, param := range params[1] {
++			_param1[u] = param.(string)
+ 		}
+-		if len(_params) > 2 {
+-			_param2 = make([]string, len(c.methodInvocations))
+-			for u, param := range _params[2] {
+-				_param2[u] = param.(string)
+-			}
+-		}
+-		if len(_params) > 3 {
+-			_param3 = make([]*go_version.Version, len(c.methodInvocations))
+-			for u, param := range _params[3] {
+-				_param3[u] = param.(*go_version.Version)
+-			}
++		_param2 = make([]*go_version.Version, len(c.methodInvocations))
++		for u, param := range params[2] {
++			_param2[u] = param.(*go_version.Version)
+ 		}
+ 	}
+ 	return
+ }
+
+--- a/server/core/terraform/mocks/mock_terraform_client.go
++++ b/server/core/terraform/mocks/mock_terraform_client.go
+@@ -16,61 +16,61 @@
+ 		option.Apply(mock)
+ 	}
+ 	return mock
+ }
+ func (mock *MockClient) SetFailHandler(fh pegomock.FailHandler) { mock.fail = fh }
+ func (mock *MockClient) FailHandler() pegomock.FailHandler      { return mock.fail }
+ func (mock *MockClient) DetectVersion(log logging.SimpleLogging, projectDirectory string) *go_version.Version {
+ 	if mock == nil {
+ 		panic("mock must not be nil. Use myMock := NewMockClient().")
+ 	}
+-	_params := []pegomock.Param{log, projectDirectory}
+-	_result := pegomock.GetGenericMockFrom(mock).Invoke("DetectVersion", _params, []reflect.Type{reflect.TypeOf((**go_version.Version)(nil)).Elem()})
+-	var _ret0 *go_version.Version
+-	if len(_result) != 0 {
+-		if _result[0] != nil {
+-			_ret0 = _result[0].(*go_version.Version)
++	params := []pegomock.Param{log, projectDirectory}
++	result := pegomock.GetGenericMockFrom(mock).Invoke("DetectVersion", params, []reflect.Type{reflect.TypeOf((**go_version.Version)(nil)).Elem()})
++	var ret0 *go_version.Version
++	if len(result) != 0 {
++		if result[0] != nil {
++			ret0 = result[0].(*go_version.Version)
+ 		}
+ 	}
+-	return _ret0
++	return ret0
+ }
+ func (mock *MockClient) EnsureVersion(log logging.SimpleLogging, v *go_version.Version) error {
+ 	if mock == nil {
+ 		panic("mock must not be nil. Use myMock := NewMockClient().")
+ 	}
+-	_params := []pegomock.Param{log, v}
+-	_result := pegomock.GetGenericMockFrom(mock).Invoke("EnsureVersion", _params, []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()})
+-	var _ret0 error
+-	if len(_result) != 0 {
+-		if _result[0] != nil {
+-			_ret0 = _result[0].(error)
++	params := []pegomock.Param{log, v}
++	result := pegomock.GetGenericMockFrom(mock).Invoke("EnsureVersion", params, []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()})
++	var ret0 error
++	if len(result) != 0 {
++		if result[0] != nil {
++			ret0 = result[0].(error)
+ 		}
+ 	}
+-	return _ret0
++	return ret0
+ }
+ func (mock *MockClient) RunCommandWithVersion(ctx command.ProjectContext, path string, args []string, envs map[string]string, v *go_version.Version, workspace string) (string, error) {
+ 	if mock == nil {
+ 		panic("mock must not be nil. Use myMock := NewMockClient().")
+ 	}
+-	_params := []pegomock.Param{ctx, path, args, envs, v, workspace}
+-	_result := pegomock.GetGenericMockFrom(mock).Invoke("RunCommandWithVersion", _params, []reflect.Type{reflect.TypeOf((*string)(nil)).Elem(), reflect.TypeOf((*error)(nil)).Elem()})
+-	var _ret0 string
+-	var _ret1 error
+-	if len(_result) != 0 {
+-		if _result[0] != nil {
+-			_ret0 = _result[0].(string)
++	params := []pegomock.Param{ctx, path, args, envs, v, workspace}
++	result := pegomock.GetGenericMockFrom(mock).Invoke("RunCommandWithVersion", params, []reflect.Type{reflect.TypeOf((*string)(nil)).Elem(), reflect.TypeOf((*error)(nil)).Elem()})
++	var ret0 string
++	var ret1 error
++	if len(result) != 0 {
++		if result[0] != nil {
++			ret0 = result[0].(string)
+ 		}
+-		if _result[1] != nil {
+-			_ret1 = _result[1].(error)
++		if result[1] != nil {
++			ret1 = result[1].(error)
+ 		}
+ 	}
+-	return _ret0, _ret1
++	return ret0, ret1
+ }
+ func (mock *MockClient) VerifyWasCalledOnce() *VerifierMockClient {
+ 	return &VerifierMockClient{
+ 		mock:                   mock,
+ 		invocationCountMatcher: pegomock.Times(1),
+ 	}
+ }
+ func (mock *MockClient) VerifyWasCalled(invocationCountMatcher pegomock.InvocationCountMatcher) *VerifierMockClient {
+ 	return &VerifierMockClient{
+ 		mock:                   mock,
+@@ -91,126 +91,106 @@
+ 		timeout:                timeout,
+ 	}
+ }
+ type VerifierMockClient struct {
+ 	mock                   *MockClient
+ 	invocationCountMatcher pegomock.InvocationCountMatcher
+ 	inOrderContext         *pegomock.InOrderContext
+ 	timeout                time.Duration
+ }
+ func (verifier *VerifierMockClient) DetectVersion(log logging.SimpleLogging, projectDirectory string) *MockClient_DetectVersion_OngoingVerification {
+-	_params := []pegomock.Param{log, projectDirectory}
+-	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "DetectVersion", _params, verifier.timeout)
++	params := []pegomock.Param{log, projectDirectory}
++	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "DetectVersion", params, verifier.timeout)
+ 	return &MockClient_DetectVersion_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
+ }
+ type MockClient_DetectVersion_OngoingVerification struct {
+ 	mock              *MockClient
+ 	methodInvocations []pegomock.MethodInvocation
+ }
+ func (c *MockClient_DetectVersion_OngoingVerification) GetCapturedArguments() (logging.SimpleLogging, string) {
+ 	log, projectDirectory := c.GetAllCapturedArguments()
+ 	return log[len(log)-1], projectDirectory[len(projectDirectory)-1]
+ }
+ func (c *MockClient_DetectVersion_OngoingVerification) GetAllCapturedArguments() (_param0 []logging.SimpleLogging, _param1 []string) {
+-	_params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
+-	if len(_params) > 0 {
+-		if len(_params) > 0 {
+-			_param0 = make([]logging.SimpleLogging, len(c.methodInvocations))
+-			for u, param := range _params[0] {
+-				_param0[u] = param.(logging.SimpleLogging)
+-			}
++	params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
++	if len(params) > 0 {
++		_param0 = make([]logging.SimpleLogging, len(c.methodInvocations))
++		for u, param := range params[0] {
++			_param0[u] = param.(logging.SimpleLogging)
+ 		}
+-		if len(_params) > 1 {
+-			_param1 = make([]string, len(c.methodInvocations))
+-			for u, param := range _params[1] {
+-				_param1[u] = param.(string)
+-			}
++		_param1 = make([]string, len(c.methodInvocations))
++		for u, param := range params[1] {
++			_param1[u] = param.(string)
+ 		}
+ 	}
+ 	return
+ }
+ func (verifier *VerifierMockClient) EnsureVersion(log logging.SimpleLogging, v *go_version.Version) *MockClient_EnsureVersion_OngoingVerification {
+-	_params := []pegomock.Param{log, v}
+-	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "EnsureVersion", _params, verifier.timeout)
++	params := []pegomock.Param{log, v}
++	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "EnsureVersion", params, verifier.timeout)
+ 	return &MockClient_EnsureVersion_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
+ }
+ type MockClient_EnsureVersion_OngoingVerification struct {
+ 	mock              *MockClient
+ 	methodInvocations []pegomock.MethodInvocation
+ }
+ func (c *MockClient_EnsureVersion_OngoingVerification) GetCapturedArguments() (logging.SimpleLogging, *go_version.Version) {
+ 	log, v := c.GetAllCapturedArguments()
+ 	return log[len(log)-1], v[len(v)-1]
+ }
+ func (c *MockClient_EnsureVersion_OngoingVerification) GetAllCapturedArguments() (_param0 []logging.SimpleLogging, _param1 []*go_version.Version) {
+-	_params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
+-	if len(_params) > 0 {
+-		if len(_params) > 0 {
+-			_param0 = make([]logging.SimpleLogging, len(c.methodInvocations))
+-			for u, param := range _params[0] {
+-				_param0[u] = param.(logging.SimpleLogging)
+-			}
++	params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
++	if len(params) > 0 {
++		_param0 = make([]logging.SimpleLogging, len(c.methodInvocations))
++		for u, param := range params[0] {
++			_param0[u] = param.(logging.SimpleLogging)
+ 		}
+-		if len(_params) > 1 {
+-			_param1 = make([]*go_version.Version, len(c.methodInvocations))
+-			for u, param := range _params[1] {
+-				_param1[u] = param.(*go_version.Version)
+-			}
++		_param1 = make([]*go_version.Version, len(c.methodInvocations))
++		for u, param := range params[1] {
++			_param1[u] = param.(*go_version.Version)
+ 		}
+ 	}
+ 	return
+ }
+ func (verifier *VerifierMockClient) RunCommandWithVersion(ctx command.ProjectContext, path string, args []string, envs map[string]string, v *go_version.Version, workspace string) *MockClient_RunCommandWithVersion_OngoingVerification {
+-	_params := []pegomock.Param{ctx, path, args, envs, v, workspace}
+-	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "RunCommandWithVersion", _params, verifier.timeout)
++	params := []pegomock.Param{ctx, path, args, envs, v, workspace}
++	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "RunCommandWithVersion", params, verifier.timeout)
+ 	return &MockClient_RunCommandWithVersion_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
+ }
+ type MockClient_RunCommandWithVersion_OngoingVerification struct {
+ 	mock              *MockClient
+ 	methodInvocations []pegomock.MethodInvocation
+ }
+ func (c *MockClient_RunCommandWithVersion_OngoingVerification) GetCapturedArguments() (command.ProjectContext, string, []string, map[string]string, *go_version.Version, string) {
+ 	ctx, path, args, envs, v, workspace := c.GetAllCapturedArguments()
+ 	return ctx[len(ctx)-1], path[len(path)-1], args[len(args)-1], envs[len(envs)-1], v[len(v)-1], workspace[len(workspace)-1]
+ }
+ func (c *MockClient_RunCommandWithVersion_OngoingVerification) GetAllCapturedArguments() (_param0 []command.ProjectContext, _param1 []string, _param2 [][]string, _param3 []map[string]string, _param4 []*go_version.Version, _param5 []string) {
+-	_params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
+-	if len(_params) > 0 {
+-		if len(_params) > 0 {
+-			_param0 = make([]command.ProjectContext, len(c.methodInvocations))
+-			for u, param := range _params[0] {
+-				_param0[u] = param.(command.ProjectContext)
+-			}
++	params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
++	if len(params) > 0 {
++		_param0 = make([]command.ProjectContext, len(c.methodInvocations))
++		for u, param := range params[0] {
++			_param0[u] = param.(command.ProjectContext)
+ 		}
+-		if len(_params) > 1 {
+-			_param1 = make([]string, len(c.methodInvocations))
+-			for u, param := range _params[1] {
+-				_param1[u] = param.(string)
+-			}
++		_param1 = make([]string, len(c.methodInvocations))
++		for u, param := range params[1] {
++			_param1[u] = param.(string)
+ 		}
+-		if len(_params) > 2 {
+-			_param2 = make([][]string, len(c.methodInvocations))
+-			for u, param := range _params[2] {
+-				_param2[u] = param.([]string)
+-			}
++		_param2 = make([][]string, len(c.methodInvocations))
++		for u, param := range params[2] {
++			_param2[u] = param.([]string)
+ 		}
+-		if len(_params) > 3 {
+-			_param3 = make([]map[string]string, len(c.methodInvocations))
+-			for u, param := range _params[3] {
+-				_param3[u] = param.(map[string]string)
+-			}
++		_param3 = make([]map[string]string, len(c.methodInvocations))
++		for u, param := range params[3] {
++			_param3[u] = param.(map[string]string)
+ 		}
+-		if len(_params) > 4 {
+-			_param4 = make([]*go_version.Version, len(c.methodInvocations))
+-			for u, param := range _params[4] {
+-				_param4[u] = param.(*go_version.Version)
+-			}
++		_param4 = make([]*go_version.Version, len(c.methodInvocations))
++		for u, param := range params[4] {
++			_param4[u] = param.(*go_version.Version)
+ 		}
+-		if len(_params) > 5 {
+-			_param5 = make([]string, len(c.methodInvocations))
+-			for u, param := range _params[5] {
+-				_param5[u] = param.(string)
+-			}
++		_param5 = make([]string, len(c.methodInvocations))
++		for u, param := range params[5] {
++			_param5[u] = param.(string)
+ 		}
+ 	}
+ 	return
+ }
+
+--- a/server/core/terraform/terraform_client.go
++++ b/server/core/terraform/terraform_client.go
+@@ -2,179 +2,188 @@
+ import (
+ 	"context"
+ 	"fmt"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+ 	"regexp"
+ 	"strings"
+ 	"sync"
+ 	"time"
++	"github.com/hashicorp/go-getter/v2"
+ 	"github.com/hashicorp/go-version"
++	install "github.com/hashicorp/hc-install"
++	"github.com/hashicorp/hc-install/product"
++	"github.com/hashicorp/hc-install/releases"
++	"github.com/hashicorp/hc-install/src"
+ 	"github.com/hashicorp/terraform-config-inspect/tfconfig"
+ 	"github.com/mitchellh/go-homedir"
+ 	"github.com/pkg/errors"
+ 	"github.com/runatlantis/atlantis/server/core/runtime/models"
+ 	"github.com/runatlantis/atlantis/server/events/command"
+ 	"github.com/runatlantis/atlantis/server/events/terraform/ansi"
+ 	"github.com/runatlantis/atlantis/server/jobs"
+ 	"github.com/runatlantis/atlantis/server/logging"
+ )
+ var LogStreamingValidCmds = [...]string{"init", "plan", "apply"}
+ type Client interface {
+ 	RunCommandWithVersion(ctx command.ProjectContext, path string, args []string, envs map[string]string, v *version.Version, workspace string) (string, error)
+ 	EnsureVersion(log logging.SimpleLogging, v *version.Version) error
+ 	DetectVersion(log logging.SimpleLogging, projectDirectory string) *version.Version
+ }
+ type DefaultClient struct {
+-	distribution Distribution
+ 	defaultVersion *version.Version
+ 	terraformPluginCacheDir string
+ 	binDir                  string
+ 	overrideTF string
++	downloader      Downloader
+ 	downloadBaseURL string
+ 	downloadAllowed bool
+ 	versions map[string]string
+ 	versionsLock *sync.Mutex
+ 	usePluginCache bool
+ 	projectCmdOutputHandler jobs.ProjectCommandOutputHandler
+ }
+-var versionRegex = regexp.MustCompile("(?:Terraform|OpenTofu) v(.*?)(\\s.*)?\n")
++type Downloader interface {
++	Install(dir string, downloadURL string, v *version.Version) (string, error)
++	GetAny(dst, src string) error
++}
++var versionRegex = regexp.MustCompile("Terraform v(.*?)(\\s.*)?\n")
+ func NewClientWithDefaultVersion(
+ 	log logging.SimpleLogging,
+-	distribution Distribution,
+ 	binDir string,
+ 	cacheDir string,
+ 	tfeToken string,
+ 	tfeHostname string,
+ 	defaultVersionStr string,
+ 	defaultVersionFlagName string,
+ 	tfDownloadURL string,
++	tfDownloader Downloader,
+ 	tfDownloadAllowed bool,
+ 	usePluginCache bool,
+ 	fetchAsync bool,
+ 	projectCmdOutputHandler jobs.ProjectCommandOutputHandler,
+ ) (*DefaultClient, error) {
+ 	var finalDefaultVersion *version.Version
+ 	var localVersion *version.Version
+ 	versions := make(map[string]string)
+ 	var versionsLock sync.Mutex
+-	localPath, err := exec.LookPath(distribution.BinName())
++	localPath, err := exec.LookPath("terraform")
+ 	if err != nil && defaultVersionStr == "" {
+-		return nil, fmt.Errorf("%s not found in $PATH. Set --%s or download terraform from https://developer.hashicorp.com/terraform/downloads", distribution.BinName(), defaultVersionFlagName)
++		return nil, fmt.Errorf("terraform not found in $PATH. Set --%s or download terraform from https://developer.hashicorp.com/terraform/downloads", defaultVersionFlagName)
+ 	}
+ 	if err == nil {
+ 		localVersion, err = getVersion(localPath)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		versions[localVersion.String()] = localPath
+ 		if defaultVersionStr == "" {
+ 			finalDefaultVersion = localVersion
+ 		}
+ 	}
+ 	if defaultVersionStr != "" {
+ 		defaultVersion, err := version.NewVersion(defaultVersionStr)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		finalDefaultVersion = defaultVersion
+ 		ensureVersionFunc := func() {
+ 			versionsLock.Lock()
+-			_, err := ensureVersion(log, distribution, versions, defaultVersion, binDir, tfDownloadURL, tfDownloadAllowed)
++			_, err := ensureVersion(log, tfDownloader, versions, defaultVersion, binDir, tfDownloadURL, tfDownloadAllowed)
+ 			versionsLock.Unlock()
+ 			if err != nil {
+-				log.Err("could not download %s %s: %s", distribution.BinName(), defaultVersion.String(), err)
++				log.Err("could not download terraform %s: %s", defaultVersion.String(), err)
+ 			}
+ 		}
+ 		if fetchAsync {
+ 			go ensureVersionFunc()
+ 		} else {
+ 			ensureVersionFunc()
+ 		}
+ 	}
+ 	if tfeToken != "" {
+ 		home, err := homedir.Dir()
+ 		if err != nil {
+ 			return nil, errors.Wrap(err, "getting home dir to write ~/.terraformrc file")
+ 		}
+ 		if err := generateRCFile(tfeToken, tfeHostname, home); err != nil {
+ 			return nil, err
+ 		}
+ 	}
+ 	return &DefaultClient{
+-		distribution:            distribution,
+ 		defaultVersion:          finalDefaultVersion,
+ 		terraformPluginCacheDir: cacheDir,
+ 		binDir:                  binDir,
++		downloader:              tfDownloader,
+ 		downloadBaseURL:         tfDownloadURL,
+ 		downloadAllowed:         tfDownloadAllowed,
+ 		versionsLock:            &versionsLock,
+ 		versions:                versions,
+ 		usePluginCache:          usePluginCache,
+ 		projectCmdOutputHandler: projectCmdOutputHandler,
+ 	}, nil
+ }
+ func NewTestClient(
+ 	log logging.SimpleLogging,
+-	distribution Distribution,
+ 	binDir string,
+ 	cacheDir string,
+ 	tfeToken string,
+ 	tfeHostname string,
+ 	defaultVersionStr string,
+ 	defaultVersionFlagName string,
+ 	tfDownloadURL string,
++	tfDownloader Downloader,
+ 	tfDownloadAllowed bool,
+ 	usePluginCache bool,
+ 	projectCmdOutputHandler jobs.ProjectCommandOutputHandler,
+ ) (*DefaultClient, error) {
+ 	return NewClientWithDefaultVersion(
+ 		log,
+-		distribution,
+ 		binDir,
+ 		cacheDir,
+ 		tfeToken,
+ 		tfeHostname,
+ 		defaultVersionStr,
+ 		defaultVersionFlagName,
+ 		tfDownloadURL,
++		tfDownloader,
+ 		tfDownloadAllowed,
+ 		usePluginCache,
+ 		false,
+ 		projectCmdOutputHandler,
+ 	)
+ }
+ func NewClient(
+ 	log logging.SimpleLogging,
+-	distribution Distribution,
+ 	binDir string,
+ 	cacheDir string,
+ 	tfeToken string,
+ 	tfeHostname string,
+ 	defaultVersionStr string,
+ 	defaultVersionFlagName string,
+ 	tfDownloadURL string,
++	tfDownloader Downloader,
+ 	tfDownloadAllowed bool,
+ 	usePluginCache bool,
+ 	projectCmdOutputHandler jobs.ProjectCommandOutputHandler,
+ ) (*DefaultClient, error) {
+ 	return NewClientWithDefaultVersion(
+ 		log,
+-		distribution,
+ 		binDir,
+ 		cacheDir,
+ 		tfeToken,
+ 		tfeHostname,
+ 		defaultVersionStr,
+ 		defaultVersionFlagName,
+ 		tfDownloadURL,
++		tfDownloader,
+ 		tfDownloadAllowed,
+ 		usePluginCache,
+ 		true,
+ 		projectCmdOutputHandler,
+ 	)
+ }
+ func (c *DefaultClient) DefaultVersion() *version.Version {
+ 	return c.defaultVersion
+ }
+ func (c *DefaultClient) TerraformBinDir() string {
+@@ -209,34 +218,50 @@
+ 			log.Debug("did not specify exact version in terraform configuration, found %q", requiredVersionSetting)
+ 			return nil
+ 		}
+ 		version, err := version.NewVersion(matched[0])
+ 		if err != nil {
+ 			log.Err("error parsing version string: %s", err)
+ 			return nil
+ 		}
+ 		return version
+ 	}
+-	downloadVersion, err := c.distribution.ResolveConstraint(context.Background(), requiredVersionSetting)
+-	if err != nil {
+-		log.Err("%s", err)
+-		return nil
+-	}
++	constraintStr := requiredVersionSetting
++	vc, err := version.NewConstraint(constraintStr)
++	if err != nil {
++		log.Err("Error parsing constraint string: %s", err)
++		return nil
++	}
++	constrainedVersions := &releases.Versions{
++		Product:     product.Terraform,
++		Constraints: vc,
++	}
++	installCandidates, err := constrainedVersions.List(context.Background())
++	if err != nil {
++		log.Err("error listing available versions: %s", err)
++		return nil
++	}
++	if len(installCandidates) == 0 {
++		log.Err("no Terraform versions found for constraints %s", constraintStr)
++		return nil
++	}
++	versionDownloader := installCandidates[len(installCandidates)-1]
++	downloadVersion := versionDownloader.(*releases.ExactVersion).Version
+ 	return downloadVersion
+ }
+ func (c *DefaultClient) EnsureVersion(log logging.SimpleLogging, v *version.Version) error {
+ 	if v == nil {
+ 		v = c.defaultVersion
+ 	}
+ 	var err error
+ 	c.versionsLock.Lock()
+-	_, err = ensureVersion(log, c.distribution, c.versions, v, c.binDir, c.downloadBaseURL, c.downloadAllowed)
++	_, err = ensureVersion(log, c.downloader, c.versions, v, c.binDir, c.downloadBaseURL, c.downloadAllowed)
+ 	c.versionsLock.Unlock()
+ 	if err != nil {
+ 		return err
+ 	}
+ 	return nil
+ }
+ func (c *DefaultClient) RunCommandWithVersion(ctx command.ProjectContext, path string, args []string, customEnvVars map[string]string, v *version.Version, workspace string) (string, error) {
+ 	if isAsyncEligibleCommand(args[0]) {
+ 		_, outCh := c.RunCommandAsync(ctx, path, args, customEnvVars, v, workspace)
+ 		var lines []string
+@@ -286,21 +311,21 @@
+ func (c *DefaultClient) prepCmd(log logging.SimpleLogging, v *version.Version, workspace string, path string, args []string) (string, []string, error) {
+ 	if v == nil {
+ 		v = c.defaultVersion
+ 	}
+ 	var binPath string
+ 	if c.overrideTF != "" {
+ 		binPath = c.overrideTF
+ 	} else {
+ 		var err error
+ 		c.versionsLock.Lock()
+-		binPath, err = ensureVersion(log, c.distribution, c.versions, v, c.binDir, c.downloadBaseURL, c.downloadAllowed)
++		binPath, err = ensureVersion(log, c.downloader, c.versions, v, c.binDir, c.downloadBaseURL, c.downloadAllowed)
+ 		c.versionsLock.Unlock()
+ 		if err != nil {
+ 			return "", nil, err
+ 		}
+ 	}
+ 	envVars := []string{
+ 		"TF_IN_AUTOMATION=true",
+ 		fmt.Sprintf("WORKSPACE=%s", workspace),
+ 		fmt.Sprintf("ATLANTIS_TERRAFORM_VERSION=%s", v.String()),
+ 		fmt.Sprintf("DIR=%s", path),
+@@ -333,55 +358,54 @@
+ }
+ func MustConstraint(v string) version.Constraints {
+ 	c, err := version.NewConstraint(v)
+ 	if err != nil {
+ 		panic(err)
+ 	}
+ 	return c
+ }
+ func ensureVersion(
+ 	log logging.SimpleLogging,
+-	dist Distribution,
++	dl Downloader,
+ 	versions map[string]string,
+ 	v *version.Version,
+ 	binDir string,
+ 	downloadURL string,
+ 	downloadsAllowed bool,
+ ) (string, error) {
+ 	if binPath, ok := versions[v.String()]; ok {
+ 		return binPath, nil
+ 	}
+-	binFile := dist.BinName() + v.String()
++	binFile := "terraform" + v.String()
+ 	if binPath, err := exec.LookPath(binFile); err == nil {
+ 		versions[v.String()] = binPath
+ 		return binPath, nil
+ 	}
+ 	dest := filepath.Join(binDir, binFile)
+ 	if _, err := os.Stat(dest); err == nil {
+ 		versions[v.String()] = dest
+ 		return dest, nil
+ 	}
+ 	if !downloadsAllowed {
+ 		return "", fmt.Errorf(
+-			"could not find %s version %s in PATH or %s, and downloads are disabled",
+-			dist.BinName(),
++			"could not find terraform version %s in PATH or %s, and downloads are disabled",
+ 			v.String(),
+ 			binDir,
+ 		)
+ 	}
+-	log.Info("could not find %s version %s in PATH or %s", dist.BinName(), v.String(), binDir)
+-	log.Info("downloading %s version %s from download URL %s", dist.BinName(), v.String(), downloadURL)
+-	execPath, err := dist.Downloader().Install(context.Background(), binDir, downloadURL, v)
++	log.Info("could not find terraform version %s in PATH or %s", v.String(), binDir)
++	log.Info("using Hashicorp's 'hc-install' to download Terraform version %s from download URL %s", v.String(), downloadURL)
++	execPath, err := dl.Install(binDir, downloadURL, v)
+ 	if err != nil {
+ 		return "", errors.Wrapf(err, "error downloading terraform version %s", v.String())
+ 	}
+-	log.Info("Downloaded %s %s to %s", dist.BinName(), v.String(), execPath)
++	log.Info("Downloaded terraform %s to %s", v.String(), execPath)
+ 	versions[v.String()] = execPath
+ 	return execPath, nil
+ }
+ func generateRCFile(tfeToken string, tfeHostname string, home string) error {
+ 	const rcFilename = ".terraformrc"
+ 	rcFile := filepath.Join(home, rcFilename)
+ 	config := fmt.Sprintf(rcFileContents, tfeHostname, tfeToken)
+ 	if _, err := os.Stat(rcFile); err == nil {
+ 		currContents, err := os.ReadFile(rcFile) // nolint: gosec
+ 		if err != nil {
+@@ -413,10 +437,34 @@
+ 	}
+ 	match := versionRegex.FindStringSubmatch(versionOutput)
+ 	if len(match) <= 1 {
+ 		return nil, fmt.Errorf("could not parse terraform version from %s", versionOutput)
+ 	}
+ 	return version.NewVersion(match[1])
+ }
+ var rcFileContents = `credentials "%s" {
+   token = %q
+ }`
++type DefaultDownloader struct{}
++func (d *DefaultDownloader) Install(dir string, downloadURL string, v *version.Version) (string, error) {
++	installer := install.NewInstaller()
++	execPath, err := installer.Install(context.Background(), []src.Installable{
++		&releases.ExactVersion{
++			Product:    product.Terraform,
++			Version:    v,
++			InstallDir: dir,
++			ApiBaseURL: downloadURL,
++		},
++	})
++	if err != nil {
++		return "", err
++	}
++	newPath := filepath.Join(dir, "terraform"+v.String())
++	if err := os.Rename(execPath, newPath); err != nil {
++		return "", err
++	}
++	return newPath, nil
++}
++func (d *DefaultDownloader) GetAny(dst, src string) error {
++	_, err := getter.GetAny(context.Background(), dst, src)
++	return err
++}
+
+--- a/server/events/command/context.go
++++ b/server/events/command/context.go
+@@ -14,12 +14,11 @@
+ 	Pull     models.PullRequest
+ 	Scope    tally.Scope
+ 	User models.User
+ 	Log  logging.SimpleLogging
+ 	PullRequestStatus models.PullReqStatus
+ 	PullStatus *models.PullStatus
+ 	PolicySet string
+ 	ClearPolicyApproval bool
+ 	Trigger Trigger
+ 	API bool
+-	TeamAllowlistChecker TeamAllowlistChecker
+ }
+
+--- a/server/events/command/project_context.go
++++ b/server/events/command/project_context.go
+@@ -48,21 +48,20 @@
+ 	PolicySetTarget string
+ 	ClearPolicyApproval bool
+ 	DeleteSourceBranchOnMerge bool
+ 	RepoLocksMode valid.RepoLocksMode
+ 	RepoConfigFile string
+ 	JobID string
+ 	ExecutionOrderGroup int
+ 	AbortOnExcecutionOrderFail bool
+ 	CustomPolicyCheck bool
+ 	SilencePRComments []string
+-	TeamAllowlistChecker TeamAllowlistChecker
+ }
+ func (p ProjectContext) SetProjectScopeTags(scope tally.Scope) tally.Scope {
+ 	v := ""
+ 	if p.TerraformVersion != nil {
+ 		v = p.TerraformVersion.String()
+ 	}
+ 	tags := ProjectScopeTags{
+ 		BaseRepo:         p.BaseRepo.FullName,
+ 		PrNumber:         strconv.Itoa(p.Pull.Num),
+ 		Project:          p.ProjectName,
+
+--- a/server/events/command/team_allowlist_checker.go
++++ b//dev/null
+@@ -1,62 +0,0 @@
+-package command
+-import (
+-	"strings"
+-	"github.com/runatlantis/atlantis/server/events/models"
+-)
+-const wildcard = "*"
+-type mapOfStrings map[string]string
+-type TeamAllowlistChecker interface {
+-	HasRules() bool
+-	IsCommandAllowedForTeam(ctx models.TeamAllowlistCheckerContext, team, command string) bool
+-	IsCommandAllowedForAnyTeam(ctx models.TeamAllowlistCheckerContext, teams []string, command string) bool
+-}
+-type DefaultTeamAllowlistChecker struct {
+-	rules []mapOfStrings
+-}
+-func NewTeamAllowlistChecker(allowlist string) (*DefaultTeamAllowlistChecker, error) {
+-	var rules []mapOfStrings
+-	pairs := strings.Split(allowlist, ",")
+-	if pairs[0] != "" {
+-		for _, pair := range pairs {
+-			values := strings.Split(pair, ":")
+-			team := strings.TrimSpace(values[0])
+-			command := strings.TrimSpace(values[1])
+-			m := mapOfStrings{team: command}
+-			rules = append(rules, m)
+-		}
+-	}
+-	return &DefaultTeamAllowlistChecker{
+-		rules: rules,
+-	}, nil
+-}
+-func (checker *DefaultTeamAllowlistChecker) HasRules() bool {
+-	return len(checker.rules) > 0
+-}
+-func (checker *DefaultTeamAllowlistChecker) IsCommandAllowedForTeam(_ models.TeamAllowlistCheckerContext, team string, command string) bool {
+-	for _, rule := range checker.rules {
+-		for key, value := range rule {
+-			if (key == wildcard || strings.EqualFold(key, team)) && (value == wildcard || strings.EqualFold(value, command)) {
+-				return true
+-			}
+-		}
+-	}
+-	return false
+-}
+-func (checker *DefaultTeamAllowlistChecker) IsCommandAllowedForAnyTeam(ctx models.TeamAllowlistCheckerContext, teams []string, command string) bool {
+-	if len(teams) == 0 {
+-		for _, rule := range checker.rules {
+-			for key, value := range rule {
+-				if (key == wildcard) && (value == wildcard || strings.EqualFold(value, command)) {
+-					return true
+-				}
+-			}
+-		}
+-	} else {
+-		for _, t := range teams {
+-			if checker.IsCommandAllowedForTeam(ctx, t, command) {
+-				return true
+-			}
+-		}
+-	}
+-	return false
+-}
+
+--- a/server/events/command_runner.go
++++ b/server/events/command_runner.go
+@@ -1,15 +1,15 @@
+ package events
+ import (
+ 	"fmt"
+ 	"strconv"
+-	"github.com/google/go-github/v63/github"
++	"github.com/google/go-github/v59/github"
+ 	"github.com/mcdafydd/go-azuredevops/azuredevops"
+ 	"github.com/pkg/errors"
+ 	"github.com/runatlantis/atlantis/server/core/config/valid"
+ 	"github.com/runatlantis/atlantis/server/events/command"
+ 	"github.com/runatlantis/atlantis/server/events/models"
+ 	"github.com/runatlantis/atlantis/server/events/vcs"
+ 	"github.com/runatlantis/atlantis/server/events/vcs/gitea"
+ 	"github.com/runatlantis/atlantis/server/logging"
+ 	"github.com/runatlantis/atlantis/server/metrics"
+ 	"github.com/runatlantis/atlantis/server/recovery"
+@@ -62,55 +62,48 @@
+ 	AllowForkPRs bool
+ 	ParallelPoolSize int
+ 	AllowForkPRsFlag string
+ 	SilenceForkPRErrors bool
+ 	SilenceForkPRErrorsFlag        string
+ 	CommentCommandRunnerByCmd      map[command.Name]CommentCommandRunner
+ 	Drainer                        *Drainer
+ 	PreWorkflowHooksCommandRunner  PreWorkflowHooksCommandRunner
+ 	PostWorkflowHooksCommandRunner PostWorkflowHooksCommandRunner
+ 	PullStatusFetcher              PullStatusFetcher
+-	TeamAllowlistChecker           command.TeamAllowlistChecker
++	TeamAllowlistChecker           *TeamAllowlistChecker
+ 	VarFileAllowlistChecker        *VarFileAllowlistChecker
+ 	CommitStatusUpdater            CommitStatusUpdater
+ }
+ func (c *DefaultCommandRunner) RunAutoplanCommand(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User) {
+ 	if opStarted := c.Drainer.StartOp(); !opStarted {
+ 		if commentErr := c.VCSClient.CreateComment(c.Logger, baseRepo, pull.Num, ShutdownComment, command.Plan.String()); commentErr != nil {
+ 			c.Logger.Log(logging.Error, "unable to comment that Atlantis is shutting down: %s", commentErr)
+ 		}
+ 		return
+ 	}
+ 	defer c.Drainer.OpDone()
+ 	log := c.buildLogger(baseRepo.FullName, pull.Num)
+ 	defer c.logPanics(baseRepo, pull.Num, log)
+ 	status, err := c.PullStatusFetcher.GetPullStatus(pull)
+ 	if err != nil {
+ 		log.Err("Unable to fetch pull status, this is likely a bug.", err)
+ 	}
+ 	scope := c.StatsScope.SubScope("autoplan")
+ 	timer := scope.Timer(metrics.ExecutionTimeMetric).Start()
+ 	defer timer.Stop()
+-	if c.TeamAllowlistChecker != nil && c.TeamAllowlistChecker.HasRules() {
+-		err := c.fetchUserTeams(baseRepo, &user)
+-		if err != nil {
+-			c.Logger.Err("Unable to fetch user teams: %s", err)
+-			return
+-		}
+-		ok, err := c.checkUserPermissions(baseRepo, user, "plan")
+-		if err != nil {
+-			c.Logger.Err("Unable to check user permissions: %s", err)
+-			return
+-		}
+-		if !ok {
+-			return
+-		}
++	ok, err := c.checkUserPermissions(baseRepo, user, "plan")
++	if err != nil {
++		c.Logger.Err("Unable to check user permissions: %s", err)
++		return
++	}
++	if !ok {
++		return
+ 	}
+ 	ctx := &command.Context{
+ 		User:       user,
+ 		Log:        log,
+ 		Scope:      scope,
+ 		Pull:       pull,
+ 		HeadRepo:   headRepo,
+ 		PullStatus: status,
+ 		Trigger:    command.AutoTrigger,
+ 	}
+@@ -160,30 +153,25 @@
+ func (c *DefaultCommandRunner) commentUserDoesNotHavePermissions(baseRepo models.Repo, pullNum int, user models.User, cmd *CommentCommand) {
+ 	errMsg := fmt.Sprintf("```\nError: User @%s does not have permissions to execute '%s' command.\n```", user.Username, cmd.Name.String())
+ 	if err := c.VCSClient.CreateComment(c.Logger, baseRepo, pullNum, errMsg, ""); err != nil {
+ 		c.Logger.Err("unable to comment on pull request: %s", err)
+ 	}
+ }
+ func (c *DefaultCommandRunner) checkUserPermissions(repo models.Repo, user models.User, cmdName string) (bool, error) {
+ 	if c.TeamAllowlistChecker == nil || !c.TeamAllowlistChecker.HasRules() {
+ 		return true, nil
+ 	}
+-	ctx := models.TeamAllowlistCheckerContext{
+-		BaseRepo:    repo,
+-		CommandName: cmdName,
+-		Log:         c.Logger,
+-		Pull:        models.PullRequest{},
+-		User:        user,
+-		Verbose:     false,
+-		API:         false,
+-	}
+-	ok := c.TeamAllowlistChecker.IsCommandAllowedForAnyTeam(ctx, user.Teams, cmdName)
++	teams, err := c.VCSClient.GetTeamNamesForUser(repo, user)
++	if err != nil {
++		return false, err
++	}
++	ok := c.TeamAllowlistChecker.IsCommandAllowedForAnyTeam(teams, cmdName)
+ 	if !ok {
+ 		return false, nil
+ 	}
+ 	return true, nil
+ }
+ func (c *DefaultCommandRunner) checkVarFilesInPlanCommandAllowlisted(cmd *CommentCommand) error {
+ 	if cmd == nil || cmd.CommandName() != command.Plan {
+ 		return nil
+ 	}
+ 	return c.VarFileAllowlistChecker.Check(cmd.Flags)
+@@ -197,62 +185,54 @@
+ 	}
+ 	defer c.Drainer.OpDone()
+ 	log := c.buildLogger(baseRepo.FullName, pullNum)
+ 	defer c.logPanics(baseRepo, pullNum, log)
+ 	scope := c.StatsScope.SubScope("comment")
+ 	if cmd != nil {
+ 		scope = scope.SubScope(cmd.Name.String())
+ 	}
+ 	timer := scope.Timer(metrics.ExecutionTimeMetric).Start()
+ 	defer timer.Stop()
+-	if c.TeamAllowlistChecker != nil && c.TeamAllowlistChecker.HasRules() {
+-		err := c.fetchUserTeams(baseRepo, &user)
+-		if err != nil {
+-			c.Logger.Err("Unable to fetch user teams: %s", err)
+-			return
+-		}
+-		ok, err := c.checkUserPermissions(baseRepo, user, cmd.Name.String())
+-		if err != nil {
+-			c.Logger.Err("Unable to check user permissions: %s", err)
+-			return
+-		}
+-		if !ok {
+-			c.commentUserDoesNotHavePermissions(baseRepo, pullNum, user, cmd)
+-			return
+-		}
++	ok, err := c.checkUserPermissions(baseRepo, user, cmd.Name.String())
++	if err != nil {
++		c.Logger.Err("Unable to check user permissions: %s", err)
++		return
++	}
++	if !ok {
++		c.commentUserDoesNotHavePermissions(baseRepo, pullNum, user, cmd)
++		return
+ 	}
+ 	if err := c.checkVarFilesInPlanCommandAllowlisted(cmd); err != nil {
+ 		errMsg := fmt.Sprintf("```\n%s\n```", err.Error())
+ 		if commentErr := c.VCSClient.CreateComment(c.Logger, baseRepo, pullNum, errMsg, ""); commentErr != nil {
+ 			c.Logger.Err("unable to comment on pull request: %s", commentErr)
+ 		}
+ 		return
+ 	}
+ 	headRepo, pull, err := c.ensureValidRepoMetadata(baseRepo, maybeHeadRepo, maybePull, user, pullNum, log)
+ 	if err != nil {
+ 		return
+ 	}
+ 	status, err := c.PullStatusFetcher.GetPullStatus(pull)
+ 	if err != nil {
+ 		log.Err("Unable to fetch pull status, this is likely a bug.", err)
+ 	}
+ 	ctx := &command.Context{
+-		User:                 user,
+-		Log:                  log,
+-		Pull:                 pull,
+-		PullStatus:           status,
+-		HeadRepo:             headRepo,
+-		Scope:                scope,
+-		Trigger:              command.CommentTrigger,
+-		PolicySet:            cmd.PolicySet,
+-		ClearPolicyApproval:  cmd.ClearPolicyApproval,
+-		TeamAllowlistChecker: c.TeamAllowlistChecker,
++		User:                user,
++		Log:                 log,
++		Pull:                pull,
++		PullStatus:          status,
++		HeadRepo:            headRepo,
++		Scope:               scope,
++		Trigger:             command.CommentTrigger,
++		PolicySet:           cmd.PolicySet,
++		ClearPolicyApproval: cmd.ClearPolicyApproval,
+ 	}
+ 	if !c.validateCtxAndComment(ctx, cmd.Name) {
+ 		return
+ 	}
+ 	err = c.PreWorkflowHooksCommandRunner.RunPreHooks(ctx, cmd)
+ 	if err != nil {
+ 		ctx.Log.Err("Error running pre-workflow hooks %s.", err)
+ 		if c.FailOnPreWorkflowHookError {
+ 			ctx.Log.Err("'fail-on-pre-workflow-hook-error' set, so not running %s command.", cmd.Name.String())
+ 			switch cmd.Name {
+@@ -365,28 +345,20 @@
+ 		err = errors.New("Unknown VCS type–this is a bug")
+ 	}
+ 	if err != nil {
+ 		log.Err(err.Error())
+ 		if commentErr := c.VCSClient.CreateComment(c.Logger, baseRepo, pullNum, fmt.Sprintf("`Error: %s`", err), ""); commentErr != nil {
+ 			log.Err("unable to comment: %s", commentErr)
+ 		}
+ 	}
+ 	return
+ }
+-func (c *DefaultCommandRunner) fetchUserTeams(repo models.Repo, user *models.User) error {
+-	teams, err := c.VCSClient.GetTeamNamesForUser(repo, *user)
+-	if err != nil {
+-		return err
+-	}
+-	user.Teams = teams
+-	return nil
+-}
+ func (c *DefaultCommandRunner) validateCtxAndComment(ctx *command.Context, commandName command.Name) bool {
+ 	if !c.AllowForkPRs && ctx.HeadRepo.Owner != ctx.Pull.BaseRepo.Owner {
+ 		if c.SilenceForkPRErrors {
+ 			return false
+ 		}
+ 		ctx.Log.Info("command was run on a fork pull request which is disallowed")
+ 		if err := c.VCSClient.CreateComment(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull.Num, fmt.Sprintf("Atlantis commands can't be run on fork pull requests. To enable, set --%s  or, to disable this message, set --%s", c.AllowForkPRsFlag, c.SilenceForkPRErrorsFlag), ""); err != nil {
+ 			ctx.Log.Err("unable to comment: %s", err)
+ 		}
+ 		return false
+
+--- a/server/events/event_parser.go
++++ b/server/events/event_parser.go
+@@ -1,20 +1,20 @@
+ package events
+ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"net/url"
+ 	"path"
+ 	"strings"
+ 	giteasdk "code.gitea.io/sdk/gitea"
+ 	"github.com/go-playground/validator/v10"
+-	"github.com/google/go-github/v63/github"
++	"github.com/google/go-github/v59/github"
+ 	lru "github.com/hashicorp/golang-lru/v2"
+ 	"github.com/mcdafydd/go-azuredevops/azuredevops"
+ 	"github.com/pkg/errors"
+ 	"github.com/runatlantis/atlantis/server/events/command"
+ 	"github.com/runatlantis/atlantis/server/events/models"
+ 	"github.com/runatlantis/atlantis/server/events/vcs/bitbucketcloud"
+ 	"github.com/runatlantis/atlantis/server/events/vcs/bitbucketserver"
+ 	"github.com/runatlantis/atlantis/server/events/vcs/gitea"
+ 	"github.com/runatlantis/atlantis/server/logging"
+ 	"github.com/xanzy/go-gitlab"
+
+--- a/server/events/external_team_allowlist_checker.go
++++ b//dev/null
+@@ -1,45 +0,0 @@
+-package events
+-import (
+-	"fmt"
+-	"strings"
+-	"github.com/runatlantis/atlantis/server/core/runtime"
+-	"github.com/runatlantis/atlantis/server/events/models"
+-)
+-type ExternalTeamAllowlistChecker struct {
+-	Command                     string
+-	ExtraArgs                   []string
+-	ExternalTeamAllowlistRunner runtime.ExternalTeamAllowlistRunner
+-}
+-func (checker *ExternalTeamAllowlistChecker) HasRules() bool {
+-	return true
+-}
+-func (checker *ExternalTeamAllowlistChecker) IsCommandAllowedForTeam(ctx models.TeamAllowlistCheckerContext, team string, command string) bool {
+-	cmd := checker.buildCommandString(ctx, []string{team}, command)
+-	out, err := checker.ExternalTeamAllowlistRunner.Run(ctx, "sh", "-c", cmd)
+-	if err != nil {
+-		return false
+-	}
+-	return checker.checkOutputResults(out)
+-}
+-func (checker *ExternalTeamAllowlistChecker) IsCommandAllowedForAnyTeam(ctx models.TeamAllowlistCheckerContext, teams []string, command string) bool {
+-	cmd := checker.buildCommandString(ctx, teams, command)
+-	out, err := checker.ExternalTeamAllowlistRunner.Run(ctx, "sh", "-c", cmd)
+-	if err != nil {
+-		return false
+-	}
+-	return checker.checkOutputResults(out)
+-}
+-func (checker *ExternalTeamAllowlistChecker) buildCommandString(ctx models.TeamAllowlistCheckerContext, teams []string, command string) string {
+-	cmdArr := append([]string{checker.Command}, checker.ExtraArgs...)
+-	orgTeams := make([]string, len(teams))
+-	for i, team := range teams {
+-		orgTeams[i] = fmt.Sprintf("%s/%s", ctx.BaseRepo.Owner, team)
+-	}
+-	teamStr := strings.Join(orgTeams, " ")
+-	return strings.Join(append(cmdArr, command, ctx.BaseRepo.FullName, teamStr), " ")
+-}
+-func (checker *ExternalTeamAllowlistChecker) checkOutputResults(output string) bool {
+-	lines := strings.Split(strings.TrimSpace(output), "\n")
+-	lastLine := lines[len(lines)-1]
+-	return strings.EqualFold(lastLine, "pass")
+-}
+
+--- a/server/events/mocks/mock_event_parsing.go
++++ b/server/events/mocks/mock_event_parsing.go
+@@ -1,14 +1,14 @@
+ package mocks
+ import (
+ 	gitea "code.gitea.io/sdk/gitea"
+-	github "github.com/google/go-github/v63/github"
++	github "github.com/google/go-github/v59/github"
+ 	azuredevops "github.com/mcdafydd/go-azuredevops/azuredevops"
+ 	pegomock "github.com/petergtz/pegomock/v4"
+ 	models "github.com/runatlantis/atlantis/server/events/models"
+ 	gitea0 "github.com/runatlantis/atlantis/server/events/vcs/gitea"
+ 	logging "github.com/runatlantis/atlantis/server/logging"
+ 	go_gitlab "github.com/xanzy/go-gitlab"
+ 	"reflect"
+ 	"time"
+ )
+ type MockEventParsing struct {
+
+--- a/server/events/mocks/mock_github_pull_getter.go
++++ b/server/events/mocks/mock_github_pull_getter.go
+@@ -1,13 +1,13 @@
+ package mocks
+ import (
+-	github "github.com/google/go-github/v63/github"
++	github "github.com/google/go-github/v59/github"
+ 	pegomock "github.com/petergtz/pegomock/v4"
+ 	models "github.com/runatlantis/atlantis/server/events/models"
+ 	logging "github.com/runatlantis/atlantis/server/logging"
+ 	"reflect"
+ 	"time"
+ )
+ type MockGithubPullGetter struct {
+ 	fail func(message string, callerSkip ...int)
+ }
+ func NewMockGithubPullGetter(options ...pegomock.Option) *MockGithubPullGetter {
+
+--- a/server/events/models/models.go
++++ b/server/events/models/models.go
+@@ -114,21 +114,20 @@
+ 		return "updated"
+ 	case ClosedPullEvent:
+ 		return "closed"
+ 	case OtherPullEvent:
+ 		return "other"
+ 	}
+ 	return "<missing String() implementation>"
+ }
+ type User struct {
+ 	Username string
+-	Teams    []string
+ }
+ type ProjectLock struct {
+ 	Project Project
+ 	Pull PullRequest
+ 	User User
+ 	Workspace string
+ 	Time time.Time
+ }
+ type Project struct {
+ 	ProjectName string
+@@ -369,35 +368,20 @@
+ 	case DiscardedPlanStatus:
+ 		return "plan_discarded"
+ 	case ErroredPolicyCheckStatus:
+ 		return "policy_check_errored"
+ 	case PassedPolicyCheckStatus:
+ 		return "policy_check_passed"
+ 	default:
+ 		panic("missing String() impl for ProjectPlanStatus")
+ 	}
+ }
+-type TeamAllowlistCheckerContext struct {
+-	BaseRepo Repo
+-	CommandName string
+-	EscapedCommentArgs []string
+-	HeadRepo Repo
+-	Log logging.SimpleLogging
+-	Pull PullRequest
+-	ProjectName string
+-	RepoDir string
+-	RepoRelDir string
+-	User User
+-	Verbose bool
+-	Workspace string
+-	API bool
+-}
+ type WorkflowHookCommandContext struct {
+ 	BaseRepo Repo
+ 	CommandName string
+ 	EscapedCommentArgs []string
+ 	HeadRepo Repo
+ 	HookDescription string
+ 	HookID string
+ 	HookStepName string
+ 	Log logging.SimpleLogging
+ 	Pull PullRequest
+
+--- a/server/events/project_command_builder.go
++++ b/server/events/project_command_builder.go
+@@ -1,16 +1,15 @@
+ package events
+ import (
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+-	"slices"
+ 	"sort"
+ 	"strings"
+ 	tally "github.com/uber-go/tally/v4"
+ 	"github.com/runatlantis/atlantis/server/core/config/valid"
+ 	"github.com/runatlantis/atlantis/server/core/terraform"
+ 	"github.com/runatlantis/atlantis/server/logging"
+ 	"github.com/runatlantis/atlantis/server/metrics"
+ 	"github.com/pkg/errors"
+ 	"github.com/runatlantis/atlantis/server/core/config"
+ 	"github.com/runatlantis/atlantis/server/events/command"
+@@ -411,41 +410,20 @@
+ 					parallelPlan,
+ 					verbose,
+ 					abortOnExcecutionOrderFail,
+ 					p.TerraformExecutor,
+ 				)...)
+ 		}
+ 	}
+ 	sort.Slice(projCtxs, func(i, j int) bool {
+ 		return projCtxs[i].ExecutionOrderGroup < projCtxs[j].ExecutionOrderGroup
+ 	})
+-	projCtxs = slices.DeleteFunc(projCtxs, func(projCtx command.ProjectContext) bool {
+-		if projCtx.TeamAllowlistChecker == nil || !projCtx.TeamAllowlistChecker.HasRules() {
+-			return false
+-		}
+-		ctx := models.TeamAllowlistCheckerContext{
+-			BaseRepo:           projCtx.BaseRepo,
+-			CommandName:        projCtx.CommandName.String(),
+-			EscapedCommentArgs: projCtx.EscapedCommentArgs,
+-			HeadRepo:           projCtx.HeadRepo,
+-			Log:                projCtx.Log,
+-			Pull:               projCtx.Pull,
+-			ProjectName:        projCtx.ProjectName,
+-			RepoDir:            repoDir,
+-			RepoRelDir:         projCtx.RepoRelDir,
+-			User:               projCtx.User,
+-			Verbose:            projCtx.Verbose,
+-			Workspace:          projCtx.Workspace,
+-			API:                false,
+-		}
+-		return !projCtx.TeamAllowlistChecker.IsCommandAllowedForAnyTeam(ctx, projCtx.User.Teams, projCtx.CommandName.String())
+-	})
+ 	return projCtxs, nil
+ }
+ func (p *DefaultProjectCommandBuilder) buildProjectPlanCommand(ctx *command.Context, cmd *CommentCommand) ([]command.ProjectContext, error) {
+ 	workspace := DefaultWorkspace
+ 	if cmd.Workspace != "" {
+ 		workspace = cmd.Workspace
+ 	}
+ 	var pcc []command.ProjectContext
+ 	ctx.Log.Debug("building plan command")
+ 	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, workspace, DefaultRepoRelDir)
+@@ -721,39 +699,18 @@
+ 				parallelApply,
+ 				parallelPlan,
+ 				verbose,
+ 				abortOnExcecutionOrderFail,
+ 				p.TerraformExecutor,
+ 			)...)
+ 	}
+ 	if err := p.validateWorkspaceAllowed(repoCfgPtr, repoRelDir, workspace); err != nil {
+ 		return []command.ProjectContext{}, err
+ 	}
+-	projCtxs = slices.DeleteFunc(projCtxs, func(projCtx command.ProjectContext) bool {
+-		if projCtx.TeamAllowlistChecker == nil || !projCtx.TeamAllowlistChecker.HasRules() {
+-			return false
+-		}
+-		ctx := models.TeamAllowlistCheckerContext{
+-			BaseRepo:           projCtx.BaseRepo,
+-			CommandName:        projCtx.CommandName.String(),
+-			EscapedCommentArgs: projCtx.EscapedCommentArgs,
+-			HeadRepo:           projCtx.HeadRepo,
+-			Log:                projCtx.Log,
+-			Pull:               projCtx.Pull,
+-			ProjectName:        projCtx.ProjectName,
+-			RepoDir:            repoDir,
+-			RepoRelDir:         projCtx.RepoRelDir,
+-			User:               projCtx.User,
+-			Verbose:            projCtx.Verbose,
+-			Workspace:          projCtx.Workspace,
+-			API:                false,
+-		}
+-		return !projCtx.TeamAllowlistChecker.IsCommandAllowedForAnyTeam(ctx, projCtx.User.Teams, projCtx.CommandName.String())
+-	})
+ 	return projCtxs, nil
+ }
+ func (p *DefaultProjectCommandBuilder) validateWorkspaceAllowed(repoCfg *valid.RepoCfg, repoRelDir string, workspace string) error {
+ 	if repoCfg == nil {
+ 		return nil
+ 	}
+ 	return repoCfg.ValidateWorkspaceAllowed(repoRelDir, workspace)
+ }
+
+--- a/server/events/project_command_context_builder.go
++++ b/server/events/project_command_context_builder.go
+@@ -107,21 +107,20 @@
+ 		prjCfg.PolicySets,
+ 		escapeArgs(commentFlags),
+ 		automerge,
+ 		parallelApply,
+ 		parallelPlan,
+ 		verbose,
+ 		abortOnExcecutionOrderFail,
+ 		ctx.Scope,
+ 		ctx.PullRequestStatus,
+ 		ctx.PullStatus,
+-		ctx.TeamAllowlistChecker,
+ 	)
+ 	projectCmds = append(projectCmds, projectCmdContext)
+ 	return
+ }
+ type PolicyCheckProjectCommandContextBuilder struct {
+ 	ProjectCommandContextBuilder *DefaultProjectCommandContextBuilder
+ 	CommentBuilder               CommentBuilder
+ }
+ func (cb *PolicyCheckProjectCommandContextBuilder) BuildProjectContext(
+ 	ctx *command.Context,
+@@ -169,21 +168,20 @@
+ 			prjCfg.PolicySets,
+ 			escapeArgs(commentFlags),
+ 			automerge,
+ 			parallelApply,
+ 			parallelPlan,
+ 			verbose,
+ 			abortOnExcecutionOrderFail,
+ 			ctx.Scope,
+ 			ctx.PullRequestStatus,
+ 			ctx.PullStatus,
+-			ctx.TeamAllowlistChecker,
+ 		))
+ 	}
+ 	return
+ }
+ func newProjectCommandContext(ctx *command.Context,
+ 	cmd command.Name,
+ 	applyCmd string,
+ 	approvePoliciesCmd string,
+ 	planCmd string,
+ 	projCfg valid.MergedProjectCfg,
+@@ -191,21 +189,20 @@
+ 	policySets valid.PolicySets,
+ 	escapedCommentArgs []string,
+ 	automergeEnabled bool,
+ 	parallelApplyEnabled bool,
+ 	parallelPlanEnabled bool,
+ 	verbose bool,
+ 	abortOnExcecutionOrderFail bool,
+ 	scope tally.Scope,
+ 	pullReqStatus models.PullReqStatus,
+ 	pullStatus *models.PullStatus,
+-	teamAllowlistChecker command.TeamAllowlistChecker,
+ ) command.ProjectContext {
+ 	var projectPlanStatus models.ProjectPlanStatus
+ 	var projectPolicyStatus []models.PolicySetStatus
+ 	if ctx.PullStatus != nil {
+ 		for _, project := range ctx.PullStatus.Projects {
+ 			if projCfg.Name == "" && project.RepoRelDir == projCfg.RepoRelDir {
+ 				projectPlanStatus = project.Status
+ 				projectPolicyStatus = project.PolicyStatus
+ 				break
+ 			}
+@@ -251,21 +248,20 @@
+ 		Workspace:                  projCfg.Workspace,
+ 		PolicySets:                 policySets,
+ 		PolicySetTarget:            ctx.PolicySet,
+ 		ClearPolicyApproval:        ctx.ClearPolicyApproval,
+ 		PullReqStatus:              pullReqStatus,
+ 		PullStatus:                 pullStatus,
+ 		JobID:                      uuid.New().String(),
+ 		ExecutionOrderGroup:        projCfg.ExecutionOrderGroup,
+ 		AbortOnExcecutionOrderFail: abortOnExcecutionOrderFail,
+ 		SilencePRComments:          projCfg.SilencePRComments,
+-		TeamAllowlistChecker:       teamAllowlistChecker,
+ 	}
+ }
+ func escapeArgs(args []string) []string {
+ 	var escaped []string
+ 	for _, arg := range args {
+ 		var escapedArg string
+ 		for i := range arg {
+ 			escapedArg += "\\" + string(arg[i])
+ 		}
+ 		escaped = append(escaped, escapedArg)
+
+--- a/server/events/vcs/gh_app_creds_rotator.go
++++ b/server/events/vcs/gh_app_creds_rotator.go
+@@ -39,16 +39,16 @@
+ 	if err != nil {
+ 		r.log.Err(err.Error())
+ 	}
+ }
+ func (r *githubAppTokenRotator) rotate() error {
+ 	r.log.Debug("Refreshing git tokens for Github App")
+ 	token, err := r.githubCredentials.GetToken()
+ 	if err != nil {
+ 		return errors.Wrap(err, "Getting github token")
+ 	}
+-	r.log.Debug("Token successfully refreshed")
++	r.log.Debug("token %s", token)
+ 	if err := WriteGitCreds("x-access-token", token, r.githubHostname, r.homeDirPath, r.log, true); err != nil {
+ 		return errors.Wrap(err, "Writing ~/.git-credentials file")
+ 	}
+ 	return nil
+ }
+
+--- a/server/events/vcs/github_client.go
++++ b/server/events/vcs/github_client.go
+@@ -1,69 +1,38 @@
+ package vcs
+ import (
+ 	"context"
+ 	"encoding/base64"
+ 	"fmt"
+ 	"net/http"
+-	"strconv"
+ 	"strings"
+ 	"time"
+-	"github.com/google/go-github/v63/github"
++	"github.com/google/go-github/v59/github"
+ 	"github.com/pkg/errors"
+ 	"github.com/runatlantis/atlantis/server/events/command"
+ 	"github.com/runatlantis/atlantis/server/events/models"
+ 	"github.com/runatlantis/atlantis/server/events/vcs/common"
+ 	"github.com/runatlantis/atlantis/server/logging"
+ 	"github.com/shurcooL/githubv4"
+ )
+ const maxCommentLength = 65536
+ var (
+ 	clientMutationID            = githubv4.NewString("atlantis")
+ 	pullRequestDismissalMessage = *githubv4.NewString("Dismissing reviews because of plan changes")
+ )
+-type GithubRepoIdCacheEntry struct {
+-	RepoId     githubv4.Int
+-	LookupTime time.Time
+-}
+-type GitHubRepoIdCache struct {
+-	cache map[githubv4.String]GithubRepoIdCacheEntry
+-}
+-func NewGitHubRepoIdCache() GitHubRepoIdCache {
+-	return GitHubRepoIdCache{
+-		cache: make(map[githubv4.String]GithubRepoIdCacheEntry),
+-	}
+-}
+-func (c *GitHubRepoIdCache) Get(key githubv4.String) (githubv4.Int, bool) {
+-	entry, ok := c.cache[key]
+-	if !ok {
+-		return githubv4.Int(0), false
+-	}
+-	if time.Since(entry.LookupTime) > time.Hour {
+-		delete(c.cache, key)
+-		return githubv4.Int(0), false
+-	}
+-	return entry.RepoId, true
+-}
+-func (c *GitHubRepoIdCache) Set(key githubv4.String, value githubv4.Int) {
+-	c.cache[key] = GithubRepoIdCacheEntry{
+-		RepoId:     value,
+-		LookupTime: time.Now(),
+-	}
+-}
+ type GithubClient struct {
+ 	user                  string
+ 	client                *github.Client
+ 	v4Client              *githubv4.Client
+ 	ctx                   context.Context
+ 	config                GithubConfig
+ 	maxCommentsPerCommand int
+-	repoIdCache           GitHubRepoIdCache
+ }
+ type GithubAppTemporarySecrets struct {
+ 	ID int64
+ 	Key string
+ 	Name string
+ 	WebhookSecret string
+ 	URL string
+ }
+ type GithubReview struct {
+ 	ID          githubv4.ID
+@@ -101,21 +70,20 @@
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "getting user")
+ 	}
+ 	return &GithubClient{
+ 		user:                  user,
+ 		client:                client,
+ 		v4Client:              v4Client,
+ 		ctx:                   context.Background(),
+ 		config:                config,
+ 		maxCommentsPerCommand: maxCommentsPerCommand,
+-		repoIdCache:           NewGitHubRepoIdCache(),
+ 	}, nil
+ }
+ func (g *GithubClient) GetModifiedFiles(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) ([]string, error) {
+ 	logger.Debug("Getting modified files for GitHub pull request %d", pull.Num)
+ 	var files []string
+ 	nextPage := 0
+ listloop:
+ 	for {
+ 		opts := github.ListOptions{
+ 			PerPage: 300,
+@@ -159,22 +127,22 @@
+ 	var sepStart string
+ 	sepEnd := "\n```\n</details>" +
+ 		"\n<br>\n\n**Warning**: Output length greater than max comment size. Continued in next comment."
+ 	if command != "" {
+ 		sepStart = fmt.Sprintf("Continued %s output from previous comment.\n<details><summary>Show Output</summary>\n\n", command) +
+ 			"```diff\n"
+ 	} else {
+ 		sepStart = "Continued from previous comment.\n<details><summary>Show Output</summary>\n\n" +
+ 			"```diff\n"
+ 	}
+-	truncationHeader := "> [!WARNING]\n" +
+-		"> **Warning**: Command output is larger than the maximum number of comments per command. Output truncated.\n"
++	truncationHeader := "\n```\n</details>" +
++		"\n<br>\n\n**Warning**: Command output is larger than the maximum number of comments per command. Output truncated.\n\n[..]\n"
+ 	comments := common.SplitComment(comment, maxCommentLength, sepEnd, sepStart, g.maxCommentsPerCommand, truncationHeader)
+ 	for i := range comments {
+ 		_, resp, err := g.client.Issues.CreateComment(g.ctx, repo.Owner, repo.Name, pullNum, &github.IssueComment{Body: &comments[i]})
+ 		if resp != nil {
+ 			logger.Debug("POST /repos/%v/%v/issues/%d/comments returned: %v", repo.Owner, repo.Name, pullNum, resp.StatusCode)
+ 		}
+ 		if err != nil {
+ 			return err
+ 		}
+ 	}
+@@ -340,327 +308,133 @@
+ 			ClientMutationID:    clientMutationID,
+ 		}
+ 		mutationResult := &mutation
+ 		err := g.v4Client.Mutate(g.ctx, mutationResult, input, nil)
+ 		if err != nil {
+ 			return errors.Wrap(err, "dismissing reviewDecision")
+ 		}
+ 	}
+ 	return nil
+ }
+-type PageInfo struct {
+-	EndCursor   *githubv4.String
+-	HasNextPage githubv4.Boolean
+-}
+-type WorkflowFileReference struct {
+-	Path         githubv4.String
+-	RepositoryId githubv4.Int
+-	Sha          *githubv4.String
+-}
+-func (original WorkflowFileReference) Copy() WorkflowFileReference {
+-	copy := WorkflowFileReference{
+-		Path:         original.Path,
+-		RepositoryId: original.RepositoryId,
+-		Sha:          new(githubv4.String),
+-	}
+-	if original.Sha != nil {
+-		*copy.Sha = *original.Sha
+-	}
+-	return copy
+-}
+-type WorkflowRun struct {
+-	File struct {
+-		Path              githubv4.String
+-		RepositoryFileUrl githubv4.String
+-		RepositoryName    githubv4.String
+-	}
+-}
+-type CheckRun struct {
+-	Name       githubv4.String
+-	Conclusion githubv4.String
+-	IsRequired githubv4.Boolean `graphql:"isRequired(pullRequestNumber: $number)"`
+-	CheckSuite struct {
+-		WorkflowRun *WorkflowRun
+-	}
+-}
+-func (original CheckRun) Copy() CheckRun {
+-	copy := CheckRun{
+-		Name:       original.Name,
+-		Conclusion: original.Conclusion,
+-		IsRequired: original.IsRequired,
+-		CheckSuite: original.CheckSuite,
+-	}
+-	if original.CheckSuite.WorkflowRun != nil {
+-		copy.CheckSuite.WorkflowRun = new(WorkflowRun)
+-		*copy.CheckSuite.WorkflowRun = *original.CheckSuite.WorkflowRun
+-	}
+-	return copy
+-}
+-type StatusContext struct {
+-	Context githubv4.String
+-	State   githubv4.String
+-	IsRequired githubv4.Boolean `graphql:"isRequired(pullRequestNumber: $number)"`
+-}
+-func (g *GithubClient) LookupRepoId(repo githubv4.String) (githubv4.Int, error) {
+-	if repoId, ok := g.repoIdCache.Get(repo); ok {
+-		return repoId, nil
+-	}
+-	repoSplit := strings.Split(string(repo), "/")
+-	if len(repoSplit) != 2 {
+-		return githubv4.Int(0), fmt.Errorf("invalid repository name: %s", repo)
+-	}
+-	var query struct {
+-		Repository struct {
+-			DatabaseId githubv4.Int
+-		} `graphql:"repository(owner: $owner, name: $name)"`
+-	}
+-	variables := map[string]interface{}{
+-		"owner": githubv4.String(repoSplit[0]),
+-		"name":  githubv4.String(repoSplit[1]),
+-	}
+-	err := g.v4Client.Query(g.ctx, &query, variables)
+-	if err != nil {
+-		return githubv4.Int(0), errors.Wrap(err, "getting repository id from GraphQL")
+-	}
+-	g.repoIdCache.Set(repo, query.Repository.DatabaseId)
+-	return query.Repository.DatabaseId, nil
+-}
+-func (g *GithubClient) WorkflowRunMatchesWorkflowFileReference(workflowRun WorkflowRun, workflowFileReference WorkflowFileReference) (bool, error) {
+-	repoId, err := g.LookupRepoId(workflowRun.File.RepositoryName)
+-	if err != nil {
+-		return false, err
+-	}
+-	if !(repoId == workflowFileReference.RepositoryId && workflowRun.File.Path == workflowFileReference.Path) {
+-		return false, nil
+-	} else if workflowFileReference.Sha != nil {
+-		return strings.Contains(string(workflowRun.File.RepositoryFileUrl), string(*workflowFileReference.Sha)), nil
+-	} else {
++func isRequiredCheck(check string, required []string) bool {
++	for _, r := range required {
++		if r == check {
++			return true
++		}
++	}
++	return false
++}
++func (g *GithubClient) GetCombinedStatusMinusApply(logger logging.SimpleLogging, repo models.Repo, pull *github.PullRequest, vcstatusname string) (bool, error) {
++	logger.Debug("Checking if GitHub pull request %d has successful status checks", pull.GetNumber())
++	status, resp, err := g.client.Repositories.GetCombinedStatus(g.ctx, *pull.Head.Repo.Owner.Login, repo.Name, *pull.Head.Ref, nil)
++	if resp != nil {
++		logger.Debug("GET /repos/%v/%v/commits/%s/status returned: %v", *pull.Head.Repo.Owner.Login, repo.Name, *pull.Head.Ref, resp.StatusCode)
++	}
++	if err != nil {
++		return false, errors.Wrap(err, "getting combined status")
++	}
++	for _, r := range status.Statuses {
++		if strings.HasPrefix(*r.Context, fmt.Sprintf("%s/%s", vcstatusname, command.Apply.String())) {
++			continue
++		}
++		if *r.State != "success" {
++			return false, nil
++		}
++	}
++	required, resp, err := g.client.Repositories.GetBranchProtection(context.Background(), repo.Owner, repo.Name, *pull.Base.Ref)
++	if resp != nil {
++		logger.Debug("GET /repos/%v/%v/branches/%s/protection returned: %v", repo.Owner, repo.Name, *pull.Base.Ref, resp.StatusCode)
++	}
++	if err != nil {
++		return false, errors.Wrap(err, "getting required status checks")
++	}
++	if required.RequiredStatusChecks == nil {
+ 		return true, nil
+ 	}
+-}
+-func (g *GithubClient) GetPullRequestMergeabilityInfo(
+-	repo models.Repo,
+-	pull *github.PullRequest,
+-) (
+-	reviewDecision githubv4.String,
+-	requiredChecks []githubv4.String,
+-	requiredWorkflows []WorkflowFileReference,
+-	checkRuns []CheckRun,
+-	statusContexts []StatusContext,
+-	err error,
+-) {
++	checksuites, resp, err := g.client.Checks.ListCheckSuitesForRef(context.Background(), *pull.Head.Repo.Owner.Login, repo.Name, *pull.Head.Ref, nil)
++	if resp != nil {
++		logger.Debug("GET /repos/%v/%v/commits/%s/check-suites returned: %v", *pull.Head.Repo.Owner.Login, repo.Name, *pull.Head.Ref, resp.StatusCode)
++	}
++	if err != nil {
++		return false, errors.Wrap(err, "getting check suites for ref")
++	}
++	for _, c := range checksuites.CheckSuites {
++		if *c.Status == "completed" {
++			suite, resp, err := g.client.Checks.ListCheckRunsCheckSuite(context.Background(), *pull.Head.Repo.Owner.Login, repo.Name, *c.ID, nil)
++			if resp != nil {
++				logger.Debug("GET /repos/%v/%v/check-suites/%d/check-runs returned: %v", *pull.Head.Repo.Owner.Login, repo.Name, *c.ID, resp.StatusCode)
++			}
++			if err != nil {
++				return false, errors.Wrap(err, "getting check runs for check suite")
++			}
++			for _, r := range suite.CheckRuns {
++				if isRequiredCheck(*r.Name, required.RequiredStatusChecks.Contexts) {
++					if *c.Conclusion == "success" {
++						continue
++					}
++					return false, nil
++				}
++				continue
++			}
++		}
++	}
++	return true, nil
++}
++func (g *GithubClient) GetPullReviewDecision(repo models.Repo, pull models.PullRequest) (approvalStatus bool, err error) {
+ 	var query struct {
+ 		Repository struct {
+ 			PullRequest struct {
+-				ReviewDecision githubv4.String
+-				BaseRef        struct {
+-					BranchProtectionRule struct {
+-						RequiredStatusChecks []struct {
+-							Context githubv4.String
+-						}
+-					}
+-					Rules struct {
+-						PageInfo PageInfo
+-						Nodes    []struct {
+-							Type              githubv4.String
+-							RepositoryRuleset struct {
+-								Enforcement githubv4.String
+-							}
+-							Parameters struct {
+-								RequiredStatusChecksParameters struct {
+-									RequiredStatusChecks []struct {
+-										Context githubv4.String
+-									}
+-								} `graphql:"... on RequiredStatusChecksParameters"`
+-								WorkflowsParameters struct {
+-									Workflows []WorkflowFileReference
+-								} `graphql:"... on WorkflowsParameters"`
+-							}
+-						}
+-					} `graphql:"rules(first: 100, after: $ruleCursor)"`
+-				}
+-				Commits struct {
+-					Nodes []struct {
+-						Commit struct {
+-							StatusCheckRollup struct {
+-								Contexts struct {
+-									PageInfo PageInfo
+-									Nodes    []struct {
+-										Typename      githubv4.String `graphql:"__typename"`
+-										CheckRun      CheckRun        `graphql:"... on CheckRun"`
+-										StatusContext StatusContext   `graphql:"... on StatusContext"`
+-									}
+-								} `graphql:"contexts(first: 100, after: $contextCursor)"`
+-							}
+-						}
+-					}
+-				} `graphql:"commits(last: 1)"`
++				ReviewDecision string
+ 			} `graphql:"pullRequest(number: $number)"`
+ 		} `graphql:"repository(owner: $owner, name: $name)"`
+ 	}
+ 	variables := map[string]interface{}{
+-		"owner":         githubv4.String(repo.Owner),
+-		"name":          githubv4.String(repo.Name),
+-		"number":        githubv4.Int(*pull.Number),
+-		"ruleCursor":    (*githubv4.String)(nil),
+-		"contextCursor": (*githubv4.String)(nil),
+-	}
+-	requiredChecksSet := make(map[githubv4.String]any)
+-pagination:
+-	for {
+-		err = g.v4Client.Query(g.ctx, &query, variables)
+-		if err != nil {
+-			break pagination
+-		}
+-		reviewDecision = query.Repository.PullRequest.ReviewDecision
+-		for _, rule := range query.Repository.PullRequest.BaseRef.BranchProtectionRule.RequiredStatusChecks {
+-			requiredChecksSet[rule.Context] = struct{}{}
+-		}
+-		for _, rule := range query.Repository.PullRequest.BaseRef.Rules.Nodes {
+-			if rule.RepositoryRuleset.Enforcement != "ACTIVE" {
+-				continue
+-			}
+-			switch rule.Type {
+-			case "REQUIRED_STATUS_CHECKS":
+-				for _, context := range rule.Parameters.RequiredStatusChecksParameters.RequiredStatusChecks {
+-					requiredChecksSet[context.Context] = struct{}{}
+-				}
+-			case "WORKFLOWS":
+-				for _, workflow := range rule.Parameters.WorkflowsParameters.Workflows {
+-					requiredWorkflows = append(requiredWorkflows, workflow.Copy())
+-				}
+-			default:
+-				continue
+-			}
+-		}
+-		if len(query.Repository.PullRequest.Commits.Nodes) == 0 {
+-			err = errors.New("no commits found on PR")
+-			break pagination
+-		}
+-		for _, context := range query.Repository.PullRequest.Commits.Nodes[0].Commit.StatusCheckRollup.Contexts.Nodes {
+-			switch context.Typename {
+-			case "CheckRun":
+-				checkRuns = append(checkRuns, context.CheckRun.Copy())
+-			case "StatusContext":
+-				statusContexts = append(statusContexts, context.StatusContext)
+-			default:
+-				err = fmt.Errorf("unknown type of status check, %q", context.Typename)
+-				break pagination
+-			}
+-		}
+-		if !query.Repository.PullRequest.BaseRef.Rules.PageInfo.HasNextPage &&
+-			!query.Repository.PullRequest.Commits.Nodes[0].Commit.StatusCheckRollup.Contexts.PageInfo.HasNextPage {
+-			break pagination
+-		}
+-		if query.Repository.PullRequest.BaseRef.Rules.PageInfo.EndCursor != nil {
+-			variables["ruleCursor"] = query.Repository.PullRequest.BaseRef.Rules.PageInfo.EndCursor
+-		}
+-		if query.Repository.PullRequest.Commits.Nodes[0].Commit.StatusCheckRollup.Contexts.PageInfo.EndCursor != nil {
+-			variables["contextCursor"] = query.Repository.PullRequest.Commits.Nodes[0].Commit.StatusCheckRollup.Contexts.PageInfo.EndCursor
+-		}
+-	}
+-	if err != nil {
+-		return "", nil, nil, nil, nil, errors.Wrap(err, "fetching rulesets, branch protections and status checks from GraphQL")
+-	}
+-	for context := range requiredChecksSet {
+-		requiredChecks = append(requiredChecks, context)
+-	}
+-	return reviewDecision, requiredChecks, requiredWorkflows, checkRuns, statusContexts, nil
+-}
+-func CheckRunPassed(checkRun CheckRun) bool {
+-	return checkRun.Conclusion == "SUCCESS" || checkRun.Conclusion == "SKIPPED" || checkRun.Conclusion == "NEUTRAL"
+-}
+-func StatusContextPassed(statusContext StatusContext, vcsstatusname string) bool {
+-	return strings.HasPrefix(string(statusContext.Context), fmt.Sprintf("%s/%s", vcsstatusname, command.Apply.String())) ||
+-		statusContext.State == "SUCCESS"
+-}
+-func ExpectedCheckPassed(expectedContext githubv4.String, checkRuns []CheckRun, statusContexts []StatusContext, vcsstatusname string) bool {
+-	for _, checkRun := range checkRuns {
+-		if checkRun.Name == expectedContext {
+-			return CheckRunPassed(checkRun)
+-		}
+-	}
+-	for _, statusContext := range statusContexts {
+-		if statusContext.Context == expectedContext {
+-			return StatusContextPassed(statusContext, vcsstatusname)
+-		}
+-	}
+-	return false
+-}
+-func (g *GithubClient) ExpectedWorkflowPassed(expectedWorkflow WorkflowFileReference, checkRuns []CheckRun) (bool, error) {
+-	for _, checkRun := range checkRuns {
+-		if checkRun.CheckSuite.WorkflowRun == nil {
+-			continue
+-		}
+-		match, err := g.WorkflowRunMatchesWorkflowFileReference(*checkRun.CheckSuite.WorkflowRun, expectedWorkflow)
+-		if err != nil {
+-			return false, err
+-		}
+-		if match {
+-			return CheckRunPassed(checkRun), nil
+-		}
++		"owner":  githubv4.String(repo.Owner),
++		"name":   githubv4.String(repo.Name),
++		"number": githubv4.Int(pull.Num),
++	}
++	err = g.v4Client.Query(g.ctx, &query, variables)
++	if err != nil {
++		return approvalStatus, errors.Wrap(err, "getting reviewDecision")
++	}
++	if query.Repository.PullRequest.ReviewDecision == "APPROVED" || len(query.Repository.PullRequest.ReviewDecision) == 0 {
++		return true, nil
+ 	}
+ 	return false, nil
+-}
+-func (g *GithubClient) IsMergeableMinusApply(logger logging.SimpleLogging, repo models.Repo, pull *github.PullRequest, vcsstatusname string) (bool, error) {
+-	if pull.Number == nil {
+-		return false, errors.New("pull request number is nil")
+-	}
+-	reviewDecision, requiredChecks, requiredWorkflows, checkRuns, statusContexts, err := g.GetPullRequestMergeabilityInfo(repo, pull)
+-	if err != nil {
+-		return false, err
+-	}
+-	notMergeablePrefix := fmt.Sprintf("Pull Request %s/%s:%s is not mergeable", repo.Owner, repo.Name, strconv.Itoa(*pull.Number))
+-	if reviewDecision != "APPROVED" && len(reviewDecision) != 0 {
+-		logger.Debug("%s: Review Decision: %s", notMergeablePrefix, reviewDecision)
+-		return false, nil
+-	}
+-	for _, requiredCheck := range requiredChecks {
+-		if !ExpectedCheckPassed(requiredCheck, checkRuns, statusContexts, vcsstatusname) {
+-			logger.Debug("%s: Expected Required Check: %s", notMergeablePrefix, requiredCheck)
+-			return false, nil
+-		}
+-	}
+-	for _, requiredWorkflow := range requiredWorkflows {
+-		passed, err := g.ExpectedWorkflowPassed(requiredWorkflow, checkRuns)
+-		if err != nil {
+-			return false, err
+-		}
+-		if !passed {
+-			logger.Debug("%s: Expected Required Workflow: RepositoryId: %d Path: %s", notMergeablePrefix, requiredWorkflow.RepositoryId, requiredWorkflow.Path)
+-			return false, nil
+-		}
+-	}
+-	return true, nil
+ }
+ func (g *GithubClient) PullIsMergeable(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest, vcsstatusname string) (bool, error) {
+ 	logger.Debug("Checking if GitHub pull request %d is mergeable", pull.Num)
+ 	githubPR, err := g.GetPullRequest(logger, repo, pull.Num)
+ 	if err != nil {
+ 		return false, errors.Wrap(err, "getting pull request")
+ 	}
+-	switch githubPR.GetMergeableState() {
+-	case "clean", "unstable", "has_hooks":
+-		return true, nil
+-	case "blocked":
++	state := githubPR.GetMergeableState()
++	if state != "clean" && state != "unstable" && state != "has_hooks" {
+ 		if g.config.AllowMergeableBypassApply {
+ 			logger.Debug("AllowMergeableBypassApply feature flag is enabled - attempting to bypass apply from mergeable requirements")
+-			isMergeableMinusApply, err := g.IsMergeableMinusApply(logger, repo, githubPR, vcsstatusname)
+-			if err != nil {
+-				return false, errors.Wrap(err, "getting pull request status")
+-			}
+-			return isMergeableMinusApply, nil
++			if state == "blocked" {
++				status, err := g.GetCombinedStatusMinusApply(logger, repo, githubPR, vcsstatusname)
++				if err != nil {
++					return false, errors.Wrap(err, "getting pull request status")
++				}
++				approved, err := g.GetPullReviewDecision(repo, pull)
++				if err != nil {
++					return false, errors.Wrap(err, "getting pull request reviewDecision")
++				}
++				if status && approved {
++					return true, nil
++				}
++			}
+ 		}
+ 		return false, nil
+-	default:
+-		return false, nil
+-	}
++	}
++	return true, nil
+ }
+ func (g *GithubClient) GetPullRequest(logger logging.SimpleLogging, repo models.Repo, num int) (*github.PullRequest, error) {
+ 	logger.Debug("Getting GitHub pull request %d", num)
+ 	var err error
+ 	var pull *github.PullRequest
+ 	maxAttempts := 5
+ 	attemptDelay := 0 * time.Second
+ 	for i := 0; i < maxAttempts; i++ {
+ 		time.Sleep(attemptDelay)
+ 		attemptDelay = 2*attemptDelay + 1*time.Second
+
+--- a/server/events/vcs/github_credentials.go
++++ b/server/events/vcs/github_credentials.go
+@@ -1,19 +1,19 @@
+ package vcs
+ import (
+ 	"context"
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
+ 	"github.com/bradleyfalzon/ghinstallation/v2"
+-	"github.com/google/go-github/v63/github"
++	"github.com/google/go-github/v59/github"
+ 	"github.com/pkg/errors"
+ )
+ type GithubCredentials interface {
+ 	Client() (*http.Client, error)
+ 	GetToken() (string, error)
+ 	GetUser() (string, error)
+ }
+ type GithubAnonymousCredentials struct{}
+ func (c *GithubAnonymousCredentials) Client() (*http.Client, error) {
+ 	tr := http.DefaultTransport
+
+--- a/server/events/vcs/instrumented_client.go
++++ b/server/events/vcs/instrumented_client.go
+@@ -1,14 +1,14 @@
+ package vcs
+ import (
+ 	"strconv"
+-	"github.com/google/go-github/v63/github"
++	"github.com/google/go-github/v59/github"
+ 	"github.com/runatlantis/atlantis/server/events/models"
+ 	"github.com/runatlantis/atlantis/server/logging"
+ 	"github.com/runatlantis/atlantis/server/metrics"
+ 	tally "github.com/uber-go/tally/v4"
+ )
+ func NewInstrumentedGithubClient(client *GithubClient, statsScope tally.Scope, logger logging.SimpleLogging) IGithubClient {
+ 	scope := statsScope.SubScope("github")
+ 	instrumentedGHClient := &InstrumentedClient{
+ 		Client:     client,
+ 		StatsScope: scope,
+
+--- a/server/events/vcs/mocks/mock_github_pull_request_getter.go
++++ b/server/events/vcs/mocks/mock_github_pull_request_getter.go
+@@ -1,13 +1,13 @@
+ package mocks
+ import (
+-	github "github.com/google/go-github/v63/github"
++	github "github.com/google/go-github/v59/github"
+ 	pegomock "github.com/petergtz/pegomock/v4"
+ 	models "github.com/runatlantis/atlantis/server/events/models"
+ 	logging "github.com/runatlantis/atlantis/server/logging"
+ 	"reflect"
+ 	"time"
+ )
+ type MockGithubPullRequestGetter struct {
+ 	fail func(message string, callerSkip ...int)
+ }
+ func NewMockGithubPullRequestGetter(options ...pegomock.Option) *MockGithubPullRequestGetter {
+
+--- a/server/server.go
++++ b/server/server.go
+@@ -329,39 +329,35 @@
+ 	var projectCmdOutputHandler jobs.ProjectCommandOutputHandler
+ 	if userConfig.TFEToken != "" && !userConfig.TFELocalExecutionMode {
+ 		projectCmdOutputHandler = &jobs.NoopProjectOutputHandler{}
+ 	} else {
+ 		projectCmdOutput := make(chan *jobs.ProjectCmdOutputLine)
+ 		projectCmdOutputHandler = jobs.NewAsyncProjectCommandOutputHandler(
+ 			projectCmdOutput,
+ 			logger,
+ 		)
+ 	}
+-	distribution := terraform.NewDistributionTerraform()
+-	if userConfig.TFDistribution == "opentofu" {
+-		distribution = terraform.NewDistributionOpenTofu()
+-	}
+ 	terraformClient, err := terraform.NewClient(
+ 		logger,
+-		distribution,
+ 		binDir,
+ 		cacheDir,
+ 		userConfig.TFEToken,
+ 		userConfig.TFEHostname,
+ 		userConfig.DefaultTFVersion,
+ 		config.DefaultTFVersionFlag,
+ 		userConfig.TFDownloadURL,
++		&terraform.DefaultDownloader{},
+ 		userConfig.TFDownload,
+ 		userConfig.UseTFPluginCache,
+ 		projectCmdOutputHandler)
+ 	if err != nil && flag.Lookup("test.v") == nil {
+-		return nil, errors.Wrap(err, fmt.Sprintf("initializing %s", userConfig.TFDistribution))
++		return nil, errors.Wrap(err, "initializing terraform")
+ 	}
+ 	markdownRenderer := events.NewMarkdownRenderer(
+ 		gitlabClient.SupportsCommonMark(),
+ 		userConfig.DisableApplyAll,
+ 		disableApply,
+ 		userConfig.DisableMarkdownFolding,
+ 		userConfig.DisableRepoLocking,
+ 		userConfig.EnableDiffMarkdownFormat,
+ 		userConfig.MarkdownTemplateOverridesDir,
+ 		userConfig.ExecutableName,
+@@ -529,21 +525,21 @@
+ 		userConfig.AutoDiscoverModeFlag,
+ 		statsScope,
+ 		terraformClient,
+ 	)
+ 	showStepRunner, err := runtime.NewShowStepRunner(terraformClient, defaultTfVersion)
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "initializing show step runner")
+ 	}
+ 	policyCheckStepRunner, err := runtime.NewPolicyCheckStepRunner(
+ 		defaultTfVersion,
+-		policy.NewConfTestExecutorWorkflow(logger, binDir, &policy.ConfTestGoGetterVersionDownloader{}),
++		policy.NewConfTestExecutorWorkflow(logger, binDir, &terraform.DefaultDownloader{}),
+ 	)
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "initializing policy check step runner")
+ 	}
+ 	applyRequirementHandler := &events.DefaultCommandRequirementHandler{
+ 		WorkingDir: workingDir,
+ 	}
+ 	projectCommandRunner := &events.DefaultProjectCommandRunner{
+ 		VcsClient:        vcsClient,
+ 		Locker:           projectLocker,
+@@ -683,32 +679,23 @@
+ 	)
+ 	commentCommandRunnerByCmd := map[command.Name]events.CommentCommandRunner{
+ 		command.Plan:            planCommandRunner,
+ 		command.Apply:           applyCommandRunner,
+ 		command.ApprovePolicies: approvePoliciesCommandRunner,
+ 		command.Unlock:          unlockCommandRunner,
+ 		command.Version:         versionCommandRunner,
+ 		command.Import:          importCommandRunner,
+ 		command.State:           stateCommandRunner,
+ 	}
+-	var teamAllowlistChecker command.TeamAllowlistChecker
+-	if globalCfg.TeamAuthz.Command != "" {
+-		teamAllowlistChecker = &events.ExternalTeamAllowlistChecker{
+-			Command:                     globalCfg.TeamAuthz.Command,
+-			ExtraArgs:                   globalCfg.TeamAuthz.Args,
+-			ExternalTeamAllowlistRunner: &runtime.DefaultExternalTeamAllowlistRunner{},
+-		}
+-	} else {
+-		teamAllowlistChecker, err = command.NewTeamAllowlistChecker(userConfig.GithubTeamAllowlist)
+-		if err != nil {
+-			return nil, err
+-		}
++	githubTeamAllowlistChecker, err := events.NewTeamAllowlistChecker(userConfig.GithubTeamAllowlist)
++	if err != nil {
++		return nil, err
+ 	}
+ 	varFileAllowlistChecker, err := events.NewVarFileAllowlistChecker(userConfig.VarFileAllowlist)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	commandRunner := &events.DefaultCommandRunner{
+ 		VCSClient:                      vcsClient,
+ 		GithubPullGetter:               githubClient,
+ 		GitlabMergeRequestGetter:       gitlabClient,
+ 		AzureDevopsPullGetter:          azuredevopsClient,
+@@ -722,21 +709,21 @@
+ 		AllowForkPRs:                   userConfig.AllowForkPRs,
+ 		AllowForkPRsFlag:               config.AllowForkPRsFlag,
+ 		SilenceForkPRErrors:            userConfig.SilenceForkPRErrors,
+ 		SilenceForkPRErrorsFlag:        config.SilenceForkPRErrorsFlag,
+ 		DisableAutoplan:                userConfig.DisableAutoplan,
+ 		DisableAutoplanLabel:           userConfig.DisableAutoplanLabel,
+ 		Drainer:                        drainer,
+ 		PreWorkflowHooksCommandRunner:  preWorkflowHooksCommandRunner,
+ 		PostWorkflowHooksCommandRunner: postWorkflowHooksCommandRunner,
+ 		PullStatusFetcher:              backend,
+-		TeamAllowlistChecker:           teamAllowlistChecker,
++		TeamAllowlistChecker:           githubTeamAllowlistChecker,
+ 		VarFileAllowlistChecker:        varFileAllowlistChecker,
+ 		CommitStatusUpdater:            commitStatusUpdater,
+ 	}
+ 	repoAllowlist, err := events.NewRepoAllowlistChecker(userConfig.RepoAllowlist)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	locksController := &controllers.LocksController{
+ 		AtlantisVersion:    config.AtlantisVersion,
+ 		AtlantisURL:        parsedURL,
+
+--- a/server/user_config.go
++++ b/server/user_config.go
+@@ -87,21 +87,20 @@
+ 	SilenceNoProjects   bool `mapstructure:"silence-no-projects"`
+ 	SilenceForkPRErrors bool `mapstructure:"silence-fork-pr-errors"`
+ 	SilenceVCSStatusNoPlans bool `mapstructure:"silence-vcs-status-no-plans"`
+ 	SilenceVCSStatusNoProjects bool            `mapstructure:"silence-vcs-status-no-projects"`
+ 	SilenceAllowlistErrors     bool            `mapstructure:"silence-allowlist-errors"`
+ 	SkipCloneNoChanges         bool            `mapstructure:"skip-clone-no-changes"`
+ 	SlackToken                 string          `mapstructure:"slack-token"`
+ 	SSLCertFile                string          `mapstructure:"ssl-cert-file"`
+ 	SSLKeyFile                 string          `mapstructure:"ssl-key-file"`
+ 	RestrictFileList           bool            `mapstructure:"restrict-file-list"`
+-	TFDistribution             string          `mapstructure:"tf-distribution"`
+ 	TFDownload                 bool            `mapstructure:"tf-download"`
+ 	TFDownloadURL              string          `mapstructure:"tf-download-url"`
+ 	TFEHostname                string          `mapstructure:"tfe-hostname"`
+ 	TFELocalExecutionMode      bool            `mapstructure:"tfe-local-execution-mode"`
+ 	TFEToken                   string          `mapstructure:"tfe-token"`
+ 	VarFileAllowlist           string          `mapstructure:"var-file-allowlist"`
+ 	VCSStatusName              string          `mapstructure:"vcs-status-name"`
+ 	DefaultTFVersion           string          `mapstructure:"default-tf-version"`
+ 	Webhooks                   []WebhookConfig `mapstructure:"webhooks" flag:"false"`
+ 	WebBasicAuth               bool            `mapstructure:"web-basic-auth"`

@@ -1,0 +1,893 @@
+# ====================================================================
+# FILE: src/utils.rs
+# Total hunks: 19
+# ====================================================================
+# --- HUNK 1: Lines 1-154 ---
+     1| #![allow(dead_code)]
+     2| use crate::config::get_setting;
+     3| use crate::{client::json, server::RequestExt};
+     4| use askama::Template;
+     5| use cookie::Cookie;
+     6| use hyper::{Body, Request, Response};
+     7| use log::error;
+     8| use once_cell::sync::Lazy;
+     9| use regex::Regex;
+    10| use rust_embed::RustEmbed;
+    11| use serde_json::Value;
+    12| use std::collections::{HashMap, HashSet};
+    13| use std::env;
+    14| use std::str::FromStr;
+    15| use time::{macros::format_description, Duration, OffsetDateTime};
+    16| use url::Url;
+    17| #[macro_export]
+    18| macro_rules! dbg_msg {
+    19| 	($x:expr) => {
+    20| 		#[cfg(debug_assertions)]
+    21| 		eprintln!("{}:{}: {}", file!(), line!(), $x.to_string())
+    22| 	};
+    23| 	($($x:expr),+) => {
+    24| 		#[cfg(debug_assertions)]
+    25| 		dbg_msg!(format!($($x),+))
+    26| 	};
+    27| }
+    28| #[derive(PartialEq, Eq)]
+    29| pub enum ResourceType {
+    30| 	Subreddit,
+    31| 	User,
+    32| 	Post,
+    33| }
+    34| pub struct Flair {
+    35| 	pub flair_parts: Vec<FlairPart>,
+    36| 	pub text: String,
+    37| 	pub background_color: String,
+    38| 	pub foreground_color: String,
+    39| }
+    40| #[derive(Clone)]
+    41| pub struct FlairPart {
+    42| 	pub flair_part_type: String,
+    43| 	pub value: String,
+    44| }
+    45| impl FlairPart {
+    46| 	pub fn parse(flair_type: &str, rich_flair: Option<&Vec<Value>>, text_flair: Option<&str>) -> Vec<Self> {
+    47| 		match flair_type {
+    48| 			"richtext" => match rich_flair {
+    49| 				Some(rich) => rich
+    50| 					.iter()
+    51| 					.map(|part| {
+    52| 						let value = |name: &str| part[name].as_str().unwrap_or_default();
+    53| 						Self {
+    54| 							flair_part_type: value("e").to_string(),
+    55| 							value: match value("e") {
+    56| 								"text" => value("t").to_string(),
+    57| 								"emoji" => format_url(value("u")),
+    58| 								_ => String::new(),
+    59| 							},
+    60| 						}
+    61| 					})
+    62| 					.collect::<Vec<Self>>(),
+    63| 				None => Vec::new(),
+    64| 			},
+    65| 			"text" => match text_flair {
+    66| 				Some(text) => vec![Self {
+    67| 					flair_part_type: "text".to_string(),
+    68| 					value: text.to_string(),
+    69| 				}],
+    70| 				None => Vec::new(),
+    71| 			},
+    72| 			_ => Vec::new(),
+    73| 		}
+    74| 	}
+    75| }
+    76| pub struct Author {
+    77| 	pub name: String,
+    78| 	pub flair: Flair,
+    79| 	pub distinguished: String,
+    80| }
+    81| pub struct Poll {
+    82| 	pub poll_options: Vec<PollOption>,
+    83| 	pub voting_end_timestamp: (String, String),
+    84| 	pub total_vote_count: u64,
+    85| }
+    86| impl Poll {
+    87| 	pub fn parse(poll_data: &Value) -> Option<Self> {
+    88| 		poll_data.as_object()?;
+    89| 		let total_vote_count = poll_data["total_vote_count"].as_u64()?;
+    90| 		let voting_end_timestamp = time(poll_data["voting_end_timestamp"].as_f64()? / 1000.0);
+    91| 		let poll_options = PollOption::parse(&poll_data["options"])?;
+    92| 		Some(Self {
+    93| 			poll_options,
+    94| 			voting_end_timestamp,
+    95| 			total_vote_count,
+    96| 		})
+    97| 	}
+    98| 	pub fn most_votes(&self) -> u64 {
+    99| 		self.poll_options.iter().filter_map(|o| o.vote_count).max().unwrap_or(0)
+   100| 	}
+   101| }
+   102| pub struct PollOption {
+   103| 	pub id: u64,
+   104| 	pub text: String,
+   105| 	pub vote_count: Option<u64>,
+   106| }
+   107| impl PollOption {
+   108| 	pub fn parse(options: &Value) -> Option<Vec<Self>> {
+   109| 		Some(
+   110| 			options
+   111| 				.as_array()?
+   112| 				.iter()
+   113| 				.filter_map(|option| {
+   114| 					let id = option["id"].as_str()?.parse::<u64>().ok()?;
+   115| 					let text = option["text"].as_str()?.to_owned();
+   116| 					let vote_count = option["vote_count"].as_u64();
+   117| 					Some(Self { id, text, vote_count })
+   118| 				})
+   119| 				.collect::<Vec<Self>>(),
+   120| 		)
+   121| 	}
+   122| }
+   123| pub struct Flags {
+   124| 	pub spoiler: bool,
+   125| 	pub nsfw: bool,
+   126| 	pub stickied: bool,
+   127| }
+   128| #[derive(Debug)]
+   129| pub struct Media {
+   130| 	pub url: String,
+   131| 	pub alt_url: String,
+   132| 	pub width: i64,
+   133| 	pub height: i64,
+   134| 	pub poster: String,
+   135| }
+   136| impl Media {
+   137| 	pub async fn parse(data: &Value) -> (String, Self, Vec<GalleryMedia>) {
+   138| 		let mut gallery = Vec::new();
+   139| 		let data_preview = &data["preview"]["reddit_video_preview"];
+   140| 		let secure_media = &data["secure_media"]["reddit_video"];
+   141| 		let crosspost_parent_media = &data["crosspost_parent_list"][0]["secure_media"]["reddit_video"];
+   142| 		let (post_type, url_val, alt_url_val) = if data_preview["fallback_url"].is_string() {
+   143| 			(
+   144| 				if data_preview["is_gif"].as_bool().unwrap_or(false) { "gif" } else { "video" },
+   145| 				&data_preview["fallback_url"],
+   146| 				Some(&data_preview["hls_url"]),
+   147| 			)
+   148| 		} else if secure_media["fallback_url"].is_string() {
+   149| 			(
+   150| 				if secure_media["is_gif"].as_bool().unwrap_or(false) { "gif" } else { "video" },
+   151| 				&secure_media["fallback_url"],
+   152| 				Some(&secure_media["hls_url"]),
+   153| 			)
+   154| 		} else if crosspost_parent_media["fallback_url"].is_string() {
+
+# --- HUNK 2: Lines 157-273 ---
+   157| 				&crosspost_parent_media["fallback_url"],
+   158| 				Some(&crosspost_parent_media["hls_url"]),
+   159| 			)
+   160| 		} else if data["post_hint"].as_str().unwrap_or("") == "image" {
+   161| 			let preview = &data["preview"]["images"][0];
+   162| 			let mp4 = &preview["variants"]["mp4"];
+   163| 			if mp4.is_object() {
+   164| 				("gif", &mp4["source"]["url"], None)
+   165| 			} else {
+   166| 				if data["domain"] == "i.redd.it" {
+   167| 					("image", &data["url"], None)
+   168| 				} else {
+   169| 					("image", &preview["source"]["url"], None)
+   170| 				}
+   171| 			}
+   172| 		} else if data["is_self"].as_bool().unwrap_or_default() {
+   173| 			("self", &data["permalink"], None)
+   174| 		} else if data["is_gallery"].as_bool().unwrap_or_default() {
+   175| 			gallery = GalleryMedia::parse(&data["gallery_data"]["items"], &data["media_metadata"]);
+   176| 			("gallery", &data["url"], None)
+   177| 		} else if data["is_reddit_media_domain"].as_bool().unwrap_or_default() && data["domain"] == "i.redd.it" {
+   178| 			("image", &data["url"], None)
+   179| 		} else {
+   180| 			("link", &data["url"], None)
+   181| 		};
+   182| 		let source = &data["preview"]["images"][0]["source"];
+   183| 		let alt_url = alt_url_val.map_or(String::new(), |val| format_url(val.as_str().unwrap_or_default()));
+   184| 		(
+   185| 			post_type.to_string(),
+   186| 			Self {
+   187| 				url: format_url(url_val.as_str().unwrap_or_default()),
+   188| 				alt_url,
+   189| 				width: source["width"].as_i64().unwrap_or_default(),
+   190| 				height: source["height"].as_i64().unwrap_or_default(),
+   191| 				poster: format_url(source["url"].as_str().unwrap_or_default()),
+   192| 			},
+   193| 			gallery,
+   194| 		)
+   195| 	}
+   196| }
+   197| pub struct GalleryMedia {
+   198| 	pub url: String,
+   199| 	pub width: i64,
+   200| 	pub height: i64,
+   201| 	pub caption: String,
+   202| 	pub outbound_url: String,
+   203| }
+   204| impl GalleryMedia {
+   205| 	fn parse(items: &Value, metadata: &Value) -> Vec<Self> {
+   206| 		items
+   207| 			.as_array()
+   208| 			.unwrap_or(&Vec::new())
+   209| 			.iter()
+   210| 			.map(|item| {
+   211| 				let media_id = item["media_id"].as_str().unwrap_or_default();
+   212| 				let image = &metadata[media_id]["s"];
+   213| 				let image_type = &metadata[media_id]["m"];
+   214| 				let url = if image_type == "image/gif" {
+   215| 					image["gif"].as_str().unwrap_or_default()
+   216| 				} else {
+   217| 					image["u"].as_str().unwrap_or_default()
+   218| 				};
+   219| 				Self {
+   220| 					url: format_url(url),
+   221| 					width: image["x"].as_i64().unwrap_or_default(),
+   222| 					height: image["y"].as_i64().unwrap_or_default(),
+   223| 					caption: item["caption"].as_str().unwrap_or_default().to_string(),
+   224| 					outbound_url: item["outbound_url"].as_str().unwrap_or_default().to_string(),
+   225| 				}
+   226| 			})
+   227| 			.collect::<Vec<Self>>()
+   228| 	}
+   229| }
+   230| pub struct Post {
+   231| 	pub id: String,
+   232| 	pub title: String,
+   233| 	pub community: String,
+   234| 	pub body: String,
+   235| 	pub author: Author,
+   236| 	pub permalink: String,
+   237| 	pub poll: Option<Poll>,
+   238| 	pub score: (String, String),
+   239| 	pub upvote_ratio: i64,
+   240| 	pub post_type: String,
+   241| 	pub flair: Flair,
+   242| 	pub flags: Flags,
+   243| 	pub thumbnail: Media,
+   244| 	pub media: Media,
+   245| 	pub domain: String,
+   246| 	pub rel_time: String,
+   247| 	pub created: String,
+   248| 	pub created_ts: u64,
+   249| 	pub num_duplicates: u64,
+   250| 	pub comments: (String, String),
+   251| 	pub gallery: Vec<GalleryMedia>,
+   252| 	pub awards: Awards,
+   253| 	pub nsfw: bool,
+   254| 	pub ws_url: String,
+   255| }
+   256| impl Post {
+   257| 	pub async fn fetch(path: &str, quarantine: bool) -> Result<(Vec<Self>, String), String> {
+   258| 		let res = match json(path.to_string(), quarantine).await {
+   259| 			Ok(response) => response,
+   260| 			Err(msg) => return Err(msg),
+   261| 		};
+   262| 		let Some(post_list) = res["data"]["children"].as_array() else {
+   263| 			return Err("No posts found".to_string());
+   264| 		};
+   265| 		let mut posts: Vec<Self> = Vec::new();
+   266| 		for post in post_list {
+   267| 			let data = &post["data"];
+   268| 			let (rel_time, created) = time(data["created_utc"].as_f64().unwrap_or_default());
+   269| 			let created_ts = data["created_utc"].as_f64().unwrap_or_default().round() as u64;
+   270| 			let score = data["score"].as_i64().unwrap_or_default();
+   271| 			let ratio: f64 = data["upvote_ratio"].as_f64().unwrap_or(1.0) * 100.0;
+   272| 			let title = val(post, "title");
+   273| 			let (post_type, media, gallery) = Media::parse(data).await;
+
+# --- HUNK 3: Lines 291-671 ---
+   291| 						),
+   292| 						text: val(post, "link_flair_text"),
+   293| 						background_color: val(post, "author_flair_background_color"),
+   294| 						foreground_color: val(post, "author_flair_text_color"),
+   295| 					},
+   296| 					distinguished: val(post, "distinguished"),
+   297| 				},
+   298| 				score: if data["hide_score"].as_bool().unwrap_or_default() {
+   299| 					("\u{2022}".to_string(), "Hidden".to_string())
+   300| 				} else {
+   301| 					format_num(score)
+   302| 				},
+   303| 				upvote_ratio: ratio as i64,
+   304| 				post_type,
+   305| 				thumbnail: Media {
+   306| 					url: format_url(val(post, "thumbnail").as_str()),
+   307| 					alt_url: String::new(),
+   308| 					width: data["thumbnail_width"].as_i64().unwrap_or_default(),
+   309| 					height: data["thumbnail_height"].as_i64().unwrap_or_default(),
+   310| 					poster: String::new(),
+   311| 				},
+   312| 				media,
+   313| 				domain: val(post, "domain"),
+   314| 				flair: Flair {
+   315| 					flair_parts: FlairPart::parse(
+   316| 						data["link_flair_type"].as_str().unwrap_or_default(),
+   317| 						data["link_flair_richtext"].as_array(),
+   318| 						data["link_flair_text"].as_str(),
+   319| 					),
+   320| 					text: val(post, "link_flair_text"),
+   321| 					background_color: val(post, "link_flair_background_color"),
+   322| 					foreground_color: if val(post, "link_flair_text_color") == "dark" {
+   323| 						"black".to_string()
+   324| 					} else {
+   325| 						"white".to_string()
+   326| 					},
+   327| 				},
+   328| 				flags: Flags {
+   329| 					spoiler: data["spoiler"].as_bool().unwrap_or_default(),
+   330| 					nsfw: data["over_18"].as_bool().unwrap_or_default(),
+   331| 					stickied: data["stickied"].as_bool().unwrap_or_default() || data["pinned"].as_bool().unwrap_or_default(),
+   332| 				},
+   333| 				permalink: val(post, "permalink"),
+   334| 				poll: Poll::parse(&data["poll_data"]),
+   335| 				rel_time,
+   336| 				created,
+   337| 				created_ts,
+   338| 				num_duplicates: post["data"]["num_duplicates"].as_u64().unwrap_or(0),
+   339| 				comments: format_num(data["num_comments"].as_i64().unwrap_or_default()),
+   340| 				gallery,
+   341| 				awards,
+   342| 				nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
+   343| 				ws_url: val(post, "websocket_url"),
+   344| 			});
+   345| 		}
+   346| 		posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
+   347| 		posts.sort_by(|a, b| b.flags.stickied.cmp(&a.flags.stickied));
+   348| 		Ok((posts, res["data"]["after"].as_str().unwrap_or_default().to_string()))
+   349| 	}
+   350| }
+   351| #[derive(Template)]
+   352| #[template(path = "comment.html")]
+   353| pub struct Comment {
+   354| 	pub id: String,
+   355| 	pub kind: String,
+   356| 	pub parent_id: String,
+   357| 	pub parent_kind: String,
+   358| 	pub post_link: String,
+   359| 	pub post_author: String,
+   360| 	pub body: String,
+   361| 	pub author: Author,
+   362| 	pub score: (String, String),
+   363| 	pub rel_time: String,
+   364| 	pub created: String,
+   365| 	pub edited: (String, String),
+   366| 	pub replies: Vec<Comment>,
+   367| 	pub highlighted: bool,
+   368| 	pub awards: Awards,
+   369| 	pub collapsed: bool,
+   370| 	pub is_filtered: bool,
+   371| 	pub more_count: i64,
+   372| 	pub prefs: Preferences,
+   373| }
+   374| #[derive(Default, Clone)]
+   375| pub struct Award {
+   376| 	pub name: String,
+   377| 	pub icon_url: String,
+   378| 	pub description: String,
+   379| 	pub count: i64,
+   380| }
+   381| impl std::fmt::Display for Award {
+   382| 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   383| 		write!(f, "{} {} {}", self.name, self.icon_url, self.description)
+   384| 	}
+   385| }
+   386| pub struct Awards(pub Vec<Award>);
+   387| impl std::ops::Deref for Awards {
+   388| 	type Target = Vec<Award>;
+   389| 	fn deref(&self) -> &Self::Target {
+   390| 		&self.0
+   391| 	}
+   392| }
+   393| impl std::fmt::Display for Awards {
+   394| 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   395| 		self.iter().fold(Ok(()), |result, award| result.and_then(|()| writeln!(f, "{award}")))
+   396| 	}
+   397| }
+   398| impl Awards {
+   399| 	pub fn parse(items: &Value) -> Self {
+   400| 		let parsed = items.as_array().unwrap_or(&Vec::new()).iter().fold(Vec::new(), |mut awards, item| {
+   401| 			let name = item["name"].as_str().unwrap_or_default().to_string();
+   402| 			let icon_url = format_url(item["resized_icons"][0]["url"].as_str().unwrap_or_default());
+   403| 			let description = item["description"].as_str().unwrap_or_default().to_string();
+   404| 			let count: i64 = i64::from_str(&item["count"].to_string()).unwrap_or(1);
+   405| 			awards.push(Award {
+   406| 				name,
+   407| 				icon_url,
+   408| 				description,
+   409| 				count,
+   410| 			});
+   411| 			awards
+   412| 		});
+   413| 		Self(parsed)
+   414| 	}
+   415| }
+   416| #[derive(Template)]
+   417| #[template(path = "error.html")]
+   418| pub struct ErrorTemplate {
+   419| 	pub msg: String,
+   420| 	pub prefs: Preferences,
+   421| 	pub url: String,
+   422| }
+   423| #[derive(Template)]
+   424| #[template(path = "nsfwlanding.html")]
+   425| pub struct NSFWLandingTemplate {
+   426| 	pub res: String,
+   427| 	pub res_type: ResourceType,
+   428| 	pub prefs: Preferences,
+   429| 	pub url: String,
+   430| }
+   431| #[derive(Default)]
+   432| pub struct User {
+   433| 	pub name: String,
+   434| 	pub title: String,
+   435| 	pub icon: String,
+   436| 	pub karma: i64,
+   437| 	pub created: String,
+   438| 	pub banner: String,
+   439| 	pub description: String,
+   440| 	pub nsfw: bool,
+   441| }
+   442| #[derive(Default)]
+   443| pub struct Subreddit {
+   444| 	pub name: String,
+   445| 	pub title: String,
+   446| 	pub description: String,
+   447| 	pub info: String,
+   448| 	pub icon: String,
+   449| 	pub members: (String, String),
+   450| 	pub active: (String, String),
+   451| 	pub wiki: bool,
+   452| 	pub nsfw: bool,
+   453| }
+   454| #[derive(serde::Deserialize)]
+   455| pub struct Params {
+   456| 	pub t: Option<String>,
+   457| 	pub q: Option<String>,
+   458| 	pub sort: Option<String>,
+   459| 	pub after: Option<String>,
+   460| 	pub before: Option<String>,
+   461| }
+   462| #[derive(Default)]
+   463| pub struct Preferences {
+   464| 	pub available_themes: Vec<String>,
+   465| 	pub theme: String,
+   466| 	pub front_page: String,
+   467| 	pub layout: String,
+   468| 	pub wide: String,
+   469| 	pub blur_spoiler: String,
+   470| 	pub show_nsfw: String,
+   471| 	pub blur_nsfw: String,
+   472| 	pub hide_hls_notification: String,
+   473| 	pub hide_sidebar_and_summary: String,
+   474| 	pub use_hls: String,
+   475| 	pub autoplay_videos: String,
+   476| 	pub fixed_navbar: String,
+   477| 	pub disable_visit_reddit_confirmation: String,
+   478| 	pub comment_sort: String,
+   479| 	pub post_sort: String,
+   480| 	pub subscriptions: Vec<String>,
+   481| 	pub filters: Vec<String>,
+   482| 	pub hide_awards: String,
+   483| 	pub hide_score: String,
+   484| }
+   485| #[derive(RustEmbed)]
+   486| #[folder = "static/themes/"]
+   487| #[include = "*.css"]
+   488| pub struct ThemeAssets;
+   489| impl Preferences {
+   490| 	pub fn new(req: &Request<Body>) -> Self {
+   491| 		let mut themes = vec!["system".to_string()];
+   492| 		for file in ThemeAssets::iter() {
+   493| 			let chunks: Vec<&str> = file.as_ref().split(".css").collect();
+   494| 			themes.push(chunks[0].to_owned());
+   495| 		}
+   496| 		Self {
+   497| 			available_themes: themes,
+   498| 			theme: setting(req, "theme"),
+   499| 			front_page: setting(req, "front_page"),
+   500| 			layout: setting(req, "layout"),
+   501| 			wide: setting(req, "wide"),
+   502| 			blur_spoiler: setting(req, "blur_spoiler"),
+   503| 			show_nsfw: setting(req, "show_nsfw"),
+   504| 			hide_sidebar_and_summary: setting(req, "hide_sidebar_and_summary"),
+   505| 			blur_nsfw: setting(req, "blur_nsfw"),
+   506| 			use_hls: setting(req, "use_hls"),
+   507| 			hide_hls_notification: setting(req, "hide_hls_notification"),
+   508| 			autoplay_videos: setting(req, "autoplay_videos"),
+   509| 			fixed_navbar: setting_or_default(req, "fixed_navbar", "on".to_string()),
+   510| 			disable_visit_reddit_confirmation: setting(req, "disable_visit_reddit_confirmation"),
+   511| 			comment_sort: setting(req, "comment_sort"),
+   512| 			post_sort: setting(req, "post_sort"),
+   513| 			subscriptions: setting(req, "subscriptions").split('+').map(String::from).filter(|s| !s.is_empty()).collect(),
+   514| 			filters: setting(req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect(),
+   515| 			hide_awards: setting(req, "hide_awards"),
+   516| 			hide_score: setting(req, "hide_score"),
+   517| 		}
+   518| 	}
+   519| }
+   520| pub fn get_filters(req: &Request<Body>) -> HashSet<String> {
+   521| 	setting(req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect::<HashSet<String>>()
+   522| }
+   523| pub fn filter_posts(posts: &mut Vec<Post>, filters: &HashSet<String>) -> (u64, bool) {
+   524| 	let lb: u64 = posts.len().try_into().unwrap_or(0);
+   525| 	if posts.is_empty() {
+   526| 		(0, false)
+   527| 	} else {
+   528| 		posts.retain(|p| !(filters.contains(&p.community) || filters.contains(&["u_", &p.author.name].concat())));
+   529| 		let la: u64 = posts.len().try_into().unwrap_or(0);
+   530| 		(lb - la, posts.is_empty())
+   531| 	}
+   532| }
+   533| pub async fn parse_post(post: &Value) -> Post {
+   534| 	let (rel_time, created) = time(post["data"]["created_utc"].as_f64().unwrap_or_default());
+   535| 	let score = post["data"]["score"].as_i64().unwrap_or_default();
+   536| 	let ratio: f64 = post["data"]["upvote_ratio"].as_f64().unwrap_or(1.0) * 100.0;
+   537| 	let (post_type, media, gallery) = Media::parse(&post["data"]).await;
+   538| 	let created_ts = post["data"]["created_utc"].as_f64().unwrap_or_default().round() as u64;
+   539| 	let awards: Awards = Awards::parse(&post["data"]["all_awardings"]);
+   540| 	let permalink = val(post, "permalink");
+   541| 	let poll = Poll::parse(&post["data"]["poll_data"]);
+   542| 	let body = if val(post, "removed_by_category") == "moderator" {
+   543| 		format!(
+   544| 			"<div class=\"md\"><p>[removed] — <a href=\"https://{}{permalink}\">view removed post</a></p></div>",
+   545| 			get_setting("REDLIB_PUSHSHIFT_FRONTEND").unwrap_or_else(|| String::from(crate::config::DEFAULT_PUSHSHIFT_FRONTEND)),
+   546| 		)
+   547| 	} else {
+   548| 		rewrite_urls(&val(post, "selftext_html"))
+   549| 	};
+   550| 	Post {
+   551| 		id: val(post, "id"),
+   552| 		title: val(post, "title"),
+   553| 		community: val(post, "subreddit"),
+   554| 		body,
+   555| 		author: Author {
+   556| 			name: val(post, "author"),
+   557| 			flair: Flair {
+   558| 				flair_parts: FlairPart::parse(
+   559| 					post["data"]["author_flair_type"].as_str().unwrap_or_default(),
+   560| 					post["data"]["author_flair_richtext"].as_array(),
+   561| 					post["data"]["author_flair_text"].as_str(),
+   562| 				),
+   563| 				text: val(post, "link_flair_text"),
+   564| 				background_color: val(post, "author_flair_background_color"),
+   565| 				foreground_color: val(post, "author_flair_text_color"),
+   566| 			},
+   567| 			distinguished: val(post, "distinguished"),
+   568| 		},
+   569| 		permalink,
+   570| 		poll,
+   571| 		score: format_num(score),
+   572| 		upvote_ratio: ratio as i64,
+   573| 		post_type,
+   574| 		media,
+   575| 		thumbnail: Media {
+   576| 			url: format_url(val(post, "thumbnail").as_str()),
+   577| 			alt_url: String::new(),
+   578| 			width: post["data"]["thumbnail_width"].as_i64().unwrap_or_default(),
+   579| 			height: post["data"]["thumbnail_height"].as_i64().unwrap_or_default(),
+   580| 			poster: String::new(),
+   581| 		},
+   582| 		flair: Flair {
+   583| 			flair_parts: FlairPart::parse(
+   584| 				post["data"]["link_flair_type"].as_str().unwrap_or_default(),
+   585| 				post["data"]["link_flair_richtext"].as_array(),
+   586| 				post["data"]["link_flair_text"].as_str(),
+   587| 			),
+   588| 			text: val(post, "link_flair_text"),
+   589| 			background_color: val(post, "link_flair_background_color"),
+   590| 			foreground_color: if val(post, "link_flair_text_color") == "dark" {
+   591| 				"black".to_string()
+   592| 			} else {
+   593| 				"white".to_string()
+   594| 			},
+   595| 		},
+   596| 		flags: Flags {
+   597| 			spoiler: post["data"]["spoiler"].as_bool().unwrap_or_default(),
+   598| 			nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
+   599| 			stickied: post["data"]["stickied"].as_bool().unwrap_or_default() || post["data"]["pinned"].as_bool().unwrap_or(false),
+   600| 		},
+   601| 		domain: val(post, "domain"),
+   602| 		rel_time,
+   603| 		created,
+   604| 		created_ts,
+   605| 		num_duplicates: post["data"]["num_duplicates"].as_u64().unwrap_or(0),
+   606| 		comments: format_num(post["data"]["num_comments"].as_i64().unwrap_or_default()),
+   607| 		gallery,
+   608| 		awards,
+   609| 		nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
+   610| 		ws_url: val(post, "websocket_url"),
+   611| 	}
+   612| }
+   613| pub fn param(path: &str, value: &str) -> Option<String> {
+   614| 	Some(
+   615| 		Url::parse(format!("https://libredd.it/{path}").as_str())
+   616| 			.ok()?
+   617| 			.query_pairs()
+   618| 			.into_owned()
+   619| 			.collect::<HashMap<_, _>>()
+   620| 			.get(value)?
+   621| 			.clone(),
+   622| 	)
+   623| }
+   624| pub fn setting(req: &Request<Body>, name: &str) -> String {
+   625| 	req
+   626| 		.cookie(name)
+   627| 		.unwrap_or_else(|| {
+   628| 			if let Some(default) = get_setting(&format!("REDLIB_DEFAULT_{}", name.to_uppercase())) {
+   629| 				Cookie::new(name, default)
+   630| 			} else {
+   631| 				Cookie::from(name)
+   632| 			}
+   633| 		})
+   634| 		.value()
+   635| 		.to_string()
+   636| }
+   637| pub fn setting_or_default(req: &Request<Body>, name: &str, default: String) -> String {
+   638| 	let value = setting(req, name);
+   639| 	if value.is_empty() {
+   640| 		default
+   641| 	} else {
+   642| 		value
+   643| 	}
+   644| }
+   645| pub async fn catch_random(sub: &str, additional: &str) -> Result<Response<Body>, String> {
+   646| 	if sub == "random" || sub == "randnsfw" {
+   647| 		let new_sub = json(format!("/r/{sub}/about.json?raw_json=1"), false).await?["data"]["display_name"]
+   648| 			.as_str()
+   649| 			.unwrap_or_default()
+   650| 			.to_string();
+   651| 		Ok(redirect(&format!("/r/{new_sub}{additional}")))
+   652| 	} else {
+   653| 		Err("No redirect needed".to_string())
+   654| 	}
+   655| }
+   656| static REGEX_URL_WWW: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://www\.reddit\.com/(.*)").unwrap());
+   657| static REGEX_URL_OLD: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://old\.reddit\.com/(.*)").unwrap());
+   658| static REGEX_URL_NP: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://np\.reddit\.com/(.*)").unwrap());
+   659| static REGEX_URL_PLAIN: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://reddit\.com/(.*)").unwrap());
+   660| static REGEX_URL_VIDEOS: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://v\.redd\.it/(.*)/DASH_([0-9]{2,4}(\.mp4|$|\?source=fallback))").unwrap());
+   661| static REGEX_URL_VIDEOS_HLS: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://v\.redd\.it/(.+)/(HLSPlaylist\.m3u8.*)$").unwrap());
+   662| static REGEX_URL_IMAGES: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://i\.redd\.it/(.*)").unwrap());
+   663| static REGEX_URL_THUMBS_A: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://a\.thumbs\.redditmedia\.com/(.*)").unwrap());
+   664| static REGEX_URL_THUMBS_B: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://b\.thumbs\.redditmedia\.com/(.*)").unwrap());
+   665| static REGEX_URL_EMOJI: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://emoji\.redditmedia\.com/(.*)/(.*)").unwrap());
+   666| static REGEX_URL_PREVIEW: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://preview\.redd\.it/(.*)").unwrap());
+   667| static REGEX_URL_EXTERNAL_PREVIEW: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://external\-preview\.redd\.it/(.*)").unwrap());
+   668| static REGEX_URL_STYLES: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://styles\.redditmedia\.com/(.*)").unwrap());
+   669| static REGEX_URL_STATIC_MEDIA: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://www\.redditstatic\.com/(.*)").unwrap());
+   670| pub fn format_url(url: &str) -> String {
+   671| 	if url.is_empty() || url == "self" || url == "default" || url == "nsfw" || url == "spoiler" {
+
+# --- HUNK 4: Lines 701-794 ---
+   701| 			}
+   702| 			match domain {
+   703| 				"www.reddit.com" => capture(&REGEX_URL_WWW, "/", 1),
+   704| 				"old.reddit.com" => capture(&REGEX_URL_OLD, "/", 1),
+   705| 				"np.reddit.com" => capture(&REGEX_URL_NP, "/", 1),
+   706| 				"reddit.com" => capture(&REGEX_URL_PLAIN, "/", 1),
+   707| 				"v.redd.it" => chain!(capture(&REGEX_URL_VIDEOS, "/vid/", 2), capture(&REGEX_URL_VIDEOS_HLS, "/hls/", 2)),
+   708| 				"i.redd.it" => capture(&REGEX_URL_IMAGES, "/img/", 1),
+   709| 				"a.thumbs.redditmedia.com" => capture(&REGEX_URL_THUMBS_A, "/thumb/a/", 1),
+   710| 				"b.thumbs.redditmedia.com" => capture(&REGEX_URL_THUMBS_B, "/thumb/b/", 1),
+   711| 				"emoji.redditmedia.com" => capture(&REGEX_URL_EMOJI, "/emoji/", 2),
+   712| 				"preview.redd.it" => capture(&REGEX_URL_PREVIEW, "/preview/pre/", 1),
+   713| 				"external-preview.redd.it" => capture(&REGEX_URL_EXTERNAL_PREVIEW, "/preview/external-pre/", 1),
+   714| 				"styles.redditmedia.com" => capture(&REGEX_URL_STYLES, "/style/", 1),
+   715| 				"www.redditstatic.com" => capture(&REGEX_URL_STATIC_MEDIA, "/static/", 1),
+   716| 				_ => url.to_string(),
+   717| 			}
+   718| 		})
+   719| 	}
+   720| }
+   721| static REDDIT_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r#"href="(https|http|)://(www\.|old\.|np\.|amp\.|new\.|)(reddit\.com|redd\.it)/"#).unwrap());
+   722| static REDDIT_PREVIEW_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://(external-preview|preview|i)\.redd\.it(.*)[^?]").unwrap());
+   723| static REDDIT_EMOJI_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://(www|).redditstatic\.com/(.*)").unwrap());
+   724| static REDLIB_PREVIEW_LINK_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r#"/(img|preview/)(pre|external-pre)?/(.*?)>"#).unwrap());
+   725| static REDLIB_PREVIEW_TEXT_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r">(.*?)</a>").unwrap());
+   726| pub fn rewrite_urls(input_text: &str) -> String {
+   727| 	let mut text1 =
+   728| 		REDDIT_REGEX.replace_all(input_text, r#"href="/"#)
+   729| 			.to_string();
+   730| 	text1 = REDDIT_EMOJI_REGEX
+   731| 		.replace_all(&text1, format_url(REDDIT_EMOJI_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default()))
+   732| 		.to_string()
+   733| 		.replace("%5C", "")
+   734| 		.replace("\\_", "_");
+   735| 	loop {
+   736| 		if REDDIT_PREVIEW_REGEX.find(&text1).is_none() {
+   737| 			return text1;
+   738| 		} else {
+   739| 			let formatted_url = format_url(REDDIT_PREVIEW_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default());
+   740| 			let image_url = REDLIB_PREVIEW_LINK_REGEX.find(&formatted_url).map_or("", |m| m.as_str()).to_string();
+   741| 			let mut image_caption = REDLIB_PREVIEW_TEXT_REGEX.find(&formatted_url).map_or("", |m| m.as_str()).to_string();
+   742| 			/* As long as image_caption isn't empty remove first and last four characters of image_text to leave us with just the text in the caption without any HTML.
+   743| 			This makes it possible to enclose it in a <figcaption> later on without having stray HTML breaking it */
+   744| 			if !image_caption.is_empty() {
+   745| 				image_caption = image_caption[1..image_caption.len() - 4].to_string();
+   746| 			}
+   747| 			let image_to_replace = format!("<a href=\"{image_url}{image_caption}</a>");
+   748| 			let mut _image_replacement = String::new();
+   749| 			/* We don't want to show a caption that's just the image's link, so we check if we find a Reddit preview link within the image's caption.
+   750| 			If we don't find one we must have actual text, so we include a <figcaption> block that contains it.
+   751| 			Otherwise we don't include the <figcaption> block as we don't need it. */
+   752| 			if REDDIT_PREVIEW_REGEX.find(&image_caption).is_none() {
+   753| 				image_caption = image_caption.replace("\\&quot;", "\"");
+   754| 				_image_replacement = format!("<figure><a href=\"{image_url}<img loading=\"lazy\" src=\"{image_url}</a><figcaption>{image_caption}</figcaption></figure>");
+   755| 			} else {
+   756| 				_image_replacement = format!("<figure><a href=\"{image_url}<img loading=\"lazy\" src=\"{image_url}</a></figure>");
+   757| 			}
+   758| 			/* In order to know if we're dealing with a normal or external preview we need to take a look at the first capture group of REDDIT_PREVIEW_REGEX
+   759| 			if it's preview we're dealing with something that needs /preview/pre, external-preview is /preview/external-pre, and i is /img */
+   760| 			let reddit_preview_regex_capture = REDDIT_PREVIEW_REGEX.captures(&text1).unwrap().get(1).map_or("", |m| m.as_str()).to_string();
+   761| 			let mut _preview_type = String::new();
+   762| 			if reddit_preview_regex_capture == "preview" {
+   763| 				_preview_type = "/preview/pre".to_string();
+   764| 			} else if reddit_preview_regex_capture == "external-preview" {
+   765| 				_preview_type = "/preview/external-pre".to_string();
+   766| 			} else {
+   767| 				_preview_type = "/img".to_string();
+   768| 			}
+   769| 			text1 = REDDIT_PREVIEW_REGEX
+   770| 				.replace(&text1, format!("{_preview_type}$2"))
+   771| 				.replace(&image_to_replace, &_image_replacement)
+   772| 				.to_string()
+   773| 		}
+   774| 	}
+   775| }
+   776| pub fn format_num(num: i64) -> (String, String) {
+   777| 	let truncated = if num >= 1_000_000 || num <= -1_000_000 {
+   778| 		format!("{:.1}m", num as f64 / 1_000_000.0)
+   779| 	} else if num >= 1000 || num <= -1000 {
+   780| 		format!("{:.1}k", num as f64 / 1_000.0)
+   781| 	} else {
+   782| 		num.to_string()
+   783| 	};
+   784| 	(truncated, num.to_string())
+   785| }
+   786| pub fn time(created: f64) -> (String, String) {
+   787| 	let time = OffsetDateTime::from_unix_timestamp(created.round() as i64).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+   788| 	let now = OffsetDateTime::now_utc();
+   789| 	let min = time.min(now);
+   790| 	let max = time.max(now);
+   791| 	let time_delta = max - min;
+   792| 	let mut rel_time = if time_delta > Duration::days(30) {
+   793| 		time.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default()
+   794| 	} else if time_delta.whole_days() > 0 {
+
+# --- HUNK 5: Lines 825-901 ---
+   825| pub fn redirect(path: &str) -> Response<Body> {
+   826| 	Response::builder()
+   827| 		.status(302)
+   828| 		.header("content-type", "text/html")
+   829| 		.header("Location", path)
+   830| 		.body(format!("Redirecting to <a href=\"{path}\">{path}</a>...").into())
+   831| 		.unwrap_or_default()
+   832| }
+   833| pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, String> {
+   834| 	error!("Error page rendered: {}", msg.split('|').next().unwrap_or_default());
+   835| 	let url = req.uri().to_string();
+   836| 	let body = ErrorTemplate {
+   837| 		msg: msg.to_string(),
+   838| 		prefs: Preferences::new(&req),
+   839| 		url,
+   840| 	}
+   841| 	.render()
+   842| 	.unwrap_or_default();
+   843| 	Ok(Response::builder().status(404).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+   844| }
+   845| pub fn sfw_only() -> bool {
+   846| 	match get_setting("REDLIB_SFW_ONLY") {
+   847| 		Some(val) => val == "on",
+   848| 		None => false,
+   849| 	}
+   850| }
+   851| pub fn should_be_nsfw_gated(req: &Request<Body>, req_url: &str) -> bool {
+   852| 	let sfw_instance = sfw_only();
+   853| 	let gate_nsfw = (setting(req, "show_nsfw") != "on") || sfw_instance;
+   854| 	let bypass_gate = !sfw_instance && req_url.contains("&bypass_nsfw_landing");
+   855| 	gate_nsfw && !bypass_gate
+   856| }
+   857| pub async fn nsfw_landing(req: Request<Body>, req_url: String) -> Result<Response<Body>, String> {
+   858| 	let res_type: ResourceType;
+   859| 	let resource: String = if !req.param("name").unwrap_or_default().is_empty() {
+   860| 		res_type = ResourceType::User;
+   861| 		req.param("name").unwrap_or_default()
+   862| 	} else if !req.param("id").unwrap_or_default().is_empty() {
+   863| 		res_type = ResourceType::Post;
+   864| 		req.param("id").unwrap_or_default()
+   865| 	} else {
+   866| 		res_type = ResourceType::Subreddit;
+   867| 		req.param("sub").unwrap_or_default()
+   868| 	};
+   869| 	let body = NSFWLandingTemplate {
+   870| 		res: resource,
+   871| 		res_type,
+   872| 		prefs: Preferences::new(&req),
+   873| 		url: req_url,
+   874| 	}
+   875| 	.render()
+   876| 	.unwrap_or_default();
+   877| 	Ok(Response::builder().status(403).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+   878| }
+   879| #[cfg(test)]
+   880| mod tests {
+   881| 	use super::{format_num, format_url, rewrite_urls};
+   882| 	#[test]
+   883| 	fn format_num_works() {
+   884| 		assert_eq!(format_num(567), ("567".to_string(), "567".to_string()));
+   885| 		assert_eq!(format_num(1234), ("1.2k".to_string(), "1234".to_string()));
+   886| 		assert_eq!(format_num(1999), ("2.0k".to_string(), "1999".to_string()));
+   887| 		assert_eq!(format_num(1001), ("1.0k".to_string(), "1001".to_string()));
+   888| 		assert_eq!(format_num(1_999_999), ("2.0m".to_string(), "1999999".to_string()));
+   889| 	}
+   890| 	#[test]
+   891| 	fn rewrite_urls_removes_backslashes_and_rewrites_url() {
+   892| 		assert_eq!(
+   893| 			rewrite_urls(
+   894| 				"<a href=\"https://new.reddit.com/r/linux%5C_gaming/comments/x/just%5C_a%5C_test%5C/\">https://new.reddit.com/r/linux\\_gaming/comments/x/just\\_a\\_test/</a>"
+   895| 			),
+   896| 			"<a href=\"/r/linux_gaming/comments/x/just_a_test/\">https://new.reddit.com/r/linux_gaming/comments/x/just_a_test/</a>"
+   897| 		);
+   898| 		assert_eq!(
+   899| 			rewrite_urls(
+   900| 				"e.g. &lt;a href=\"https://www.reddit.com/r/linux%5C_gaming/comments/ql9j15/anyone%5C_else%5C_confused%5C_with%5C_linus%5C_linux%5C_issues/\"&gt;https://www.reddit.com/r/linux\\_gaming/comments/ql9j15/anyone\\_else\\_confused\\_with\\_linus\\_linux\\_issues/&lt;/a&gt;"
+   901| 			),
+
+# --- HUNK 6: Lines 921-974 ---
+   921| 		assert_eq!(
+   922| 			format_url("https://preview.redd.it/qwerty.jpg?auto=webp&s=asdf"),
+   923| 			"/preview/pre/qwerty.jpg?auto=webp&s=asdf"
+   924| 		);
+   925| 		assert_eq!(format_url("https://v.redd.it/foo/DASH_360.mp4?source=fallback"), "/vid/foo/360.mp4");
+   926| 		assert_eq!(
+   927| 			format_url("https://v.redd.it/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"),
+   928| 			"/hls/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"
+   929| 		);
+   930| 		assert_eq!(format_url("https://www.redditstatic.com/gold/awards/icon/icon.png"), "/static/gold/awards/icon/icon.png");
+   931| 		assert_eq!(
+   932| 			format_url("https://www.redditstatic.com/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif"),
+   933| 			"/static/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif"
+   934| 		);
+   935| 		assert_eq!(format_url(""), "");
+   936| 		assert_eq!(format_url("self"), "");
+   937| 		assert_eq!(format_url("default"), "");
+   938| 		assert_eq!(format_url("nsfw"), "");
+   939| 		assert_eq!(format_url("spoiler"), "");
+   940| 	}
+   941| }
+   942| #[test]
+   943| fn test_rewriting_emoji() {
+   944| 	let input = r#"<div class="md"><p>How can you have such hard feelings towards a license? <img src="https://www.redditstatic.com/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif" width="20" height="20" style="vertical-align:middle"> Let people use what license they want, and BSD is one of the least restrictive ones AFAIK.</p>"#;
+   945| 	let output = r#"<div class="md"><p>How can you have such hard feelings towards a license? <img src="/static/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif" width="20" height="20" style="vertical-align:middle"> Let people use what license they want, and BSD is one of the least restrictive ones AFAIK.</p>"#;
+   946| 	assert_eq!(rewrite_urls(input), output);
+   947| }
+   948| #[tokio::test(flavor = "multi_thread")]
+   949| async fn test_fetching_subreddit_quarantined() {
+   950| 	let subreddit = Post::fetch("/r/drugs", true).await;
+   951| 	assert!(subreddit.is_ok());
+   952| 	assert!(!subreddit.unwrap().0.is_empty());
+   953| }
+   954| #[tokio::test(flavor = "multi_thread")]
+   955| async fn test_fetching_nsfw_subreddit() {
+   956| 	let subreddit = Post::fetch("/r/randnsfw", false).await;
+   957| 	assert!(subreddit.is_ok());
+   958| 	assert!(!subreddit.unwrap().0.is_empty());
+   959| }
+   960| #[tokio::test(flavor = "multi_thread")]
+   961| async fn test_fetching_ws() {
+   962| 	let subreddit = Post::fetch("/r/popular", false).await;
+   963| 	assert!(subreddit.is_ok());
+   964| 	for post in subreddit.unwrap().0 {
+   965| 		assert!(post.ws_url.starts_with("wss://k8s-lb.wss.redditmedia.com/link/"));
+   966| 	}
+   967| }
+   968| #[test]
+   969| fn test_rewriting_image_links() {
+   970| 	let input =
+   971| 		r#"<p><a href="https://preview.redd.it/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc">caption 1</a></p>"#;
+   972| 	let output = r#"<p><figure><a href="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"><img loading="lazy" src="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"></a><figcaption>caption 1</figcaption></figure></p"#;
+   973| 	assert_eq!(rewrite_urls(input), output);
+   974| }
+

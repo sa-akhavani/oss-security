@@ -1,0 +1,150 @@
+--- a/packages/app/src/TransformRequest/MultipartFormDataTransform.ts
++++ b/packages/app/src/TransformRequest/MultipartFormDataTransform.ts
+@@ -8,44 +8,45 @@
+ import {IRequest} from "../interfaces.js";
+ export const MultipartFormDataTransform = async <T = unknown>(request: IRequest): Promise<T> => {
+     request.headers.assert("Content-Type", (value) => value.startsWith("multipart/form-data"));
+     const bb = busboy({
+         headers: request.headers.toJSON(),
+         defCharset: "utf-8",
+         defParamCharset: "utf-8",
+     });
+     const rs = await request.createReadableStream();
+     const defer = new Defer<void>();
++    const result: Record<string, any> = {};
+     const pending: Defer<void>[] = [];
+-    const qs = new QueryString();
++    const {parseFieldName, inject} = QueryString;
+     bb
+         .on("file", (name, file, info) => {
+             const {encoding, filename, mimeType} = info;
+             const tmpname = join(
+                 tmpdir(),
+                 `${randomBytes(4).toString("hex")}-${Buffer.from(filename, "utf-8").toString("hex")}`,
+             );
+             const value = {
+                 filename,
+                 encoding,
+                 mimeType,
+                 tmpname,
+             };
+-            qs.push(name, value);
++            inject(parseFieldName(name), value, result);
+             const def = new Defer<void>();
+             pending.push(def);
+             file
+                 .pipe(createWriteStream(tmpname))
+                 .on("close", () => def.resolve());
+         })
+         .on("field", (name, value) => {
+             try {
+-                qs.push(name, JSON.parse(value));
++                inject(parseFieldName(name), JSON.parse(value), result);
+             } catch {
+             }
+         })
+         .on("close", () => defer.resolve());
+     rs.pipe(bb);
+     await defer;
+     await Promise.all(pending);
+-    return qs.toObject();
++    return result as any;
+ };
+
+--- a/packages/util/src/qs.ts
++++ b/packages/util/src/qs.ts
+@@ -1,32 +1,18 @@
+-import {Rec} from "@bunt/type";
+ const isNumeric = (key: string): boolean => !isNaN(+key);
+ export class QueryString {
+-    readonly #value: Rec;
+-    constructor(entries: [field: string, value: unknown][] = []) {
+-        this.#value = Object.create(null);
+-        for (const [field, value] of entries) {
+-            this.push(field, value);
+-        }
+-    }
+-    public parseField(name: string): string[] {
++    public static parseFieldName = (name: string): string[] => {
+         const base = name.replace(/\[.+/, "");
+         return [base, ...[...name.matchAll(/\[([^\]]*)\]/ig)].map(([, key]) => key)];
+-    }
+-    public push(name: string, value: unknown): Rec {
+-        return this.#inject(this.parseField(name), value, this.#value);
+-    }
+-    public toObject(): Rec {
+-        return this.#value;
+-    }
+-    #inject = ([key, ...paths]: string[], value: unknown, fields: Rec = Object.create(null)): Rec => {
++    };
++    public static inject = ([key, ...paths]: string[], value: unknown, fields: any = {}): any => {
+         if (paths.length > 0) {
+-            fields[key] = this.#inject(paths, value, fields[key]);
++            fields[key] = this.inject(paths, value, fields[key]);
+         } else {
+             fields[key] = value;
+         }
+         if (isNumeric(key)) {
+             return Object.values(fields);
+         }
+         return fields;
+     };
+ }
+
+--- a/packages/web/src/Transport/Response/DownloadResponse.ts
++++ b/packages/web/src/Transport/Response/DownloadResponse.ts
+@@ -22,27 +22,22 @@
+ export class DownloadResponse extends ResponseAbstract<Readable> {
+     constructor(options: DownloadOptionsAuth) {
+         super(...createOptions(options));
+     }
+     public serialize(source: Readable): Readable {
+         return source;
+     }
+ }
+ function createHeaders(options: DownloadOptions): Record<string, string> {
+     const size = options.size;
+-    const attributes = [
+-        "attachment",
+-        `filename="${encodeURI(options.filename)}"`,
+-        `filename*=utf-8''${encodeURI(options.filename)}`,
+-    ];
+     const headers: Record<string, string> = {
+-        "Content-Disposition": attributes.join("; "),
++        "Content-Disposition": `attachment; filename=${encodeURI(options.filename)}`,
+         "Content-Length": size.toString(),
+         "Content-Type": options.mimeType,
+     };
+     return headers;
+ }
+ function factoryReadableStream(source: string | Readable): Readable {
+     if (isString(source)) {
+         return createReadStream(source);
+     }
+     return source;
+
+--- a/packages/web/src/Transport/Response/ResponseAbstract.ts
++++ b/packages/web/src/Transport/Response/ResponseAbstract.ts
+@@ -29,21 +29,21 @@
+     readonly #headers: Promisify<{[key: string]: string}>;
+     #response: Promisify<T>;
+     constructor(...[response, options = {}]: ResponseArgs<T>) {
+         this.#response = isFunction(response) ? response() : response;
+         const {code, status, headers} = options;
+         if (isNumber(code) && code > 0) {
+             this.code = code;
+         }
+         this.status = status;
+         if (!this.status) {
+-            const suggest = Reflect.get(HTTP, this.code.toString());
++            const suggest = HTTP[this.code];
+             this.status = isString(suggest) ? suggest : "Unknown";
+         }
+         if (isInstanceOf(headers, Headers)) {
+             this.#headers = headers.toJSON();
+         } else {
+             this.#headers = headers || {};
+         }
+     }
+     public get cookies(): Cookie[] {
+         return [...this.#cookies.values()];

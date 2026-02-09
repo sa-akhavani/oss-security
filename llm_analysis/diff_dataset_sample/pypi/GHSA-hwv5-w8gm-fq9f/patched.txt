@@ -1,0 +1,202 @@
+# ====================================================================
+# FILE: setup.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-34 ---
+     1| import os.path
+     2| import runpy
+     3| import setuptools
+     4| from setuptools import setup, find_packages
+     5| here = os.path.abspath(os.path.dirname(__file__))
+     6| with open(os.path.join(here, "README.rst"), encoding="utf-8") as f:
+     7|     long_description = f.read()
+     8| install_requires = [
+     9|     'flask~=0.12',
+    10|     'flask-cors~=3.0.3',
+    11| ]
+    12| setup(
+    13|     name="xmpp-http-upload",
+    14|     version="0.4.0",
+    15|     description="Flask-based HTTP service to handle XMPP HTTP upload requests from Prosody mod_http_upload_external",
+    16|     long_description=long_description,
+    17|     url="https://github.com/horazont/xmpp-http-upload",
+    18|     author="Jonas Wielicki",
+    19|     author_email="jonas@wielicki.name",
+    20|     license="GPLv3+",
+    21|     classifiers=[
+    22|         "Development Status :: 3 - Alpha",
+    23|         "Intended Audience :: Developers",
+    24|         "Operating System :: POSIX",
+    25|         "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    26|         "Programming Language :: Python :: 3 :: Only",
+    27|         "Programming Language :: Python :: 3.3",
+    28|         "Programming Language :: Python :: 3.4",
+    29|         "Topic :: Communications :: Chat",
+    30|         "Topic :: Internet :: WWW/HTTP",
+    31|         "Topic :: Internet :: XMPP",
+    32|     ],
+    33|     keywords="xmpp http",
+    34|     install_requires=install_requires,
+
+
+# ====================================================================
+# FILE: xhu.py
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-100 ---
+     1| import contextlib
+     2| import errno
+     3| import fnmatch
+     4| import json
+     5| import hashlib
+     6| import hmac
+     7| import pathlib
+     8| import typing
+     9| import flask
+    10| import werkzeug.exceptions
+    11| app = flask.Flask("xmpp-http-upload")
+    12| app.config.from_envvar("XMPP_HTTP_UPLOAD_CONFIG")
+    13| application = app
+    14| if app.config['ENABLE_CORS']:
+    15|     from flask_cors import CORS
+    16|     CORS(app)
+    17| def get_paths(root: str, sub_path: str) \
+    18|         -> typing.Tuple[pathlib.Path, pathlib.Path]:
+    19|     base_path = flask.safe_join(root, sub_path)
+    20|     data_file = pathlib.Path(base_path + ".data")
+    21|     metadata_file = pathlib.Path(base_path + ".meta")
+    22|     return data_file, metadata_file
+    23| def load_metadata(metadata_file):
+    24|     with metadata_file.open("r") as f:
+    25|         return json.load(f)
+    26| def get_info(path: str) -> typing.Tuple[
+    27|         pathlib.Path,
+    28|         dict]:
+    29|     data_file, metadata_file = get_paths(app.config["DATA_ROOT"], path)
+    30|     return data_file, load_metadata(metadata_file)
+    31| @contextlib.contextmanager
+    32| def write_file(at: pathlib.Path):
+    33|     with at.open("xb") as f:
+    34|         try:
+    35|             yield f
+    36|         except:  # NOQA
+    37|             at.unlink()
+    38|             raise
+    39| @app.route("/")
+    40| def index():
+    41|     return flask.Response(
+    42|         "Welcome to XMPP HTTP Upload. State your business.",
+    43|         mimetype="text/plain",
+    44|     )
+    45| def stream_file(src, dest, nbytes):
+    46|     while nbytes > 0:
+    47|         data = src.read(min(nbytes, 4096))
+    48|         if not data:
+    49|             break
+    50|         dest.write(data)
+    51|         nbytes -= len(data)
+    52|     if nbytes > 0:
+    53|         raise EOFError
+    54| @app.route("/<path:path>", methods=["PUT"])
+    55| def put_file(path):
+    56|     try:
+    57|         data_file, metadata_file = get_paths(app.config["DATA_ROOT"], path)
+    58|     except werkzeug.exceptions.NotFound:
+    59|         return flask.Response(
+    60|             "Not Found",
+    61|             404,
+    62|             mimetype="text/plain",
+    63|         )
+    64|     verification_key = flask.request.args.get("v", "")
+    65|     length = int(flask.request.headers.get("Content-Length", 0))
+    66|     hmac_input = "{} {}".format(path, length).encode("utf-8")
+    67|     key = app.config["SECRET_KEY"]
+    68|     mac = hmac.new(key, hmac_input, hashlib.sha256)
+    69|     digest = mac.hexdigest()
+    70|     if not hmac.compare_digest(digest, verification_key):
+    71|         return flask.Response(
+    72|             "Invalid verification key",
+    73|             403,
+    74|             mimetype="text/plain",
+    75|         )
+    76|     content_type = flask.request.headers.get(
+    77|         "Content-Type",
+    78|         "application/octet-stream",
+    79|     )
+    80|     data_file.parent.mkdir(parents=True, exist_ok=True, mode=0o770)
+    81|     try:
+    82|         with write_file(data_file) as fout:
+    83|             stream_file(flask.request.stream, fout, length)
+    84|             with metadata_file.open("x") as f:
+    85|                 json.dump(
+    86|                     {
+    87|                         "headers": {"Content-Type": content_type},
+    88|                     },
+    89|                     f,
+    90|                 )
+    91|     except EOFError:
+    92|         return flask.Response(
+    93|             "Bad Request",
+    94|             400,
+    95|             mimetype="text/plain",
+    96|         )
+    97|     except OSError as exc:
+    98|         if exc.errno == errno.EEXIST:
+    99|             return flask.Response(
+   100|                 "Conflict",
+
+# --- HUNK 2: Lines 105-157 ---
+   105|     return flask.Response(
+   106|         "Created",
+   107|         201,
+   108|         mimetype="text/plain",
+   109|     )
+   110| def generate_headers(response_headers, metadata_headers):
+   111|     for key, value in metadata_headers.items():
+   112|         response_headers[key] = value
+   113|     content_type = metadata_headers["Content-Type"]
+   114|     for mimetype_glob in app.config.get("NON_ATTACHMENT_MIME_TYPES", []):
+   115|         if fnmatch.fnmatch(content_type, mimetype_glob):
+   116|             break
+   117|     else:
+   118|         response_headers["Content-Disposition"] = "attachment"
+   119|     response_headers["X-Content-Type-Options"] = "nosniff"
+   120|     response_headers["X-Frame-Options"] = "DENY"
+   121|     response_headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'; sandbox"
+   122| @app.route("/<path:path>", methods=["HEAD"])
+   123| def head_file(path):
+   124|     try:
+   125|         data_file, metadata = get_info(path)
+   126|         stat = data_file.stat()
+   127|     except (OSError, werkzeug.exceptions.NotFound):
+   128|         return flask.Response(
+   129|             "Not Found",
+   130|             404,
+   131|             mimetype="text/plain",
+   132|         )
+   133|     response = flask.Response()
+   134|     response.headers["Content-Length"] = str(stat.st_size)
+   135|     generate_headers(
+   136|         response.headers,
+   137|         metadata["headers"],
+   138|     )
+   139|     return response
+   140| @app.route("/<path:path>", methods=["GET"])
+   141| def get_file(path):
+   142|     try:
+   143|         data_file, metadata = get_info(path)
+   144|     except (OSError, werkzeug.exceptions.NotFound):
+   145|         return flask.Response(
+   146|             "Not Found",
+   147|             404,
+   148|             mimetype="text/plain",
+   149|         )
+   150|     response = flask.make_response(flask.send_file(
+   151|         str(data_file),
+   152|     ))
+   153|     generate_headers(
+   154|         response.headers,
+   155|         metadata["headers"],
+   156|     )
+   157|     return response
+

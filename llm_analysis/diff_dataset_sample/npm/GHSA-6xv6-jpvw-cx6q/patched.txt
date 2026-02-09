@@ -1,0 +1,141 @@
+# ====================================================================
+# FILE: lib/bestzip.js
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-135 ---
+     1| "use strict";
+     2| const cp = require("child_process");
+     3| const fs = require("fs");
+     4| const path = require("path");
+     5| const archiver = require("archiver");
+     6| const async = require("async");
+     7| const glob = require("glob");
+     8| const which = require("which");
+     9| function hasNativeZip() {
+    10|   return Boolean(which.sync("zip", { nothrow: true }));
+    11| }
+    12| function expandSources(cwd, source, done) {
+    13|   const globOpts = {
+    14|     cwd,
+    15|     dot: false, // ignore .dotfiles
+    16|     noglobstar: true, // treat ** as *
+    17|     noext: true, // no (a|b)
+    18|     nobrace: true // no {a,b}
+    19|   };
+    20|   if (Array.isArray(source)) {
+    21|     return async.concat(
+    22|       source,
+    23|       (_source, next) => expandSources(cwd, _source, next),
+    24|       done
+    25|     );
+    26|   }
+    27|   if (typeof source !== "string") {
+    28|     throw new Error(`source is (${typeof source}) `);
+    29|   }
+    30|   if (glob.hasMagic(source, globOpts)) {
+    31|     glob(source, globOpts, done);
+    32|   } else {
+    33|     process.nextTick(() => {
+    34|       done(null, [source]);
+    35|     });
+    36|   }
+    37| }
+    38| function walkDir(fullPath) {
+    39|   const files = fs.readdirSync(fullPath).map(f => {
+    40|     const filePath = path.join(fullPath, f);
+    41|     const stats = fs.statSync(filePath);
+    42|     if (stats.isDirectory()) {
+    43|       return walkDir(filePath);
+    44|     }
+    45|     return filePath;
+    46|   });
+    47|   return files.reduce((acc, cur) => acc.concat(cur), []);
+    48| }
+    49| const nativeZip = options =>
+    50|   new Promise((resolve, reject) => {
+    51|     const cwd = options.cwd || process.cwd();
+    52|     const command = "zip";
+    53|     expandSources(cwd, options.source, (err, sources) => {
+    54|       const args = ["--quiet", "--recurse-paths", options.destination].concat(
+    55|         sources
+    56|       );
+    57|       const zipProcess = cp.spawn(command, args, {
+    58|         stdio: "inherit",
+    59|         cwd
+    60|       });
+    61|       zipProcess.on("error", reject);
+    62|       zipProcess.on("close", exitCode => {
+    63|         if (exitCode === 0) {
+    64|           resolve();
+    65|         } else {
+    66|           reject(
+    67|             new Error(
+    68|               `Unexpected exit code from native zip: ${exitCode}\n executed command '${command} ${args.join(
+    69|                 " "
+    70|               )}'\n executed in directory '${cwd}'`
+    71|             )
+    72|           );
+    73|         }
+    74|       });
+    75|     });
+    76|   });
+    77| const nodeZip = options =>
+    78|   new Promise((resolve, reject) => {
+    79|     const cwd = options.cwd || process.cwd();
+    80|     const output = fs.createWriteStream(path.resolve(cwd, options.destination));
+    81|     const archive = archiver("zip");
+    82|     output.on("close", resolve);
+    83|     archive.on("error", reject);
+    84|     archive.pipe(output);
+    85|     function addSource(source, next) {
+    86|       const fullPath = path.resolve(cwd, source);
+    87|       const destPath = source;
+    88|       fs.stat(fullPath, function(err, stats) {
+    89|         if (err) {
+    90|           return next(err);
+    91|         }
+    92|         if (stats.isDirectory()) {
+    93|           const files = walkDir(fullPath);
+    94|           files.forEach(f => {
+    95|             const subPath = f.substring(fullPath.length);
+    96|             archive.file(f, {
+    97|               name: destPath + subPath
+    98|             });
+    99|           });
+   100|         } else if (stats.isFile()) {
+   101|           archive.file(fullPath, { stats: stats, name: destPath });
+   102|         }
+   103|         next();
+   104|       });
+   105|     }
+   106|     expandSources(cwd, options.source, (err, expandedSources) => {
+   107|       if (err) {
+   108|         return reject(err);
+   109|       }
+   110|       async.forEach(expandedSources, addSource, err => {
+   111|         if (err) {
+   112|           return reject(err);
+   113|         }
+   114|         archive.finalize();
+   115|       });
+   116|     });
+   117|   });
+   118| function zip(options) {
+   119|   const compatMode = typeof options === "string";
+   120|   if (compatMode) {
+   121|     options = {
+   122|       source: arguments[1],
+   123|       destination: arguments[0]
+   124|     };
+   125|   }
+   126|   let promise;
+   127|   if (hasNativeZip()) {
+   128|     promise = nativeZip(options);
+   129|   } else {
+   130|     promise = nodeZip(options);
+   131|   }
+   132|   if (compatMode) {
+   133|     promise.then(arguments[2]).catch(arguments[2]);
+   134|   } else {
+   135|     return promise;
+

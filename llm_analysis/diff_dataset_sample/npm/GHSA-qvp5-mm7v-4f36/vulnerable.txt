@@ -1,0 +1,1537 @@
+# ====================================================================
+# FILE: packages/strapi-admin/config/functions/bootstrap.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-22 ---
+     1| 'use strict';
+     2| const adminActions = require('../admin-actions');
+     3| const adminConditions = require('../admin-conditions');
+     4| const registerPermissionActions = () => {
+     5|   const { actionProvider } = strapi.admin.services.permission;
+     6|   actionProvider.register(adminActions.actions);
+     7| };
+     8| const registerAdminConditions = () => {
+     9|   const { conditionProvider } = strapi.admin.services.permission;
+    10|   conditionProvider.registerMany(adminConditions.conditions);
+    11| };
+    12| module.exports = async () => {
+    13|   registerAdminConditions();
+    14|   registerPermissionActions();
+    15|   await strapi.admin.services.permission.cleanPermissionInDatabase();
+    16|   await strapi.admin.services.permission.ensureBoundPermissionsInDatabase();
+    17|   await strapi.admin.services.user.migrateUsers();
+    18|   await strapi.admin.services.role.createRolesIfNoneExist();
+    19|   await strapi.admin.services.permission.resetSuperAdminPermissions();
+    20|   await strapi.admin.services.role.displayWarningIfNoSuperAdmin();
+    21|   await strapi.admin.services.user.displayWarningIfUsersDontHaveRole();
+    22| };
+
+
+# ====================================================================
+# FILE: packages/strapi-admin/controllers/role.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 89-114 ---
+    89|       await validatedUpdatePermissionsInput(input, role);
+    90|     } catch (err) {
+    91|       return ctx.badRequest('ValidationError', err);
+    92|     }
+    93|     let existingPermissions = strapi.admin.services.permission.actionProvider.getAllByMap();
+    94|     let permissionsToAssign;
+    95|     if ([EDITOR_CODE, AUTHOR_CODE].includes(role.code)) {
+    96|       permissionsToAssign = input.permissions.filter(
+    97|         p => existingPermissions.get(p.action).section !== 'contentTypes'
+    98|       );
+    99|       const modifiedPermissions = input.permissions
+   100|         .filter(p => existingPermissions.get(p.action).section === 'contentTypes')
+   101|         .map(p => ({
+   102|           ...p,
+   103|           conditions: role.code === AUTHOR_CODE ? ['admin::is-creator'] : [],
+   104|         }));
+   105|       permissionsToAssign.push(...modifiedPermissions);
+   106|     } else {
+   107|       permissionsToAssign = input.permissions;
+   108|     }
+   109|     const permissions = await strapi.admin.services.permission.assign(role.id, permissionsToAssign);
+   110|     ctx.body = {
+   111|       data: permissions,
+   112|     };
+   113|   },
+   114| };
+
+
+# ====================================================================
+# FILE: packages/strapi-admin/ee/controllers/role.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 62-87 ---
+    62|    */
+    63|   async updatePermissions(ctx) {
+    64|     const { id } = ctx.params;
+    65|     const input = ctx.request.body;
+    66|     const role = await strapi.admin.services.role.findOne({ id });
+    67|     if (!role) {
+    68|       return ctx.notFound('role.notFound');
+    69|     }
+    70|     try {
+    71|       if (role.code === SUPER_ADMIN_CODE) {
+    72|         const err = new yup.ValidationError("Super admin permissions can't be edited.");
+    73|         throw formatYupErrors(err);
+    74|       }
+    75|       await validatedUpdatePermissionsInput(input);
+    76|     } catch (err) {
+    77|       return ctx.badRequest('ValidationError', err);
+    78|     }
+    79|     if (!role) {
+    80|       return ctx.notFound('role.notFound');
+    81|     }
+    82|     const permissions = await strapi.admin.services.permission.assign(role.id, input.permissions);
+    83|     ctx.body = {
+    84|       data: permissions,
+    85|     };
+    86|   },
+    87| };
+
+
+# ====================================================================
+# FILE: packages/strapi-admin/services/metrics.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-9 ---
+     1| 'use strict';
+     2| const sendDidInviteUser = async () => {
+     3|   const numberOfUsers = await strapi.admin.services.user.count();
+     4|   const numberOfRoles = await strapi.admin.services.role.count();
+     5|   return strapi.telemetry.send('didInviteUser', { numberOfRoles, numberOfUsers });
+     6| };
+     7| module.exports = {
+     8|   sendDidInviteUser,
+     9| };
+
+
+# ====================================================================
+# FILE: packages/strapi-admin/services/permission.js
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-47 ---
+     1| 'use strict';
+     2| const _ = require('lodash');
+     3| const { flatMap, filter } = require('lodash/fp');
+     4| const pmap = require('p-map');
+     5| const { validatePermissionsExist } = require('../validation/permission');
+     6| const createPermissionsManager = require('./permission/permissions-manager');
+     7| const createConditionProvider = require('./permission/condition-provider');
+     8| const createPermissionEngine = require('./permission/engine');
+     9| const actionProvider = require('./permission/action-provider');
+    10| const { EDITOR_CODE } = require('./constants');
+    11| const { getBoundActionsBySubject, BOUND_ACTIONS_FOR_FIELDS } = require('../domain/role');
+    12| const { createPermission } = require('../domain/permission');
+    13| const conditionProvider = createConditionProvider();
+    14| const engine = createPermissionEngine(conditionProvider);
+    15| const fieldsToCompare = ['action', 'subject', 'fields', 'conditions'];
+    16| const getPermissionWithSortedFields = perm => {
+    17|   const sortedPerm = _.cloneDeep(perm);
+    18|   if (Array.isArray(sortedPerm.fields)) {
+    19|     sortedPerm.fields.sort();
+    20|   }
+    21|   return sortedPerm;
+    22| };
+    23| const arePermissionsEqual = (perm1, perm2) =>
+    24|   _.isEqual(
+    25|     _.pick(getPermissionWithSortedFields(perm1), fieldsToCompare),
+    26|     _.pick(getPermissionWithSortedFields(perm2), fieldsToCompare)
+    27|   );
+    28| /**
+    29|  * Removes unwanted fields from a permission
+    30|  * @param perm
+    31|  * @returns {*}
+    32|  */
+    33| const sanitizePermission = perm => ({
+    34|   ..._.pick(perm, ['id', 'action', 'subject', 'fields']),
+    35|   conditions: strapi.admin.services.condition.removeUnkownConditionIds(perm.conditions),
+    36| });
+    37| /**
+    38|  * Delete permissions of roles in database
+    39|  * @param rolesIds ids of roles
+    40|  * @returns {Promise<array>}
+    41|  */
+    42| const deleteByRolesIds = rolesIds => {
+    43|   return strapi.query('permission', 'admin').delete({ role_in: rolesIds });
+    44| };
+    45| /**
+    46|  * Delete permissions
+    47|  * @param ids ids of permissions
+
+# --- HUNK 2: Lines 57-135 ---
+    57|  */
+    58| const createMany = async permissions => {
+    59|   return strapi.query('permission', 'admin').createMany(permissions);
+    60| };
+    61| /**
+    62|  * Update a permission
+    63|  * @returns {Promise<*[]|*>}
+    64|  * @param params
+    65|  * @param attributes
+    66|  */
+    67| const update = async (params, attributes) => {
+    68|   return strapi.query('permission', 'admin').update(params, attributes);
+    69| };
+    70| /**
+    71|  * Find assigned permissions in the database
+    72|  * @param params query params to find the permissions
+    73|  * @returns {Promise<array<Object>>}
+    74|  */
+    75| const find = (params = {}) => {
+    76|   return strapi.query('permission', 'admin').find(params, []);
+    77| };
+    78| /**
+    79|  * Assign permissions to a role
+    80|  * @param {string|int} roleId - role ID
+    81|  * @param {Array<Permission{action,subject,fields,conditions}>} permissions - permissions to assign to the role
+    82|  */
+    83| const assign = async (roleId, permissions = []) => {
+    84|   try {
+    85|     await validatePermissionsExist(permissions);
+    86|   } catch (err) {
+    87|     throw strapi.errors.badRequest('ValidationError', err);
+    88|   }
+    89|   const permissionsWithRole = permissions.map(permission =>
+    90|     createPermission({
+    91|       ...permission,
+    92|       conditions: strapi.admin.services.condition.removeUnkownConditionIds(permission.conditions),
+    93|       role: roleId,
+    94|     })
+    95|   );
+    96|   const existingPermissions = await find({ role: roleId, _limit: -1 });
+    97|   const permissionsToAdd = _.differenceWith(
+    98|     permissionsWithRole,
+    99|     existingPermissions,
+   100|     arePermissionsEqual
+   101|   );
+   102|   const permissionsToDelete = _.differenceWith(
+   103|     existingPermissions,
+   104|     permissionsWithRole,
+   105|     arePermissionsEqual
+   106|   );
+   107|   const permissionsToReturn = _.differenceBy(existingPermissions, permissionsToDelete, 'id');
+   108|   if (permissionsToDelete.length > 0) {
+   109|     await deleteByIds(permissionsToDelete.map(p => p.id));
+   110|   }
+   111|   if (permissionsToAdd.length > 0) {
+   112|     const createdPermissions = await createMany(permissionsToAdd);
+   113|     permissionsToReturn.push(...createdPermissions.map(p => ({ ...p, role: p.role.id })));
+   114|   }
+   115|   return permissionsToReturn;
+   116| };
+   117| /**
+   118|  * Find all permissions for a user
+   119|  * @param roles
+   120|  * @returns {Promise<*[]|*>}
+   121|  */
+   122| const findUserPermissions = async ({ roles }) => {
+   123|   if (!_.isArray(roles)) {
+   124|     return [];
+   125|   }
+   126|   return strapi
+   127|     .query('permission', 'admin')
+   128|     .find({ role_in: roles.map(_.property('id')), _limit: -1 });
+   129| };
+   130| /**
+   131|  * Removes permissions in database that don't exist anymore
+   132|  * @returns {Promise<>}
+   133|  */
+   134| const cleanPermissionInDatabase = async () => {
+   135|   const pageSize = 200;
+
+# --- HUNK 3: Lines 191-252 ---
+   191|       []
+   192|     );
+   193|     if (permissions.length === 0) {
+   194|       return;
+   195|     }
+   196|     const fields = _.flow(flatMap('fields'), filter(_.negate(_.isNil)), _.uniq)(permissions);
+   197|     const missingActions = _.difference(boundActions, _.map(permissions, 'action'));
+   198|     if (missingActions.length > 0) {
+   199|       const permissions = missingActions.map(action =>
+   200|         createPermission({
+   201|           action,
+   202|           subject: contentType.uid,
+   203|           role: editorRole.id,
+   204|           fields: BOUND_ACTIONS_FOR_FIELDS.includes(action) ? fields : null,
+   205|         })
+   206|       );
+   207|       await createMany(permissions);
+   208|     }
+   209|   }
+   210| };
+   211| /**
+   212|  * Reset super admin permissions (giving it all permissions)
+   213|  * @returns {Promise<>}
+   214|  */
+   215| const resetSuperAdminPermissions = async () => {
+   216|   const superAdminRole = await strapi.admin.services.role.getSuperAdmin();
+   217|   if (!superAdminRole) {
+   218|     return;
+   219|   }
+   220|   const allActions = strapi.admin.services.permission.actionProvider.getAll();
+   221|   const contentTypesActions = allActions.filter(a => a.section === 'contentTypes');
+   222|   const permissions = strapi.admin.services['content-type'].getPermissionsWithNestedFields(
+   223|     contentTypesActions
+   224|   );
+   225|   const otherActions = allActions.filter(a => a.section !== 'contentTypes');
+   226|   otherActions.forEach(action => {
+   227|     if (action.subjects) {
+   228|       const newPerms = action.subjects.map(subject =>
+   229|         createPermission({ action: action.actionId, subject })
+   230|       );
+   231|       permissions.push(...newPerms);
+   232|     } else {
+   233|       permissions.push(createPermission({ action: action.actionId }));
+   234|     }
+   235|   });
+   236|   await assign(superAdminRole.id, permissions);
+   237| };
+   238| module.exports = {
+   239|   find,
+   240|   deleteByRolesIds,
+   241|   deleteByIds,
+   242|   assign,
+   243|   sanitizePermission,
+   244|   findUserPermissions,
+   245|   actionProvider,
+   246|   createPermissionsManager,
+   247|   engine,
+   248|   conditionProvider,
+   249|   cleanPermissionInDatabase,
+   250|   resetSuperAdminPermissions,
+   251|   ensureBoundPermissionsInDatabase,
+   252| };
+
+
+# ====================================================================
+# FILE: packages/strapi-admin/services/role.js
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-32 ---
+     1| 'use strict';
+     2| const _ = require('lodash');
+     3| const { set } = require('lodash/fp');
+     4| const { generateTimestampCode, stringIncludes } = require('strapi-utils');
+     5| const { SUPER_ADMIN_CODE } = require('./constants');
+     6| const { createPermission } = require('../domain/permission');
+     7| const ACTIONS = {
+     8|   publish: 'plugins::content-manager.explorer.publish',
+     9| };
+    10| const sanitizeRole = role => {
+    11|   return _.omit(role, ['users', 'permissions']);
+    12| };
+    13| /**
+    14|  * Create and save a role in database
+    15|  * @param attributes A partial role object
+    16|  * @returns {Promise<role>}
+    17|  */
+    18| const create = async attributes => {
+    19|   const alreadyExists = await exists({ name: attributes.name });
+    20|   if (alreadyExists) {
+    21|     throw strapi.errors.badRequest('ValidationError', {
+    22|       name: [`The name must be unique and a role with name \`${attributes.name}\` already exists.`],
+    23|     });
+    24|   }
+    25|   const autoGeneratedCode = `${_.kebabCase(attributes.name)}-${generateTimestampCode()}`;
+    26|   const rolesWithCode = {
+    27|     ...attributes,
+    28|     code: attributes.code || autoGeneratedCode,
+    29|   };
+    30|   return strapi.query('role', 'admin').create(rolesWithCode);
+    31| };
+    32| /**
+
+# --- HUNK 2: Lines 139-238 ---
+   139|   return deletedRoles;
+   140| };
+   141| /** Count the number of users for some roles
+   142|  * @returns {Promise<integer>}
+   143|  * @param roleId
+   144|  */
+   145| const getUsersCount = async roleId => {
+   146|   return strapi.query('user', 'admin').count({ roles: [roleId] });
+   147| };
+   148| /** Returns admin role
+   149|  * @returns {Promise<role>}
+   150|  */
+   151| const getSuperAdmin = () => findOne({ code: SUPER_ADMIN_CODE });
+   152| /** Returns admin role with userCount
+   153|  * @returns {Promise<role>}
+   154|  */
+   155| const getSuperAdminWithUsersCount = () => findOneWithUsersCount({ code: SUPER_ADMIN_CODE });
+   156| /** Create superAdmin, Author and Editor role is no role already exist
+   157|  * @returns {Promise<>}
+   158|  */
+   159| const createRolesIfNoneExist = async ({ createPermissionsForAdmin = false } = {}) => {
+   160|   const someRolesExist = await exists();
+   161|   if (someRolesExist) {
+   162|     return;
+   163|   }
+   164|   const allActions = strapi.admin.services.permission.actionProvider.getAll();
+   165|   const contentTypesActions = allActions.filter(a => a.section === 'contentTypes');
+   166|   const superAdminRole = await create({
+   167|     name: 'Super Admin',
+   168|     code: 'strapi-super-admin',
+   169|     description: 'Super Admins can access and manage all features and settings.',
+   170|   });
+   171|   await strapi.admin.services.user.assignARoleToAll(superAdminRole.id);
+   172|   const editorRole = await create({
+   173|     name: 'Editor',
+   174|     code: 'strapi-editor',
+   175|     description: 'Editors can manage and publish contents including those of other users.',
+   176|   });
+   177|   const authorRole = await create({
+   178|     name: 'Author',
+   179|     code: 'strapi-author',
+   180|     description: 'Authors can manage the content they have created.',
+   181|   });
+   182|   const editorPermissions = strapi.admin.services['content-type'].getPermissionsWithNestedFields(
+   183|     contentTypesActions,
+   184|     {
+   185|       restrictedSubjects: ['plugins::users-permissions.user'],
+   186|     }
+   187|   );
+   188|   const authorPermissions = editorPermissions
+   189|     .filter(({ action }) => action !== ACTIONS.publish)
+   190|     .map(set('conditions', ['admin::is-creator']));
+   191|   editorPermissions.push(...getDefaultPluginPermissions());
+   192|   authorPermissions.push(...getDefaultPluginPermissions({ isAuthor: true }));
+   193|   await strapi.admin.services.permission.assign(editorRole.id, editorPermissions);
+   194|   await strapi.admin.services.permission.assign(authorRole.id, authorPermissions);
+   195|   if (createPermissionsForAdmin) {
+   196|     await strapi.admin.services.permission.resetSuperAdminPermissions();
+   197|   }
+   198| };
+   199| const getDefaultPluginPermissions = ({ isAuthor = false } = {}) => {
+   200|   const conditions = isAuthor ? ['admin::is-creator'] : null;
+   201|   return [
+   202|     { action: 'plugins::upload.read', conditions },
+   203|     { action: 'plugins::upload.assets.create' },
+   204|     { action: 'plugins::upload.assets.update', conditions },
+   205|     { action: 'plugins::upload.assets.download' },
+   206|     { action: 'plugins::upload.assets.copy-link' },
+   207|   ].map(createPermission);
+   208| };
+   209| /** Display a warning if the role superAdmin doesn't exist
+   210|  *  or if the role is not assigned to at least one user
+   211|  * @returns {Promise<>}
+   212|  */
+   213| const displayWarningIfNoSuperAdmin = async () => {
+   214|   const superAdminRole = await getSuperAdminWithUsersCount();
+   215|   const someUsersExists = await strapi.admin.services.user.exists();
+   216|   if (!superAdminRole) {
+   217|     strapi.log.warn("Your application doesn't have a super admin role.");
+   218|   } else if (someUsersExists && superAdminRole.usersCount === 0) {
+   219|     strapi.log.warn("Your application doesn't have a super admin user.");
+   220|   }
+   221| };
+   222| module.exports = {
+   223|   sanitizeRole,
+   224|   create,
+   225|   findOne,
+   226|   findOneWithUsersCount,
+   227|   find,
+   228|   findAllWithUsersCount,
+   229|   update,
+   230|   exists,
+   231|   count,
+   232|   deleteByIds,
+   233|   getUsersCount,
+   234|   getSuperAdmin,
+   235|   getSuperAdminWithUsersCount,
+   236|   createRolesIfNoneExist,
+   237|   displayWarningIfNoSuperAdmin,
+   238| };
+
+
+# ====================================================================
+# FILE: packages/strapi-connector-bookshelf/lib/build-database-schema.js
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-105 ---
+     1| const _ = require('lodash');
+     2| const { singular } = require('pluralize');
+     3| const { contentTypes: contentTypesUtils } = require('strapi-utils');
+     4| const { storeDefinition, didDefinitionChange } = require('./utils/store-definition');
+     5| const { getDraftAndPublishMigrationWay, migrateDraftAndPublish } = require('./database-migration');
+     6| module.exports = async ({ ORM, loadedModel, definition, connection, model }) => {
+     7|   const definitionDidChange = await didDefinitionChange(definition, ORM);
+     8|   if (!definitionDidChange) {
+     9|     return;
+    10|   }
+    11|   const draftAndPublishMigrationWay = await getDraftAndPublishMigrationWay({ definition, ORM });
+    12|   if (draftAndPublishMigrationWay === 'disable') {
+    13|     await migrateDraftAndPublish({ definition, ORM, way: 'disable' });
+    14|   }
+    15|   if (loadedModel.hasTimestamps) {
+    16|     definition.attributes[loadedModel.hasTimestamps[0]] = { type: 'currentTimestamp' };
+    17|     definition.attributes[loadedModel.hasTimestamps[1]] = { type: 'currentTimestamp' };
+    18|   }
+    19|   if (connection.options && connection.options.autoMigration !== false) {
+    20|     await createOrUpdateTable({
+    21|       table: loadedModel.tableName,
+    22|       attributes: definition.attributes,
+    23|       definition,
+    24|       ORM,
+    25|       model,
+    26|     });
+    27|   }
+    28|   const morphRelations = definition.associations.filter(association => {
+    29|     return association.nature.toLowerCase().includes('morphto');
+    30|   });
+    31|   for (const morphRelation of morphRelations) {
+    32|     const attributes = {
+    33|       [`${loadedModel.tableName}_id`]: { type: definition.primaryKeyType },
+    34|       [`${morphRelation.alias}_id`]: { type: definition.primaryKeyType },
+    35|       [`${morphRelation.alias}_type`]: { type: 'text' },
+    36|       [definition.attributes[morphRelation.alias].filter]: { type: 'text' },
+    37|       order: { type: 'integer' },
+    38|     };
+    39|     if (connection.options && connection.options.autoMigration !== false) {
+    40|       await createOrUpdateTable({
+    41|         table: `${loadedModel.tableName}_morph`,
+    42|         attributes,
+    43|         definition,
+    44|         ORM,
+    45|         model,
+    46|       });
+    47|     }
+    48|   }
+    49|   const manyRelations = definition.associations.filter(({ nature }) =>
+    50|     ['manyToMany', 'manyWay'].includes(nature)
+    51|   );
+    52|   for (const manyRelation of manyRelations) {
+    53|     const { plugin, collection, via, dominant, alias } = manyRelation;
+    54|     if (dominant) {
+    55|       const targetCollection = strapi.db.getModel(collection, plugin);
+    56|       const targetAttr = via
+    57|         ? targetCollection.attributes[via]
+    58|         : {
+    59|             attribute: singular(definition.collectionName),
+    60|             column: definition.primaryKey,
+    61|           };
+    62|       const defAttr = definition.attributes[alias];
+    63|       const targetCol = `${targetAttr.attribute}_${targetAttr.column}`;
+    64|       let rootCol = `${defAttr.attribute}_${defAttr.column}`;
+    65|       if (rootCol === targetCol) {
+    66|         rootCol = `related_${rootCol}`;
+    67|       }
+    68|       const attributes = {
+    69|         [targetCol]: { type: targetCollection.primaryKeyType },
+    70|         [rootCol]: { type: definition.primaryKeyType },
+    71|       };
+    72|       const table = manyRelation.tableCollectionName;
+    73|       if (connection.options && connection.options.autoMigration !== false) {
+    74|         await createOrUpdateTable({ table, attributes, definition, ORM, model });
+    75|       }
+    76|     }
+    77|   }
+    78|   if (loadedModel.hasTimestamps) {
+    79|     delete definition.attributes[loadedModel.hasTimestamps[0]];
+    80|     delete definition.attributes[loadedModel.hasTimestamps[1]];
+    81|   }
+    82|   if (draftAndPublishMigrationWay === 'enable') {
+    83|     await migrateDraftAndPublish({ definition, ORM, way: 'enable' });
+    84|   }
+    85|   await storeDefinition(definition, ORM);
+    86| };
+    87| const isColumn = ({ definition, attribute, name }) => {
+    88|   if (!_.has(attribute, 'type')) {
+    89|     const relation = definition.associations.find(association => {
+    90|       return association.alias === name;
+    91|     });
+    92|     if (!relation) return false;
+    93|     if (['oneToOne', 'manyToOne', 'oneWay'].includes(relation.nature)) {
+    94|       return true;
+    95|     }
+    96|     return false;
+    97|   }
+    98|   if (['component', 'dynamiczone'].includes(attribute.type)) {
+    99|     return false;
+   100|   }
+   101|   return true;
+   102| };
+   103| const uniqueColName = (table, key) => `${table}_${key}_unique`;
+   104| const buildColType = ({ name, attribute, table, tableExists = false, definition, ORM }) => {
+   105|   if (!attribute.type) {
+
+# --- HUNK 2: Lines 206-309 ---
+   206|         }
+   207|       }
+   208|       if (alter) {
+   209|         col.alter();
+   210|       }
+   211|     });
+   212|   };
+   213|   const alterColumns = (tbl, columns, opts = {}) => {
+   214|     return createColumns(tbl, columns, { ...opts, alter: true });
+   215|   };
+   216|   const createTable = (table, { trx = ORM.knex, ...opts } = {}) => {
+   217|     return trx.schema.createTable(table, tbl => {
+   218|       createIdType(tbl);
+   219|       createColumns(tbl, attributes, { ...opts, tableExists: false });
+   220|     });
+   221|   };
+   222|   if (!tableExists) {
+   223|     await createTable(table);
+   224|     return;
+   225|   }
+   226|   const columns = Object.keys(attributes);
+   227|   const columnsExist = await Promise.all(
+   228|     columns.map(attribute => ORM.knex.schema.hasColumn(table, attribute))
+   229|   );
+   230|   const columnsToAdd = {};
+   231|   columnsExist.forEach((columnExist, index) => {
+   232|     const attribute = attributes[columns[index]];
+   233|     if (!columnExist) {
+   234|       columnsToAdd[columns[index]] = attribute;
+   235|     }
+   236|   });
+   237|   if (Object.keys(columnsToAdd).length > 0) {
+   238|     await ORM.knex.schema.table(table, tbl => {
+   239|       createColumns(tbl, columnsToAdd, { tableExists });
+   240|     });
+   241|   }
+   242|   if (definition.client === 'sqlite3') {
+   243|     const tmpTable = `tmp_${table}`;
+   244|     const rebuildTable = async trx => {
+   245|       await trx.schema.renameTable(table, tmpTable);
+   246|       await Promise.all(
+   247|         columns.map(key => trx.raw('DROP INDEX IF EXISTS ??', uniqueColName(table, key)))
+   248|       );
+   249|       await createTable(table, { trx });
+   250|       const attrs = Object.keys(attributes).filter(attribute =>
+   251|         isColumn({
+   252|           definition,
+   253|           attribute: attributes[attribute],
+   254|           name: attribute,
+   255|         })
+   256|       );
+   257|       const allAttrs = ['id', ...attrs];
+   258|       await trx.insert(qb => qb.select(allAttrs).from(tmpTable)).into(table);
+   259|       await trx.schema.dropTableIfExists(tmpTable);
+   260|     };
+   261|     try {
+   262|       await ORM.knex.transaction(trx => rebuildTable(trx));
+   263|     } catch (err) {
+   264|       if (err.message.includes('UNIQUE constraint failed')) {
+   265|         strapi.log.error(
+   266|           `Unique constraint fails, make sure to update your data and restart to apply the unique constraint.\n\t- ${err.stack}`
+   267|         );
+   268|       } else {
+   269|         strapi.log.error(`Migration failed`);
+   270|         strapi.log.error(err);
+   271|       }
+   272|       return false;
+   273|     }
+   274|   } else {
+   275|     const alterTable = async trx => {
+   276|       await Promise.all(
+   277|         columns.map(col => {
+   278|           return ORM.knex.schema
+   279|             .alterTable(table, tbl => {
+   280|               tbl.dropUnique(col, uniqueColName(table, col));
+   281|             })
+   282|             .catch(() => {});
+   283|         })
+   284|       );
+   285|       await trx.schema.alterTable(table, tbl => {
+   286|         alterColumns(tbl, _.pick(attributes, columns), {
+   287|           tableExists,
+   288|         });
+   289|       });
+   290|     };
+   291|     try {
+   292|       await ORM.knex.transaction(trx => alterTable(trx));
+   293|     } catch (err) {
+   294|       if (err.code === '23505' && definition.client === 'pg') {
+   295|         strapi.log.error(
+   296|           `Unique constraint fails, make sure to update your data and restart to apply the unique constraint.\n\t- ${err.message}\n\t- ${err.detail}`
+   297|         );
+   298|       } else if (definition.client === 'mysql' && err.errno === 1062) {
+   299|         strapi.log.error(
+   300|           `Unique constraint fails, make sure to update your data and restart to apply the unique constraint.\n\t- ${err.sqlMessage}`
+   301|         );
+   302|       } else {
+   303|         strapi.log.error(`Migration failed`);
+   304|         strapi.log.error(err);
+   305|       }
+   306|       return false;
+   307|     }
+   308|   }
+   309| };
+
+
+# ====================================================================
+# FILE: packages/strapi-connector-bookshelf/lib/buildQuery.js
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-63 ---
+     1| const _ = require('lodash');
+     2| const { singular } = require('pluralize');
+     3| const { toQueries, runPopulateQueries } = require('./utils/populate-queries');
+     4| const BOOLEAN_OPERATORS = ['or'];
+     5| /**
+     6|  * Build filters on a bookshelf query
+     7|  * @param {Object} options - Options
+     8|  * @param {Object} options.model - Bookshelf model
+     9|  * @param {Object} options.filters - Filters params (start, limit, sort, where)
+    10|  */
+    11| const buildQuery = ({ model, filters }) => qb => {
+    12|   if (_.has(filters, 'where') && Array.isArray(filters.where) && filters.where.length > 0) {
+    13|     qb.distinct();
+    14|     buildJoinsAndFilter(qb, model, filters.where);
+    15|   }
+    16|   if (_.has(filters, 'sort')) {
+    17|     qb.orderBy(
+    18|       filters.sort.map(({ field, order }) => ({
+    19|         column: field,
+    20|         order,
+    21|       }))
+    22|     );
+    23|   }
+    24|   if (_.has(filters, 'start')) {
+    25|     qb.offset(filters.start);
+    26|   }
+    27|   if (_.has(filters, 'limit') && filters.limit >= 0) {
+    28|     qb.limit(filters.limit);
+    29|   }
+    30|   if (_.has(filters, 'publicationState')) {
+    31|     runPopulateQueries(
+    32|       toQueries({ publicationState: { query: filters.publicationState, model } }),
+    33|       qb
+    34|     );
+    35|   }
+    36| };
+    37| /**
+    38|  * Add joins and where filters
+    39|  * @param {Object} qb - knex query builder
+    40|  * @param {Object} model - Bookshelf model
+    41|  * @param {Array<Object>} whereClauses - an array of where clause
+    42|  */
+    43| const buildJoinsAndFilter = (qb, model, whereClauses) => {
+    44|   /**
+    45|    * Returns an alias for a name (simple incremental alias name)
+    46|    * @param {string} name - name to alias
+    47|    */
+    48|   const aliasMap = {};
+    49|   const generateAlias = name => {
+    50|     if (!aliasMap[name]) {
+    51|       aliasMap[name] = 1;
+    52|     }
+    53|     const alias = `${name}_${aliasMap[name]}`;
+    54|     aliasMap[name] += 1;
+    55|     return alias;
+    56|   };
+    57|   /**
+    58|    * Build a query joins and where clauses from a query tree
+    59|    * @param {Object} qb - Knex query builder
+    60|    * @param {Object} tree - Query tree
+    61|    */
+    62|   const buildJoinsFromTree = (qb, queryTree) => {
+    63|     Object.keys(queryTree.joins).forEach(key => {
+
+# --- HUNK 2: Lines 158-201 ---
+   158|    * Format every where clauses whith the right table name aliases.
+   159|    * Add table joins to the joins list
+   160|    * @param {Array<{field, operator, value}>} whereClauses a list of where clauses
+   161|    * @param {Object} context
+   162|    * @param {Object} context.model model on which the query is run
+   163|    */
+   164|   const buildWhereClauses = (whereClauses, { model }) => {
+   165|     return whereClauses.map(whereClause => {
+   166|       const { field, operator, value } = whereClause;
+   167|       if (BOOLEAN_OPERATORS.includes(operator)) {
+   168|         return { field, operator, value: value.map(v => buildWhereClauses(v, { model })) };
+   169|       }
+   170|       const path = generateNestedJoins(field, tree);
+   171|       return {
+   172|         field: path,
+   173|         operator,
+   174|         value,
+   175|       };
+   176|     });
+   177|   };
+   178|   const aliasedWhereClauses = buildWhereClauses(whereClauses, { model });
+   179|   buildJoinsFromTree(qb, tree);
+   180|   aliasedWhereClauses.forEach(w => buildWhereClause({ qb, ...w }));
+   181|   return;
+   182| };
+   183| /**
+   184|  * Builds a sql where clause
+   185|  * @param {Object} options - Options
+   186|  * @param {Object} options.qb - Bookshelf (knex) query builder
+   187|  * @param {Object} options.model - Bookshelf model
+   188|  * @param {Object} options.field - Filtered field
+   189|  * @param {Object} options.operator - Filter operator (=,in,not eq etc..)
+   190|  * @param {Object} options.value - Filter value
+   191|  */
+   192| const buildWhereClause = ({ qb, field, operator, value }) => {
+   193|   if (Array.isArray(value) && !['or', 'in', 'nin'].includes(operator)) {
+   194|     return qb.where(subQb => {
+   195|       for (let val of value) {
+   196|         subQb.orWhere(q => buildWhereClause({ qb: q, field, operator, value: val }));
+   197|       }
+   198|     });
+   199|   }
+   200|   switch (operator) {
+   201|     case 'or':
+
+
+# ====================================================================
+# FILE: packages/strapi-connector-bookshelf/lib/database-migration.js
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-53 ---
+     1| 'use strict';
+     2| const _ = require('lodash');
+     3| const { contentTypes: contentTypesUtils } = require('strapi-utils');
+     4| const { PUBLISHED_AT_ATTRIBUTE } = contentTypesUtils.constants;
+     5| const { getDefinitionFromStore } = require('./utils/store-definition');
+     6| const getDraftAndPublishMigrationWay = async ({ definition, ORM }) => {
+     7|   const previousDefRow = await getDefinitionFromStore(definition, ORM);
+     8|   const previousDef = JSON.parse(_.get(previousDefRow, 'value', null));
+     9|   const previousDraftAndPublish = contentTypesUtils.hasDraftAndPublish(previousDef);
+    10|   const actualDraftAndPublish = contentTypesUtils.hasDraftAndPublish(definition);
+    11|   if (previousDraftAndPublish === actualDraftAndPublish) {
+    12|     return 'none';
+    13|   }
+    14|   if (!previousDraftAndPublish && actualDraftAndPublish) {
+    15|     return 'enable';
+    16|   }
+    17|   if (previousDraftAndPublish && !actualDraftAndPublish) {
+    18|     return 'disable';
+    19|   }
+    20| };
+    21| const migrateDraftAndPublish = async ({ definition, ORM, way }) => {
+    22|   if (way === 'enable') {
+    23|     const now = new Date();
+    24|     let publishedAtValue = now;
+    25|     if (_.get(definition, 'options.timestamps', false)) {
+    26|       const createdAtColumn = _.get(definition, 'options.timestamps.0', 'created_at');
+    27|       publishedAtValue = ORM.knex.ref(createdAtColumn);
+    28|     }
+    29|     await ORM.knex(definition.collectionName)
+    30|       .update({ [PUBLISHED_AT_ATTRIBUTE]: publishedAtValue })
+    31|       .where(PUBLISHED_AT_ATTRIBUTE, null);
+    32|     await ORM.knex(definition.collectionName) // in case some created_at were null
+    33|       .update({ [PUBLISHED_AT_ATTRIBUTE]: now })
+    34|       .where(PUBLISHED_AT_ATTRIBUTE, null);
+    35|   } else if (way === 'disable') {
+    36|     await ORM.knex(definition.collectionName)
+    37|       .delete()
+    38|       .where(PUBLISHED_AT_ATTRIBUTE, null);
+    39|     const publishedAtColumnExists = await ORM.knex.schema.hasColumn(
+    40|       definition.collectionName,
+    41|       PUBLISHED_AT_ATTRIBUTE
+    42|     );
+    43|     if (definition.client !== 'sqlite3' && publishedAtColumnExists) {
+    44|       await ORM.knex.schema.table(definition.collectionName, table => {
+    45|         table.dropColumn(PUBLISHED_AT_ATTRIBUTE);
+    46|       });
+    47|     }
+    48|   }
+    49| };
+    50| module.exports = {
+    51|   getDraftAndPublishMigrationWay,
+    52|   migrateDraftAndPublish,
+    53| };
+
+
+# ====================================================================
+# FILE: packages/strapi-connector-bookshelf/lib/mount-models.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 50-94 ---
+    50|         writable: false,
+    51|         private: isPrivate,
+    52|       };
+    53|       definition.attributes[UPDATED_BY_ATTRIBUTE] = {
+    54|         model: 'user',
+    55|         plugin: 'admin',
+    56|         configurable: false,
+    57|         writable: false,
+    58|         private: isPrivate,
+    59|       };
+    60|     }
+    61|     definition.globalName = _.upperFirst(_.camelCase(definition.globalId));
+    62|     definition.associations = [];
+    63|     GLOBALS[definition.globalId] = {};
+    64|     definition.orm = 'bookshelf';
+    65|     definition.databaseName = getDatabaseName(connection);
+    66|     definition.client = _.get(connection.settings, 'client');
+    67|     definition.primaryKey = 'id';
+    68|     definition.primaryKeyType = 'integer';
+    69|     target[model].allAttributes = { ...definition.attributes };
+    70|     const createAtCol = _.get(definition, 'options.timestamps.0', 'created_at');
+    71|     const updatedAtCol = _.get(definition, 'options.timestamps.1', 'updated_at');
+    72|     if (_.get(definition, 'options.timestamps', false)) {
+    73|       _.set(definition, 'options.timestamps', [createAtCol, updatedAtCol]);
+    74|       target[model].allAttributes[createAtCol] = { type: 'timestamp' };
+    75|       target[model].allAttributes[updatedAtCol] = { type: 'timestamp' };
+    76|     } else {
+    77|       _.set(definition, 'options.timestamps', false);
+    78|     }
+    79|     const loadedModel = _.assign(
+    80|       {
+    81|         requireFetch: false,
+    82|         tableName: definition.collectionName,
+    83|         hasTimestamps: definition.options.timestamps,
+    84|         associations: [],
+    85|         defaults: Object.keys(definition.attributes).reduce((acc, current) => {
+    86|           if (definition.attributes[current].type && definition.attributes[current].default) {
+    87|             acc[current] = definition.attributes[current].default;
+    88|           }
+    89|           return acc;
+    90|         }, {}),
+    91|       },
+    92|       definition.options
+    93|     );
+    94|     const componentAttributes = Object.keys(definition.attributes).filter(key =>
+
+
+# ====================================================================
+# FILE: packages/strapi-connector-bookshelf/lib/utils/associations.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-7 ---
+     1| 'use strict';
+     2| const isPolymorphic = ({ assoc }) => {
+     3|   return assoc.nature.toLowerCase().indexOf('morph') !== -1;
+     4| };
+     5| module.exports = {
+     6|   isPolymorphic,
+     7| };
+
+
+# ====================================================================
+# FILE: packages/strapi-connector-bookshelf/lib/utils/populate-queries.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-34 ---
+     1| 'use strict';
+     2| const _ = require('lodash');
+     3| const {
+     4|   contentTypes: {
+     5|     hasDraftAndPublish,
+     6|     constants: { DP_PUB_STATE_LIVE, DP_PUB_STATE_PREVIEW, PUBLISHED_AT_ATTRIBUTE },
+     7|   },
+     8| } = require('strapi-utils');
+     9| const optionsMap = {
+    10|   publicationState: {
+    11|     queries: {
+    12|       [DP_PUB_STATE_LIVE]: ({ model }) => qb => {
+    13|         const { collectionName } = model;
+    14|         qb.whereNotNull(`${collectionName}.${PUBLISHED_AT_ATTRIBUTE}`);
+    15|       },
+    16|       [DP_PUB_STATE_PREVIEW]: () => null,
+    17|     },
+    18|     validate({ model, query: publicationState }) {
+    19|       return hasDraftAndPublish(model) && _.has(this.queries, publicationState);
+    20|     },
+    21|   },
+    22| };
+    23| const availableOptions = Object.keys(optionsMap);
+    24| const isValidOption = option => availableOptions.includes(option);
+    25| const validate = (option, params) => {
+    26|   const opt = _.get(optionsMap, option, {});
+    27|   return !_.isFunction(opt.validate) || opt.validate(params);
+    28| };
+    29| const resolveQuery = (option, params) => optionsMap[option].queries[params.query](params);
+    30| /**
+    31|  * Transform given options to populate queries based on the optionsMap
+    32|  * @param options
+    33|  * @returns Array<Function>
+    34|  */
+
+
+# ====================================================================
+# FILE: packages/strapi-connector-bookshelf/lib/utils/store-definition.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 10-40 ---
+    10|     return undefined;
+    11|   }
+    12|   const def = await strapi.models['core_store']
+    13|     .forge({ key: `model_def_${definition.uid}` })
+    14|     .fetch();
+    15|   return def ? def.toJSON() : undefined;
+    16| };
+    17| const storeDefinition = async (definition, ORM) => {
+    18|   const defToStore = formatDefinitionToStore(definition);
+    19|   const existingDef = await getDefinitionFromStore(definition, ORM);
+    20|   const defData = {
+    21|     key: `model_def_${definition.uid}`,
+    22|     type: 'object',
+    23|     value: defToStore,
+    24|   };
+    25|   if (existingDef) {
+    26|     return strapi.models['core_store'].forge({ id: existingDef.id }).save(defData);
+    27|   }
+    28|   return strapi.models['core_store'].forge(defData).save();
+    29| };
+    30| const didDefinitionChange = async (definition, ORM) => {
+    31|   const previousDefRow = await getDefinitionFromStore(definition, ORM);
+    32|   const previousDefJSON = _.get(previousDefRow, 'value', null);
+    33|   const actualDefJSON = formatDefinitionToStore(definition);
+    34|   return previousDefJSON !== actualDefJSON;
+    35| };
+    36| module.exports = {
+    37|   storeDefinition,
+    38|   didDefinitionChange,
+    39|   getDefinitionFromStore,
+    40| };
+
+
+# ====================================================================
+# FILE: packages/strapi-connector-mongoose/lib/buildQuery.js
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-28 ---
+     1| 'use strict';
+     2| const _ = require('lodash');
+     3| var semver = require('semver');
+     4| const utils = require('./utils')();
+     5| const populateQueries = require('./utils/populate-queries');
+     6| const {
+     7|   hasDeepFilters,
+     8|   contentTypes: { hasDraftAndPublish },
+     9| } = require('strapi-utils');
+    10| const combineSearchAndWhere = (search = [], wheres = []) => {
+    11|   const criterias = {};
+    12|   if (search.length > 0 && wheres.length > 0) {
+    13|     criterias.$and = [{ $and: wheres }, { $or: search }];
+    14|   } else if (search.length > 0) {
+    15|     criterias.$or = search;
+    16|   } else if (wheres.length > 0) {
+    17|     criterias.$and = wheres;
+    18|   }
+    19|   return criterias;
+    20| };
+    21| const buildSearchOr = (model, query) => {
+    22|   if (typeof query !== 'string') {
+    23|     return [];
+    24|   }
+    25|   const searchOr = Object.keys(model.attributes).reduce((acc, curr) => {
+    26|     switch (model.attributes[curr].type) {
+    27|       case 'biginteger':
+    28|       case 'integer':
+
+# --- HUNK 2: Lines 100-168 ---
+   100|   query = applyQueryParams({ model, query, filters });
+   101|   return Object.assign(query, {
+   102|     count(...args) {
+   103|       return query.countDocuments(...args);
+   104|     },
+   105|   });
+   106| };
+   107| /**
+   108|  * Builds a deep aggregate query when there are deep filters
+   109|  * @param {Object} options - Query options
+   110|  * @param {Object} options.model - The model you are querying
+   111|  * @param {Object} options.filters - An object with the possible filters (start, limit, sort, where)
+   112|  * @param {Object} options.populate - An array of paths to populate
+   113|  */
+   114| const buildDeepQuery = ({ model, filters, search, populate }) => {
+   115|   const { populatePaths, wherePaths } = computePopulatedPaths({
+   116|     model,
+   117|     populate,
+   118|     where: filters.where,
+   119|   });
+   120|   const customQueryOptions = _.pick(filters, ['publicationState']);
+   121|   let query = model
+   122|     .aggregate(
+   123|       buildQueryAggregate(model, {
+   124|         paths: _.merge({}, populatePaths, wherePaths),
+   125|       })
+   126|     )
+   127|     .append(buildQueryMatches(model, filters, search));
+   128|   return {
+   129|     /**
+   130|      * Overrides the promise to rehydrate mongoose docs after the aggregation query
+   131|      */
+   132|     then(...args) {
+   133|       return query
+   134|         .append({
+   135|           $project: { _id: true },
+   136|         })
+   137|         .then(results => results.map(el => el._id))
+   138|         .then(ids => {
+   139|           if (ids.length === 0) return [];
+   140|           const query = model
+   141|             .find(
+   142|               {
+   143|                 _id: {
+   144|                   $in: ids,
+   145|                 },
+   146|               },
+   147|               null,
+   148|               { custom: customQueryOptions }
+   149|             )
+   150|             .populate(populate);
+   151|           return applyQueryParams({ model, query, filters });
+   152|         })
+   153|         .then(...args);
+   154|     },
+   155|     catch(...args) {
+   156|       return this.then(r => r).catch(...args);
+   157|     },
+   158|     /**
+   159|      * Maps to query.count
+   160|      */
+   161|     count() {
+   162|       return query.count('count').then(results => _.get(results, ['0', 'count'], 0));
+   163|     },
+   164|     /**
+   165|      * Maps to query group
+   166|      */
+   167|     group(...args) {
+   168|       return query.group(...args);
+
+# --- HUNK 3: Lines 230-398 ---
+   230|     .reduce((acc, paths) => acc.concat(paths), []);
+   231|   const castedWherePaths = recursiveCastedWherePaths(where, { model });
+   232|   return {
+   233|     populatePaths: pathsToTree(castedPopulatePaths),
+   234|     wherePaths: pathsToTree(castedWherePaths),
+   235|   };
+   236| };
+   237| const recursiveCastedWherePaths = (whereClauses, { model }) => {
+   238|   const paths = whereClauses.map(({ field, operator, value }) => {
+   239|     if (BOOLEAN_OPERATORS.includes(operator)) {
+   240|       return value.map(where => recursiveCastedWherePaths(where, { model }));
+   241|     }
+   242|     return findModelPath({ rootModel: model, path: field });
+   243|   });
+   244|   return _.flattenDeep(paths).filter(path => !!path);
+   245| };
+   246| /**
+   247|  * Builds an object based on paths:
+   248|  * [
+   249|  *    'articles',
+   250|  *    'articles.tags.cateogry',
+   251|  *    'articles.tags.label',
+   252|  * ] => {
+   253|  *  articles: {
+   254|  *    tags: {
+   255|  *      category: {},
+   256|  *      label: {}
+   257|  *    }
+   258|  *  }
+   259|  * }
+   260|  * @param {Array<string>} paths - A list of paths to transform
+   261|  */
+   262| const pathsToTree = paths => paths.reduce((acc, path) => _.merge(acc, _.set({}, path, {})), {});
+   263| /**
+   264|  * Builds the aggregations pipeling of the query
+   265|  * @param {Object} model - Queried model
+   266|  * @param {Object} options - Options
+   267|  * @param {Object} options.paths - A tree of paths to aggregate e.g { article : { tags : { label: {}}}}
+   268|  */
+   269| const buildQueryAggregate = (model, { paths } = {}) => {
+   270|   return Object.keys(paths).reduce((acc, key) => {
+   271|     return acc.concat(buildLookup({ model, key, paths: paths[key] }));
+   272|   }, []);
+   273| };
+   274| /**
+   275|  * Builds a lookup aggregation for a specific key
+   276|  * @param {Object} options - Options
+   277|  * @param {Object} options.model - Queried model
+   278|  * @param {string} options.key - The attribute name to lookup on the model
+   279|  * @param {Object} options.paths - A tree of paths to aggregate inside the current lookup e.g { { tags : { label: {}}}
+   280|  */
+   281| const buildLookup = ({ model, key, paths }) => {
+   282|   const assoc = model.associations.find(a => a.alias === key);
+   283|   const assocModel = strapi.db.getModelByAssoc(assoc);
+   284|   if (!assocModel) return [];
+   285|   return [
+   286|     {
+   287|       $lookup: {
+   288|         from: assocModel.collectionName,
+   289|         as: assoc.alias,
+   290|         let: {
+   291|           localId: '$_id',
+   292|           localAlias: `$${assoc.alias}`,
+   293|         },
+   294|         pipeline: []
+   295|           .concat(buildLookupMatch({ assoc }))
+   296|           .concat(buildQueryAggregate(assocModel, { paths })),
+   297|       },
+   298|     },
+   299|   ];
+   300| };
+   301| /**
+   302|  * Build a lookup match expression (equivalent to a SQL join condition)
+   303|  * @param {Object} options - Options
+   304|  * @param {Object} options.assoc - The association on which is based the ematching xpression
+   305|  */
+   306| const buildLookupMatch = ({ assoc }) => {
+   307|   switch (assoc.nature) {
+   308|     case 'oneToOne': {
+   309|       return [
+   310|         {
+   311|           $match: {
+   312|             $expr: {
+   313|               $eq: [`$${assoc.via}`, '$$localId'],
+   314|             },
+   315|           },
+   316|         },
+   317|       ];
+   318|     }
+   319|     case 'oneToMany': {
+   320|       return {
+   321|         $match: {
+   322|           $expr: {
+   323|             $eq: [`$${assoc.via}`, '$$localId'],
+   324|           },
+   325|         },
+   326|       };
+   327|     }
+   328|     case 'oneWay':
+   329|     case 'manyToOne': {
+   330|       return {
+   331|         $match: {
+   332|           $expr: {
+   333|             $eq: ['$$localAlias', '$_id'],
+   334|           },
+   335|         },
+   336|       };
+   337|     }
+   338|     case 'manyWay': {
+   339|       return {
+   340|         $match: {
+   341|           $expr: {
+   342|             $in: ['$_id', '$$localAlias'],
+   343|           },
+   344|         },
+   345|       };
+   346|     }
+   347|     case 'manyToMany': {
+   348|       if (assoc.dominant === true) {
+   349|         return {
+   350|           $match: {
+   351|             $expr: {
+   352|               $in: ['$_id', '$$localAlias'],
+   353|             },
+   354|           },
+   355|         };
+   356|       }
+   357|       return {
+   358|         $match: {
+   359|           $expr: {
+   360|             $in: ['$$localId', `$${assoc.via}`],
+   361|           },
+   362|         },
+   363|       };
+   364|     }
+   365|     case 'manyToManyMorph':
+   366|     case 'oneToManyMorph': {
+   367|       return [
+   368|         {
+   369|           $unwind: { path: `$${assoc.via}`, preserveNullAndEmptyArrays: true },
+   370|         },
+   371|         {
+   372|           $match: {
+   373|             $expr: {
+   374|               $and: [
+   375|                 { $eq: [`$${assoc.via}.ref`, '$$localId'] },
+   376|                 { $eq: [`$${assoc.via}.${assoc.filter}`, assoc.alias] },
+   377|               ],
+   378|             },
+   379|           },
+   380|         },
+   381|       ];
+   382|     }
+   383|     default:
+   384|       return [];
+   385|   }
+   386| };
+   387| /**
+   388|  * Match query for lookups
+   389|  * @param {Object} model - Mongoose model
+   390|  * @param {Object} filters - Filters object
+   391|  * @param {Array} search
+   392|  */
+   393| const buildQueryMatches = (model, filters, search = []) => {
+   394|   if (_.has(filters, 'where') && Array.isArray(filters.where)) {
+   395|     const wheres = filters.where.map(whereClause => {
+   396|       return buildWhereClause(formatWhereClause(model, whereClause));
+   397|     });
+   398|     const criterias = combineSearchAndWhere(search, wheres);
+
+
+# ====================================================================
+# FILE: packages/strapi-connector-mongoose/lib/database-migration.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-31 ---
+     1| 'use strict';
+     2| const _ = require('lodash');
+     3| const { contentTypes: contentTypesUtils } = require('strapi-utils');
+     4| const { PUBLISHED_AT_ATTRIBUTE } = contentTypesUtils.constants;
+     5| const { getDefinitionFromStore } = require('./utils/store-definition');
+     6| const getDraftAndPublishMigrationWay = async (definition, ORM) => {
+     7|   const previousDefRow = await getDefinitionFromStore(definition, ORM);
+     8|   const previousDef = JSON.parse(_.get(previousDefRow, 'value', null));
+     9|   const previousDraftAndPublish = contentTypesUtils.hasDraftAndPublish(previousDef);
+    10|   const actualDraftAndPublish = contentTypesUtils.hasDraftAndPublish(definition);
+    11|   if (previousDraftAndPublish === actualDraftAndPublish) {
+    12|     return 'none';
+    13|   }
+    14|   if (!previousDraftAndPublish && actualDraftAndPublish) {
+    15|     return 'enable';
+    16|   }
+    17|   if (previousDraftAndPublish && !actualDraftAndPublish) {
+    18|     return 'disable';
+    19|   }
+    20| };
+    21| const migrateDraftAndPublish = async ({ definition, model, ORM }) => {
+    22|   let way = await getDraftAndPublishMigrationWay(definition, ORM);
+    23|   if (way === 'enable') {
+    24|     const createdAtCol = _.get(definition, 'timestamps.createdAt', 'createdAt');
+    25|     await model
+    26|       .aggregate([
+    27|         {
+    28|           $addFields: {
+    29|             [PUBLISHED_AT_ATTRIBUTE]: { $ifNull: [`$${createdAtCol}`, new Date()] },
+    30|           },
+    31|         },
+
+
+# ====================================================================
+# FILE: packages/strapi-plugin-content-manager/admin/src/components/PreviewWysiwyg/index.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-27 ---
+     1| /* eslint-disable react/no-danger */
+     2| /**
+     3|  *
+     4|  * PreviewWysiwyg
+     5|  *
+     6|  */
+     7| import React, { memo, useMemo } from 'react';
+     8| import PropTypes from 'prop-types';
+     9| import useWysiwyg from '../../hooks/useWysiwyg';
+    10| import md from './utils/mdRenderer';
+    11| import Wrapper from './Wrapper';
+    12| const PreviewWysiwyg = ({ data }) => {
+    13|   const { isFullscreen } = useWysiwyg();
+    14|   const html = useMemo(() => md.render(data || ''), [data]);
+    15|   return (
+    16|     <Wrapper isFullscreen={isFullscreen}>
+    17|       <div dangerouslySetInnerHTML={{ __html: html }} />
+    18|     </Wrapper>
+    19|   );
+    20| };
+    21| PreviewWysiwyg.defaultProps = {
+    22|   data: '',
+    23| };
+    24| PreviewWysiwyg.propTypes = {
+    25|   data: PropTypes.string,
+    26| };
+    27| export default memo(PreviewWysiwyg);
+
+
+# ====================================================================
+# FILE: packages/strapi-plugin-upload/admin/src/containers/InputModalStepperProvider/index.js
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-23 ---
+     1| import React, { useReducer, useEffect, useState } from 'react';
+     2| import PropTypes from 'prop-types';
+     3| import { auth, request, generateSearchFromFilters, useGlobalContext } from 'strapi-helper-plugin';
+     4| import { clone, get, isEmpty, set } from 'lodash';
+     5| import { useIntl } from 'react-intl';
+     6| import axios from 'axios';
+     7| import pluginId from '../../pluginId';
+     8| import {
+     9|   getFilesToDownload,
+    10|   getRequestUrl,
+    11|   getYupError,
+    12|   compactParams,
+    13|   createNewFilesToUploadArray,
+    14|   urlSchema,
+    15|   getFileModelTimestamps,
+    16|   formatFilters,
+    17| } from '../../utils';
+    18| import InputModalStepperContext from '../../contexts/InputModal/InputModalDataManager';
+    19| import init from './init';
+    20| import reducer, { initialState } from './reducer';
+    21| /* eslint-disable indent */
+    22| const InputModalStepperProvider = ({
+    23|   allowedActions,
+
+# --- HUNK 2: Lines 57-98 ---
+    57|         _sort: `${updated_at}:DESC`,
+    58|       },
+    59|     })
+    60|   );
+    61|   const { params, filesToDownload, filesToUpload, fileToEdit } = reducerState;
+    62|   useEffect(() => {
+    63|     if (isOpen) {
+    64|       fetchMediaLib();
+    65|     }
+    66|   }, [isOpen, params]);
+    67|   const downloadFiles = async () => {
+    68|     const files = getFilesToDownload(filesToUpload);
+    69|     if (files.length > 0) {
+    70|       emitEvent('didSelectFile', { source: 'url', location: 'content-manager' });
+    71|     }
+    72|     try {
+    73|       await Promise.all(
+    74|         files.map(file => {
+    75|           const { source } = file;
+    76|           return axios
+    77|             .get(`${strapi.backendURL}/${pluginId}/proxy?url=${file.fileURL}`, {
+    78|               headers: { Authorization: `Bearer ${auth.getToken()}` },
+    79|               responseType: 'blob',
+    80|               cancelToken: source.token,
+    81|               timeout: 60000,
+    82|             })
+    83|             .then(({ data }) => {
+    84|               const createdFile = new File([data], file.fileURL, {
+    85|                 type: data.type,
+    86|               });
+    87|               dispatch({
+    88|                 type: 'FILE_DOWNLOADED',
+    89|                 blob: createdFile,
+    90|                 originalIndex: file.originalIndex,
+    91|                 fileTempId: file.tempId,
+    92|               });
+    93|             })
+    94|             .catch(err => {
+    95|               console.error('fetch file error', err);
+    96|               dispatch({
+    97|                 type: 'SET_FILE_TO_DOWNLOAD_ERROR',
+    98|                 originalIndex: file.originalIndex,
+
+
+# ====================================================================
+# FILE: packages/strapi-plugin-upload/admin/src/containers/ModalStepper/index.js
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-32 ---
+     1| import React, { useCallback, useEffect, useState, useReducer, useRef } from 'react';
+     2| import axios from 'axios';
+     3| import PropTypes from 'prop-types';
+     4| import { isEqual, isEmpty, get, set } from 'lodash';
+     5| import {
+     6|   Modal,
+     7|   ModalFooter,
+     8|   PopUpWarning,
+     9|   useGlobalContext,
+    10|   auth,
+    11|   request,
+    12| } from 'strapi-helper-plugin';
+    13| import { Button } from '@buffetjs/core';
+    14| import pluginId from '../../pluginId';
+    15| import { getFilesToDownload, getTrad, getYupError, urlSchema } from '../../utils';
+    16| import { useAppContext } from '../../hooks';
+    17| import ModalHeader from '../../components/ModalHeader';
+    18| import stepper from './stepper';
+    19| import init from './init';
+    20| import reducer, { initialState } from './reducer';
+    21| const ModalStepper = ({
+    22|   initialFileToEdit,
+    23|   initialStep,
+    24|   isOpen,
+    25|   onClosed,
+    26|   onRemoveFileFromDataToDelete,
+    27|   onToggle,
+    28| }) => {
+    29|   const { allowedActions } = useAppContext();
+    30|   const { emitEvent, formatMessage } = useGlobalContext();
+    31|   const [isWarningDeleteOpen, setIsWarningDeleteOpen] = useState(false);
+    32|   const [showModalConfirmButtonLoading, setShowModalConfirmButtonLoading] = useState(false);
+
+# --- HUNK 2: Lines 64-105 ---
+    64|     }
+    65|   }, [isOpen]);
+    66|   const addFilesToUpload = ({ target: { value } }) => {
+    67|     emitEvent('didSelectFile', { source: 'computer', location: 'upload' });
+    68|     dispatch({
+    69|       type: 'ADD_FILES_TO_UPLOAD',
+    70|       filesToUpload: value,
+    71|     });
+    72|     goTo(next);
+    73|   };
+    74|   downloadFilesRef.current = async () => {
+    75|     const files = getFilesToDownload(filesToUpload);
+    76|     if (files.length > 0) {
+    77|       emitEvent('didSelectFile', { source: 'url', location: 'upload' });
+    78|     }
+    79|     try {
+    80|       await Promise.all(
+    81|         files.map(file => {
+    82|           const { source } = file;
+    83|           return axios
+    84|             .get(`${strapi.backendURL}/${pluginId}/proxy?url=${file.fileURL}`, {
+    85|               headers: { Authorization: `Bearer ${auth.getToken()}` },
+    86|               responseType: 'blob',
+    87|               cancelToken: source.token,
+    88|               timeout: 60000,
+    89|             })
+    90|             .then(({ data }) => {
+    91|               const fileName = file.fileInfo.name;
+    92|               const createdFile = new File([data], fileName, {
+    93|                 type: data.type,
+    94|               });
+    95|               dispatch({
+    96|                 type: 'FILE_DOWNLOADED',
+    97|                 blob: createdFile,
+    98|                 originalIndex: file.originalIndex,
+    99|                 fileTempId: file.tempId,
+   100|               });
+   101|             })
+   102|             .catch(err => {
+   103|               console.error('fetch file error', err);
+   104|               dispatch({
+   105|                 type: 'SET_FILE_TO_DOWNLOAD_ERROR',
+
+
+# ====================================================================
+# FILE: packages/strapi-plugin-upload/controllers/proxy.js
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-35 ---
+     1| 'use strict';
+     2| const _ = require('lodash');
+     3| const fetch = require('node-fetch');
+     4| const isValidDomain = require('is-valid-domain');
+     5| module.exports = {
+     6|   async uploadProxy(ctx) {
+     7|     try {
+     8|       const url = new URL(ctx.query.url);
+     9|       if (!['http:', 'https:'].includes(url.protocol)) {
+    10|         throw new Error('Unexpected url protocol');
+    11|       }
+    12|       if (!isValidDomain(url.hostname)) {
+    13|         throw new Error('Invalid url hostname');
+    14|       }
+    15|     } catch (err) {
+    16|       ctx.status = 400;
+    17|       ctx.body = 'Invalid URL';
+    18|       return;
+    19|     }
+    20|     try {
+    21|       const res = await fetch(new URL(ctx.query.url), {
+    22|         headers: _.omit(ctx.request.headers, ['origin', 'host', 'authorization']),
+    23|       });
+    24|       for (const [key, value] of res.headers.entries()) {
+    25|         ctx.set(key, value);
+    26|       }
+    27|       ctx.status = res.status;
+    28|       ctx.body = res.body;
+    29|     } catch (err) {
+    30|       strapi.log.error(err);
+    31|       ctx.status = 500;
+    32|       ctx.body = 'Internal Server Error';
+    33|     }
+    34|   },
+    35| };
+

@@ -1,0 +1,180 @@
+# ====================================================================
+# FILE: packages/app/src/TransformRequest/MultipartFormDataTransform.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-52 ---
+     1| import {randomBytes} from "crypto";
+     2| import {tmpdir} from "os";
+     3| import {join} from "path";
+     4| import {createWriteStream} from "fs";
+     5| import {QueryString} from "@bunt/util";
+     6| import busboy from "busboy";
+     7| import {Defer} from "@bunt/async";
+     8| import {IRequest} from "../interfaces.js";
+     9| export const MultipartFormDataTransform = async <T = unknown>(request: IRequest): Promise<T> => {
+    10|     request.headers.assert("Content-Type", (value) => value.startsWith("multipart/form-data"));
+    11|     const bb = busboy({
+    12|         headers: request.headers.toJSON(),
+    13|         defCharset: "utf-8",
+    14|         defParamCharset: "utf-8",
+    15|     });
+    16|     const rs = await request.createReadableStream();
+    17|     const defer = new Defer<void>();
+    18|     const result: Record<string, any> = {};
+    19|     const pending: Defer<void>[] = [];
+    20|     const {parseFieldName, inject} = QueryString;
+    21|     bb
+    22|         .on("file", (name, file, info) => {
+    23|             const {encoding, filename, mimeType} = info;
+    24|             const tmpname = join(
+    25|                 tmpdir(),
+    26|                 `${randomBytes(4).toString("hex")}-${Buffer.from(filename, "utf-8").toString("hex")}`,
+    27|             );
+    28|             const value = {
+    29|                 filename,
+    30|                 encoding,
+    31|                 mimeType,
+    32|                 tmpname,
+    33|             };
+    34|             inject(parseFieldName(name), value, result);
+    35|             const def = new Defer<void>();
+    36|             pending.push(def);
+    37|             file
+    38|                 .pipe(createWriteStream(tmpname))
+    39|                 .on("close", () => def.resolve());
+    40|         })
+    41|         .on("field", (name, value) => {
+    42|             try {
+    43|                 inject(parseFieldName(name), JSON.parse(value), result);
+    44|             } catch {
+    45|             }
+    46|         })
+    47|         .on("close", () => defer.resolve());
+    48|     rs.pipe(bb);
+    49|     await defer;
+    50|     await Promise.all(pending);
+    51|     return result as any;
+    52| };
+
+
+# ====================================================================
+# FILE: packages/util/src/qs.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-18 ---
+     1| const isNumeric = (key: string): boolean => !isNaN(+key);
+     2| export class QueryString {
+     3|     public static parseFieldName = (name: string): string[] => {
+     4|         const base = name.replace(/\[.+/, "");
+     5|         return [base, ...[...name.matchAll(/\[([^\]]*)\]/ig)].map(([, key]) => key)];
+     6|     };
+     7|     public static inject = ([key, ...paths]: string[], value: unknown, fields: any = {}): any => {
+     8|         if (paths.length > 0) {
+     9|             fields[key] = this.inject(paths, value, fields[key]);
+    10|         } else {
+    11|             fields[key] = value;
+    12|         }
+    13|         if (isNumeric(key)) {
+    14|             return Object.values(fields);
+    15|         }
+    16|         return fields;
+    17|     };
+    18| }
+
+
+# ====================================================================
+# FILE: packages/web/src/Transport/Response/DownloadResponse.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 12-53 ---
+    12|     mimeType: string;
+    13|     source: DownloadSource;
+    14|     size: number;
+    15| };
+    16| type DownloadOptionsAuth = {
+    17|     filename: string;
+    18|     mimeType: string;
+    19|     source: DownloadSource;
+    20|     size?: number;
+    21| };
+    22| export class DownloadResponse extends ResponseAbstract<Readable> {
+    23|     constructor(options: DownloadOptionsAuth) {
+    24|         super(...createOptions(options));
+    25|     }
+    26|     public serialize(source: Readable): Readable {
+    27|         return source;
+    28|     }
+    29| }
+    30| function createHeaders(options: DownloadOptions): Record<string, string> {
+    31|     const size = options.size;
+    32|     const headers: Record<string, string> = {
+    33|         "Content-Disposition": `attachment; filename=${encodeURI(options.filename)}`,
+    34|         "Content-Length": size.toString(),
+    35|         "Content-Type": options.mimeType,
+    36|     };
+    37|     return headers;
+    38| }
+    39| function factoryReadableStream(source: string | Readable): Readable {
+    40|     if (isString(source)) {
+    41|         return createReadStream(source);
+    42|     }
+    43|     return source;
+    44| }
+    45| function createOptions(options: DownloadOptionsAuth): ResponseArgs<Readable> {
+    46|     const {size} = options;
+    47|     if (isUndefined(size)) {
+    48|         return createTemporarySource(options);
+    49|     }
+    50|     const readable = factoryReadableStream(options.source);
+    51|     return [readable, {headers: createHeaders({...options, size})}];
+    52| }
+    53| function createTemporarySource(options: DownloadOptionsAuth): ResponseArgs<Readable> {
+
+
+# ====================================================================
+# FILE: packages/web/src/Transport/Response/ResponseAbstract.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 19-59 ---
+    19|     body: string | Buffer | Readable;
+    20|     headers: Record<string, string>;
+    21|     cookies: Cookie[];
+    22| }
+    23| export abstract class ResponseAbstract<T> {
+    24|     public readonly code: number = 200;
+    25|     public readonly status?: string;
+    26|     public readonly type: string = "text/plain";
+    27|     public readonly encoding: string = "utf-8";
+    28|     readonly #cookies = new Map<string, Cookie>();
+    29|     readonly #headers: Promisify<{[key: string]: string}>;
+    30|     #response: Promisify<T>;
+    31|     constructor(...[response, options = {}]: ResponseArgs<T>) {
+    32|         this.#response = isFunction(response) ? response() : response;
+    33|         const {code, status, headers} = options;
+    34|         if (isNumber(code) && code > 0) {
+    35|             this.code = code;
+    36|         }
+    37|         this.status = status;
+    38|         if (!this.status) {
+    39|             const suggest = HTTP[this.code];
+    40|             this.status = isString(suggest) ? suggest : "Unknown";
+    41|         }
+    42|         if (isInstanceOf(headers, Headers)) {
+    43|             this.#headers = headers.toJSON();
+    44|         } else {
+    45|             this.#headers = headers || {};
+    46|         }
+    47|     }
+    48|     public get cookies(): Cookie[] {
+    49|         return [...this.#cookies.values()];
+    50|     }
+    51|     public setContent(data: Promisify<T>): void {
+    52|         this.#response = data;
+    53|     }
+    54|     public setCookie(name: string, value: string, options: CookieOptions): void {
+    55|         this.#cookies.set(name, new Cookie(name, value, options));
+    56|     }
+    57|     public hasCookie(name: string): boolean {
+    58|         return this.#cookies.has(name);
+    59|     }
+

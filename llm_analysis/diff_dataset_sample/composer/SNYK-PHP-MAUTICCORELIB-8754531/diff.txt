@@ -1,0 +1,772 @@
+--- a/app/bundles/AssetBundle/Config/config.php
++++ b/app/bundles/AssetBundle/Config/config.php
+@@ -55,53 +55,26 @@
+                 'arguments' => [
+                     'mautic.helper.core_parameters',
+                 ],
+             ],
+         ],
+         'others' => [
+             'mautic.asset.upload.error.handler' => [
+                 'class'     => Mautic\AssetBundle\ErrorHandler\DropzoneErrorHandler::class,
+                 'arguments' => 'mautic.factory',
+             ],
+-            'oneup_uploader.controller.dropzone.class' => [
+-                'class'     => Mautic\AssetBundle\Controller\UploadController::class,
+-            ],
++            'oneup_uploader.controller.dropzone.class' => Mautic\AssetBundle\Controller\UploadController::class,
+         ],
+         'fixtures' => [
+             'mautic.asset.fixture.asset' => [
+                 'class'     => Mautic\AssetBundle\DataFixtures\ORM\LoadAssetData::class,
+                 'tag'       => Doctrine\Bundle\FixturesBundle\DependencyInjection\CompilerPass\FixturesCompilerPass::FIXTURE_TAG,
+             ],
+         ],
+     ],
+     'parameters' => [
+         'upload_dir'          => '%mautic.application_dir%/media/files',
+         'max_size'            => '6',
+         'allowed_extensions'  => ['csv', 'doc', 'docx', 'epub', 'gif', 'jpg', 'jpeg', 'mpg', 'mpeg', 'mp3', 'odt', 'odp', 'ods', 'pdf', 'png', 'ppt', 'pptx', 'tif', 'tiff', 'txt', 'xls', 'xlsx', 'wav'],
+         'streamed_extensions' => ['gif', 'jpg', 'jpeg', 'mpg', 'mpeg', 'mp3', 'pdf', 'png', 'wav'],
+-        'allowed_mimetypes'   => [
+-            'csv'  => 'text/csv',
+-            'doc'  => 'application/msword',
+-            'docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+-            'epub' => 'application/epub+zip',
+-            'gif'  => 'image/gif',
+-            'jpg'  => 'image/jpeg',
+-            'jpeg' => 'image/jpeg',
+-            'mpg'  => 'video/mpeg',
+-            'mpeg' => 'video/mpeg',
+-            'mp3'  => 'audio/mpeg',
+-            'odt'  => 'application/vnd.oasis.opendocument.text',
+-            'odp'  => 'application/vnd.oasis.opendocument.presentation',
+-            'ods'  => 'application/vnd.oasis.opendocument.spreadsheet',
+-            'pdf'  => 'application/pdf',
+-            'png'  => 'image/png',
+-            'ppt'  => 'application/vnd.ms-powerpoint',
+-            'pptx' => 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+-            'tif'  => 'image/tiff',
+-            'tiff' => 'image/tiff',
+-            'txt'  => 'text/plain',
+-            'xls'  => 'application/vnd.ms-excel',
+-            'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+-            'wav'  => 'audio/wav',
+-        ],
+     ],
+ ];
+
+--- a/app/bundles/AssetBundle/Controller/UploadController.php
++++ b/app/bundles/AssetBundle/Controller/UploadController.php
+@@ -6,21 +6,20 @@
+ use Symfony\Component\HttpFoundation\JsonResponse;
+ use Symfony\Contracts\Translation\TranslatorInterface;
+ class UploadController extends DropzoneController
+ {
+     private TranslatorInterface $translator;
+     public function upload(): JsonResponse
+     {
+         $request  = $this->getRequest();
+         $response = new EmptyResponse();
+         $files    = $this->getFiles($request->files);
+-        $this->setTranslator($this->container->get('translator'));
+         if (!empty($files)) {
+             foreach ($files as $file) {
+                 try {
+                     $this->handleUpload($file, $response, $request);
+                 } catch (UploadException $e) {
+                     $this->errorHandler->addException($response, $e);
+                 } catch (\Exception $e) {
+                     error_log($e);
+                     $error = new UploadException($this->translator->trans('mautic.asset.error.file.failed'));
+                     $this->errorHandler->addException($response, $error);
+
+--- a/app/bundles/AssetBundle/Entity/Asset.php
++++ b/app/bundles/AssetBundle/Entity/Asset.php
+@@ -1,19 +1,18 @@
+ <?php
+ namespace Mautic\AssetBundle\Entity;
+ use Doctrine\DBAL\Types\Types;
+ use Doctrine\ORM\Mapping as ORM;
+ use Mautic\ApiBundle\Serializer\Driver\ApiMetadataDriver;
+ use Mautic\CoreBundle\Doctrine\Mapping\ClassMetadataBuilder;
+ use Mautic\CoreBundle\Entity\FormEntity;
+ use Mautic\CoreBundle\Helper\FileHelper;
+-use Mautic\CoreBundle\Loader\ParameterLoader;
+ use Symfony\Component\Filesystem\Filesystem;
+ use Symfony\Component\HttpFoundation\File\Exception\FileNotFoundException;
+ use Symfony\Component\HttpFoundation\File\File;
+ use Symfony\Component\HttpFoundation\File\UploadedFile;
+ use Symfony\Component\Validator\Constraints as Assert;
+ use Symfony\Component\Validator\Context\ExecutionContextInterface;
+ use Symfony\Component\Validator\Mapping\ClassMetadata;
+ class Asset extends FormEntity
+ {
+     /**
+@@ -967,41 +966,20 @@
+                     ->atPath('tempName')
+                     ->setTranslationDomain('validators')
+                     ->addViolation();
+             }
+             if (null === $object->getTitle()) {
+                 $context->buildViolation('mautic.asset.asset.error.missing.title')
+                     ->atPath('title')
+                     ->setTranslationDomain('validators')
+                     ->addViolation();
+             }
+-            $loader           = new ParameterLoader();
+-            $parameters       = $loader->getParameterBag();
+-            $mimeTypesAllowed = $parameters->get('allowed_mimetypes');
+-            if (!empty($object->getFileMimeType()) && !in_array($object->getFileMimeType(), $mimeTypesAllowed)) {
+-                $context->buildViolation('mautic.asset.asset.error.invalid.mimetype', [
+-                    '%fileMimetype%'=> $object->getFileMimeType(),
+-                    '%mimetypes%'   => implode(', ', $mimeTypesAllowed),
+-                ])->atPath('file')
+-                    ->setTranslationDomain('validators')
+-                    ->addViolation();
+-            }
+-            $extensionsAllowed = array_keys($mimeTypesAllowed);
+-            $fileType          = $object->getExtension();
+-            if (null !== $object->getExtension() && !in_array($fileType, $extensionsAllowed)) {
+-                $context->buildViolation('mautic.asset.asset.error.file.extension', [
+-                    '%fileExtension%'=> $object->getExtension(),
+-                    '%extensions%'   => implode(', ', $extensionsAllowed),
+-                ])->atPath('file')
+-                    ->setTranslationDomain('validators')
+-                    ->addViolation();
+-            }
+             $object->setRemotePath(null);
+         } elseif ($object->isRemote()) {
+             if (null === $object->getRemotePath()) {
+                 $context->buildViolation('mautic.asset.asset.error.missing.remote.path')
+                     ->atPath('remotePath')
+                     ->setTranslationDomain('validators')
+                     ->addViolation();
+             }
+             $object->setPath(null);
+         }
+
+--- a/app/bundles/AssetBundle/EventListener/UploadSubscriber.php
++++ b/app/bundles/AssetBundle/EventListener/UploadSubscriber.php
+@@ -1,89 +1,68 @@
+ <?php
+ namespace Mautic\AssetBundle\EventListener;
+ use Mautic\AssetBundle\Model\AssetModel;
+ use Mautic\CoreBundle\Exception\FileInvalidException;
+ use Mautic\CoreBundle\Helper\CoreParametersHelper;
+-use Mautic\CoreBundle\Translation\Translator;
+ use Mautic\CoreBundle\Validator\FileUploadValidator;
+ use Oneup\UploaderBundle\Event\PostUploadEvent;
+ use Oneup\UploaderBundle\Event\ValidationEvent;
+ use Oneup\UploaderBundle\Uploader\Exception\ValidationException;
+ use Oneup\UploaderBundle\UploadEvents;
+ use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+ class UploadSubscriber implements EventSubscriberInterface
+ {
+     public function __construct(
+         private CoreParametersHelper $coreParametersHelper,
+         private AssetModel $assetModel,
+-        private FileUploadValidator $fileUploadValidator,
+-        protected Translator $translator,
++        private FileUploadValidator $fileUploadValidator
+     ) {
+     }
+     public static function getSubscribedEvents(): array
+     {
+         return [
+             UploadEvents::POST_UPLOAD => ['onPostUpload', 0],
+             UploadEvents::VALIDATION  => ['onUploadValidation', 0],
+         ];
+     }
+     /**
+      * Moves upladed file to temporary directory where it can be found later
+      * and all uploaded files in there cleared. Also sets file name to the response.
+      */
+     public function onPostUpload(PostUploadEvent $event): void
+     {
+         $request   = $event->getRequest()->request;
+         $response  = $event->getResponse();
+-        $tempId    = basename($request->get('tempId'));
++        $tempId    = $request->get('tempId');
+         $file      = $event->getFile();
+         $config    = $event->getConfig();
+         $uploadDir = $config['storage']['directory'];
+         $tmpDir    = $uploadDir.'/tmp/'.$tempId;
+         $file->move($tmpDir);
+         $response['state']       = 1;
+         $response['tmpFileName'] = $file->getBasename();
+     }
+     /**
+      * Validates file before upload.
+      *
+      * @throws ValidationException
+      */
+     public function onUploadValidation(ValidationEvent $event): void
+     {
+         $file       = $event->getFile();
+-        $mimetypes  = $this->coreParametersHelper->get('allowed_mimetypes');
+-        $extensions = array_keys($mimetypes);
++        $extensions = $this->coreParametersHelper->get('allowed_extensions');
+         $maxSize    = $this->assetModel->getMaxUploadSize('B');
+         if (null === $file) {
+             return;
+         }
+         try {
+             $this->fileUploadValidator->checkFileSize($file->getSize(), $maxSize, 'mautic.asset.asset.error.file.size');
+         } catch (FileInvalidException $e) {
+             throw new ValidationException($e->getMessage());
+         }
+         try {
+             $this->fileUploadValidator->checkExtension($file->getExtension(), $extensions, 'mautic.asset.asset.error.file.extension');
+         } catch (FileInvalidException $e) {
+             throw new ValidationException($e->getMessage());
+         }
+-        try {
+-            $this->checkMimeType($file->getMimeType(), $mimetypes, 'mautic.asset.asset.error.file.mimetype');
+-        } catch (FileInvalidException $e) {
+-            throw new ValidationException($e->getMessage());
+-        }
+-    }
+-    /**
+-     * @param array<string,string> $allowedMimeTypes
+-     */
+-    private function checkMimeType(string $mimeType, array $allowedMimeTypes, string $extensionErrorMsg): void
+-    {
+-        if (!in_array(strtolower($mimeType), array_map('strtolower', $allowedMimeTypes), true)) {
+-            $error = $this->translator->trans($extensionErrorMsg, [
+-                '%fileMimetype%' => $mimeType,
+-                '%mimetypes%'    => implode(', ', $allowedMimeTypes),
+-            ], 'validators');
+-            throw new FileInvalidException($error);
+-        }
+     }
+ }
+
+--- a/app/bundles/AssetBundle/Form/Type/AssetType.php
++++ b/app/bundles/AssetBundle/Form/Type/AssetType.php
+@@ -3,32 +3,29 @@
+ use Mautic\AssetBundle\Entity\Asset;
+ use Mautic\AssetBundle\Model\AssetModel;
+ use Mautic\CategoryBundle\Form\Type\CategoryListType;
+ use Mautic\CoreBundle\Form\EventListener\CleanFormSubscriber;
+ use Mautic\CoreBundle\Form\EventListener\FormExitSubscriber;
+ use Mautic\CoreBundle\Form\Type\ButtonGroupType;
+ use Mautic\CoreBundle\Form\Type\FormButtonsType;
+ use Mautic\CoreBundle\Form\Type\PublishDownDateType;
+ use Mautic\CoreBundle\Form\Type\PublishUpDateType;
+ use Mautic\CoreBundle\Form\Type\YesNoButtonGroupType;
+-use Mautic\CoreBundle\Loader\ParameterLoader;
+ use Symfony\Component\Form\AbstractType;
+ use Symfony\Component\Form\Extension\Core\Type\HiddenType;
+ use Symfony\Component\Form\Extension\Core\Type\LocaleType;
+ use Symfony\Component\Form\Extension\Core\Type\TextareaType;
+ use Symfony\Component\Form\Extension\Core\Type\TextType;
+ use Symfony\Component\Form\FormBuilderInterface;
+ use Symfony\Component\OptionsResolver\OptionsResolver;
+-use Symfony\Component\Validator\Constraints\Callback;
+ use Symfony\Component\Validator\Constraints\NotBlank;
+ use Symfony\Component\Validator\Constraints\Url;
+-use Symfony\Component\Validator\Context\ExecutionContextInterface;
+ use Symfony\Contracts\Translation\TranslatorInterface;
+ /**
+  * @extends AbstractType<Asset>
+  */
+ class AssetType extends AbstractType
+ {
+     public function __construct(
+         private TranslatorInterface $translator,
+         private AssetModel $assetModel
+     ) {
+@@ -45,37 +42,31 @@
+             ],
+             'attr'              => [
+                 'onchange' => 'Mautic.changeAssetStorageLocation();',
+             ],
+         ]);
+         $maxUploadSize = $this->assetModel->getMaxUploadSize('', true);
+         $builder->add(
+             'tempName',
+             HiddenType::class,
+             [
+-                'label'       => $this->translator->trans('mautic.asset.asset.form.file.upload', ['%max%' => $maxUploadSize]),
+-                'label_attr'  => ['class' => 'control-label'],
+-                'required'    => false,
+-                'constraints' => [
+-                    new Callback([$this, 'validateExtension']),
+-                ],
++                'label'      => $this->translator->trans('mautic.asset.asset.form.file.upload', ['%max%' => $maxUploadSize]),
++                'label_attr' => ['class' => 'control-label'],
++                'required'   => false,
+             ]
+         );
+         $builder->add(
+             'originalFileName',
+             HiddenType::class,
+             [
+-                'required'    => false,
+-                'constraints' => [
+-                    new Callback([$this, 'validateExtension']),
+-                ],
+-            ],
++                'required' => false,
++            ]
+         );
+         $builder->add(
+             'disallow',
+             YesNoButtonGroupType::class,
+             [
+                 'label' => 'mautic.asset.asset.form.disallow.crawlers',
+                 'attr'  => [
+                     'tooltip'      => 'mautic.asset.asset.form.disallow.crawlers.descr',
+                     'data-show-on' => '{"asset_storageLocation_0":"checked"}',
+                 ],
+@@ -164,41 +155,15 @@
+             HiddenType::class,
+             [
+                 'required' => false,
+             ]
+         );
+         $builder->add('buttons', FormButtonsType::class, []);
+         if (!empty($options['action'])) {
+             $builder->setAction($options['action']);
+         }
+     }
+-    /**
+-     * @param Asset|string|null $object
+-     */
+-    public function validateExtension($object, ExecutionContextInterface $context): void
+-    {
+-        if (empty($object)) {
+-            return;
+-        }
+-        $parameters       = (new ParameterLoader())->getParameterBag();
+-        $mimeTypesAllowed = $parameters->get('allowed_mimetypes');
+-        $extensions       = array_keys($mimeTypesAllowed);
+-        $fileName         = $object;
+-        if (!is_string($object) && $object instanceof Asset) {
+-            $fileName = $object->getOriginalFileName();
+-        }
+-        $fileExtension    = pathinfo($fileName, PATHINFO_EXTENSION);
+-        if (!in_array($fileExtension, $extensions, true)) {
+-            $context->buildViolation('mautic.asset.asset.error.file.extension', [
+-                '%fileExtension%'=> $fileExtension,
+-                '%extensions%'   => implode(', ', $extensions),
+-            ])
+-                ->atPath('file')
+-                ->setTranslationDomain('validators')
+-                ->addViolation();
+-        }
+-    }
+     public function configureOptions(OptionsResolver $resolver): void
+     {
+         $resolver->setDefaults(['data_class' => Asset::class]);
+     }
+ }
+
+--- a/app/bundles/ChannelBundle/Model/MessageQueueModel.php
++++ b/app/bundles/ChannelBundle/Model/MessageQueueModel.php
+@@ -156,23 +156,25 @@
+         return true;
+     }
+     public function sendMessages($channel = null, $channelId = null): int
+     {
+         $processStarted = new \DateTime();
+         $limit          = 50;
+         $counter        = 0;
+         foreach ($this->getRepository()->getQueuedMessages($limit, $processStarted, $channel, $channelId) as $queue) {
+             $counter += $this->processMessageQueue($queue);
+             $event   = $queue->getEvent();
++            $lead    = $queue->getLead();
+             if ($event) {
+                 $this->em->detach($event);
+             }
++            $this->em->detach($lead);
+             $this->em->detach($queue);
+         }
+         return $counter;
+     }
+     public function processMessageQueue($queue): int
+     {
+         if (!is_array($queue)) {
+             if (!$queue instanceof MessageQueue) {
+                 throw new \InvalidArgumentException('$queue must be an instance of '.MessageQueue::class);
+             }
+
+--- a/app/bundles/CoreBundle/Assets/js/11.editor.js
++++ b/app/bundles/CoreBundle/Assets/js/11.editor.js
+@@ -230,22 +230,22 @@
+         complete: function() {
+             Mautic.builderTokensRequestInProgress = false;
+         }
+     });
+     return Mautic.builderTokensForCkEditor;
+ };
+ Mautic.getCKEditorFonts = function(fonts) {
+     fonts = Array.isArray(fonts) ? fonts : [];
+     const CKEditorFonts = [];
+     for (let i = 0; i < fonts.length; i++) {
+-        if ('undefined' != typeof fonts[i].font) {
+-            CKEditorFonts.push(fonts[i].font);
++        if ('undefined' != typeof fonts[i].name) {
++            CKEditorFonts.push(fonts[i].name);
+         }
+     }
+     return CKEditorFonts;
+ }
+ Mautic.ConvertFieldToCkeditor  = function(textarea, ckEditorToolbarOptions) {
+     if (ckEditors.has( textarea[0] ))
+     {
+         ckEditors.get( textarea[0] ).destroy();
+         ckEditors.delete( textarea[0] )
+     }
+
+--- a/app/bundles/EmailBundle/Config/config.php
++++ b/app/bundles/EmailBundle/Config/config.php
+@@ -253,21 +253,20 @@
+                 'tag'       => Doctrine\Bundle\FixturesBundle\DependencyInjection\CompilerPass\FixturesCompilerPass::FIXTURE_TAG,
+                 'arguments' => ['mautic.email.model.email'],
+             ],
+         ],
+     ],
+     'parameters' => [
+         'mailer_from_name'               => 'Mautic',
+         'mailer_from_email'              => 'email@yoursite.com',
+         'mailer_reply_to_email'          => null,
+         'mailer_return_path'             => null,
+-        'mailer_address_length_limit'    => 320,
+         'mailer_append_tracking_pixel'   => true,
+         'mailer_convert_embed_images'    => false,
+         'mailer_custom_headers'          => [],
+         'mailer_dsn'                     => 'smtp://localhost:25',
+         'unsubscribe_text'               => null,
+         'webview_text'                   => null,
+         'unsubscribe_message'            => null,
+         'resubscribe_message'            => null,
+         'monitored_email'                => [
+             'general' => [
+
+--- a/app/bundles/EmailBundle/Controller/EmailController.php
++++ b/app/bundles/EmailBundle/Controller/EmailController.php
+@@ -790,21 +790,21 @@
+                                 'msgVars' => ['%id%' => $objectId],
+                             ],
+                         ],
+                     ]
+                 )
+             );
+         } elseif (!$this->security->isGranted('email:emails:create')
+             || !$this->security->hasEntityAccess(
+                 'email:emails:viewown',
+                 'email:emails:viewother',
+-                $emailEntity->getCreatedBy()
++                $entity->getCreatedBy()
+             )
+         ) {
+             return $this->accessDenied();
+         } elseif ($model->isLocked($entity)) {
+             return $this->isLocked($postActionVars, $entity, 'email');
+         }
+         $action = $this->generateUrl('mautic_email_action', ['objectAction' => 'clone', 'objectId' => $objectId]);
+         /** @var Form $form */
+         $form = $model->createForm($entity, $this->formFactory, $action);
+         if ('POST' === $method) {
+
+--- a/app/bundles/EmailBundle/Controller/PublicController.php
++++ b/app/bundles/EmailBundle/Controller/PublicController.php
+@@ -383,21 +383,21 @@
+         $emailEntity = $model->getEntity($objectId);
+         if (null === $emailEntity) {
+             return $this->notFound();
+         }
+         $publicPreview = $emailEntity->isPublicPreview();
+         $draftEnabled  = $emailConfig->isDraftEnabled();
+         if ('draft' === $objectType && $draftEnabled && $emailEntity->hasDraft()) {
+             $publicPreview = $emailEntity->getDraft()->isPublicPreview();
+         }
+         if (
+-            ($this->security->isAnonymous() && !$publicPreview)
++            ($this->security->isAnonymous() && (!$emailEntity->isPublished() || !$publicPreview))
+             || (!$this->security->isAnonymous()
+                 && !$this->security->hasEntityAccess(
+                     'email:emails:viewown',
+                     'email:emails:viewother',
+                     $emailEntity->getCreatedBy()
+                 ))
+         ) {
+             return $this->accessDenied();
+         }
+         if ($contactId && (
+
+--- a/app/bundles/EmailBundle/EventListener/TrackingSubscriber.php
++++ b/app/bundles/EmailBundle/EventListener/TrackingSubscriber.php
+@@ -13,27 +13,27 @@
+     }
+     public static function getSubscribedEvents(): array
+     {
+         return [
+             LeadEvents::ON_CLICKTHROUGH_IDENTIFICATION => ['onIdentifyContact', 0],
+         ];
+     }
+     public function onIdentifyContact(ContactIdentificationEvent $event): void
+     {
+         $clickthrough = $event->getClickthrough();
+-        if (empty($clickthrough['stat'])) {
++        if (empty($clickthrough['channel']['email']) && empty($clickthrough['stat'])) {
+             return;
+         }
+         /** @var Stat $stat */
+         $stat = $this->statRepository->findOneBy(['trackingHash' => $clickthrough['stat']]);
+         if (!$stat) {
+             return;
+         }
+-        if (isset($clickthrough['channel']['email']) && $stat->getEmail() && (int) $stat->getEmail()->getId() !== (int) $clickthrough['channel']['email']) {
++        if ($stat->getEmail() && (int) $stat->getEmail()->getId() !== (int) $clickthrough['channel']['email']) {
+             return;
+         }
+         if (!$contact = $stat->getLead()) {
+             return;
+         }
+         $event->setIdentifiedContact($contact, 'email');
+     }
+ }
+
+--- a/app/bundles/EmailBundle/Form/Type/ConfigType.php
++++ b/app/bundles/EmailBundle/Form/Type/ConfigType.php
+@@ -241,34 +241,20 @@
+                 'label_attr' => ['class' => 'control-label'],
+                 'attr'       => [
+                     'class'    => 'form-control',
+                     'tooltip'  => 'mautic.email.config.mailer.return.path.tooltip',
+                     'onchange' => 'Mautic.disableSendTestEmailButton(this)',
+                 ],
+                 'required'   => false,
+             ]
+         );
+         $builder->add(
+-            'mailer_address_length_limit',
+-            NumberType::class,
+-            [
+-                'scale'      => 0,
+-                'label'      => 'mautic.email.config.mailer.address.length.limit',
+-                'label_attr' => ['class' => 'control-label'],
+-                'attr'       => [
+-                    'class'    => 'form-control',
+-                    'tooltip'  => 'mautic.email.config.mailer.address.length.limit.tooltip',
+-                ],
+-                'required'   => true,
+-            ]
+-        );
+-        $builder->add(
+             'mailer_dsn',
+             DsnType::class,
+             [
+                 'constraints' => [new Dsn()],
+                 'test_button' => [
+                     'action' => 'email:sendTestEmail',
+                     'label'  => $this->translator->trans('mautic.email.config.mailer.transport.test_send'),
+                 ],
+             ]
+         );
+
+--- a/app/bundles/EmailBundle/Helper/MailHelper.php
++++ b/app/bundles/EmailBundle/Helper/MailHelper.php
+@@ -20,21 +20,20 @@
+ use Mautic\EmailBundle\MonitoredEmail\Mailbox;
+ use Mautic\LeadBundle\Entity\Lead;
+ use Psr\Log\LoggerInterface;
+ use Symfony\Component\EventDispatcher\EventDispatcherInterface;
+ use Symfony\Component\Mailer\Exception\TransportExceptionInterface;
+ use Symfony\Component\Mailer\MailerInterface;
+ use Symfony\Component\Mailer\Transport\TransportInterface;
+ use Symfony\Component\Mime\Address;
+ use Symfony\Component\Mime\Exception\RfcComplianceException;
+ use Symfony\Component\Mime\Header\HeaderInterface;
+-use Symfony\Component\Mime\Header\MailboxListHeader;
+ use Symfony\Component\Mime\Header\UnstructuredHeader;
+ use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
+ use Symfony\Component\Routing\RouterInterface;
+ use Twig\Environment;
+ class MailHelper
+ {
+     public const QUEUE_RESET_TO           = 'RESET_TO';
+     public const QUEUE_FULL_RESET         = 'FULL_RESET';
+     public const QUEUE_DO_NOTHING         = 'DO_NOTHING';
+     public const QUEUE_NOTHING_IF_FAILED  = 'IF_FAILED';
+@@ -56,21 +55,20 @@
+     protected $twig;
+     protected ?EventDispatcherInterface $dispatcher = null;
+     /**
+      * @var bool|MauticMessage
+      */
+     public $message;
+     protected ?AddressDTO $from = null;
+     protected ?AddressDTO $systemFrom = null;
+     protected ?string $replyTo = null;
+     protected ?string $systemReplyTo = null;
+-    protected int $addressLengthLimit;
+     /**
+      * @var string
+      */
+     protected $returnPath;
+     /**
+      * @var array
+      */
+     protected $errors = [];
+     /**
+      * @var array|Lead
+@@ -194,21 +192,20 @@
+         private MailHashHelper $mailHashHelper,
+         private RouterInterface $router
+     ) {
+         $this->transport  = $this->getTransport();
+         $this->returnPath = $coreParametersHelper->get('mailer_return_path');
+         $systemFromEmail    = (string) $coreParametersHelper->get('mailer_from_email');
+         $systemReplyToEmail = $coreParametersHelper->get('mailer_reply_to_email');
+         $systemFromName     = $this->cleanName(
+             $coreParametersHelper->get('mailer_from_name')
+         );
+-        $this->addressLengthLimit = (int) $coreParametersHelper->get('mailer_address_length_limit');
+         $this->setDefaultFrom(false, new AddressDTO($systemFromEmail, $systemFromName));
+         $this->setDefaultReplyTo($systemReplyToEmail, $this->from);
+         if ($this->transport instanceof TokenTransportInterface) {
+             $this->tokenizationEnabled = true;
+         }
+         $this->message = $this->getMessageInstance();
+     }
+     /**
+      * Mirrors previous MauticFactory functionality.
+      *
+@@ -715,28 +712,21 @@
+      *
+      * @param string      $address
+      * @param string|null $name
+      *
+      * @return bool
+      */
+     public function addTo($address, $name = null)
+     {
+         $this->checkBatchMaxRecipients();
+         try {
+-            $fullAddress          = (new AddressDTO($address, $name))->toMailerAddress();
+-            $encodedAddressLength = strlen((new MailboxListHeader('To', [$fullAddress]))->getBodyAsString());
+-            if ($encodedAddressLength > $this->addressLengthLimit) {
+-                $shortAddress = (new AddressDTO($address))->toMailerAddress();
+-                $this->message->addTo($shortAddress);
+-            } else {
+-                $this->message->addTo($fullAddress);
+-            }
++            $this->message->addTo((new AddressDTO($address, $name))->toMailerAddress());
+             $this->queuedRecipients[$address] = $name;
+             return true;
+         } catch (\Exception $e) {
+             $this->logError($e, 'to');
+             return false;
+         }
+     }
+     /**
+      * Set CC address(es).
+      *
+
+--- a/app/bundles/LeadBundle/Segment/Decorator/Date/TimezoneResolver.php
++++ b/app/bundles/LeadBundle/Segment/Decorator/Date/TimezoneResolver.php
+@@ -17,15 +17,15 @@
+          * $hasTimePart tells us if field in a database is date or datetime
+          * All datetime fields are stored in UTC
+          * Date field, however, is always stored in a local time (there is no time information, so it cannot be converted to UTC).
+          *
+          * We will generate default date according to this. We need midnight as a default date (for relative intervals like "today" or "-1 day"
+          *  1) in UTC for datetime fields
+          *  2) in the local timezone for date fields
+          *
+          * Later we use toLocalString() method - it gives us midnight in UTC for first condition and midnight in local timezone for second option.
+          */
+-        $timezone = $hasTimePart ? 'UTC' : $this->coreParametersHelper->get('default_timezone', 'UTC') ?? 'UTC';
++        $timezone = $hasTimePart ? 'UTC' : $this->coreParametersHelper->get('default_timezone', 'UTC');
+         $date = new \DateTime('midnight today', new \DateTimeZone($timezone));
+         return new DateTimeHelper($date, null, $timezone);
+     }
+ }
+
+--- a/app/bundles/ReportBundle/Controller/Api/ReportApiController.php
++++ b/app/bundles/ReportBundle/Controller/Api/ReportApiController.php
+@@ -1,75 +1,61 @@
+ <?php
+ namespace Mautic\ReportBundle\Controller\Api;
+ use Doctrine\Persistence\ManagerRegistry;
+ use Mautic\ApiBundle\Controller\CommonApiController;
+ use Mautic\ApiBundle\Helper\EntityResultHelper;
+ use Mautic\CoreBundle\Factory\MauticFactory;
+ use Mautic\CoreBundle\Factory\ModelFactory;
+ use Mautic\CoreBundle\Helper\AppVersion;
+ use Mautic\CoreBundle\Helper\CoreParametersHelper;
+-use Mautic\CoreBundle\Helper\UserHelper;
+-use Mautic\CoreBundle\Security\Exception\PermissionException;
+ use Mautic\CoreBundle\Security\Permissions\CorePermissions;
+ use Mautic\CoreBundle\Translation\Translator;
+ use Mautic\ReportBundle\Entity\Report;
+ use Mautic\ReportBundle\Model\ReportModel;
+ use Symfony\Component\EventDispatcher\EventDispatcherInterface;
+ use Symfony\Component\Form\FormFactoryInterface;
+ use Symfony\Component\HttpFoundation\Request;
+ use Symfony\Component\HttpFoundation\RequestStack;
+ use Symfony\Component\HttpFoundation\Response;
+ use Symfony\Component\Routing\RouterInterface;
+ /**
+  * @extends CommonApiController<Report>
+  */
+ class ReportApiController extends CommonApiController
+ {
+     /**
+      * @var ReportModel|null
+      */
+     protected $model;
+-    public function __construct(CorePermissions $security, Translator $translator, EntityResultHelper $entityResultHelper, RouterInterface $router, FormFactoryInterface $formFactory, AppVersion $appVersion, RequestStack $requestStack, ManagerRegistry $doctrine, ModelFactory $modelFactory, EventDispatcherInterface $dispatcher, CoreParametersHelper $coreParametersHelper, MauticFactory $factory, protected UserHelper $userHelper)
++    public function __construct(CorePermissions $security, Translator $translator, EntityResultHelper $entityResultHelper, RouterInterface $router, FormFactoryInterface $formFactory, AppVersion $appVersion, RequestStack $requestStack, ManagerRegistry $doctrine, ModelFactory $modelFactory, EventDispatcherInterface $dispatcher, CoreParametersHelper $coreParametersHelper, MauticFactory $factory)
+     {
+         $reportModel = $modelFactory->getModel('report');
+         \assert($reportModel instanceof ReportModel);
+         $this->model            = $reportModel;
+         $this->entityClass      = Report::class;
+         $this->entityNameOne    = 'report';
+         $this->entityNameMulti  = 'reports';
+         $this->serializerGroups = ['reportList', 'reportDetails'];
+         parent::__construct($security, $translator, $entityResultHelper, $router, $formFactory, $appVersion, $requestStack, $doctrine, $modelFactory, $dispatcher, $coreParametersHelper, $factory);
+     }
+     /**
+      * Obtains a compiled report.
+      *
+      * @param int $id Report ID
++     *
++     * @return Response
+      */
+-    public function getEntityAction(Request $request, $id): Response
++    public function getEntityAction(Request $request, $id)
+     {
+-        try {
+-            if (!$this->security->isGranted($this->permissionBase.':view')) {
+-                return $this->accessDenied();
+-            }
+-        } catch (PermissionException $e) {
+-            return $this->accessDenied($e->getMessage());
+-        }
+-        $entity        = $this->model->getEntity($id);
++        $entity = $this->model->getEntity($id);
+         if (!$entity instanceof $this->entityClass) {
+             return $this->notFound();
+-        }
+-        if (
+-            $this->security->checkPermissionExists($this->permissionBase.':viewother')
+-            && !$this->security->isGranted($this->permissionBase.':viewother')
+-            && $entity->getCreatedBy() !== $this->userHelper->getUser()->getId()
+-        ) {
+-            return $this->accessDenied();
+         }
+         $reportData = $this->model->getReportData($entity, $this->formFactory, $this->getOptionsFromRequest($request));
+         foreach (['graphs', 'contentTemplate', 'columns'] as $key) {
+             unset($reportData[$key]);
+         }
+         $reportData[$this->entityNameOne] = $entity;
+         return $this->handleView(
+             $this->view($reportData, Response::HTTP_OK)
+         );
+     }

@@ -1,0 +1,1894 @@
+# ====================================================================
+# FILE: docs/conf.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-22 ---
+     1| import os
+     2| import sys
+     3| import sys
+     4| try:
+     5|     from mock import Mock as MagicMock
+     6| except:
+     7|     from unittest.mock import MagicMock
+     8| class Mock(MagicMock):
+     9|     @classmethod
+    10|     def __getattr__(cls, name):
+    11|         return Mock()
+    12| MOCK_MODULES = ['ldap']
+    13| sys.modules.update((mod_name, Mock()) for mod_name in MOCK_MODULES)
+    14| sys.path.insert(0, os.path.abspath('..'))
+    15| sys.path.insert(0, os.path.abspath('../ldapcherry'))
+    16| from version import version
+    17| extensions = ['sphinx.ext.viewcode', 'sphinx.ext.todo', 'sphinx.ext.autodoc']
+    18| source_suffix = '.rst'
+    19| master_doc = 'index'
+    20| project = u'LdapCherry - Directory Management Interface'
+    21| copyright = u'2016, Pierre-Francois Carpentier'
+    22| release = version
+
+
+# ====================================================================
+# FILE: ldapcherry/__init__.py
+# Total hunks: 12
+# ====================================================================
+# --- HUNK 1: Lines 1-73 ---
+     1| import sys
+     2| import re
+     3| import traceback
+     4| import json
+     5| import logging
+     6| import logging.handlers
+     7| from operator import itemgetter
+     8| from socket import error as socket_error
+     9| import base64
+    10| import cgi
+    11| from exceptions import *
+    12| from ldapcherry.lclogging import *
+    13| from ldapcherry.roles import Roles
+    14| from ldapcherry.attributes import Attributes
+    15| import cherrypy
+    16| from cherrypy.lib.httputil import parse_query_string
+    17| from mako.template import Template
+    18| from mako import lookup
+    19| from mako import exceptions
+    20| from sets import Set
+    21| SESSION_KEY = '_cp_username'
+    22| class LdapCherry(object):
+    23|     def _handle_exception(self, e):
+    24|         if hasattr(e, 'log'):
+    25|             cherrypy.log.error(
+    26|                 msg=e.log,
+    27|                 severity=logging.ERROR
+    28|             )
+    29|         else:
+    30|             cherrypy.log.error(
+    31|                 msg="uncaught exception: [%(e)s]" % {'e': str(e)},
+    32|                 severity=logging.ERROR
+    33|             )
+    34|         cherrypy.log.error(
+    35|             msg='',
+    36|             severity=logging.DEBUG,
+    37|             traceback=True
+    38|             )
+    39|     def _escape_list(self, data):
+    40|         ret = []
+    41|         for i in data:
+    42|             ret.append(cgi.escape(i, True))
+    43|         return ret
+    44|     def _escape_dict(self, data):
+    45|         for d in data:
+    46|             if isinstance(data[d], list):
+    47|                 data[d] = self._escape_list(data[d])
+    48|             elif isinstance(data[d], dict):
+    49|                 data[d] = self._escape_dict(data[d])
+    50|             elif isinstance(data[d], Set):
+    51|                 data[d] = Set(self._escape_list(data[d]))
+    52|             else:
+    53|                 data[d] = cgi.escape(data[d], True)
+    54|         return data
+    55|     def _escape(self, data, dtype):
+    56|         if data is None:
+    57|             return None
+    58|         elif dtype == 'search_list':
+    59|             for d in data:
+    60|                 data[d] = self._escape_dict(data[d])
+    61|         elif dtype == 'attr_list':
+    62|             data = self._escape_dict(data)
+    63|         elif dtype == 'lonely_groups':
+    64|             data = self._escape_dict(data)
+    65|         return data
+    66|     def _get_param(self, section, key, config, default=None):
+    67|         """ Get configuration parameter "key" from config
+    68|         @str section: the section of the config file
+    69|         @str key: the key to get
+    70|         @dict config: the configuration (dictionnary)
+    71|         @str default: the default value if parameter "key" is not present
+    72|         @rtype: str (value of config['key'] if present default otherwith
+    73|         """
+
+# --- HUNK 2: Lines 100-226 ---
+   100|         user_roles = self.roles.get_roles(groups)
+   101|         cherrypy.log.error(
+   102|             msg="user '" + username + "' roles: " + str(user_roles),
+   103|             severity=logging.DEBUG,
+   104|         )
+   105|         return user_roles
+   106|     def _is_admin(self, username):
+   107|         """ Check if a user is an ldapcherry administrator
+   108|         @str username: name of the user
+   109|         @rtype: bool, True if administrator, False otherwise
+   110|         """
+   111|         roles = self._get_roles(username)
+   112|         return self.roles.is_admin(roles['roles'])
+   113|     def _check_backends(self):
+   114|         """ Check that every backend in roles and attributes
+   115|         is declared in main configuration
+   116|         """
+   117|         backends = self.backends_params.keys()
+   118|         for b in self.roles.get_backends():
+   119|             if b not in backends:
+   120|                 raise MissingBackend(b)
+   121|         for b in self.roles.get_backends():
+   122|             if b not in backends:
+   123|                 raise MissingBackend(b)
+   124|     def _init_backends(self, config):
+   125|         """ Init all backends
+   126|         @dict: configuration of ldapcherry
+   127|         """
+   128|         self.backends_params = {}
+   129|         self.backends = {}
+   130|         self.backends_display_names = {}
+   131|         for entry in config['backends']:
+   132|             backend, sep, param = entry.partition('.')
+   133|             value = config['backends'][entry]
+   134|             if backend not in self.backends_params:
+   135|                 self.backends_params[backend] = {}
+   136|             self.backends_params[backend][param] = value
+   137|         for backend in self.backends_params:
+   138|             try:
+   139|                 self.backends_display_names[backend] = \
+   140|                     self.backends_params[backend]['display_name']
+   141|             except:
+   142|                 self.backends_display_names[backend] = backend
+   143|                 self.backends_params[backend]['display_name'] = backend
+   144|             params = self.backends_params[backend]
+   145|             try:
+   146|                 module = params['module']
+   147|             except Exception as e:
+   148|                 raise MissingParameter('backends', backend + '.module')
+   149|             try:
+   150|                 bc = __import__(module, globals(), locals(), ['Backend'], -1)
+   151|             except Exception as e:
+   152|                 self._handle_exception(e)
+   153|                 raise BackendModuleLoadingFail(module)
+   154|             try:
+   155|                 attrslist = self.attributes.get_backend_attributes(backend)
+   156|                 key = self.attributes.get_backend_key(backend)
+   157|                 self.backends[backend] = bc.Backend(
+   158|                     params,
+   159|                     cherrypy.log,
+   160|                     backend,
+   161|                     attrslist,
+   162|                     key,
+   163|                     )
+   164|             except MissingParameter as e:
+   165|                 raise
+   166|             except Exception as e:
+   167|                 self._handle_exception(e)
+   168|                 raise BackendModuleInitFail(module)
+   169|     def _init_custom_js(self, config):
+   170|         self.custom_js = []
+   171|         if '/custom' not in config:
+   172|             return
+   173|         directory = self._get_param(
+   174|             '/custom',
+   175|             'tools.staticdir.dir',
+   176|             config,
+   177|             )
+   178|         for file in os.listdir(directory):
+   179|             if file.endswith(".js"):
+   180|                 self.custom_js.append(file)
+   181|     def _init_ppolicy(self, config):
+   182|         module = self._get_param(
+   183|             'ppolicy',
+   184|             'ppolicy.module',
+   185|             config,
+   186|             'ldapcherry.ppolicy'
+   187|         )
+   188|         try:
+   189|             pp = __import__(module, globals(), locals(), ['PPolicy'], -1)
+   190|         except:
+   191|             raise BackendModuleLoadingFail(module)
+   192|         if 'ppolicy' in config:
+   193|             ppcfg = config['ppolicy']
+   194|         else:
+   195|             ppcfg = {}
+   196|         self.ppolicy = pp.PPolicy(ppcfg, cherrypy.log)
+   197|     def _init_auth(self, config):
+   198|         """ Init authentication
+   199|         @dict: configuration of ldapcherry
+   200|         """
+   201|         self.auth_mode = self._get_param('auth', 'auth.mode', config)
+   202|         if self.auth_mode in ['and', 'or', 'none']:
+   203|             pass
+   204|         elif self.auth_mode == 'custom':
+   205|             auth_module = self._get_param('auth', 'auth.module', config)
+   206|             auth = __import__(auth_module, globals(), locals(), ['Auth'], -1)
+   207|             self.auth = auth.Auth(config['auth'], cherrypy.log)
+   208|         else:
+   209|             raise WrongParamValue(
+   210|                 'auth.mode',
+   211|                 'auth',
+   212|                 ['and', 'or', 'none', 'custom'],
+   213|                 )
+   214|         self.roles_file = self._get_param('roles', 'roles.file', config)
+   215|         cherrypy.log.error(
+   216|             msg="loading roles file '%(file)s'" % {'file': self.roles_file},
+   217|             severity=logging.DEBUG
+   218|         )
+   219|         self.roles = Roles(self.roles_file)
+   220|     def _set_access_log(self, config, level):
+   221|         """ Configure access logs
+   222|         """
+   223|         access_handler = self._get_param(
+   224|             'global',
+   225|             'log.access_handler',
+   226|             config,
+
+# --- HUNK 3: Lines 301-341 ---
+   301|         if not ret1:
+   302|             return {'connected': False, 'isadmin': False}
+   303|         else:
+   304|             isadmin = self._is_admin(user)
+   305|             return {'connected': True, 'isadmin': isadmin}
+   306|     def _load_templates(self, config):
+   307|         """ load templates
+   308|         @dict: configuration of ldapcherry
+   309|         """
+   310|         self.template_dir = self._get_param(
+   311|             'resources',
+   312|             'templates.dir',
+   313|             config
+   314|             )
+   315|         cherrypy.log.error(
+   316|             msg="loading templates from dir '%(dir)s'" %
+   317|                 {'dir': self.template_dir},
+   318|             severity=logging.DEBUG
+   319|         )
+   320|         self.temp_lookup = lookup.TemplateLookup(
+   321|             directories=self.template_dir, input_encoding='utf-8'
+   322|             )
+   323|         self.temp = {}
+   324|         for t in ('index.tmpl', 'error.tmpl', 'login.tmpl', '404.tmpl',
+   325|                   'searchadmin.tmpl', 'searchuser.tmpl', 'adduser.tmpl',
+   326|                   'roles.tmpl', 'groups.tmpl', 'form.tmpl', 'selfmodify.tmpl',
+   327|                   'modify.tmpl', 'service_unavailable.tmpl'
+   328|                   ):
+   329|             self.temp[t] = self.temp_lookup.get_template(t)
+   330|     def reload(self, config=None, debug=False):
+   331|         """ load/reload configuration
+   332|         @dict: configuration of ldapcherry
+   333|         """
+   334|         try:
+   335|             level = get_loglevel(
+   336|                 self._get_param(
+   337|                     'global',
+   338|                     'log.level',
+   339|                     config,
+   340|                     'debug',
+   341|                     )
+
+# --- HUNK 4: Lines 450-541 ---
+   450|             elif p_type == 'group':
+   451|                 backend, sep, value = param.partition('.')
+   452|                 if backend not in ret['groups']:
+   453|                     ret['groups'][backend] = []
+   454|                 ret['groups'][backend].append(value)
+   455|         return ret
+   456|     def _check_admin(self):
+   457|         """ check in the session database if current user
+   458|         is an ldapcherry administrator
+   459|         @rtype: boolean, True if administrator, False otherwise
+   460|         """
+   461|         if self.auth_mode == 'none':
+   462|             return True
+   463|         return cherrypy.session['isadmin']
+   464|     def _check_session(self):
+   465|         if self.auth_mode == 'none':
+   466|             return 'anonymous'
+   467|         return cherrypy.session.get(SESSION_KEY)
+   468|     def _check_auth(self, must_admin, redir_login=True):
+   469|         """ check if a user is autheticated and, optionnaly an administrator
+   470|         if user not authentifaced -> redirection to login page (with base64
+   471|             of the originaly requested page (redirection after login)
+   472|         if user authenticated, not admin and must_admin enabled -> 403 error
+   473|         @boolean must_admin: flag "user must be an administrator to access
+   474|             this page"
+   475|         @rtype str: login of the user
+   476|         """
+   477|         if self.auth_mode == 'none':
+   478|             return 'anonymous'
+   479|         username = self._check_session()
+   480|         if cherrypy.request.query_string == '':
+   481|             qs = ''
+   482|         else:
+   483|             qs = '?' + cherrypy.request.query_string
+   484|         b64requrl = base64.b64encode(cherrypy.url() + qs)
+   485|         if not username:
+   486|             if redir_login:
+   487|                 raise cherrypy.HTTPRedirect(
+   488|                     "/signin?url=%(url)s" % {'url': b64requrl},
+   489|                     )
+   490|             else:
+   491|                 raise cherrypy.HTTPError(
+   492|                     "403 Forbidden",
+   493|                     "You must be logged in to access this ressource.",
+   494|                     )
+   495|         if 'connected' not in cherrypy.session \
+   496|                 or not cherrypy.session['connected']:
+   497|             if redir_login:
+   498|                 raise cherrypy.HTTPRedirect(
+   499|                     "/signin?url=%(url)s" % {'url': b64requrl},
+   500|                     )
+   501|             else:
+   502|                 raise cherrypy.HTTPError(
+   503|                     "403 Forbidden",
+   504|                     "You must be logged in to access this ressource.",
+   505|                     )
+   506|         if cherrypy.session['connected'] and \
+   507|                 not cherrypy.session['isadmin']:
+   508|             if must_admin:
+   509|                 raise cherrypy.HTTPError(
+   510|                     "403 Forbidden",
+   511|                     "You are not allowed to access this resource.",
+   512|                     )
+   513|             else:
+   514|                 return username
+   515|         if cherrypy.session['connected'] and \
+   516|                 cherrypy.session['isadmin']:
+   517|             return username
+   518|         else:
+   519|             if redir_login:
+   520|                 raise cherrypy.HTTPRedirect(
+   521|                     "/signin?url=%(url)s" % {'url': b64requrl},
+   522|                     )
+   523|             else:
+   524|                 raise cherrypy.HTTPError(
+   525|                     "403 Forbidden",
+   526|                     "You must be logged in to access this ressource.",
+   527|                     )
+   528|     def _adduser(self, params):
+   529|         cherrypy.log.error(
+   530|             msg="add user form attributes: " + str(params),
+   531|             severity=logging.DEBUG
+   532|         )
+   533|         badd = {}
+   534|         for attr in self.attributes.get_attributes():
+   535|             if self.attributes.attributes[attr]['type'] == 'password':
+   536|                 pwd1 = attr + '1'
+   537|                 pwd2 = attr + '2'
+   538|                 if params['attrs'][pwd1] != params['attrs'][pwd2]:
+   539|                     raise PasswordMissMatch()
+   540|                 if not self._checkppolicy(params['attrs'][pwd1])['match']:
+   541|                     raise PPolicyError()
+
+# --- HUNK 5: Lines 559-599 ---
+   559|         if not added:
+   560|             raise e
+   561|         key = self.attributes.get_key()
+   562|         username = params['attrs'][key]
+   563|         sess = cherrypy.session
+   564|         admin = sess.get(SESSION_KEY, 'unknown')
+   565|         cherrypy.log.error(
+   566|             msg="user '" + username + "' added by '" + admin + "'",
+   567|             severity=logging.INFO
+   568|         )
+   569|         cherrypy.log.error(
+   570|             msg="user '" + username + "' attributes: " + str(badd),
+   571|             severity=logging.DEBUG
+   572|         )
+   573|         roles = []
+   574|         for r in self.roles.get_allroles():
+   575|             if r in params['roles']:
+   576|                 roles.append(r)
+   577|         groups = self.roles.get_groups(roles)
+   578|         for b in groups:
+   579|             self.backends[b].add_to_groups(username, Set(groups[b]))
+   580|         cherrypy.log.error(
+   581|             msg="user '" + username + "' made member of " +
+   582|                 str(roles) + " by '" + admin + "'",
+   583|             severity=logging.INFO
+   584|         )
+   585|         cherrypy.log.error(
+   586|             msg="user '" + username + "' groups: " + str(groups),
+   587|             severity=logging.DEBUG
+   588|         )
+   589|     def _modify_attrs(self, params, attr_list, username):
+   590|         badd = {}
+   591|         for attr in attr_list:
+   592|             if self.attributes.attributes[attr]['type'] == 'password':
+   593|                 pwd1 = attr + '1'
+   594|                 pwd2 = attr + '2'
+   595|                 if pwd1 in params['attrs']:
+   596|                     if params['attrs'][pwd1] != params['attrs'][pwd2]:
+   597|                         raise PasswordMissMatch()
+   598|                     if params['attrs'][pwd1] != '' and \
+   599|                             not self._checkppolicy(
+
+# --- HUNK 6: Lines 672-733 ---
+   672|                         groups_keep[b] = []
+   673|                     groups_keep[b].append(g)
+   674|                 else:
+   675|                     if b not in groups_remove:
+   676|                         groups_remove[b] = []
+   677|                     groups_remove[b].append(g)
+   678|         for r in self.roles.get_allroles():
+   679|             if r in params['roles']:
+   680|                 roles_member.append(r)
+   681|             else:
+   682|                 roles_not_member.append(r)
+   683|         groups_current = self.roles.get_groups(roles_current)
+   684|         groups_rm = self.roles.get_groups(roles_not_member)
+   685|         groups_add = self.roles.get_groups(roles_member)
+   686|         for b in groups_add:
+   687|             for g in [groups_add, groups_keep,
+   688|                       groups_current, lonely_groups]:
+   689|                 if b not in g:
+   690|                     g[b] = []
+   691|             tmp = \
+   692|                 Set(groups_add[b]) - \
+   693|                 Set(groups_keep[b]) - \
+   694|                 Set(groups_current[b]) - \
+   695|                 Set(lonely_groups[b])
+   696|             cherrypy.log.error(
+   697|                 msg="user '" + username + "' added to groups: " +
+   698|                     str(list(tmp)) + " in backend '" + b + "'",
+   699|                 severity=logging.DEBUG
+   700|             )
+   701|             self.backends[b].add_to_groups(username, tmp)
+   702|         for b in groups_rm:
+   703|             for g in [groups_remove, groups_rm, groups_add,
+   704|                       groups_keep, groups_current, lonely_groups]:
+   705|                 if b not in g:
+   706|                     g[b] = []
+   707|             tmp = \
+   708|                 (
+   709|                     (Set(groups_rm[b]) | Set(groups_remove[b])) -
+   710|                     (Set(groups_keep[b]) | Set(groups_add[b]))
+   711|                 ) & \
+   712|                 (
+   713|                     Set(groups_current[b]) | Set(lonely_groups[b])
+   714|                 )
+   715|             cherrypy.log.error(
+   716|                 msg="user '" + username + "' removed from groups: " +
+   717|                     str(list(tmp)) + " in backend '" + b + "'",
+   718|                 severity=logging.DEBUG
+   719|             )
+   720|             self.backends[b].del_from_groups(username, tmp)
+   721|         cherrypy.log.error(
+   722|             msg="user '" + username + "' made member of " +
+   723|                 str(roles_member) + " by '" + admin + "'",
+   724|             severity=logging.INFO
+   725|         )
+   726|     def _deleteuser(self, username):
+   727|         sess = cherrypy.session
+   728|         admin = sess.get(SESSION_KEY, 'unknown')
+   729|         for b in self.backends:
+   730|             try:
+   731|                 self.backends[b].del_user(username)
+   732|             except UserDoesntExist as e:
+   733|                 cherrypy.log.error(
+
+# --- HUNK 7: Lines 761-814 ---
+   761|         cherrypy.session['connected'] = auth['connected']
+   762|         if auth['connected']:
+   763|             if auth['isadmin']:
+   764|                 message = \
+   765|                     "login success for user '%(user)s' as administrator" % {
+   766|                         'user': login
+   767|                     }
+   768|             else:
+   769|                 message = \
+   770|                     "login success for user '%(user)s' as normal user" % {
+   771|                         'user': login
+   772|                     }
+   773|             cherrypy.log.error(
+   774|                 msg=message,
+   775|                 severity=logging.INFO
+   776|             )
+   777|             cherrypy.session[SESSION_KEY] = cherrypy.request.login = login
+   778|             if url is None:
+   779|                 redirect = "/"
+   780|             else:
+   781|                 redirect = base64.b64decode(url)
+   782|             raise cherrypy.HTTPRedirect(redirect)
+   783|         else:
+   784|             message = "login failed for user '%(user)s'" % {
+   785|                 'user': login
+   786|             }
+   787|             cherrypy.log.error(
+   788|                 msg=message,
+   789|                 severity=logging.WARNING
+   790|             )
+   791|             if url is None:
+   792|                 qs = ''
+   793|             else:
+   794|                 qs = '?url=' + url
+   795|             raise cherrypy.HTTPRedirect("/signin" + qs)
+   796|     @cherrypy.expose
+   797|     @exception_decorator
+   798|     def logout(self):
+   799|         """ logout page
+   800|         """
+   801|         sess = cherrypy.session
+   802|         username = sess.get(SESSION_KEY, None)
+   803|         sess[SESSION_KEY] = None
+   804|         if username:
+   805|             cherrypy.request.login = None
+   806|         cherrypy.log.error(
+   807|             msg="user '%(user)s' logout" % {'user': username},
+   808|             severity=logging.INFO
+   809|         )
+   810|         raise cherrypy.HTTPRedirect("/signin")
+   811|     @cherrypy.expose
+   812|     @exception_decorator
+   813|     def index(self):
+   814|         """main page rendering
+
+# --- HUNK 8: Lines 834-874 ---
+   834|         """ search user page """
+   835|         self._check_auth(must_admin=False)
+   836|         is_admin = self._check_admin()
+   837|         if searchstring is not None and len(searchstring) > 2:
+   838|             res = self._search(searchstring)
+   839|         else:
+   840|             res = None
+   841|         attrs_list = self.attributes.get_search_attributes()
+   842|         return self.temp['searchuser.tmpl'].render(
+   843|             searchresult=self._escape(res, 'search_list'),
+   844|             attrs_list=attrs_list,
+   845|             is_admin=is_admin,
+   846|             custom_js=self.custom_js,
+   847|             notifications=self._empty_notification(),
+   848|             )
+   849|     @cherrypy.expose
+   850|     @exception_decorator
+   851|     def checkppolicy(self, **params):
+   852|         """ search user page """
+   853|         self._check_auth(must_admin=False, redir_login=False)
+   854|         keys = params.keys()
+   855|         if len(keys) != 1:
+   856|             cherrypy.response.status = 400
+   857|             return "bad argument"
+   858|         password = params[keys[0]]
+   859|         is_admin = self._check_admin()
+   860|         ret = self._checkppolicy(password)
+   861|         if ret['match']:
+   862|             cherrypy.response.status = 200
+   863|         else:
+   864|             cherrypy.response.status = 200
+   865|         return json.dumps(ret, separators=(',', ':'))
+   866|     @cherrypy.expose
+   867|     @exception_decorator
+   868|     def searchadmin(self, searchstring=None):
+   869|         """ search user page """
+   870|         self._check_auth(must_admin=True)
+   871|         is_admin = self._check_admin()
+   872|         if searchstring is not None:
+   873|             res = self._search(searchstring)
+   874|         else:
+
+# --- HUNK 9: Lines 917-974 ---
+   917|                 )
+   918|             return self.temp['adduser.tmpl'].render(
+   919|                 form=form,
+   920|                 roles=roles,
+   921|                 is_admin=is_admin,
+   922|                 custom_js=self.custom_js,
+   923|                 notifications=self._empty_notification(),
+   924|                 )
+   925|         except NameError:
+   926|             raise TemplateRenderError(
+   927|                     exceptions.text_error_template().render()
+   928|                     )
+   929|     @cherrypy.expose
+   930|     @exception_decorator
+   931|     def delete(self, user):
+   932|         """ remove user page """
+   933|         self._check_auth(must_admin=True)
+   934|         is_admin = self._check_admin()
+   935|         try:
+   936|             referer = cherrypy.request.headers['Referer']
+   937|         except:
+   938|             referer = '/'
+   939|         self._deleteuser(user)
+   940|         self._add_notification('User Deleted')
+   941|         raise cherrypy.HTTPRedirect(referer)
+   942|     @cherrypy.expose
+   943|     @exception_decorator
+   944|     def modify(self, user=None, **params):
+   945|         """ modify user page """
+   946|         self._check_auth(must_admin=True)
+   947|         is_admin = self._check_admin()
+   948|         if cherrypy.request.method.upper() == 'POST':
+   949|             params = self._parse_params(params)
+   950|             self._modify(params)
+   951|             self._add_notification("User modified")
+   952|             try:
+   953|                 referer = cherrypy.request.headers['Referer']
+   954|             except:
+   955|                 referer = '/'
+   956|             raise cherrypy.HTTPRedirect(referer)
+   957|         graph = {}
+   958|         for r in self.roles.graph:
+   959|             s = list(self.roles.graph[r]['sub_roles'])
+   960|             p = list(self.roles.graph[r]['parent_roles'])
+   961|             graph[r] = {'sub_roles': s, 'parent_roles': p}
+   962|         graph_js = json.dumps(graph, separators=(',', ':'))
+   963|         display_names = {}
+   964|         for r in self.roles.flatten:
+   965|             display_names[r] = self.roles.flatten[r]['display_name']
+   966|         if user is None:
+   967|             cherrypy.response.status = 400
+   968|             return self.temp['error.tmpl'].render(
+   969|                 is_admin=is_admin,
+   970|                 alert='warning',
+   971|                 message="No user requested"
+   972|                 )
+   973|         user_attrs = self._get_user(user)
+   974|         if user_attrs == {}:
+
+
+# ====================================================================
+# FILE: ldapcherry/attributes.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-76 ---
+     1| import os
+     2| import sys
+     3| import re
+     4| from ldapcherry.pyyamlwrapper import loadNoDump
+     5| from ldapcherry.pyyamlwrapper import DumplicatedKey
+     6| from ldapcherry.exceptions import *
+     7| from sets import Set
+     8| import yaml
+     9| types = ['string', 'textfield', 'email', 'int', 'stringlist',
+    10|          'fix', 'password']
+    11| class Attributes:
+    12|     def __init__(self, attributes_file):
+    13|         self.attributes_file = attributes_file
+    14|         self.backends = Set([])
+    15|         self.self_attributes = {}
+    16|         self.backend_attributes = {}
+    17|         self.displayed_attributes = {}
+    18|         self.key = None
+    19|         try:
+    20|             stream = open(attributes_file, 'r')
+    21|         except:
+    22|             raise MissingAttributesFile(attributes_file)
+    23|         try:
+    24|             self.attributes = loadNoDump(stream)
+    25|         except DumplicatedKey as e:
+    26|             raise DumplicateAttributesKey(e.key)
+    27|         for attrid in self.attributes:
+    28|             self._mandatory_check(attrid)
+    29|             attr = self.attributes[attrid]
+    30|             if not attr['type'] in types:
+    31|                 raise WrongAttributeType(
+    32|                     attr['type'],
+    33|                     attrid,
+    34|                     attributes_file
+    35|                     )
+    36|             if attr['type'] == 'password':
+    37|                 if attrid + '1' in self.attributes or \
+    38|                         attrid + '2' in self.attributes:
+    39|                     raise PasswordAttributesCollision(attrid)
+    40|             if 'self' in attr and attr['self']:
+    41|                 self.self_attributes[attrid] = attr
+    42|             if 'key' in attr and attr['key']:
+    43|                 if self.key is not None:
+    44|                     raise DumplicateUserKey(attrid, self.key)
+    45|                 self.key = attrid
+    46|             for b in attr['backends']:
+    47|                 self.backends.add(b)
+    48|                 if b not in self.backend_attributes:
+    49|                     self.backend_attributes[b] = {}
+    50|                 self.backend_attributes[b][attr['backends'][b]] = attrid
+    51|             if 'search_displayed' in attr and attr['search_displayed']:
+    52|                 self.displayed_attributes[attrid] = attr
+    53|         if self.key is None:
+    54|             raise MissingUserKey()
+    55|     def _is_email(self, email):
+    56|         pattern = '[\.\w]{1,}[@]\w+[.]\w+'
+    57|         if re.match(pattern, email):
+    58|             return True
+    59|         else:
+    60|             return False
+    61|     def check_attr(self, attr, value):
+    62|         attrid = attr
+    63|         if attrid not in self.attributes:
+    64|             raise AttrNotDefined(attrid)
+    65|         attr_type = self.attributes[attrid]['type']
+    66|         if attr_type == 'string':
+    67|             return
+    68|         elif attr_type == 'textfield':
+    69|             return
+    70|         elif attr_type == 'email':
+    71|             if self._is_email(value):
+    72|                 return
+    73|             else:
+    74|                 raise WrongAttrValue(attrid, attr_type)
+    75|         elif attr_type == 'int':
+    76|             try:
+
+# --- HUNK 2: Lines 88-117 ---
+    88|                 raise WrongAttrValue(attrid, attr_type)
+    89|         elif attr_type == 'password':
+    90|             return
+    91|     def get_search_attributes(self):
+    92|         return self.displayed_attributes
+    93|     def get_key(self):
+    94|         return self.key
+    95|     def _mandatory_check(self, attr):
+    96|         for m in ['description', 'display_name', 'type', 'backends', 'weight']:
+    97|             if m not in self.attributes[attr]:
+    98|                 raise MissingKey(m, attr, self.attributes_file)
+    99|     def get_selfattributes(self):
+   100|         """get the list of groups from roles"""
+   101|         return self.self_attributes
+   102|     def get_backends(self):
+   103|         """return the list of backends in roles file"""
+   104|         return self.backends
+   105|     def get_backend_attributes(self, backend):
+   106|         if backend not in self.backends:
+   107|             raise WrongBackend(backend)
+   108|         return self.backend_attributes[backend].keys()
+   109|     def get_backend_key(self, backend):
+   110|         if backend not in self.backends:
+   111|             raise WrongBackend(backend)
+   112|         return self.attributes[self.key]['backends'][backend]
+   113|     def get_attributes(self):
+   114|         """get the list of groups from roles"""
+   115|         return self.attributes.keys()
+   116|     def get_backends_attributes(self, attribute):
+   117|         return self.attributes[attribute]['backends']
+
+
+# ====================================================================
+# FILE: ldapcherry/backend/backendAD.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-30 ---
+     1| import ldapcherry.backend.backendLdap
+     2| import cherrypy
+     3| import ldap
+     4| import ldap.modlist as modlist
+     5| import ldap.filter
+     6| import logging
+     7| import ldapcherry.backend
+     8| from ldapcherry.exceptions import UserDoesntExist, GroupDoesntExist
+     9| import os
+    10| import re
+    11| class CaFileDontExist(Exception):
+    12|     def __init__(self, cafile):
+    13|         self.cafile = cafile
+    14|         self.log = "CA file %(cafile)s don't exist" % {'cafile': cafile}
+    15| class MissingAttr(Exception):
+    16|     def __init__(self):
+    17|         self.log = 'attributes "cn" and "unicodePwd" must be declared ' \
+    18|            'in attributes.yml for all Active Directory backends.'
+    19| NO_ATTR = 0
+    20| DISPLAYED_ATTRS = 1
+    21| LISTED_ATTRS = 2
+    22| ALL_ATTRS = 3
+    23| SCRIPT = 0x0001
+    24| ACCOUNTDISABLE = 0x0002
+    25| HOMEDIR_REQUIRED = 0x0008
+    26| LOCKOUT = 0x0010
+    27| PASSWD_NOTREQD = 0x0020
+    28| PASSWD_CANT_CHANGE = 0x0040
+    29| ENCRYPTED_TEXT_PWD_ALLOWED = 0x0080
+    30| TEMP_DUPLICATE_ACCOUNT = 0x0100
+
+# --- HUNK 2: Lines 82-215 ---
+    82|         self.uri = self.get_param('uri')
+    83|         self.timeout = self.get_param('timeout', 1)
+    84|         self.userdn = 'CN=Users,' + basedn
+    85|         self.groupdn = self.userdn
+    86|         self.builtin = 'CN=Builtin,' + basedn
+    87|         self.user_filter_tmpl = '(sAMAccountName=%(username)s)'
+    88|         self.group_filter_tmpl = '(member=%(userdn)s)'
+    89|         self.search_filter_tmpl = '(&(|(sAMAccountName=%(searchstring)s)' \
+    90|             '(cn=%(searchstring)s*)' \
+    91|             '(name=%(searchstring)s*)' \
+    92|             '(sn=%(searchstring)s*)' \
+    93|             '(givenName=%(searchstring)s*)' \
+    94|             '(cn=%(searchstring)s*))' \
+    95|             '(&(objectClass=person)' \
+    96|             '(objectClass=user)' \
+    97|             '(!(objectClass=computer)))' \
+    98|             ')'
+    99|         self.dn_user_attr = 'cn'
+   100|         self.key = 'sAMAccountName'
+   101|         self.objectclasses = [
+   102|             'top',
+   103|             'person',
+   104|             'organizationalPerson',
+   105|             'user',
+   106|             'posixAccount',
+   107|             ]
+   108|         self.group_attrs = {
+   109|             'member': "%(dn)s"
+   110|             }
+   111|         self.attrlist = []
+   112|         self.group_attrs_keys = []
+   113|         for a in attrslist:
+   114|             self.attrlist.append(self._str(a))
+   115|         if 'cn' not in self.attrlist:
+   116|             raise MissingAttr()
+   117|         if 'unicodePwd' not in self.attrlist:
+   118|             raise MissingAttr()
+   119|     def _search_group(self, searchfilter, groupdn):
+   120|         searchfilter = self._str(searchfilter)
+   121|         ldap_client = self._bind()
+   122|         try:
+   123|             r = ldap_client.search_s(
+   124|                 groupdn,
+   125|                 ldap.SCOPE_SUBTREE,
+   126|                 searchfilter,
+   127|                 attrlist=['CN']
+   128|                 )
+   129|         except Exception as e:
+   130|             ldap_client.unbind_s()
+   131|             self._exception_handler(e)
+   132|         ldap_client.unbind_s()
+   133|         return r
+   134|     def _build_groupdn(self, groups):
+   135|         ad_groups = []
+   136|         for group in groups:
+   137|             if group in AD_BUILTIN_GROUPS:
+   138|                 ad_groups.append('cn=' + group + ',' + self.builtin)
+   139|             else:
+   140|                 ad_groups.append('cn=' + group + ',' + self.groupdn)
+   141|         return ad_groups
+   142|     def _set_password(self, name, password, by_cn=True):
+   143|         unicode_pass = '\"' + password + '\"'
+   144|         password_value = unicode_pass.encode('utf-16-le')
+   145|         ldap_client = self._bind()
+   146|         if by_cn:
+   147|             dn = self._str('CN=%(cn)s,%(user_dn)s' % {
+   148|                         'cn': name,
+   149|                         'user_dn': self.userdn
+   150|                        })
+   151|         else:
+   152|             dn = self._str(name)
+   153|         attrs = {}
+   154|         attrs['unicodePwd'] = self._str(password_value)
+   155|         ldif = modlist.modifyModlist({'unicodePwd': 'tmp'}, attrs)
+   156|         ldap_client.modify_s(dn, ldif)
+   157|         del(attrs['unicodePwd'])
+   158|         attrs['UserAccountControl'] = str(NORMAL_ACCOUNT)
+   159|         ldif = modlist.modifyModlist({'UserAccountControl': 'tmp'}, attrs)
+   160|         ldap_client.modify_s(dn, ldif)
+   161|     def add_user(self, attrs):
+   162|         password = attrs['unicodePwd']
+   163|         del(attrs['unicodePwd'])
+   164|         super(Backend, self).add_user(attrs)
+   165|         self._set_password(attrs['cn'], password)
+   166|     def set_attrs(self, username, attrs):
+   167|         if 'unicodePwd' in attrs:
+   168|             password = attrs['unicodePwd']
+   169|             del(attrs['unicodePwd'])
+   170|             userdn = self._get_user(self._str(username), NO_ATTR)
+   171|             self._set_password(userdn, password, False)
+   172|         super(Backend, self).set_attrs(username, attrs)
+   173|     def add_to_groups(self, username, groups):
+   174|         ad_groups = self._build_groupdn(groups)
+   175|         super(Backend, self).add_to_groups(username, ad_groups)
+   176|     def del_from_groups(self, username, groups):
+   177|         ad_groups = self._build_groupdn(groups)
+   178|         super(Backend, self).del_from_groups(username, ad_groups)
+   179|     def get_groups(self, username):
+   180|         username = ldap.filter.escape_filter_chars(username)
+   181|         userdn = self._get_user(self._str(username), NO_ATTR)
+   182|         searchfilter = self.group_filter_tmpl % {
+   183|             'userdn': userdn,
+   184|             'username': username
+   185|         }
+   186|         groups = self._search_group(searchfilter, self.groupdn)
+   187|         groups = groups + self._search_group(searchfilter, self.builtin)
+   188|         ret = []
+   189|         self._logger(
+   190|             severity=logging.DEBUG,
+   191|             msg="%(backend)s: groups of '%(user)s' are %(groups)s" % {
+   192|                 'user': username,
+   193|                 'groups': str(groups),
+   194|                 'backend': self.backend_name
+   195|                 }
+   196|         )
+   197|         for entry in groups:
+   198|             ret.append(entry[1]['cn'][0])
+   199|         return ret
+   200|     def auth(self, username, password):
+   201|         binddn = username + '@' + self.domain
+   202|         if binddn is not None:
+   203|             ldap_client = self._connect()
+   204|             try:
+   205|                 ldap_client.simple_bind_s(
+   206|                     self._str(binddn),
+   207|                     self._str(password)
+   208|                 )
+   209|             except ldap.INVALID_CREDENTIALS:
+   210|                 ldap_client.unbind_s()
+   211|                 return False
+   212|             ldap_client.unbind_s()
+   213|             return True
+   214|         else:
+   215|             return False
+
+
+# ====================================================================
+# FILE: ldapcherry/backend/backendDemo.py
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-156 ---
+     1| from sets import Set
+     2| import ldapcherry.backend
+     3| from ldapcherry.exceptions import UserDoesntExist, \
+     4|     GroupDoesntExist, MissingParameter, \
+     5|     UserAlreadyExists
+     6| import re
+     7| class Backend(ldapcherry.backend.Backend):
+     8|     def __init__(self, config, logger, name, attrslist, key):
+     9|         """ Initialize the backend
+    10|         :param config: the configuration of the backend
+    11|         :type config: dict {'config key': 'value'}
+    12|         :param logger: the cherrypy error logger object
+    13|         :type logger: python logger
+    14|         :param name: id of the backend
+    15|         :type name: string
+    16|         :param attrslist: list of the backend attributes
+    17|         :type attrslist: list of strings
+    18|         :param key: the key attribute
+    19|         :type key: string
+    20|         """
+    21|         self.config = config
+    22|         self._logger = logger
+    23|         self.users = {}
+    24|         self.backend_name = name
+    25|         admin_user = self.get_param('admin.user', 'admin')
+    26|         admin_password = self.get_param('admin.password', 'admin')
+    27|         admin_groups = Set(re.split('\W+', self.get_param('admin.groups')))
+    28|         basic_user = self.get_param('basic.user', 'user')
+    29|         basic_password = self.get_param('basic.password', 'user')
+    30|         basic_groups = Set(re.split('\W+', self.get_param('basic.groups')))
+    31|         pwd_attr = self.get_param('pwd_attr')
+    32|         self.search_attrs = Set(
+    33|             re.split('\W+', self.get_param('search_attributes')),
+    34|             )
+    35|         self.pwd_attr = pwd_attr
+    36|         self.admin_user = admin_user
+    37|         self.basic_user = basic_user
+    38|         self.key = key
+    39|         self.users[admin_user] = {
+    40|                 key: admin_user,
+    41|                 pwd_attr: admin_password,
+    42|                 'groups': admin_groups,
+    43|                 }
+    44|         self.users[basic_user] = {
+    45|                 key: basic_user,
+    46|                 pwd_attr: basic_password,
+    47|                 'groups': basic_groups,
+    48|                 }
+    49|     def _check_fix_users(self, username):
+    50|         if self.admin_user == username or self.basic_user == username:
+    51|             raise Exception('User cannot be modified')
+    52|     def auth(self, username, password):
+    53|         """ Check authentication against the backend
+    54|         :param username: 'key' attribute of the user
+    55|         :type username: string
+    56|         :param password: password of the user
+    57|         :type password: string
+    58|         :rtype: boolean (True is authentication success, False otherwise)
+    59|         """
+    60|         if username not in self.users:
+    61|             return False
+    62|         elif self.users[username][self.pwd_attr] == password:
+    63|             return True
+    64|         return False
+    65|     def add_user(self, attrs):
+    66|         """ Add a user to the backend
+    67|         :param attrs: attributes of the user
+    68|         :type attrs: dict ({<attr>: <value>})
+    69|         .. warning:: raise UserAlreadyExists if user already exists
+    70|         """
+    71|         username = attrs[self.key]
+    72|         if username in self.users:
+    73|             raise UserAlreadyExists(username, self.backend_name)
+    74|         self.users[username] = attrs
+    75|         self.users[username]['groups'] = Set([])
+    76|     def del_user(self, username):
+    77|         """ Delete a user from the backend
+    78|         :param username: 'key' attribute of the user
+    79|         :type username: string
+    80|         """
+    81|         self._check_fix_users(username)
+    82|         try:
+    83|             del self.users[username]
+    84|         except:
+    85|             raise UserDoesntExist(username, self.backend_name)
+    86|     def set_attrs(self, username, attrs):
+    87|         """ Set a list of attributes for a given user
+    88|         :param username: 'key' attribute of the user
+    89|         :type username: string
+    90|         :param attrs: attributes of the user
+    91|         :type attrs: dict ({<attr>: <value>})
+    92|         """
+    93|         self._check_fix_users(username)
+    94|         for attr in attrs:
+    95|             self.users[username][attr] = attrs[attr]
+    96|     def add_to_groups(self, username, groups):
+    97|         """ Add a user to a list of groups
+    98|         :param username: 'key' attribute of the user
+    99|         :type username: string
+   100|         :param groups: list of groups
+   101|         :type groups: list of strings
+   102|         """
+   103|         self._check_fix_users(username)
+   104|         current_groups = self.users[username]['groups']
+   105|         new_groups = current_groups | Set(groups)
+   106|         self.users[username]['groups'] = new_groups
+   107|     def del_from_groups(self, username, groups):
+   108|         """ Delete a user from a list of groups
+   109|         :param username: 'key' attribute of the user
+   110|         :type username: string
+   111|         :param groups: list of groups
+   112|         :type groups: list of strings
+   113|         .. warning:: raise GroupDoesntExist if group doesn't exist
+   114|         """
+   115|         self._check_fix_users(username)
+   116|         current_groups = self.users[username]['groups']
+   117|         new_groups = current_groups - Set(groups)
+   118|         self.users[username]['groups'] = new_groups
+   119|     def search(self, searchstring):
+   120|         """ Search backend for users
+   121|         :param searchstring: the search string
+   122|         :type searchstring: string
+   123|         :rtype: dict of dict ( {<user attr key>: {<attr>: <value>}} )
+   124|         """
+   125|         ret = {}
+   126|         for user in self.users:
+   127|             match = False
+   128|             for attr in self.search_attrs:
+   129|                 if attr not in self.users[user]:
+   130|                     pass
+   131|                 elif re.search(searchstring + '.*', self.users[user][attr]):
+   132|                     match = True
+   133|             if match:
+   134|                 ret[user] = self.users[user]
+   135|         return ret
+   136|     def get_user(self, username):
+   137|         """ Get a user's attributes
+   138|         :param username: 'key' attribute of the user
+   139|         :type username: string
+   140|         :rtype: dict ( {<attr>: <value>} )
+   141|         .. warning:: raise UserDoesntExist if user doesn't exist
+   142|         """
+   143|         try:
+   144|             return self.users[username]
+   145|         except:
+   146|             raise UserDoesntExist(username, self.backend_name)
+   147|     def get_groups(self, username):
+   148|         """ Get a user's groups
+   149|         :param username: 'key' attribute of the user
+   150|         :type username: string
+   151|         :rtype: list of groups
+   152|         """
+   153|         try:
+   154|             return self.users[username]['groups']
+   155|         except:
+   156|             raise UserDoesntExist(username, self.backend_name)
+
+
+# ====================================================================
+# FILE: ldapcherry/backend/backendLdap.py
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-142 ---
+     1| import cherrypy
+     2| import ldap
+     3| import ldap.modlist as modlist
+     4| import ldap.filter
+     5| import logging
+     6| import ldapcherry.backend
+     7| from sets import Set
+     8| from ldapcherry.exceptions import UserDoesntExist, \
+     9|     GroupDoesntExist, \
+    10|     UserAlreadyExists
+    11| import os
+    12| import re
+    13| class CaFileDontExist(Exception):
+    14|     def __init__(self, cafile):
+    15|         self.cafile = cafile
+    16|         self.log = "CA file %(cafile)s does not exist" % {'cafile': cafile}
+    17| class MissingGroupAttr(Exception):
+    18|     def __init__(self, attr):
+    19|         self.attr = attr
+    20|         self.log = "User doesn't have %(attr)s in its attributes" \
+    21|             ", cannot use it to set group" % {'attr': attr}
+    22| class MultivaluedGroupAttr(Exception):
+    23|     def __init__(self, attr):
+    24|         self.attr = cafile
+    25|         self.log = "User's attribute '%(attr)s' is multivalued" \
+    26|             ", cannot use it to set group" % {'attr': attr}
+    27| NO_ATTR = 0
+    28| DISPLAYED_ATTRS = 1
+    29| LISTED_ATTRS = 2
+    30| ALL_ATTRS = 3
+    31| class Backend(ldapcherry.backend.Backend):
+    32|     def __init__(self, config, logger, name, attrslist, key):
+    33|         """Backend initialization"""
+    34|         self.config = config
+    35|         self._logger = logger
+    36|         self.backend_name = name
+    37|         self.backend_display_name = self.get_param('display_name')
+    38|         self.binddn = self.get_param('binddn')
+    39|         self.bindpassword = self.get_param('password')
+    40|         self.ca = self.get_param('ca', False)
+    41|         self.checkcert = self.get_param('checkcert', 'on')
+    42|         self.starttls = self.get_param('starttls', 'off')
+    43|         self.uri = self.get_param('uri')
+    44|         self.timeout = self.get_param('timeout', 1)
+    45|         self.userdn = self.get_param('userdn')
+    46|         self.groupdn = self.get_param('groupdn')
+    47|         self.user_filter_tmpl = self.get_param('user_filter_tmpl')
+    48|         self.group_filter_tmpl = self.get_param('group_filter_tmpl')
+    49|         self.search_filter_tmpl = self.get_param('search_filter_tmpl')
+    50|         self.dn_user_attr = self.get_param('dn_user_attr')
+    51|         self.objectclasses = []
+    52|         self.key = key
+    53|         for o in re.split('\W+', self.get_param('objectclasses')):
+    54|             self.objectclasses.append(self._str(o))
+    55|         self.group_attrs = {}
+    56|         self.group_attrs_keys = Set([])
+    57|         for param in config:
+    58|             name, sep, group = param.partition('.')
+    59|             if name == 'group_attr':
+    60|                 self.group_attrs[group] = self.get_param(param)
+    61|                 self.group_attrs_keys |= Set(
+    62|                     self._extract_format_keys(self.get_param(param))
+    63|                 )
+    64|         self.attrlist = []
+    65|         for a in attrslist:
+    66|             self.attrlist.append(self._str(a))
+    67|     def _exception_handler(self, e):
+    68|         """ Exception handling"""
+    69|         et = type(e)
+    70|         if et is ldap.OPERATIONS_ERROR:
+    71|             self._logger(
+    72|                 severity=logging.ERROR,
+    73|                 msg="cannot use starttls with ldaps://"
+    74|                     " uri (uri: " + self.uri + ")",
+    75|             )
+    76|         elif et is ldap.INVALID_CREDENTIALS:
+    77|             self._logger(
+    78|                 severity=logging.ERROR,
+    79|                 msg="Configuration error, wrong credentials,"
+    80|                 " unable to connect to ldap with '" + self.binddn + "'",
+    81|             )
+    82|         elif et is ldap.SERVER_DOWN:
+    83|             self._logger(
+    84|                 severity=logging.ERROR,
+    85|                 msg="Unable to contact ldap server '" +
+    86|                     self.uri +
+    87|                     "', check 'auth.ldap.uri'"
+    88|                     " and ssl/tls configuration",
+    89|                 )
+    90|         elif et is ldap.FILTER_ERROR:
+    91|             self._logger(
+    92|                 severity=logging.ERROR,
+    93|                 msg="Bad search filter, check '" +
+    94|                     self.backend_name +
+    95|                     ".*_filter_tmpl' params",
+    96|                 )
+    97|         elif et is ldap.NO_SUCH_OBJECT:
+    98|             self._logger(
+    99|                 severity=logging.ERROR,
+   100|                 msg="DN doesn't exist, check '" +
+   101|                     self.backend_name +
+   102|                     ".userdn'or '" +
+   103|                     self.backend_name +
+   104|                     ".groupdn'",
+   105|                 )
+   106|         elif et is ldap.OBJECT_CLASS_VIOLATION:
+   107|             info = e[0]['info']
+   108|             desc = e[0]['desc']
+   109|             self._logger(
+   110|                 severity=logging.ERROR,
+   111|                 msg="Configuration error, " + desc + ", " + info,
+   112|                 )
+   113|         elif et is ldap.INSUFFICIENT_ACCESS:
+   114|             self._logger(
+   115|                 severity=logging.ERROR,
+   116|                 msg="Access error on '" +
+   117|                     self.backend_name +
+   118|                     "' backend, please check your acls in backend " +
+   119|                     self.backend_name,
+   120|                 )
+   121|         elif et is ldap.ALREADY_EXISTS:
+   122|             desc = e[0]['desc']
+   123|             self._logger(
+   124|                 severity=logging.ERROR,
+   125|                 msg="adding user failed, " + desc,
+   126|                 )
+   127|         else:
+   128|             self._logger(
+   129|                 severity=logging.ERROR,
+   130|                 msg="unknow exception in backend " + self.backend_name,
+   131|                 )
+   132|         raise
+   133|     def _extract_format_keys(self, fmt_string):
+   134|         """Extract the keys of a format string
+   135|         (the 'stuff' in '%(stuff)s'
+   136|         """
+   137|         class AccessSaver:
+   138|             def __init__(self):
+   139|                 self.keys = []
+   140|             def __getitem__(self, key):
+   141|                 self.keys.append(key)
+   142|         a = AccessSaver()
+
+# --- HUNK 2: Lines 227-483 ---
+   227|         ret = []
+   228|         for entry in r:
+   229|             uni_dn = self._uni(entry[0])
+   230|             uni_attrs = {}
+   231|             for attr in entry[1]:
+   232|                 if type(entry[1][attr]) is list:
+   233|                     tmp = []
+   234|                     for value in entry[1][attr]:
+   235|                         tmp.append(self._uni(value))
+   236|                 else:
+   237|                     tmp = self._uni(entry[1][attr])
+   238|                 uni_attrs[self._uni(attr)] = tmp
+   239|             ret.append((uni_dn, uni_attrs))
+   240|         return ret
+   241|     def _get_user(self, username, attrs=ALL_ATTRS):
+   242|         """Get a user from the ldap"""
+   243|         username = ldap.filter.escape_filter_chars(username)
+   244|         user_filter = self.user_filter_tmpl % {
+   245|             'username': self._uni(username)
+   246|         }
+   247|         r = self._search(self._str(user_filter), attrs, self.userdn)
+   248|         if len(r) == 0:
+   249|             return None
+   250|         if attrs == NO_ATTR:
+   251|             dn_entry = r[0][0]
+   252|         else:
+   253|             dn_entry = r[0]
+   254|         return dn_entry
+   255|     def _str(self, s):
+   256|         """unicode -> bytes conversion"""
+   257|         if s is None:
+   258|             return None
+   259|         return s.encode('utf-8')
+   260|     def _uni(self, s):
+   261|         """bytes -> unicode conversion"""
+   262|         if s is None:
+   263|             return None
+   264|         return s.decode('utf-8', 'ignore')
+   265|     def auth(self, username, password):
+   266|         """Authentication of a user"""
+   267|         binddn = self._get_user(self._str(username), NO_ATTR)
+   268|         if binddn is not None:
+   269|             ldap_client = self._connect()
+   270|             try:
+   271|                 ldap_client.simple_bind_s(
+   272|                         self._str(binddn),
+   273|                         self._str(password)
+   274|                         )
+   275|             except ldap.INVALID_CREDENTIALS:
+   276|                 ldap_client.unbind_s()
+   277|                 return False
+   278|             ldap_client.unbind_s()
+   279|             return True
+   280|         else:
+   281|             return False
+   282|     def attrs_pretreatment(self, attrs):
+   283|         attrs_str = {}
+   284|         for a in attrs:
+   285|             attrs_str[self._str(a)] = self._str(attrs[a])
+   286|         return attrs_str
+   287|     def add_user(self, attrs):
+   288|         """add a user"""
+   289|         ldap_client = self._bind()
+   290|         attrs_str = self.attrs_pretreatment(attrs)
+   291|         attrs_str['objectClass'] = self.objectclasses
+   292|         dn = \
+   293|             self._str(self.dn_user_attr) + \
+   294|             '=' + \
+   295|             ldap.dn.escape_dn_chars(
+   296|                 self._str(attrs[self.dn_user_attr])
+   297|                 ) + \
+   298|             ',' + \
+   299|             self._str(self.userdn)
+   300|         ldif = modlist.addModlist(attrs_str)
+   301|         try:
+   302|             ldap_client.add_s(dn, ldif)
+   303|         except ldap.ALREADY_EXISTS as e:
+   304|             raise UserAlreadyExists(attrs[self.key], self.backend_name)
+   305|         except Exception as e:
+   306|             ldap_client.unbind_s()
+   307|             self._exception_handler(e)
+   308|         ldap_client.unbind_s()
+   309|     def del_user(self, username):
+   310|         """delete a user"""
+   311|         ldap_client = self._bind()
+   312|         dn = self._str(self._get_user(self._str(username), NO_ATTR))
+   313|         if dn is not None:
+   314|             ldap_client.delete_s(dn)
+   315|         else:
+   316|             ldap_client.unbind_s()
+   317|             raise UserDoesntExist(username, self.backend_name)
+   318|         ldap_client.unbind_s()
+   319|     def set_attrs(self, username, attrs):
+   320|         """ Set user attributes"""
+   321|         ldap_client = self._bind()
+   322|         tmp = self._get_user(self._str(username), ALL_ATTRS)
+   323|         if tmp is None:
+   324|             raise UserDoesntExist(username, self.backend_name)
+   325|         dn = self._str(tmp[0])
+   326|         old_attrs = tmp[1]
+   327|         for attr in attrs:
+   328|             bcontent = self._str(attrs[attr])
+   329|             battr = self._str(attr)
+   330|             new = {battr: bcontent}
+   331|             if attr.lower() == self.dn_user_attr.lower():
+   332|                 ldap_client.rename_s(
+   333|                     dn,
+   334|                     ldap.dn.dn2str([[(battr, bcontent, 1)]])
+   335|                     )
+   336|                 dn = ldap.dn.dn2str(
+   337|                     [[(battr, bcontent, 1)]] + ldap.dn.str2dn(dn)[1:]
+   338|                     )
+   339|             else:
+   340|                 if attr in old_attrs:
+   341|                     if type(old_attrs[attr]) is list:
+   342|                         tmp = []
+   343|                         for value in old_attrs[attr]:
+   344|                             tmp.append(self._str(value))
+   345|                         bold_value = tmp
+   346|                     else:
+   347|                         bold_value = self._str(old_attrs[attr])
+   348|                     old = {battr: bold_value}
+   349|                 else:
+   350|                     old = {}
+   351|                 ldif = modlist.modifyModlist(old, new)
+   352|                 try:
+   353|                     ldap_client.modify_s(dn, ldif)
+   354|                 except Exception as e:
+   355|                     ldap_client.unbind_s()
+   356|                     self._exception_handler(e)
+   357|         ldap_client.unbind_s()
+   358|     def add_to_groups(self, username, groups):
+   359|         ldap_client = self._bind()
+   360|         tmp = self._get_user(self._str(username), ALL_ATTRS)
+   361|         dn = tmp[0]
+   362|         attrs = tmp[1]
+   363|         attrs['dn'] = dn
+   364|         self._normalize_group_attrs(attrs)
+   365|         dn = self._str(tmp[0])
+   366|         for group in groups:
+   367|             group = self._str(group)
+   368|             for attr in self.group_attrs:
+   369|                 content = self._str(self.group_attrs[attr] % attrs)
+   370|                 self._logger(
+   371|                     severity=logging.DEBUG,
+   372|                     msg="%(backend)s: adding user '%(user)s'"
+   373|                         " with dn '%(dn)s' to group '%(group)s' by"
+   374|                         " setting '%(attr)s' to '%(content)s'" % {
+   375|                             'user': username,
+   376|                             'dn': self._uni(dn),
+   377|                             'group': self._uni(group),
+   378|                             'attr': attr,
+   379|                             'content': self._uni(content),
+   380|                             'backend': self.backend_name
+   381|                             }
+   382|                 )
+   383|                 ldif = modlist.modifyModlist({}, {attr: content})
+   384|                 try:
+   385|                     ldap_client.modify_s(group, ldif)
+   386|                 except ldap.TYPE_OR_VALUE_EXISTS as e:
+   387|                     self._logger(
+   388|                         severity=logging.INFO,
+   389|                         msg="%(backend)s: user '%(user)s'"
+   390|                             " already member of group '%(group)s'"
+   391|                             " (attribute '%(attr)s')" % {
+   392|                                 'user': username,
+   393|                                 'group': self._uni(group),
+   394|                                 'attr': attr,
+   395|                                 'backend': self.backend_name
+   396|                                 }
+   397|                     )
+   398|                 except ldap.NO_SUCH_OBJECT as e:
+   399|                     raise GroupDoesntExist(group, self.backend_name)
+   400|                 except Exception as e:
+   401|                     ldap_client.unbind_s()
+   402|                     self._exception_handler(e)
+   403|         ldap_client.unbind_s()
+   404|     def del_from_groups(self, username, groups):
+   405|         """Delete user from groups"""
+   406|         ldap_client = self._bind()
+   407|         tmp = self._get_user(self._str(username), ALL_ATTRS)
+   408|         if tmp is None:
+   409|             raise UserDoesntExist(username, self.backend_name)
+   410|         dn = tmp[0]
+   411|         attrs = tmp[1]
+   412|         attrs['dn'] = dn
+   413|         self._normalize_group_attrs(attrs)
+   414|         dn = self._str(tmp[0])
+   415|         for group in groups:
+   416|             group = self._str(group)
+   417|             for attr in self.group_attrs:
+   418|                 content = self._str(self.group_attrs[attr] % attrs)
+   419|                 ldif = [(ldap.MOD_DELETE, attr, content)]
+   420|                 try:
+   421|                     ldap_client.modify_s(group, ldif)
+   422|                 except ldap.NO_SUCH_ATTRIBUTE as e:
+   423|                     self._logger(
+   424|                         severity=logging.INFO,
+   425|                         msg="%(backend)s: user '%(user)s'"
+   426|                         " wasn't member of group '%(group)s'"
+   427|                         " (attribute '%(attr)s')" % {
+   428|                             'user': username,
+   429|                             'group': self._uni(group),
+   430|                             'attr': attr,
+   431|                             'backend': self.backend_name
+   432|                             }
+   433|                     )
+   434|                 except Exception as e:
+   435|                     ldap_client.unbind_s()
+   436|                     self._exception_handler(e)
+   437|         ldap_client.unbind_s()
+   438|     def search(self, searchstring):
+   439|         """Search users"""
+   440|         searchstring = ldap.filter.escape_filter_chars(self._str(searchstring))
+   441|         searchfilter = self.search_filter_tmpl % {
+   442|             'searchstring': searchstring
+   443|         }
+   444|         ret = {}
+   445|         for u in self._search(searchfilter, DISPLAYED_ATTRS, self.userdn):
+   446|             attrs = {}
+   447|             attrs_tmp = u[1]
+   448|             for attr in attrs_tmp:
+   449|                 value_tmp = attrs_tmp[attr]
+   450|                 if len(value_tmp) == 1:
+   451|                     attrs[attr] = value_tmp[0]
+   452|                 else:
+   453|                     attrs[attr] = value_tmp
+   454|             if self.key in attrs:
+   455|                 ret[attrs[self.key]] = attrs
+   456|         return ret
+   457|     def get_user(self, username):
+   458|         """Gest a specific user"""
+   459|         ret = {}
+   460|         tmp = self._get_user(self._str(username), ALL_ATTRS)
+   461|         if tmp is None:
+   462|             raise UserDoesntExist(username, self.backend_name)
+   463|         attrs_tmp = tmp[1]
+   464|         for attr in attrs_tmp:
+   465|             value_tmp = attrs_tmp[attr]
+   466|             if len(value_tmp) == 1:
+   467|                 ret[attr] = value_tmp[0]
+   468|             else:
+   469|                 ret[attr] = value_tmp
+   470|         return ret
+   471|     def get_groups(self, username):
+   472|         """Get all groups of a user"""
+   473|         username = ldap.filter.escape_filter_chars(self._str(username))
+   474|         userdn = self._get_user(username, NO_ATTR)
+   475|         searchfilter = self.group_filter_tmpl % {
+   476|             'userdn': userdn,
+   477|             'username': username
+   478|         }
+   479|         groups = self._search(searchfilter, NO_ATTR, self.groupdn)
+   480|         ret = []
+   481|         for entry in groups:
+   482|             ret.append(entry[0])
+   483|         return ret
+
+
+# ====================================================================
+# FILE: ldapcherry/exceptions.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 12-56 ---
+    12|         self.key = key
+    13|         self.section = section
+    14|         self.ymlfile = ymlfile
+    15|         self.log = \
+    16|             "missing key '%(key)s' in section '%(section)s'" \
+    17|             " inside file '%(ymlfile)s'" % \
+    18|             {'key': key, 'section': section, 'ymlfile': ymlfile}
+    19| class DumplicateRoleKey(Exception):
+    20|     def __init__(self, role):
+    21|         self.role = role
+    22|         self.log = \
+    23|             "duplicate role key '%(role)s' in role file" % \
+    24|             {'role': role}
+    25| class MissingRole(Exception):
+    26|     def __init__(self, role):
+    27|         self.role = role
+    28|         self.log = \
+    29|             "role '%(role)s' does not exist in role file" % \
+    30|             {'role': role}
+    31| class MissingBackend(Exception):
+    32|     def __init__(self, backend):
+    33|         self.backend = backend
+    34|         self.log = \
+    35|             "backend '%(backend)s' does not exist in main config file" % \
+    36|             {'backend': backend}
+    37| class WrongBackend(Exception):
+    38|     def __init__(self, backend):
+    39|         self.backend = backend
+    40|         self.log = \
+    41|             "backend '%(backend)s' does not exist" % \
+    42|             {'backend': backend}
+    43| class DumplicateRoleContent(Exception):
+    44|     def __init__(self, role1, role2):
+    45|         self.role1 = role1
+    46|         self.role2 = role2
+    47|         self.log = \
+    48|             "role '%(role1)s' and '%(role2)s' are identical" % \
+    49|             {'role1': role1, 'role2': role2}
+    50| class MissingRolesFile(Exception):
+    51|     def __init__(self, rolefile):
+    52|         self.rolefile = rolefile
+    53|         self.log = \
+    54|             "fail to open role file '%(rolefile)s'" % \
+    55|             {'rolefile': rolefile}
+    56| class PasswordMissMatch(Exception):
+
+
+# ====================================================================
+# FILE: ldapcherry/roles.py
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-62 ---
+     1| import os
+     2| import sys
+     3| import copy
+     4| from sets import Set
+     5| from ldapcherry.pyyamlwrapper import loadNoDump
+     6| from ldapcherry.pyyamlwrapper import DumplicatedKey
+     7| from ldapcherry.exceptions import *
+     8| import yaml
+     9| class CustomDumper(yaml.SafeDumper):
+    10|     "A custom YAML dumper that never emits aliases"
+    11|     def ignore_aliases(self, _data):
+    12|         return True
+    13| class Roles:
+    14|     def __init__(self, role_file):
+    15|         self.role_file = role_file
+    16|         self.backends = Set([])
+    17|         try:
+    18|             stream = open(role_file, 'r')
+    19|         except:
+    20|             raise MissingRolesFile(role_file)
+    21|         try:
+    22|             self.roles_raw = loadNoDump(stream)
+    23|         except DumplicatedKey as e:
+    24|             raise DumplicateRoleKey(e.key)
+    25|         stream.close()
+    26|         self.graph = {}
+    27|         self.roles = {}
+    28|         self.flatten = {}
+    29|         self.group2roles = {}
+    30|         self.admin_roles = []
+    31|         self._nest()
+    32|     def _merge_groups(self, backends_list):
+    33|         """ merge a list backends_groups"""
+    34|         ret = {}
+    35|         for backends in backends_list:
+    36|             for b in backends:
+    37|                 if b not in ret:
+    38|                     ret[b] = Set([])
+    39|                 for group in backends[b]:
+    40|                     ret[b].add(group)
+    41|         for b in ret:
+    42|             ret[b] = list(ret[b])
+    43|         return ret
+    44|     def _flatten(self, roles=None, groups=None):
+    45|         """ flatten a (semi) nest roles structure"""
+    46|         if roles is None:
+    47|             roles_in = copy.deepcopy(self.roles_raw)
+    48|         else:
+    49|             roles_in = roles
+    50|         for roleid in roles_in:
+    51|             role = roles_in[roleid]
+    52|             if groups is not None:
+    53|                 role['backends_groups'] = self._merge_groups(
+    54|                     [role['backends_groups'], groups],
+    55|                     )
+    56|             if 'subroles' in role:
+    57|                 self._flatten(
+    58|                     role['subroles'],
+    59|                     role['backends_groups'],
+    60|                     )
+    61|                 del role['subroles']
+    62|             self.flatten[roleid] = role
+
+# --- HUNK 2: Lines 82-132 ---
+    82|             for group in role2['backends_groups'][b2]:
+    83|                 if group not in role1['backends_groups'][b2]:
+    84|                     return True
+    85|         raise DumplicateRoleContent(roleid1, roleid2)
+    86|     def _nest(self):
+    87|         """nests the roles (creates roles hierarchy)"""
+    88|         self._flatten()
+    89|         parent_roles = {}
+    90|         for roleid in self.flatten:
+    91|             role = copy.deepcopy(self.flatten[roleid])
+    92|             if 'display_name' not in role:
+    93|                 raise MissingKey('display_name', role, self.role_file)
+    94|             if 'description' not in role:
+    95|                 raise MissingKey('description', role, self.role_file)
+    96|             if 'backends_groups' not in role:
+    97|                 raise MissingKey('backends_groups', role, self.role_file)
+    98|             for backend in role['backends_groups']:
+    99|                 self.backends.add(backend)
+   100|             if roleid not in self.graph:
+   101|                 self.graph[roleid] = {
+   102|                     'parent_roles': Set([]),
+   103|                     'sub_roles': Set([])
+   104|                     }
+   105|         for roleid in self.flatten:
+   106|             role = copy.deepcopy(self.flatten[roleid])
+   107|             for b in role['backends_groups']:
+   108|                 for g in role['backends_groups'][b]:
+   109|                     if b not in self.group2roles:
+   110|                         self.group2roles[b] = {}
+   111|                     if g not in self.group2roles[b]:
+   112|                         self.group2roles[b][g] = Set([])
+   113|                     self.group2roles[b][g].add(roleid)
+   114|             parent_roles[roleid] = []
+   115|             for roleid2 in self.flatten:
+   116|                 role2 = copy.deepcopy(self.flatten[roleid2])
+   117|                 if self._is_parent(roleid, roleid2):
+   118|                     parent_roles[roleid].append(roleid2)
+   119|                     self.graph[roleid2]['parent_roles'].add(roleid)
+   120|                     self.graph[roleid]['sub_roles'].add(roleid2)
+   121|         for r in parent_roles:
+   122|             for p in parent_roles[r]:
+   123|                 for p2 in parent_roles[r]:
+   124|                     if p != p2 and p in parent_roles[p2]:
+   125|                         parent_roles[r].remove(p)
+   126|         def nest(p):
+   127|             ret = copy.deepcopy(self.flatten[p])
+   128|             ret['subroles'] = {}
+   129|             if len(parent_roles[p]) == 0:
+   130|                 return ret
+   131|             else:
+   132|                 for i in parent_roles[p]:
+
+# --- HUNK 3: Lines 148-264 ---
+   148|         return yaml.dump(self.roles, Dumper=CustomDumper)
+   149|     def dump_flatten(self):
+   150|         """dump the nested role hierarchy"""
+   151|         return yaml.dump(self.flatten, Dumper=CustomDumper)
+   152|     def _check_member(
+   153|             self, role, groups, notroles,
+   154|             roles, parentroles, usedgroups):
+   155|         if role in notroles:
+   156|             return False
+   157|         if not (role in parentroles or role in roles):
+   158|             for b in self.roles[role]['backends_groups']:
+   159|                 for g in self.roles[role]['backends_groups'][b]:
+   160|                     if b not in groups:
+   161|                         notroles.add(role)
+   162|                         return False
+   163|                     if g not in groups[b]:
+   164|                         notroles.add(role)
+   165|                         return False
+   166|         for b in self.roles[role]['backends_groups']:
+   167|             if b not in usedgroups:
+   168|                 usedgroups[b] = Set([])
+   169|             for g in self.roles[role]['backends_groups'][b]:
+   170|                 usedgroups[b].add(g)
+   171|         flag = True
+   172|         for subrole in self.roles[role]['subroles']:
+   173|             flag = flag and not \
+   174|                 self._check_member(
+   175|                     subrole,
+   176|                     groups,
+   177|                     notroles,
+   178|                     roles,
+   179|                     parentroles,
+   180|                     usedgroups,
+   181|                     )
+   182|         if flag:
+   183|             roles.add(role)
+   184|         else:
+   185|             if role in roles:
+   186|                 roles.remove(role)
+   187|             parentroles.add(role)
+   188|         return True
+   189|     def get_groups_to_remove(self, current_roles, roles_to_remove):
+   190|         """get groups to remove from list of
+   191|         roles to remove and current roles
+   192|         """
+   193|         current_roles = Set(current_roles)
+   194|         ret = {}
+   195|         roles_to_remove = Set(roles_to_remove)
+   196|         tmp = Set([])
+   197|         for r in roles_to_remove:
+   198|             for sr in self._get_subroles(r):
+   199|                 if sr not in roles_to_remove and sr in current_roles:
+   200|                     tmp.add(sr)
+   201|         roles_to_remove = roles_to_remove.union(tmp)
+   202|         roles = current_roles.difference(Set(roles_to_remove))
+   203|         groups_roles = self._get_groups(roles)
+   204|         groups_roles_to_remove = self._get_groups(roles_to_remove)
+   205|         for b in groups_roles_to_remove:
+   206|             if b in groups_roles:
+   207|                 groups_roles_to_remove[b] = \
+   208|                     groups_roles_to_remove[b].difference(groups_roles[b])
+   209|         return groups_roles_to_remove
+   210|     def _get_groups(self, roles):
+   211|         ret = {}
+   212|         for r in roles:
+   213|             for b in self.flatten[r]['backends_groups']:
+   214|                 groups = self.flatten[r]['backends_groups'][b]
+   215|                 if b not in ret:
+   216|                     ret[b] = Set(groups)
+   217|                 ret[b] = ret[b].union(Set(groups))
+   218|         return ret
+   219|     def _get_subroles(self, role):
+   220|         ret = Set([])
+   221|         for sr in self.graph[role]['sub_roles']:
+   222|             tmp = self._get_subroles(sr)
+   223|             tmp.add(sr)
+   224|             ret = ret.union(tmp)
+   225|         return ret
+   226|     def get_roles(self, groups):
+   227|         """get list of roles and list of standalone groups"""
+   228|         roles = Set([])
+   229|         parentroles = Set([])
+   230|         notroles = Set([])
+   231|         tmp = Set([])
+   232|         usedgroups = {}
+   233|         unusedgroups = {}
+   234|         ret = {}
+   235|         for role in self.roles:
+   236|             if self._check_member(
+   237|                     role, groups, notroles,
+   238|                     tmp, parentroles, usedgroups):
+   239|                 roles.add(role)
+   240|         for b in groups:
+   241|             for g in groups[b]:
+   242|                 if b not in usedgroups or g not in usedgroups[b]:
+   243|                     if b not in unusedgroups:
+   244|                         unusedgroups[b] = Set([])
+   245|                     unusedgroups[b].add(g)
+   246|         ret['roles'] = roles
+   247|         ret['unusedgroups'] = unusedgroups
+   248|         return ret
+   249|     def get_allroles(self):
+   250|         """get the list of roles"""
+   251|         return self.flatten.keys()
+   252|     def get_display_name(self, role):
+   253|         """get the display name of a role"""
+   254|         if role not in self.flatten:
+   255|             raise MissingRole(role)
+   256|         return self.flatten[role]['display_name']
+   257|     def get_groups(self, roles):
+   258|         """get the list of groups from role"""
+   259|         ret = {}
+   260|         for role in roles:
+   261|             if role not in self.flatten:
+   262|                 raise MissingRole(role)
+   263|             for b in self.flatten[role]['backends_groups']:
+   264|                 if b not in ret:
+
+
+# ====================================================================
+# FILE: ldapcherry/version.py
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-1 ---
+     1| version = '0.5.2'
+
+
+# ====================================================================
+# FILE: setup.py
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 1-41 ---
+     1| import os
+     2| import re
+     3| import sys
+     4| from distutils.core import setup, run_setup
+     5| sysconfdir = os.getenv("SYSCONFDIR", "/etc")
+     6| datarootdir = os.getenv("DATAROOTDIR", os.path.join(sys.prefix, 'share'))
+     7| data_dir = os.path.join(datarootdir, 'ldapcherry')
+     8| config_dir = os.path.join(sysconfdir, 'ldapcherry')
+     9| small_description = 'A simple web application to manage Ldap entries'
+    10| sys.path.append('ldapcherry/')
+    11| from version import version
+    12| if sys.version_info[0] == 2:
+    13|     install_requires = [
+    14|         'CherryPy >= 3.0.0',
+    15|         'python-ldap',
+    16|         'PyYAML',
+    17|         'Mako'
+    18|         ],
+    19| elif sys.version_info[0] == 3:
+    20|     print('unsupported version')
+    21|     exit(1)
+    22| else:
+    23|     print('unsupported version')
+    24|     exit(1)
+    25| try:
+    26|     f = open(os.path.join(os.path.dirname(__file__), 'README.rst'))
+    27|     description = f.read()
+    28|     f.close()
+    29| except IOError:
+    30|     description = small_description
+    31| try:
+    32|     license = open('LICENSE').read()
+    33| except IOError:
+    34|     license = 'MIT'
+    35| try:
+    36|     from setuptools import setup
+    37|     from setuptools.command.test import test as TestCommand
+    38|     class PyTest(TestCommand):
+    39|         def finalize_options(self):
+    40|             TestCommand.finalize_options(self)
+    41|             self.test_args = []
+
+# --- HUNK 2: Lines 73-116 ---
+    73|                     config_dir,
+    74|                     [
+    75|                         'conf/ldapcherry.ini',
+    76|                         'conf/attributes.yml',
+    77|                         'conf/roles.yml'
+    78|                     ]
+    79|                 )
+    80|                 )
+    81| setup(
+    82|     name='ldapcherry',
+    83|     zip_safe=False,
+    84|     version=version,
+    85|     author='Pierre-Francois Carpentier',
+    86|     author_email='carpentier.pf@gmail.com',
+    87|     packages=[
+    88|         'ldapcherry',
+    89|         'ldapcherry.backend',
+    90|         'ldapcherry.ppolicy'
+    91|         ],
+    92|     data_files=resources_files,
+    93|     scripts=['scripts/ldapcherryd'],
+    94|     url='https://github.com/kakwa/ldapcherry',
+    95|     license=license,
+    96|     description=small_description,
+    97|     long_description=description,
+    98|     install_requires=install_requires,
+    99|     tests_require=['pytest', 'pep8'],
+   100|     cmdclass={'test': PyTest},
+   101|     classifiers=[
+   102|         'Development Status :: 3 - Alpha',
+   103|         'Environment :: Web Environment',
+   104|         'Framework :: CherryPy',
+   105|         'Intended Audience :: System Administrators',
+   106|         'License :: OSI Approved :: MIT License',
+   107|         'Natural Language :: English',
+   108|         'Operating System :: POSIX',
+   109|         'Programming Language :: Python',
+   110|         'Programming Language :: Python :: 2.7',
+   111|         "Topic :: System :: Systems Administration"
+   112|         " :: Authentication/Directory :: LDAP",
+   113|         "Topic :: System :: Systems Administration"
+   114|         " :: Authentication/Directory",
+   115|         ],
+   116| )
+

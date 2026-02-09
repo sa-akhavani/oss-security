@@ -1,0 +1,386 @@
+# ====================================================================
+# FILE: gogs.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-30 ---
+     1| package main
+     2| import (
+     3| 	"os"
+     4| 	"github.com/urfave/cli"
+     5| 	log "unknwon.dev/clog/v2"
+     6| 	"gogs.io/gogs/internal/cmd"
+     7| 	"gogs.io/gogs/internal/conf"
+     8| )
+     9| func init() {
+    10| 	conf.App.Version = "0.12.9"
+    11| }
+    12| func main() {
+    13| 	app := cli.NewApp()
+    14| 	app.Name = "Gogs"
+    15| 	app.Usage = "A painless self-hosted Git service"
+    16| 	app.Version = conf.App.Version
+    17| 	app.Commands = []cli.Command{
+    18| 		cmd.Web,
+    19| 		cmd.Serv,
+    20| 		cmd.Hook,
+    21| 		cmd.Cert,
+    22| 		cmd.Admin,
+    23| 		cmd.Import,
+    24| 		cmd.Backup,
+    25| 		cmd.Restore,
+    26| 	}
+    27| 	if err := app.Run(os.Args); err != nil {
+    28| 		log.Fatal("Failed to start application: %v", err)
+    29| 	}
+    30| }
+
+
+# ====================================================================
+# FILE: internal/db/pull.go
+# Total hunks: 2
+# ====================================================================
+# --- HUNK 1: Lines 461-500 ---
+   461| 	has, err := e.Get(pr)
+   462| 	if err != nil {
+   463| 		return nil, err
+   464| 	} else if !has {
+   465| 		return nil, ErrPullRequestNotExist{args: map[string]interface{}{"issueID": issueID}}
+   466| 	}
+   467| 	return pr, pr.loadAttributes(e)
+   468| }
+   469| func GetPullRequestByIssueID(issueID int64) (*PullRequest, error) {
+   470| 	return getPullRequestByIssueID(x, issueID)
+   471| }
+   472| func (pr *PullRequest) Update() error {
+   473| 	_, err := x.Id(pr.ID).AllCols().Update(pr)
+   474| 	return err
+   475| }
+   476| func (pr *PullRequest) UpdateCols(cols ...string) error {
+   477| 	_, err := x.Id(pr.ID).Cols(cols...).Update(pr)
+   478| 	return err
+   479| }
+   480| func (pr *PullRequest) UpdatePatch() (err error) {
+   481| 	headGitRepo, err := git.Open(pr.HeadRepo.RepoPath())
+   482| 	if err != nil {
+   483| 		return fmt.Errorf("open repository: %v", err)
+   484| 	}
+   485| 	tmpRemote := com.ToStr(time.Now().UnixNano())
+   486| 	baseRepoPath := RepoPath(pr.BaseRepo.MustOwner().Name, pr.BaseRepo.Name)
+   487| 	err = headGitRepo.AddRemote(tmpRemote, baseRepoPath, git.AddRemoteOptions{Fetch: true})
+   488| 	if err != nil {
+   489| 		return fmt.Errorf("add remote %q [repo_id: %d]: %v", tmpRemote, pr.HeadRepoID, err)
+   490| 	}
+   491| 	defer func() {
+   492| 		if err := headGitRepo.RemoveRemote(tmpRemote); err != nil {
+   493| 			log.Error("Failed to remove remote %q [repo_id: %d]: %v", tmpRemote, pr.HeadRepoID, err)
+   494| 		}
+   495| 	}()
+   496| 	remoteBranch := "remotes/" + tmpRemote + "/" + pr.BaseBranch
+   497| 	pr.MergeBase, err = headGitRepo.MergeBase(remoteBranch, pr.HeadBranch)
+   498| 	if err != nil {
+   499| 		return fmt.Errorf("get merge base: %v", err)
+   500| 	} else if err = pr.Update(); err != nil {
+
+# --- HUNK 2: Lines 566-609 ---
+   566| 		return fmt.Errorf("find issues: %v", err)
+   567| 	}
+   568| 	for i := range issues {
+   569| 		set[issues[i].ID] = issues[i]
+   570| 	}
+   571| 	for i := range prs {
+   572| 		prs[i].Issue = set[prs[i].IssueID]
+   573| 	}
+   574| 	for i := range prs {
+   575| 		if err = prs[i].loadAttributes(e); err != nil {
+   576| 			return fmt.Errorf("loadAttributes [%d]: %v", prs[i].ID, err)
+   577| 		}
+   578| 	}
+   579| 	return nil
+   580| }
+   581| func (prs PullRequestList) LoadAttributes() error {
+   582| 	return prs.loadAttributes(x)
+   583| }
+   584| func addHeadRepoTasks(prs []*PullRequest) {
+   585| 	for _, pr := range prs {
+   586| 		if pr.HeadRepo == nil {
+   587| 			log.Trace("addHeadRepoTasks[%d]: missing head repository", pr.ID)
+   588| 			continue
+   589| 		}
+   590| 		log.Trace("addHeadRepoTasks[%d]: composing new test task", pr.ID)
+   591| 		if err := pr.UpdatePatch(); err != nil {
+   592| 			log.Error("UpdatePatch: %v", err)
+   593| 			continue
+   594| 		} else if err := pr.PushToBaseRepo(); err != nil {
+   595| 			log.Error("PushToBaseRepo: %v", err)
+   596| 			continue
+   597| 		}
+   598| 		pr.AddToTaskQueue()
+   599| 	}
+   600| }
+   601| func AddTestPullRequestTask(doer *User, repoID int64, branch string, isSync bool) {
+   602| 	log.Trace("AddTestPullRequestTask [head_repo_id: %d, head_branch: %s]: finding pull requests", repoID, branch)
+   603| 	prs, err := GetUnmergedPullRequestsByHeadInfo(repoID, branch)
+   604| 	if err != nil {
+   605| 		log.Error("Find pull requests [head_repo_id: %d, head_branch: %s]: %v", repoID, branch, err)
+   606| 		return
+   607| 	}
+   608| 	if isSync {
+   609| 		if err = PullRequestList(prs).LoadAttributes(); err != nil {
+
+
+# ====================================================================
+# FILE: internal/db/repo.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 690-730 ---
+   690| 			return repo, fmt.Errorf("cleanUpMigrateGitConfig.(wiki): %v", err)
+   691| 		}
+   692| 	}
+   693| 	return repo, UpdateRepository(repo, false)
+   694| }
+   695| func initRepoCommit(tmpPath string, sig *git.Signature) (err error) {
+   696| 	var stderr string
+   697| 	if _, stderr, err = process.ExecDir(-1,
+   698| 		tmpPath, fmt.Sprintf("initRepoCommit (git add): %s", tmpPath),
+   699| 		"git", "add", "--all"); err != nil {
+   700| 		return fmt.Errorf("git add: %s", stderr)
+   701| 	}
+   702| 	if _, stderr, err = process.ExecDir(-1,
+   703| 		tmpPath, fmt.Sprintf("initRepoCommit (git commit): %s", tmpPath),
+   704| 		"git", "commit", fmt.Sprintf("--author='%s <%s>'", sig.Name, sig.Email),
+   705| 		"-m", "Initial commit"); err != nil {
+   706| 		return fmt.Errorf("git commit: %s", stderr)
+   707| 	}
+   708| 	if _, stderr, err = process.ExecDir(-1,
+   709| 		tmpPath, fmt.Sprintf("initRepoCommit (git push): %s", tmpPath),
+   710| 		"git", "push"); err != nil {
+   711| 		return fmt.Errorf("git push: %s", stderr)
+   712| 	}
+   713| 	return nil
+   714| }
+   715| type CreateRepoOptions struct {
+   716| 	Name        string
+   717| 	Description string
+   718| 	Gitignores  string
+   719| 	License     string
+   720| 	Readme      string
+   721| 	IsPrivate   bool
+   722| 	IsMirror    bool
+   723| 	AutoInit    bool
+   724| }
+   725| func getRepoInitFile(tp, name string) ([]byte, error) {
+   726| 	relPath := path.Join("conf", tp, strings.TrimLeft(path.Clean("/"+name), "/"))
+   727| 	customPath := filepath.Join(conf.CustomDir(), relPath)
+   728| 	if osutil.IsFile(customPath) {
+   729| 		return ioutil.ReadFile(customPath)
+   730| 	}
+
+
+# ====================================================================
+# FILE: internal/db/repo_editor.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 324-368 ---
+   324| 		if IsErrUploadNotExist(err) {
+   325| 			return nil
+   326| 		}
+   327| 		return fmt.Errorf("get upload by UUID[%s]: %v", uuid, err)
+   328| 	}
+   329| 	if err := DeleteUpload(upload); err != nil {
+   330| 		return fmt.Errorf("delete upload: %v", err)
+   331| 	}
+   332| 	return nil
+   333| }
+   334| type UploadRepoFileOptions struct {
+   335| 	LastCommitID string
+   336| 	OldBranch    string
+   337| 	NewBranch    string
+   338| 	TreePath     string
+   339| 	Message      string
+   340| 	Files        []string // In UUID format
+   341| }
+   342| func isRepositoryGitPath(path string) bool {
+   343| 	return strings.HasSuffix(path, ".git") ||
+   344| 		strings.Contains(path, ".git/") ||
+   345| 		strings.Contains(path, `.git\`) ||
+   346| 		strings.HasSuffix(path, ".git.") ||
+   347| 		strings.Contains(path, ".git./") ||
+   348| 		strings.Contains(path, `.git.\`)
+   349| }
+   350| func (repo *Repository) UploadRepoFiles(doer *User, opts UploadRepoFileOptions) error {
+   351| 	if len(opts.Files) == 0 {
+   352| 		return nil
+   353| 	}
+   354| 	if isRepositoryGitPath(opts.TreePath) {
+   355| 		return errors.Errorf("bad tree path %q", opts.TreePath)
+   356| 	}
+   357| 	uploads, err := GetUploadsByUUIDs(opts.Files)
+   358| 	if err != nil {
+   359| 		return fmt.Errorf("get uploads by UUIDs[%v]: %v", opts.Files, err)
+   360| 	}
+   361| 	repoWorkingPool.CheckIn(com.ToStr(repo.ID))
+   362| 	defer repoWorkingPool.CheckOut(com.ToStr(repo.ID))
+   363| 	if err = repo.DiscardLocalRepoBranchChanges(opts.OldBranch); err != nil {
+   364| 		return fmt.Errorf("discard local repo branch[%s] changes: %v", opts.OldBranch, err)
+   365| 	} else if err = repo.UpdateLocalCopyBranch(opts.OldBranch); err != nil {
+   366| 		return fmt.Errorf("update local copy branch[%s]: %v", opts.OldBranch, err)
+   367| 	}
+   368| 	if opts.OldBranch != opts.NewBranch {
+
+
+# ====================================================================
+# FILE: internal/pathutil/pathutil.go
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-9 ---
+     1| package pathutil
+     2| import (
+     3| 	"path"
+     4| 	"strings"
+     5| )
+     6| func Clean(p string) string {
+     7| 	p = strings.ReplaceAll(p, `\`, "/")
+     8| 	return strings.Trim(path.Clean("/"+p), "/")
+     9| }
+
+
+# ====================================================================
+# FILE: internal/route/repo/http.go
+# Total hunks: 3
+# ====================================================================
+# --- HUNK 1: Lines 1-39 ---
+     1| package repo
+     2| import (
+     3| 	"bytes"
+     4| 	"compress/gzip"
+     5| 	"fmt"
+     6| 	"net/http"
+     7| 	"os"
+     8| 	"os/exec"
+     9| 	"path"
+    10| 	"path/filepath"
+    11| 	"strconv"
+    12| 	"strings"
+    13| 	"time"
+    14| 	"gopkg.in/macaron.v1"
+    15| 	log "unknwon.dev/clog/v2"
+    16| 	"gogs.io/gogs/internal/conf"
+    17| 	"gogs.io/gogs/internal/db"
+    18| 	"gogs.io/gogs/internal/lazyregexp"
+    19| 	"gogs.io/gogs/internal/pathutil"
+    20| 	"gogs.io/gogs/internal/tool"
+    21| )
+    22| type HTTPContext struct {
+    23| 	*macaron.Context
+    24| 	OwnerName string
+    25| 	OwnerSalt string
+    26| 	RepoID    int64
+    27| 	RepoName  string
+    28| 	AuthUser  *db.User
+    29| }
+    30| func askCredentials(c *macaron.Context, status int, text string) {
+    31| 	c.Header().Set("WWW-Authenticate", "Basic realm=\".\"")
+    32| 	c.Error(status, text)
+    33| }
+    34| func HTTPContexter() macaron.Handler {
+    35| 	return func(c *macaron.Context) {
+    36| 		if len(conf.HTTP.AccessControlAllowOrigin) > 0 {
+    37| 			c.Header().Set("Access-Control-Allow-Origin", conf.HTTP.AccessControlAllowOrigin)
+    38| 			c.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, User-Agent")
+    39| 			if c.Req.Method == "OPTIONS" {
+
+# --- HUNK 2: Lines 61-101 ---
+    61| 		if err != nil {
+    62| 			if db.IsErrRepoNotExist(err) {
+    63| 				c.Status(http.StatusNotFound)
+    64| 			} else {
+    65| 				c.Status(http.StatusInternalServerError)
+    66| 				log.Error("Failed to get repository [owner_id: %d, name: %s]: %v", owner.ID, repoName, err)
+    67| 			}
+    68| 			return
+    69| 		}
+    70| 		if isPull && !repo.IsPrivate && !conf.Auth.RequireSigninView {
+    71| 			c.Map(&HTTPContext{
+    72| 				Context: c,
+    73| 			})
+    74| 			return
+    75| 		}
+    76| 		action := c.Params("*")
+    77| 		if !strings.Contains(action, "git-") &&
+    78| 			!strings.Contains(action, "info/") &&
+    79| 			!strings.Contains(action, "HEAD") &&
+    80| 			!strings.Contains(action, "objects/") {
+    81| 			c.Error(http.StatusBadRequest, fmt.Sprintf("Unrecognized action %q", action))
+    82| 			return
+    83| 		}
+    84| 		authHead := c.Req.Header.Get("Authorization")
+    85| 		if len(authHead) == 0 {
+    86| 			askCredentials(c, http.StatusUnauthorized, "")
+    87| 			return
+    88| 		}
+    89| 		auths := strings.Fields(authHead)
+    90| 		if len(auths) != 2 || auths[0] != "Basic" {
+    91| 			askCredentials(c, http.StatusUnauthorized, "")
+    92| 			return
+    93| 		}
+    94| 		authUsername, authPassword, err := tool.BasicAuthDecode(auths[1])
+    95| 		if err != nil {
+    96| 			askCredentials(c, http.StatusUnauthorized, "")
+    97| 			return
+    98| 		}
+    99| 		authUser, err := db.Users.Authenticate(authUsername, authPassword, -1)
+   100| 		if err != nil && !db.IsErrUserNotExist(err) {
+   101| 			c.Status(http.StatusInternalServerError)
+
+# --- HUNK 3: Lines 315-364 ---
+   315| 		dir += ".git"
+   316| 	}
+   317| 	filename := filepath.Join(conf.Repository.Root, dir)
+   318| 	if _, err := os.Stat(filename); os.IsNotExist(err) {
+   319| 		return "", err
+   320| 	}
+   321| 	return filename, nil
+   322| }
+   323| func HTTP(c *HTTPContext) {
+   324| 	for _, route := range routes {
+   325| 		reqPath := strings.ToLower(c.Req.URL.Path)
+   326| 		m := route.re.FindStringSubmatch(reqPath)
+   327| 		if m == nil {
+   328| 			continue
+   329| 		}
+   330| 		if conf.Repository.DisableHTTPGit {
+   331| 			c.Error(http.StatusForbidden, "Interacting with repositories by HTTP protocol is disabled")
+   332| 			return
+   333| 		}
+   334| 		if route.method != c.Req.Method {
+   335| 			c.Error(http.StatusNotFound)
+   336| 			return
+   337| 		}
+   338| 		cleaned := pathutil.Clean(m[1])
+   339| 		if m[1] != "/"+cleaned {
+   340| 			c.Error(http.StatusBadRequest, "Request path contains suspicious characters")
+   341| 			return
+   342| 		}
+   343| 		file := strings.TrimPrefix(reqPath, cleaned)
+   344| 		dir, err := getGitRepoPath(cleaned)
+   345| 		if err != nil {
+   346| 			log.Warn("HTTP.getGitRepoPath: %v", err)
+   347| 			c.Error(http.StatusNotFound)
+   348| 			return
+   349| 		}
+   350| 		route.handler(serviceHandler{
+   351| 			w:    c.Resp,
+   352| 			r:    c.Req.Request,
+   353| 			dir:  dir,
+   354| 			file: file,
+   355| 			authUser:  c.AuthUser,
+   356| 			ownerName: c.OwnerName,
+   357| 			ownerSalt: c.OwnerSalt,
+   358| 			repoID:    c.RepoID,
+   359| 			repoName:  c.RepoName,
+   360| 		})
+   361| 		return
+   362| 	}
+   363| 	c.Error(http.StatusNotFound)
+   364| }
+

@@ -1,0 +1,198 @@
+# ====================================================================
+# FILE: packages/app/src/TransformRequest/MultipartFormDataTransform.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-51 ---
+     1| import {randomBytes} from "crypto";
+     2| import {tmpdir} from "os";
+     3| import {join} from "path";
+     4| import {createWriteStream} from "fs";
+     5| import {QueryString} from "@bunt/util";
+     6| import busboy from "busboy";
+     7| import {Defer} from "@bunt/async";
+     8| import {IRequest} from "../interfaces.js";
+     9| export const MultipartFormDataTransform = async <T = unknown>(request: IRequest): Promise<T> => {
+    10|     request.headers.assert("Content-Type", (value) => value.startsWith("multipart/form-data"));
+    11|     const bb = busboy({
+    12|         headers: request.headers.toJSON(),
+    13|         defCharset: "utf-8",
+    14|         defParamCharset: "utf-8",
+    15|     });
+    16|     const rs = await request.createReadableStream();
+    17|     const defer = new Defer<void>();
+    18|     const pending: Defer<void>[] = [];
+    19|     const qs = new QueryString();
+    20|     bb
+    21|         .on("file", (name, file, info) => {
+    22|             const {encoding, filename, mimeType} = info;
+    23|             const tmpname = join(
+    24|                 tmpdir(),
+    25|                 `${randomBytes(4).toString("hex")}-${Buffer.from(filename, "utf-8").toString("hex")}`,
+    26|             );
+    27|             const value = {
+    28|                 filename,
+    29|                 encoding,
+    30|                 mimeType,
+    31|                 tmpname,
+    32|             };
+    33|             qs.push(name, value);
+    34|             const def = new Defer<void>();
+    35|             pending.push(def);
+    36|             file
+    37|                 .pipe(createWriteStream(tmpname))
+    38|                 .on("close", () => def.resolve());
+    39|         })
+    40|         .on("field", (name, value) => {
+    41|             try {
+    42|                 qs.push(name, JSON.parse(value));
+    43|             } catch {
+    44|             }
+    45|         })
+    46|         .on("close", () => defer.resolve());
+    47|     rs.pipe(bb);
+    48|     await defer;
+    49|     await Promise.all(pending);
+    50|     return qs.toObject();
+    51| };
+
+
+# ====================================================================
+# FILE: packages/util/src/qs.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 1-32 ---
+     1| import {Rec} from "@bunt/type";
+     2| const isNumeric = (key: string): boolean => !isNaN(+key);
+     3| export class QueryString {
+     4|     readonly #value: Rec;
+     5|     constructor(entries: [field: string, value: unknown][] = []) {
+     6|         this.#value = Object.create(null);
+     7|         for (const [field, value] of entries) {
+     8|             this.push(field, value);
+     9|         }
+    10|     }
+    11|     public parseField(name: string): string[] {
+    12|         const base = name.replace(/\[.+/, "");
+    13|         return [base, ...[...name.matchAll(/\[([^\]]*)\]/ig)].map(([, key]) => key)];
+    14|     }
+    15|     public push(name: string, value: unknown): Rec {
+    16|         return this.#inject(this.parseField(name), value, this.#value);
+    17|     }
+    18|     public toObject(): Rec {
+    19|         return this.#value;
+    20|     }
+    21|     #inject = ([key, ...paths]: string[], value: unknown, fields: Rec = Object.create(null)): Rec => {
+    22|         if (paths.length > 0) {
+    23|             fields[key] = this.#inject(paths, value, fields[key]);
+    24|         } else {
+    25|             fields[key] = value;
+    26|         }
+    27|         if (isNumeric(key)) {
+    28|             return Object.values(fields);
+    29|         }
+    30|         return fields;
+    31|     };
+    32| }
+
+
+# ====================================================================
+# FILE: packages/web/src/Transport/Response/DownloadResponse.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 12-58 ---
+    12|     mimeType: string;
+    13|     source: DownloadSource;
+    14|     size: number;
+    15| };
+    16| type DownloadOptionsAuth = {
+    17|     filename: string;
+    18|     mimeType: string;
+    19|     source: DownloadSource;
+    20|     size?: number;
+    21| };
+    22| export class DownloadResponse extends ResponseAbstract<Readable> {
+    23|     constructor(options: DownloadOptionsAuth) {
+    24|         super(...createOptions(options));
+    25|     }
+    26|     public serialize(source: Readable): Readable {
+    27|         return source;
+    28|     }
+    29| }
+    30| function createHeaders(options: DownloadOptions): Record<string, string> {
+    31|     const size = options.size;
+    32|     const attributes = [
+    33|         "attachment",
+    34|         `filename="${encodeURI(options.filename)}"`,
+    35|         `filename*=utf-8''${encodeURI(options.filename)}`,
+    36|     ];
+    37|     const headers: Record<string, string> = {
+    38|         "Content-Disposition": attributes.join("; "),
+    39|         "Content-Length": size.toString(),
+    40|         "Content-Type": options.mimeType,
+    41|     };
+    42|     return headers;
+    43| }
+    44| function factoryReadableStream(source: string | Readable): Readable {
+    45|     if (isString(source)) {
+    46|         return createReadStream(source);
+    47|     }
+    48|     return source;
+    49| }
+    50| function createOptions(options: DownloadOptionsAuth): ResponseArgs<Readable> {
+    51|     const {size} = options;
+    52|     if (isUndefined(size)) {
+    53|         return createTemporarySource(options);
+    54|     }
+    55|     const readable = factoryReadableStream(options.source);
+    56|     return [readable, {headers: createHeaders({...options, size})}];
+    57| }
+    58| function createTemporarySource(options: DownloadOptionsAuth): ResponseArgs<Readable> {
+
+
+# ====================================================================
+# FILE: packages/web/src/Transport/Response/ResponseAbstract.ts
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 19-59 ---
+    19|     body: string | Buffer | Readable;
+    20|     headers: Record<string, string>;
+    21|     cookies: Cookie[];
+    22| }
+    23| export abstract class ResponseAbstract<T> {
+    24|     public readonly code: number = 200;
+    25|     public readonly status?: string;
+    26|     public readonly type: string = "text/plain";
+    27|     public readonly encoding: string = "utf-8";
+    28|     readonly #cookies = new Map<string, Cookie>();
+    29|     readonly #headers: Promisify<{[key: string]: string}>;
+    30|     #response: Promisify<T>;
+    31|     constructor(...[response, options = {}]: ResponseArgs<T>) {
+    32|         this.#response = isFunction(response) ? response() : response;
+    33|         const {code, status, headers} = options;
+    34|         if (isNumber(code) && code > 0) {
+    35|             this.code = code;
+    36|         }
+    37|         this.status = status;
+    38|         if (!this.status) {
+    39|             const suggest = Reflect.get(HTTP, this.code.toString());
+    40|             this.status = isString(suggest) ? suggest : "Unknown";
+    41|         }
+    42|         if (isInstanceOf(headers, Headers)) {
+    43|             this.#headers = headers.toJSON();
+    44|         } else {
+    45|             this.#headers = headers || {};
+    46|         }
+    47|     }
+    48|     public get cookies(): Cookie[] {
+    49|         return [...this.#cookies.values()];
+    50|     }
+    51|     public setContent(data: Promisify<T>): void {
+    52|         this.#response = data;
+    53|     }
+    54|     public setCookie(name: string, value: string, options: CookieOptions): void {
+    55|         this.#cookies.set(name, new Cookie(name, value, options));
+    56|     }
+    57|     public hasCookie(name: string): boolean {
+    58|         return this.#cookies.has(name);
+    59|     }
+

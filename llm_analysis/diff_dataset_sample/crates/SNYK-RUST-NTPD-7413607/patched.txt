@@ -1,0 +1,376 @@
+# ====================================================================
+# FILE: ntpd/src/daemon/config/server.rs
+# Total hunks: 1
+# ====================================================================
+# --- HUNK 1: Lines 96-146 ---
+    96|     fn try_from(value: &str) -> Result<Self, Self::Error> {
+    97|         Ok(ServerConfig {
+    98|             listen: SocketAddr::from_str(value)?,
+    99|             denylist: FilterList::default_denylist(),
+   100|             allowlist: FilterList::default_allowlist(),
+   101|             rate_limiting_cache_size: Default::default(),
+   102|             rate_limiting_cutoff: Default::default(),
+   103|         })
+   104|     }
+   105| }
+   106| #[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
+   107| #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+   108| pub struct NtsKeConfig {
+   109|     pub certificate_chain_path: PathBuf,
+   110|     pub private_key_path: PathBuf,
+   111|     #[serde(default)]
+   112|     #[cfg(feature = "unstable_nts-pool")]
+   113|     pub authorized_pool_server_certificates: Vec<PathBuf>,
+   114|     #[serde(default = "default_nts_ke_timeout")]
+   115|     pub key_exchange_timeout_ms: u64,
+   116|     #[serde(default = "default_concurrent_connections")]
+   117|     pub concurrent_connections: usize,
+   118|     pub listen: SocketAddr,
+   119|     pub ntp_port: Option<u16>,
+   120|     pub ntp_server: Option<String>,
+   121| }
+   122| fn default_nts_ke_timeout() -> u64 {
+   123|     1000
+   124| }
+   125| fn default_concurrent_connections() -> usize {
+   126|     512
+   127| }
+   128| #[cfg(test)]
+   129| mod tests {
+   130|     use super::*;
+   131|     #[test]
+   132|     fn test_deserialize_server() {
+   133|         #[derive(Deserialize, Debug)]
+   134|         struct TestConfig {
+   135|             server: ServerConfig,
+   136|         }
+   137|         let test: TestConfig = toml::from_str(
+   138|             r#"
+   139|             [server]
+   140|             listen = "0.0.0.0:123"
+   141|             "#,
+   142|         )
+   143|         .unwrap();
+   144|         assert_eq!(test.server.listen, "0.0.0.0:123".parse().unwrap());
+   145|         assert_eq!(test.server.allowlist.filter, IpFilter::all());
+   146|         assert_eq!(test.server.allowlist.action, FilterAction::Ignore);
+
+
+# ====================================================================
+# FILE: ntpd/src/daemon/keyexchange.rs
+# Total hunks: 4
+# ====================================================================
+# --- HUNK 1: Lines 1-40 ---
+     1| use std::{
+     2|     future::Future,
+     3|     io::{BufRead, BufReader, IoSlice, Read, Write},
+     4|     ops::ControlFlow,
+     5|     path::Path,
+     6|     pin::Pin,
+     7|     sync::Arc,
+     8|     task::{Context, Poll},
+     9| };
+    10| use libc::{ECONNABORTED, EMFILE, ENFILE, ENOBUFS, ENOMEM};
+    11| use ntp_proto::{
+    12|     KeyExchangeClient, KeyExchangeError, KeyExchangeResult, KeyExchangeServer, KeySet,
+    13| };
+    14| use rustls::{Certificate, PrivateKey};
+    15| use tokio::{
+    16|     io::{AsyncRead, AsyncWrite, ReadBuf},
+    17|     net::TcpListener,
+    18|     task::JoinHandle,
+    19| };
+    20| use tracing::{debug, error};
+    21| use super::config::NtsKeConfig;
+    22| use super::exitcode;
+    23| fn build_client_config(
+    24|     extra_certificates: &[Certificate],
+    25| ) -> Result<rustls::ClientConfig, KeyExchangeError> {
+    26|     let mut roots = rustls::RootCertStore::empty();
+    27|     for cert in rustls_native_certs::load_native_certs()? {
+    28|         let cert = rustls::Certificate(cert.0);
+    29|         roots.add(&cert).map_err(KeyExchangeError::Certificate)?;
+    30|     }
+    31|     for cert in extra_certificates {
+    32|         roots.add(cert).map_err(KeyExchangeError::Certificate)?;
+    33|     }
+    34|     Ok(rustls::ClientConfig::builder()
+    35|         .with_safe_defaults()
+    36|         .with_root_certificates(roots)
+    37|         .with_no_client_auth())
+    38| }
+    39| pub(crate) async fn key_exchange_client(
+    40|     server_name: String,
+
+# --- HUNK 2: Lines 128-239 ---
+   128|         .with_safe_defaults()
+   129|         .with_client_cert_verifier(Arc::new(
+   130|             #[cfg(not(feature = "unstable_nts-pool"))]
+   131|             rustls::server::NoClientAuth,
+   132|             #[cfg(feature = "unstable_nts-pool")]
+   133|             ntp_proto::tls_utils::AllowAnyAnonymousOrCertificateBearingClient,
+   134|         ))
+   135|         .with_single_cert(certificate_chain, private_key)
+   136|         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+   137|     config.alpn_protocols.clear();
+   138|     config.alpn_protocols.push(b"ntske/1".to_vec());
+   139|     Ok(Arc::new(config))
+   140| }
+   141| async fn key_exchange_server(
+   142|     keyset: tokio::sync::watch::Receiver<Arc<KeySet>>,
+   143|     ke_config: NtsKeConfig,
+   144|     certificate_chain: Vec<Certificate>,
+   145|     pool_certs: Vec<Certificate>,
+   146|     private_key: PrivateKey,
+   147| ) -> std::io::Result<()> {
+   148|     let config = build_server_config(certificate_chain, private_key)?;
+   149|     let pool_certs = Arc::<[_]>::from(pool_certs);
+   150|     let timeout = std::time::Duration::from_millis(ke_config.key_exchange_timeout_ms);
+   151|     loop {
+   152|         let listener = match TcpListener::bind(&ke_config.listen).await {
+   153|             Ok(listener) => listener,
+   154|             Err(e) => {
+   155|                 error!("Could not open network port for KE server: {}", e);
+   156|                 tokio::time::sleep(timeout).await;
+   157|                 continue;
+   158|             }
+   159|         };
+   160|         let connectionpermits = Arc::new(tokio::sync::Semaphore::new(
+   161|             ke_config.concurrent_connections,
+   162|         ));
+   163|         loop {
+   164|             let permit = match connectionpermits.clone().acquire_owned().await {
+   165|                 Ok(permit) => permit,
+   166|                 Err(e) => {
+   167|                     error!("Could not get ticket for new connection: {}", e);
+   168|                     tokio::time::sleep(timeout).await;
+   169|                     break;
+   170|                 }
+   171|             };
+   172|             let (stream, peer_addr) = match listener.accept().await {
+   173|                 Ok(a) => a,
+   174|                 Err(e) if matches!(e.raw_os_error(), Some(ECONNABORTED)) => {
+   175|                     debug!("Potential client-triggered accept error in NTS-KE: {}", e);
+   176|                     continue;
+   177|                 }
+   178|                 Err(e)
+   179|                     if matches!(
+   180|                         e.raw_os_error(),
+   181|                         Some(ENFILE) | Some(EMFILE) | Some(ENOMEM) | Some(ENOBUFS)
+   182|                     ) =>
+   183|                 {
+   184|                     error!("Out of resources in NTS-KE, consider raising limits or lowering max parallel connections: {}", e);
+   185|                     tokio::time::sleep(timeout).await;
+   186|                     continue;
+   187|                 }
+   188|                 Err(e) => {
+   189|                     error!("Could not accept NTS-KE connection: {}", e);
+   190|                     tokio::time::sleep(timeout).await;
+   191|                     break;
+   192|                 }
+   193|             };
+   194|             let config = config.clone();
+   195|             let keyset = keyset.borrow().clone();
+   196|             let pool_certs = pool_certs.clone();
+   197|             let ntp_port = ke_config.ntp_port;
+   198|             let ntp_server = ke_config.ntp_server.clone();
+   199|             let fut = async move {
+   200|                 BoundKeyExchangeServer::run(
+   201|                     stream,
+   202|                     config,
+   203|                     keyset,
+   204|                     ntp_port,
+   205|                     ntp_server.clone(),
+   206|                     pool_certs,
+   207|                 )
+   208|                 .await
+   209|                 .map_err(|ke_error| std::io::Error::new(std::io::ErrorKind::Other, ke_error))
+   210|             };
+   211|             tokio::spawn(async move {
+   212|                 match tokio::time::timeout(timeout, fut).await {
+   213|                     Err(_) => tracing::debug!(?peer_addr, "NTS KE timed out"),
+   214|                     Ok(Err(err)) => tracing::debug!(?err, ?peer_addr, "NTS KE failed"),
+   215|                     Ok(Ok(())) => tracing::debug!(?peer_addr, "NTS KE completed"),
+   216|                 }
+   217|                 drop(permit);
+   218|             });
+   219|         }
+   220|     }
+   221| }
+   222| pub(crate) struct BoundKeyExchangeClient<IO>
+   223| where
+   224|     IO: AsyncRead + AsyncWrite + Unpin,
+   225| {
+   226|     inner: Option<BoundKeyExchangeClientData<IO>>,
+   227| }
+   228| impl<IO> BoundKeyExchangeClient<IO>
+   229| where
+   230|     IO: AsyncRead + AsyncWrite + Unpin,
+   231| {
+   232|     pub fn new(
+   233|         io: IO,
+   234|         server_name: String,
+   235|         config: rustls::ClientConfig,
+   236|         denied_servers: impl IntoIterator<Item = String>,
+   237|     ) -> Result<Self, KeyExchangeError> {
+   238|         Ok(Self {
+   239|             inner: Some(BoundKeyExchangeClientData {
+
+# --- HUNK 3: Lines 558-713 ---
+   558|         let input = include_bytes!("../../test-keys/rsa_key.pem");
+   559|         let _ = private_key_from_bufread(input.as_slice()).unwrap().unwrap();
+   560|         let input = include_bytes!("../../test-keys/ec_key.pem");
+   561|         let _ = private_key_from_bufread(input.as_slice()).unwrap().unwrap();
+   562|         let input = include_bytes!("../../test-keys/pkcs8_key.pem");
+   563|         let _ = private_key_from_bufread(input.as_slice()).unwrap().unwrap();
+   564|     }
+   565|     #[tokio::test]
+   566|     async fn key_exchange_roundtrip() {
+   567|         let provider = KeySetProvider::new(1);
+   568|         let keyset = provider.get();
+   569|         #[cfg(feature = "unstable_nts-pool")]
+   570|         let pool_certs = ["testdata/certificates/nos-nl.pem"];
+   571|         let (_sender, keyset) = tokio::sync::watch::channel(keyset);
+   572|         let nts_ke_config = NtsKeConfig {
+   573|             certificate_chain_path: PathBuf::from("test-keys/end.fullchain.pem"),
+   574|             private_key_path: PathBuf::from("test-keys/end.key"),
+   575|             #[cfg(feature = "unstable_nts-pool")]
+   576|             authorized_pool_server_certificates: pool_certs.iter().map(PathBuf::from).collect(),
+   577|             key_exchange_timeout_ms: 1000,
+   578|             concurrent_connections: 512,
+   579|             listen: "0.0.0.0:5431".parse().unwrap(),
+   580|             ntp_port: None,
+   581|             ntp_server: None,
+   582|         };
+   583|         let _join_handle = spawn(nts_ke_config, keyset);
+   584|         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+   585|         let ca = include_bytes!("../../test-keys/testca.pem");
+   586|         let result = key_exchange_client(
+   587|             "localhost".to_string(),
+   588|             5431,
+   589|             &certificates_from_bufread(BufReader::new(Cursor::new(ca))),
+   590|         )
+   591|         .await
+   592|         .unwrap();
+   593|         assert_eq!(result.remote, "localhost");
+   594|         assert_eq!(result.port, 123);
+   595|     }
+   596|     #[tokio::test]
+   597|     async fn key_exchange_connection_limiter() {
+   598|         let provider = KeySetProvider::new(1);
+   599|         let keyset = provider.get();
+   600|         #[cfg(feature = "unstable_nts-pool")]
+   601|         let pool_certs = ["testdata/certificates/nos-nl.pem"];
+   602|         let (_sender, keyset) = tokio::sync::watch::channel(keyset);
+   603|         let nts_ke_config = NtsKeConfig {
+   604|             certificate_chain_path: PathBuf::from("test-keys/end.fullchain.pem"),
+   605|             private_key_path: PathBuf::from("test-keys/end.key"),
+   606|             #[cfg(feature = "unstable_nts-pool")]
+   607|             authorized_pool_server_certificates: pool_certs.iter().map(PathBuf::from).collect(),
+   608|             key_exchange_timeout_ms: 10000,
+   609|             concurrent_connections: 1,
+   610|             listen: "0.0.0.0:5435".parse().unwrap(),
+   611|             ntp_port: None,
+   612|             ntp_server: None,
+   613|         };
+   614|         let _join_handle = spawn(nts_ke_config, keyset);
+   615|         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+   616|         let mut blocker = tokio::net::TcpStream::connect("localhost:5435")
+   617|             .await
+   618|             .unwrap();
+   619|         blocker.write_all(b"\x16\x03\x01\x00\xf5\x01\x00\x00\xf1\x03\x03\xfc\x86\xea\x41\x80\x21\xec\x3e\x14\x5f\xf9\x4c\xa0\xcd\x8a\x1a\x66\x65\x41\xe5\x95\xd6\x8e\xb4\x65\x3b\x62\x49\x8d\xe1\xe0\xd8\x20\xe9\xa8\x94\xdb\xbf\x99\xfd\xc9\x3d\xd7\xcf\x7a\xc6\x7c\x03\xee\xb3\xcf\x17\x0b\x57\x69\xb6\x51\x48\xb1\xc6\x3e\xcb\x2d\x54\x2c\x00\x14\x13\x02\x13\x01\x13\x03\xc0\x2c\xc0\x2b\xcc\xa9\xc0\x30\xc0\x2f\xcc\xa8\x00\xff\x01\x00\x00\x94\x00\x33\x00\x26\x00\x24\x00\x1d\x00\x20\x4e\xcb\x36\xd3\xff\xc7\x64\x3e\xd8\x25\xf2\x1a\x20\x42\xc7\xa0\x29\x89\x8d\x00\x82\x0c\x9f\xff\xdf\xa6\xa0\xdc\xcf\xa7\xb8\x2b\x00\x0d\x00\x14\x00\x12\x05\x03\x04\x03\x08\x07\x08\x06\x08\x05\x08\x04\x06\x01\x05\x01\x04\x01\x00\x2b\x00\x05\x04\x03\x04\x03\x03\x00\x23\x00\x00\x00\x05\x00\x05\x01\x00\x00\x00\x00\x00\x17\x00\x00\x00\x10\x00\x0a\x00\x08\x07\x6e\x74\x73\x6b\x65\x2f\x31\x00\x00\x00\x0e\x00\x0c\x00\x00\x09\x6c\x6f\x63\x61\x6c\x68\x6f\x73\x74\x00\x2d\x00\x02\x01\x01\x00\x0a\x00\x08\x00\x06\x00\x1d\x00\x17\x00\x18\x00\x0b\x00\x02\x01\x00").await.unwrap();
+   620|         blocker.flush().await.unwrap();
+   621|         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+   622|         let ca = include_bytes!("../../test-keys/testca.pem");
+   623|         assert!(tokio::time::timeout(
+   624|             std::time::Duration::from_millis(100),
+   625|             key_exchange_client(
+   626|                 "localhost".to_string(),
+   627|                 5435,
+   628|                 &certificates_from_bufread(BufReader::new(Cursor::new(ca))).unwrap(),
+   629|             )
+   630|         )
+   631|         .await
+   632|         .is_err());
+   633|         blocker.shutdown().await.unwrap();
+   634|         drop(blocker);
+   635|         let result = tokio::time::timeout(
+   636|             std::time::Duration::from_millis(100),
+   637|             key_exchange_client(
+   638|                 "localhost".to_string(),
+   639|                 5435,
+   640|                 &certificates_from_bufread(BufReader::new(Cursor::new(ca))).unwrap(),
+   641|             ),
+   642|         )
+   643|         .await
+   644|         .unwrap()
+   645|         .unwrap();
+   646|         assert_eq!(result.remote, "localhost");
+   647|         assert_eq!(result.port, 123);
+   648|     }
+   649|     #[tokio::test]
+   650|     async fn key_exchange_roundtrip_with_port_server() {
+   651|         let provider = KeySetProvider::new(1);
+   652|         let keyset = provider.get();
+   653|         #[cfg(feature = "unstable_nts-pool")]
+   654|         let pool_certs = ["testdata/certificates/nos-nl.pem"];
+   655|         let (_sender, keyset) = tokio::sync::watch::channel(keyset);
+   656|         let nts_ke_config = NtsKeConfig {
+   657|             certificate_chain_path: PathBuf::from("test-keys/end.fullchain.pem"),
+   658|             private_key_path: PathBuf::from("test-keys/end.key"),
+   659|             #[cfg(feature = "unstable_nts-pool")]
+   660|             authorized_pool_server_certificates: pool_certs.iter().map(PathBuf::from).collect(),
+   661|             key_exchange_timeout_ms: 1000,
+   662|             concurrent_connections: 512,
+   663|             listen: "0.0.0.0:5432".parse().unwrap(),
+   664|             ntp_port: Some(568),
+   665|             ntp_server: Some("jantje".into()),
+   666|         };
+   667|         let _join_handle = spawn(nts_ke_config, keyset);
+   668|         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+   669|         let ca = include_bytes!("../../test-keys/testca.pem");
+   670|         let result = key_exchange_client(
+   671|             "localhost".to_string(),
+   672|             5432,
+   673|             &certificates_from_bufread(BufReader::new(Cursor::new(ca))),
+   674|         )
+   675|         .await
+   676|         .unwrap();
+   677|         assert_eq!(result.remote, "jantje");
+   678|         assert_eq!(result.port, 568);
+   679|     }
+   680|     #[cfg(feature = "unstable_nts-pool")]
+   681|     #[tokio::test]
+   682|     async fn key_exchange_refusal_due_to_invalid_config() {
+   683|         let cert_path = "testdata/certificates/nos-nl-chain.pem";
+   684|         let certs = [cert_path];
+   685|         let provider = KeySetProvider::new(1);
+   686|         let keyset = provider.get();
+   687|         let (_sender, keyset) = tokio::sync::watch::channel(keyset);
+   688|         let nts_ke_config = NtsKeConfig {
+   689|             certificate_chain_path: PathBuf::from("test-keys/end.fullchain.pem"),
+   690|             private_key_path: PathBuf::from("test-keys/end.key"),
+   691|             authorized_pool_server_certificates: certs.iter().map(PathBuf::from).collect(),
+   692|             key_exchange_timeout_ms: 1000,
+   693|             concurrent_connections: 512,
+   694|             listen: "0.0.0.0:5433".parse().unwrap(),
+   695|             ntp_port: None,
+   696|             ntp_server: None,
+   697|         };
+   698|         let Err(io_error) = run_nts_ke(nts_ke_config, keyset).await else {
+   699|             panic!("nts server started normally, this should not happen");
+   700|         };
+   701|         let expected_error_msg = format!(
+   702|             "pool certificate file at `\"{cert_path}\"` should contain exactly one certificate"
+   703|         );
+   704|         assert_eq!(io_error.to_string(), expected_error_msg);
+   705|     }
+   706|     #[tokio::test]
+   707|     async fn client_connection_refused() {
+   708|         let result = key_exchange_client("localhost".to_string(), 5434, &[]).await;
+   709|         let error = result.unwrap_err();
+   710|         match error {
+   711|             KeyExchangeError::Io(error) => {
+   712|                 assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+   713|             }
+

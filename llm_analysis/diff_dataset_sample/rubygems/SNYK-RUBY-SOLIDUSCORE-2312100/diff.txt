@@ -1,0 +1,157 @@
+--- a/backend/spec/spec_helper.rb
++++ b/backend/spec/spec_helper.rb
+@@ -20,21 +20,20 @@
+ require 'spree/testing_support/authorization_helpers'
+ require 'spree/testing_support/preferences'
+ require 'spree/testing_support/controller_requests'
+ require 'spree/testing_support/flash'
+ require 'spree/testing_support/url_helpers'
+ require 'spree/testing_support/order_walkthrough'
+ require 'spree/testing_support/capybara_ext'
+ require 'spree/testing_support/precompiled_assets'
+ require 'spree/testing_support/translations'
+ require 'spree/testing_support/job_helpers'
+-require 'spree/testing_support/blacklist_urls'
+ require 'capybara-screenshot/rspec'
+ Capybara.save_path = ENV['CIRCLE_ARTIFACTS'] if ENV['CIRCLE_ARTIFACTS']
+ Capybara.exact = true
+ require "selenium/webdriver"
+ require 'webdrivers'
+ Capybara.register_driver :selenium_chrome_headless do |app|
+   browser_options = ::Selenium::WebDriver::Chrome::Options.new
+   browser_options.args << '--headless'
+   browser_options.args << '--disable-gpu'
+   browser_options.args << '--window-size=1920,1080'
+@@ -54,26 +53,28 @@
+   config.mock_with :rspec do |c|
+     c.syntax = :expect
+   end
+   config.use_transactional_fixtures = true
+   config.fixture_path = "spec/fixtures"
+   config.before :suite do
+     DatabaseCleaner.clean_with :truncation
+   end
+   config.before do
+     Rails.cache.clear
++    if RSpec.current_example.metadata[:js] && page.driver.browser.respond_to?(:url_blacklist)
++      page.driver.browser.url_blacklist = ['http://fonts.googleapis.com']
++    end
+   end
+   config.include BaseFeatureHelper, type: :feature
+   config.include BaseFeatureHelper, type: :system
+   config.include FactoryBot::Syntax::Methods
+   config.include Spree::TestingSupport::Preferences
+   config.include Spree::TestingSupport::UrlHelpers
+   config.include Spree::TestingSupport::ControllerRequests, type: :controller
+   config.include Spree::TestingSupport::Flash
+   config.include Spree::TestingSupport::Translations
+   config.include Spree::TestingSupport::JobHelpers
+-  config.include Spree::TestingSupport::BlacklistUrls
+   config.extend WithModel
+   config.example_status_persistence_file_path = "./spec/examples.txt"
+   config.order = :random
+   Kernel.srand config.seed
+ end
+
+--- a/core/lib/spree/core/validators/email.rb
++++ b/core/lib/spree/core/validators/email.rb
+@@ -1,10 +1,10 @@
+ module Spree
+   class EmailValidator < ActiveModel::EachValidator
+-    EMAIL_REGEXP = URI::MailTo::EMAIL_REGEXP
++    EMAIL_REGEXP = /\A([^@\.]|[^@\.]([^@\s]*)[^@\.])@([^@\s]+\.)+[^@\s]+\z/
+     def validate_each(record, attribute, value)
+       unless EMAIL_REGEXP.match? value
+         record.errors.add(attribute, :invalid, { value: value }.merge!(options))
+       end
+     end
+   end
+ end
+
+--- a/core/lib/spree/core/version.rb
++++ b/core/lib/spree/core/version.rb
+@@ -1,9 +1,9 @@
+ module Spree
+-  VERSION = "2.11.13"
++  VERSION = "2.11.12"
+   def self.solidus_version
+     VERSION
+   end
+   def self.solidus_gem_version
+     Gem::Version.new(solidus_version)
+   end
+ end
+
+--- a/core/spec/lib/spree/core/validators/email_spec.rb
++++ b/core/spec/lib/spree/core/validators/email_spec.rb
+@@ -13,32 +13,35 @@
+       'e@email.com',
+       'valid+email@email.com',
+       'valid-email@email.com',
+       'valid_email@email.com',
+       'valid.email@email.com'
+     ]
+   }
+   let(:invalid_emails) {
+     [
+       'invalid email@email.com',
++      '.invalid.email@email.com',
++      'invalid.email.@email.com',
+       '@email.com',
++      '.@email.com',
+       'invalidemailemail.com',
+       '@invalid.email@email.com',
+       'invalid@email@email.com',
+       'invalid.email@@email.com'
+     ]
+   }
+-  it 'validates valid email addresses', :aggregate_failures do
++  it 'validates valid email addresses' do
+     tester = Tester.new
+     valid_emails.each do |email|
+       tester.email_address = email
+-      expect(tester.valid?).to be(true), "expected #{email} to be valid"
++      expect(tester.valid?).to be true
+     end
+   end
+-  it 'validates invalid email addresses', :aggregate_failures do
++  it 'validates invalid email addresses' do
+     tester = Tester.new
+     invalid_emails.each do |email|
+       tester.email_address = email
+-      expect(tester.valid?).to be(false), "expected #{email} not to be valid"
++      expect(tester.valid?).to be false
+     end
+   end
+ end
+
+--- a/core/spec/lib/tasks/solidus/check_orders_with_invalid_email_spec.rb
++++ b//dev/null
+@@ -1,27 +0,0 @@
+-require 'rails_helper'
+-path = Spree::Core::Engine.root.join('lib/tasks/solidus/check_orders_with_invalid_email.rake')
+-RSpec.describe 'solidus' do
+-  describe 'check_orders_with_invalid_email' do
+-    include_context(
+-      'rake',
+-      task_path: path,
+-      task_name: 'solidus:check_orders_with_invalid_email'
+-    )
+-    it 'includes orders with invalid email' do
+-      order = create(:order)
+-      order.update_column(:email, 'invalid email@email.com')
+-      expect { task.invoke }.to output(/invalid email@email.com \/ #{order.id} \/ #{order.number}\n/).to_stdout
+-    end
+-    it "doesn't include orders with valid email" do
+-      order = create(:order, email: 'valid@email.com')
+-      expect { task.invoke }.not_to output(/valid@email.com/).to_stdout
+-    end
+-    it "doesn't include orders with no email" do
+-      order = create(:order, user: nil, email: nil, number: '123')
+-      expect { task.invoke }.not_to output(/#{order.number}/).to_stdout
+-    end
+-    it "prints message when no matches found" do
+-      expect { task.invoke }.to output(/NO MATCHES/).to_stdout
+-    end
+-  end
+-end
